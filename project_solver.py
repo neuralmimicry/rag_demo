@@ -5536,6 +5536,9 @@ def _plan_recovery_steps(
     except json.JSONDecodeError as exc:
         logger.info(f"Recovery plan JSON parse failed: {exc}")
         return []
+    payload = _coerce_plan_payload(payload)
+    if not isinstance(payload, dict):
+        return []
     plan_steps = payload.get("plan", [])
     if not isinstance(plan_steps, list):
         return []
