@@ -1,0 +1,107 @@
+Analyse the following text regarding KPIs in the Telco industry. Extend the document to be a complete approach to KPIs for each of the following network automation domains:
+Mobile Access Network - RAN
+Fixed Access Network - FNA
+Core Network - Core
+IP & Transport Network - Transport
+Telco Cloud
+Business to Business (B2B)
+AI Automation - AI
+
+Use industry knowledge and corporate information from Jira and Confluence to provide a complete analysis and corporate context of the KPIs.
+The original document can be found here via CQL: https://neuralmimicry.atlassian.net/wiki/spaces/CDNP/pages/6997278749
+Add mermaid flowcharts and drawio compatible diagrams where appropriate.
+Ensure bullet points are expanded in to actionable paragraphs, without going too far down the rabbit hole.
+
+NeuralMimicry Network Autonomy & SDN KPI Framework
+
+By Paul Isaac'S
+
+Open image-20251127-142951.png
+image-20251127-142951.png
+Need: To add the NeuralMimicry UK version to this chart
+ 
+Executive Summary: The Autonomy Index Approach
+To drive measurable automation maturity across Virgin Media O2 (NeuralMimicry), this framework aligns with TM Forum Autonomy Index (Levels 0–5). The framework assesses autonomy for each domain - RAN, Core, Transport, IP, Fixed Access, and Telco Cloud - using SDN capabilities, CI/CD maturity, and measurable KPIs. It integrates DORA metrics, AI-driven forecasting, and operational data pipelines to enable full lifecycle automation across planning, build, run, and optimise phases.
+Domain-Specific Autonomy & KPIs
+RAN (Mobile Access)
+Current Focus: 4G/5G Enablement & Open RAN Integration
+Autonomy Drivers: AI-driven forecasting, dynamic resource management, and KPI extension to Mavenir equipment.
+Key KPIs: 5G slicing latency, forecast accuracy, ORAN platform performance parity.
+Core Network
+Current Focus: Network Slicing & Dynamic Policy Enforcement
+Autonomy Drivers: Centralised control for IoT and enterprise slices, SDN controller-based resource management.
+Key KPIs: Slice instantiation time, policy update success rate, mobility management efficiency.
+IP & Transport
+Current Focus: SD-WAN Orchestration & Virtualisation
+Autonomy Drivers: Automated SD-WAN inventory discovery, traffic optimisation, SLA automation.
+Key KPIs: Orchestration success rate, inventory accuracy, SLA compliance automation.
+Fixed Access
+Current Focus: Proactive Care & Fault Resolution
+Autonomy Drivers: Zero-touch resolution, automated Wi-Fi fault remediation, proactive care analytics.
+Key KPIs: Fault automation rate, autonomous resolution %, NPS uplift from proactive interventions.
+Telco Cloud
+Current Focus: Infrastructure-as-Code & Resilience
+Autonomy Drivers: CI/CD integration, automated load balancing, compliance automation.
+Key KPIs: Downtime reduction, configuration time reduction, compliance automation coverage.
+B2B
+a
+b
+Cross-Domain Enablers
+These enablers contribute to raising automation maturity across all domains.
+CI/CD & DevOps Maturity: Track DORA metrics (Deployment Frequency, Lead Time, Change Failure Rate, MTTR).
+Security & Compliance Automation: Integrate SCOUT/DAST scans, track MTTRv, automate compliance evidence.
+Device Inventory & Lifecycle: Maintain SD-WAN CPE/NTU lifecycle, firmware updates, password rotation automation.
+Operationalisation: How to Measure & Report
+Data Pipeline Architecture:
+Ingest: OSS/BSS, SDN Controllers, SharePoint.
+Process: Blue Prism bots and Power Automate workflows.
+Visualise: Innovile INNSIGHT dashboards, Sourcetable for forecasting, SharePoint for audit evidence.
+Autonomy Index by Domain
+Domain
+Current Level
+Target Level
+Key Gap to Close
+RAN
+Level 2 (Assisted)
+Level 3
+Automate Mavenir patch deployment via CI/CD
+Core
+Level 2 (Partial)
+Level 3
+Dynamic slice creation and lifecycle automation
+IP/Transport
+Level 2 (Partial)
+Level 3
+Automate SD-WAN SLA credit calculation
+Fixed Access
+Level 3 (Conditional)
+Level 4
+Increase zero-touch resolution >40%
+Telco Cloud
+Level 3 (Conditional)
+Level 4
+Full SCOUT/DAST integration with auto-blocking
+Next Steps
+Conduct baseline autonomy assessment per domain using KPI data.
+Integrate KPI tracking into Innovile dashboards with SharePoint governance.
+Align partner SoWs (e.g., Amartus) to autonomy targets and throughput KPIs.
+Review and update quarterly to measure progression toward full automation.
+
+
+How is the Index Calculated?
+
+The TMForum model defines several levels of autonomy, typically ranging from:
+Level 0: Manual operation (no automation)
+Level 1: Assisted automation (basic scripting, some tool support)
+Level 2: Partial automation (automated workflows, human-in-the-loop)
+Level 3: Conditional automation (systems can act autonomously under certain conditions)
+Level 4: High automation (systems act autonomously, humans monitor)
+Level 5: Full autonomy (end-to-end closed-loop automation, minimal human oversight)
+Each domain and process is assessed against these levels, considering both the automation technology in place and the use of AI for decision-making, prediction, and optimization.
+Why is the Autonomy Level Index Important for NeuralMimicry?
+
+Benchmarking: Enables NeuralMimicry to benchmark its automation maturity against industry standards and peers.
+Strategic Planning: Identifies areas where further automation or AI investment will yield the greatest operational and business impact.
+Cross-Domain Consistency: Ensures that automation progress is measured consistently across Mobile, Fixed, B2B, and Cloud domains.
+Continuous Improvement: Supports ongoing improvement by highlighting gaps and tracking progress over time.
+

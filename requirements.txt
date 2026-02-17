@@ -1,0 +1,15 @@
+Flask
+requests
+packaging
+jira
+holidays
+fuzzywuzzy
+matplotlib
+pytest
+python-Levenshtein
+pypdf
+python-docx
+odfpy
+beautifulsoup4
+Pillow
+cryptography
