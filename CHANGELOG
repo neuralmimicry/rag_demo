@@ -7,6 +7,7 @@ Nov.19th Initial commit to repository
 - Added requirement-to-change traceability in project_solver output (requirements → plan steps → file edits).
 - Added optional Action Plan sections to Jira and Confluence analysis reports (CLI: --action-plan).
 - OpenAI responses now auto-retry incomplete outputs using the recommended max token size (with caps).
+- Recovery planning now tolerates list-style JSON responses without crashing.
 
 2025-12-15 Pagination hardening for Jira and Confluence
 - Confluence: fetch all pages beyond 50/100 server limits with config-driven page size and high safety cap; robust comment listing pagination.
