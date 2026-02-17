@@ -1,0 +1,148 @@
+Nov.19th Initial commit to repository
+
+2026-02-17 Agentic solver and analysis enhancements
+- Added explicit agentic workflow loop (plan/act/verify/reflect), progress tracking, and verification-first execution in the project solver.
+- Added multi-agent role overrides and shared repo context indexing (Repo-RAG) for solver prompts.
+- Unified web research utilities across topic research and project solver; solver can inject external research with caching.
+- Added requirement-to-change traceability in project_solver output (requirements → plan steps → file edits).
+- Added optional Action Plan sections to Jira and Confluence analysis reports (CLI: --action-plan).
+- OpenAI responses now auto-retry incomplete outputs using the recommended max token size (with caps).
+
+2025-12-15 Pagination hardening for Jira and Confluence
+- Confluence: fetch all pages beyond 50/100 server limits with config-driven page size and high safety cap; robust comment listing pagination.
+- Jira: enforce config-driven `max_items` cap; ensure REST and client pagination continue across 50/100 boundaries; report uses configured cap.
+- Added tests to verify pagination over multiple pages and strict caps.
+
+2025-12-16 Jira insights: optional Confluence context and concurrency
+- Added optional `jira_insights` section to config with:
+  - `include_confluence` (default true)
+  - `max_confluence_pages_per_issue` (default 3)
+  - `max_confluence_chars_per_page` (default 5000)
+  - `max_parallel_confluence_fetches` (default 4)
+- Jira quality analysis now detects Confluence links in issue descriptions and fetches those pages concurrently (bounded thread pool), appending text as context for LLM insights.
+- Prompts updated so insights end with a `Draft ticket` section; Jira comment upsert remains unchanged and includes the draft by posting the full assessment.
+
+2025-12-23 Topic Research and Document Generation
+- Added `topic_researcher.py` for iterative document generation based on a topic and requirements.
+- Supports querying Jira, Confluence, LLMs, and Search Engines (simulated via LLM).
+- Ensures document is comprehensive and uses professional British English.
+- Exposed functionality via `--topic-research` CLI argument in `run_rag.py`.
+- Added tests to verify iterative research and document formulation.
+- Extended with `--context` support to provide additional URLs and documents for context, relevance, and focus.
+- Integrated an agentic debate mechanism using multiple LLM roles (Critic, Editor) to fine-tune the document.
+- Support for multi-format input and context:
+  - Added `FileConverter` to support `.docx`, `.pdf`, `.odf`, `.html`, `.jpg`, `.png`, `.svg`, `.mp3`, and `.mp4`.
+  - Multimodal LLM support for image description and audio transcription.
+  - Automatic conversion of remote binary files from URLs.
+- Fixed packaging and installation:
+  - Configured `pyproject.toml` to correctly export the `rag_demo` package from the project root.
+  - Added `sys.path` injection in `__init__.py` and `cli.py` to support legacy top-level imports when invoked via the console script.
+- Fixed `AttributeError` in `topic_researcher.py` where `LLMResponse` was incorrectly accessed via `.content` instead of `.text`.
+- Enhanced `TopicResearcher` with URL failure fallback logic:
+  - Added `_fallback_url_research` to analyse failed URLs (Jira, Confluence, or general) using LLM.
+  - Automatically attempts alternative searches (Web, Jira Keywords, Confluence Keywords) when primary fetches or search queries fail.
+  - Improved robustness of `--topic-research` and `--context` fetching.
+- Robust LLM Timeout Configuration:
+  - Added `--llm-timeout` CLI argument to `run_rag.py`.
+  - Added `LLM_TIMEOUT_SECONDS` environment variable support.
+  - Corrected `llm_providers.py` to allow overriding the default 180-second timeout, particularly useful for local LLMs like Ollama.
+- Improved Research Robustness and Query Generation:
+  - Updated LLM prompts to ensure valid JQL/CQL query strings, preventing malformed URL-style parameter splitting.
+  - Enhanced `TopicResearcher` to detect Jira/Confluence URLs in context/source and fetch them via authenticated APIs if direct access fails.
+  - Added robust handling for JQL/CQL provided as lists.
+  - Improved fallback research with a stronger emphasis on keyword-based text searches when specific queries fail.
+
+2025-12-23 Logging, Debug, and Status Monitoring
+- Implemented a robust logging system with support for verbose and debug levels.
+- Added CLI arguments `--verbose` (-v), `--debug` (-d), and `--log-file` to `run_rag.py`.
+- Enhanced `TopicResearcher` with real-time status updates (prefixed with `[*]`) to monitor progress during long-running research tasks.
+- Added detailed debug logging across all major modules (`llm_providers.py`, `jira_analysis.py`, `confluence_analysis.py`, `file_converter.py`):
+  - Truncated LLM request payloads and responses.
+  - Detailed Jira and Confluence API request logs.
+  - File conversion process details and results.
+- Logs are saved to `rag_demo.log` by default, enabling post-execution analysis.
+- Enhanced `TopicResearcher` to track and log all Jira issues and Confluence pages that contribute to the research report, providing a clear audit trail of sources used in the final document.
+
+2025-12-23 Google Search Integration
+- Replaced simulated search with real Google Search Engine integration using Google Custom Search API.
+- Added support for `--google-api-key` and `--google-cse-id` CLI arguments and environment variables.
+- Enhanced the research loop to fetch and analyse full content from search result URLs, providing deeper insights and context.
+- Integrated automated content fetching for search results, supporting various formats (HTML, PDF, etc.) via the existing conversion pipeline.
+- Added a verification step for Google Search credentials that validates API keys and Search Engine IDs on startup, falling back to simulated search if credentials are invalid.
+
+2025-12-23 Robustness and JSON Parsing Fixes
+- Hardened `TopicResearcher` to handle empty or malformed LLM responses gracefully across all research stages (Query Generation, Fallback Research, Document Formulation, Agentic Refinement).
+- Implemented key-validation for generated research queries, ensuring missing fields are automatically populated from robust fallbacks.
+- Enhanced logging to include response snippets when JSON parsing fails, aiding in troubleshooting LLM behaviour.
+- Added detailed debug logging in `OllamaProvider` to track empty responses from local LLM instances.
+- Added comprehensive robustness tests in `tests/test_research_robustness.py`.
+
+2025-12-29 Business-Context Focused Research
+- Enhanced `TopicResearcher` to prioritize internal business context from Jira and Confluence over general LLM knowledge.
+- Implemented automated detection of generic placeholders (e.g., "Domain A", "System X") in research reports, triggering targeted expansion and research iterations to replace them with real data.
+- Strengthened LLM prompts across all research phases (Query Generation, Formulation, Agentic Debate, Completeness Check) to enforce strict business-specific detail and professional British standards.
+- Improved fallback query generation to leverage requirements keywords for more effective Jira and Confluence searching.
+- Updated the test suite to verify placeholder detection and more stringent depth heuristics.
+
+2025-12-29 Search Relevance and Content Filtering
+- Enhanced `TopicResearcher` to verify the relevance of documents retrieved from web search results before including them in the research data.
+- Implemented `_is_content_relevant` using LLM to evaluate search result snippets and full content against the research topic and requirements.
+- Updated `_execute_queries` to filter out irrelevant external documents, reducing noise and improving the focus of the generated research reports.
+- Adjusted test suites to account for additional relevance-checking iterations.
+
+2025-12-29 Robust JSON Extraction and Query Sanitization
+- Implemented `_extract_json` in `TopicResearcher` to robustly extract JSON objects from LLM responses, handling triple backticks, preambles, and stray curly braces.
+- Enhanced `_sanitize_queries` to automatically map invalid JQL/CQL fields (e.g., `page` or `title` in JQL) to correct ones (`text`, `summary`), improving reliability with diverse LLM outputs.
+- Added automated quote escaping for fallback JQL/CQL queries to prevent malformed queries when topics contain special characters.
+- Expanded the robustness test suite to verify JSON extraction and field sanitization.
+
+2025-12-29 Research Resumption Support
+- Enhanced `TopicResearcher` to support resuming or continuing research from an existing `research_report.md` file.
+- Implemented automated relevance verification using LLM to ensure existing report content matches the current research topic and requirements before using it as a starting draft.
+- Added comprehensive test cases to verify successful resumption, fresh start on irrelevance, and immediate completion for perfect reports.
+
+2025-12-29 Search Results Filtering and Relevance
+- Enhanced `TopicResearcher` to automatically exclude LinkedIn profiles and posts from search results unless they are explicitly requested in the requirements.
+- Updated `_is_content_relevant` system prompt to explicitly flag LinkedIn content as generally irrelevant for technical research reports.
+- Improved logging to notify when LinkedIn URLs are skipped.
+
+2025-12-29 Research Resumption and Query Robustness
+- Improved `_is_content_relevant` to handle research resumption with a more lenient prompt, preventing valid reports from being overwritten.
+- Increased relevance check snippet size to 4000 characters for better context evaluation.
+- Enhanced `_extract_json` with a robust fixer (`_try_fix_truncated_json`) that handles truncated responses by closing unclosed quotes, brackets, and braces.
+- Implemented `_extract_queries_from_text` as a fallback mechanism to extract JQL, CQL, Search Queries, and LLM Questions from Markdown-style text when JSON parsing fails.
+- Updated `_generate_queries` system prompt to explicitly forbid preambles and provide a Markdown fallback structure.
+- Verified fixes with comprehensive new tests and existing test suite.
+
+2025-12-30 LLM Quota Handling and Failover
+- Implemented `LLMQuotaError` to specifically identify and track HTTP 429 (Quota Exceeded) responses from LLM providers.
+- Added a `_quota_reached` circuit breaker in `TopicResearcher` to prevent redundant failing LLM calls once a quota limit is detected.
+- Implemented `_heuristic_relevance_check` (keyword-based) as an alternate non-LLM method for content relevance verification when LLM quota is hit.
+- Enhanced `TopicResearcher` with primary-to-secondary LLM failover support (`_predict_with_fallback`), allowing research to continue seamlessly using a secondary provider (e.g., Ollama) if the primary hits a limit.
+- Exposed `--fallback-llm-provider` and `--fallback-llm-model` CLI arguments in `run_rag.py`.
+- Updated all core research functions to use robust failover logic, ensuring better resilience during long-running tasks.
+- Added a comprehensive test suite for quota detection and failover mechanisms.
+
+2025-12-30 Bibliography and Citation Support
+- Extended `TopicResearcher` to track comprehensive metadata (titles, URLs, identifiers) for all Jira, Confluence, and Web sources used during research.
+- Added automated source recording during API fetches and search engine queries.
+- Implemented `_generate_bibliography` to produce a structured Markdown file containing all references grouped by source type.
+- Exposed `--references-output` CLI argument in `run_rag.py` to allow users to specify a separate file for the report's bibliography.
+- Added unit tests to verify accurate bibliography generation and saving.
+
+2025-12-30 Robust Query Execution and Sanitization
+- Enhanced `TopicResearcher` to handle lists of JQL/CQL queries individually instead of joining them with `AND`. This prevents syntax errors when multiple full queries (each with their own `ORDER BY`) are generated by the LLM.
+- Updated `_sanitize_queries` to automatically detect and split concatenated query strings that contain multiple `ORDER BY` clauses joined by `AND`.
+- Improved the `ORDER BY` cleaning logic to remove redundant ordering clauses and their associated field lists from within a single query, ensuring technical validity for Atlassian APIs.
+- Refined `fix_quotes` heuristic to correctly identify terminal JQL/CQL keywords (`ORDER BY`, `GROUP BY`, `LIMIT`) as markers for closing quotes, preventing incorrect escaping of valid structural elements.
+- Verified improvements with a suite of new test cases covering query concatenation, splitting, and terminal keyword recognition.
+
+2025-12-30 JQL/CQL Sanitization and Extraction Hardening
+- Improved `_sanitize_queries` in `TopicResearcher` to address common LLM hallucinations and syntax errors:
+  - Implemented robust mapping for hallucinated field names (e.g., `updatedDate`, `createdDate`, `resolvedDate`, `commentDate`, `issueKey`, `pageId`) to valid JQL and CQL equivalents.
+  - Added automated removal of redundant wrapping quotes from query strings.
+  - Implemented cleanup for dangling operators and hallucinated templates (e.g., trailing `AND (`).
+  - Enforced mandatory quoting for project and space identifiers in `IN` and comparison clauses to prevent `400 Bad Request` errors in Confluence.
+  - Expanded support for various CamelCase and snake_case field variants.
+- Enhanced `_extract_queries_from_text` with more restrictive regex to prevent capturing subsequent query blocks as part of the current one when queries are not in JSON format.
+- Verified fixes with targeted reproduction scripts and confirmed no regressions in the full test suite.

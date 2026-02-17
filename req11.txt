@@ -1,0 +1,52 @@
+The following note applies to the named staff listed here:
+Das Wijesundera
+Jozsef Tamasi
+Matthew Rose
+Neil Venter
+Sandy Cox
+Tom Voinquel
+
+For context, documents relating to dates between 01-Jan-2025 and 31-Dec-2025 inclusive. However, for the creation of comments/answers, facts are only relevant between dates 01-Nov-2025 and 31-Dec-2025 inclusive.
+
+Use Jira and Confluence to extract related timelines, relevant projects/tickets and those of subordinate team members. Ensure that all information referred to includes a verifiable/valid/relevant link to that information.
+
+Construct factual summaries for each named staff. The staff names should only be used in Jira/Confluence searches, not the wider Internet searches.
+For tickets that have any sort of reference to the individual person with dates between 01-Jan-2025 and 31-Dec-2025 inclusive, create a table for each person with the following columns:
+Ticket reference, Ticket description, Last Date updated, Last comment.
+
+When complete, sanity check all formatting of the final report. Links that are inferred must still actually exist for them to be valid.
+
+Morning Paul,
+Hope you are well mate.
+ 
+Quick one please mate: I have to do the Q4 appraisal for the Tech Leads in Jan. Are you able to share some note on them that i can incorporate in my 1 to 1 with them. Please make it constructive.
+ 
+These were their goals:
+1. 2025 Getting back to growth...for our people (People and Culture)
+Foster a culture of belonging, growth, and inclusivity by integrating DEI principles in daily operations. Empower teams to collaborate effectively across products, platforms, and external stakeholders, ensuring continuous improvement and accountability. Promote personal development and recognise achievements through frameworks that align with company values and Can Do plans.
+ 
+2. 2025 Getting back to growth...for our customers, businesses, wholesale partners
+Proactively enhance customer experience by minimising negative impacts and ensuring all customer-facing teams are aligned in their approach. Build a more agile, customer-centric organisation where feedback loops are strong, and improvements are continuous.
+ 
+3. Transformation and Innovation in line with DESA
+Drive cost optimisation through innovative transformation strategies that generate clear, measurable benefits. Encourage a mindset of curiosity and bold decision-making to embrace new technologies and processes, enhancing internal capabilities and customer offerings. Ensure seamless alignment with the digital end-state architecture by adopting best practices in solution design, focusing on scalability, security, and automation. Strengthen cross-functional collaboration to drive the evolution of the architecture, ensuring it supports both current and future business needs while maximising innovation and cost efficiency.
+ 
+4. Collaboration and Stakeholder Engagement
+
+
+Strengthen collaboration between product and platform teams, ensuring alignment and reducing duplication.
+Increase engagement with external stakeholders to build strategic partnerships and enhance market positioning.
+Ensure active participation in the "front door" process by directing customers to the process, ensuring that new requirements are funnelled through it to create a holistic view, prevent silos, and align all stakeholders for better decision-making.
+ 
+I also added three more kpis for them to track:
+Reusability KPI:
+
+How many of the automation components (microservices, workflows, services/actions, IAG scripts, DAGS, helper scripts) produced this quarter are re-usable across squads, and how many have been re-used.
+Efficiency KPI:
+
+How long did it take to deliver an MVP, from the first story being worked on to value being realised by the stakeholder.
+Quality KPI (Bug Escape Rate): keep the number of bugs escaping into prod as low as possible. Ensure high test coverage. <65% unit testing coverage and high number of automated regression testing coverage.
+
+ 
+Another one to consider: KPI: how many things are in production done in Q4, that is adding value to stakeholders. Jacs can probably help with this one.
+ 

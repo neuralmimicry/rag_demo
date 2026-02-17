@@ -1,0 +1,191 @@
+ NeuralMimicry Cross-Domain Test Strategy
+
+Expand and improve the existing Test Strategy, and its child pages, located at: https://neuralmimicry.atlassian.net/wiki/spaces/CDNP/pages/6441140238/Testing+Strategy which can be obtained via a Confluence API query.
+Use pre-existing relevant Confluence pages, via the Confluence API, for context and relevance.
+Use pre-existing relevant Jira tickets, via the Jira API, for context and relevance.
+Use domain specific details for focused sections on:
+Fixed Network Access - FNA
+Mobile Network Access - RAN
+Telco Cloud - Telco Cloud
+Core Network - Core
+IP & Transport - Transport
+Business to business connections - B2B
+Physical equipment transformation - Pe TX
+AI Automation - AI
+
+Where appropriate, include mermaid flowcharts and drawio compatible diagrams.
+Ensure bullet points are expanded into detailed sections and practical steps, where appropriate without going too far down rabbitholes.
+
+Additional initial relevant approaches to a testing strategy:
+1) Governance and test “contract” (set once, enforce everywhere)
+
+1.1 Define the canonical models (the source of truth)
+
+Business / capability map aligned to TM Forum ODA concepts (what capabilities exist, who owns them, what “good” looks like). 
+
+API contract standard for northbound / partner interfaces using TM Forum Open APIs (schema-first; versioned). 
+
+Network configuration contract for southbound control using IETF YANG + NETCONF/RESTCONF with an explicit datastore model (NMDA mindset: intended vs operational). 
+
+1.2 Define quality gates (non-negotiables)
+
+Every change must pass: contract tests, backwards compatibility checks, security checks, performance budget, and rollback safety.
+
+Publish “Definition of Done” for each component: code + IaC + API + dashboards + runbooks + tests.
+
+1.3 Conformance and certification posture
+
+If you buy/build products around TMF Open APIs, adopt TMF Open API Conformance (self-assess + CTK where applicable) as a formal gate for suppliers and for internal teams. 
+
+If you’re running ODA-aligned components, align with ODA conformance expectations for plug-and-play interoperability. 
+
+2) Test architecture (how you organise tests so they scale)
+
+Use a three-layer test system, applied across RAN, Core, Transport/IP, Fixed Access, Telco Cloud, OSS/BSS, Observability:
+
+Layer A — Component Verification (fast, isolated)
+
+Unit tests, static analysis, SAST
+
+Container image tests (SBOM, vuln scan), IaC linting, policy-as-code
+
+Deterministic mocks for dependencies
+
+Layer B — Contract & Interop (the “always-on” safety net)
+
+TMF Open API contract tests: OpenAPI schema, payload rules, error models, pagination, idempotency, correlation IDs, event schemas. 
+
+Network management contract tests: YANG schema validation, datastore behaviour (intended/operational), and protocol compatibility (NETCONF/RESTCONF behaviours). 
+
+Layer C — End-to-End Service Journeys (few but high value)
+
+Prioritise 6–10 “golden journeys” that cross domains, e.g.:
+
+Order → Provision → Activate → Assure (end customer fixed broadband, mobile plan, enterprise VPN)
+
+Change → Validate → Rollback (policy/routing/QoS change through controller → devices)
+
+Fault → Correlate → Heal → Verify (alarm → RCA → remediation → KPI restored)
+
+Capacity → Optimise (traffic shift / scaling event → SLA maintained)
+
+3) The procedural workflow (what you do, in order, every time)
+Step 0 — Classify the change (drives test depth)
+
+Low risk: UI, docs, non-prod-only config
+
+Medium: new API fields (backwards compatible), non-critical workflow change
+
+High: routing/policy changes, control-plane, authN/Z, billing impacts, anything that can page on-call
+
+Step 1 — Convert requirements into testable acceptance criteria
+
+Each story has:
+
+Functional criteria (what)
+
+Contract criteria (inputs/outputs)
+
+Operational criteria (metrics/logs/traces exist; SLO impact)
+
+Security criteria (authZ rules, audit trails)
+
+Step 2 — Build/refresh the representative environment
+
+Reference lab mirrors production topology patterns:
+
+fixed + mobile adjacency
+
+“mini” telco cloud (K8s), observability stack, message bus
+
+realistic inventories/topologies (synthetic but production-shaped)
+
+Include fault injection hooks (link flap, node drain, API latency, DB failover)
+
+Step 3 — Run Layer A (component gates)
+
+compile/build + unit tests + lint + image scan
+
+IaC plan/validate and policy checks
+
+fail fast
+
+Step 4 — Run Layer B (contracts + conformance)
+
+TMF Open API contract tests and (where appropriate) TMF conformance tooling/process gates. 
+
+YANG/NETCONF datastore validation (schema and behaviour aligned to NMDA expectations). 
+
+Step 5 — Run Layer C (golden journeys)
+
+Execute the small set of cross-domain E2E journeys
+
+Capture:
+
+service-level KPIs (latency, throughput, availability)
+
+domain KPIs (e.g., attach success, session setup, broadband sync, routing convergence)
+
+telemetry completeness (trace continuity, log correlation, alarm linkage)
+
+Step 6 — Non-functional test suite (performance, resilience, security)
+
+Performance benchmarking for dataplane/network elements using IETF-style methodology such as RFC 2544 (throughput, latency, frame loss, back-to-back). 
+
+Resilience: chaos tests (pod/node failure, device unreachable, message bus partition)
+
+Security: DAST + authZ negative tests + secrets handling + audit event validation
+
+Step 7 — Release with production safety checks
+
+Progressive delivery (canary/blue-green), feature flags, automatic rollback conditions
+
+Post-deploy smoke + synthetic probes per golden journey (fast subset)
+
+On success: tag release, store evidence, update runbooks
+
+4) Cross-domain coverage matrix (what must be tested where)
+
+Control & orchestration (Telco Cloud + OSS):
+
+API contract correctness (TMF Open APIs), eventing, idempotency, retries, back-pressure 
+
+State management correctness (intended vs operational), reconciliation loops 
+IETF Datatracker
+
+Transport/IP:
+
+Change safety: staged policy/routing updates, convergence verification
+
+Benchmark dataplane changes with a standard method (RFC 2544-style) 
+IETF Datatracker
+
+Mobile + Fixed access:
+
+Service activation journeys (order → activate → assure)
+
+Fault handling: noisy alarms, correlation accuracy, ticketing loop closure
+
+Performance under load + failover scenarios (site/core/cloud failures)
+
+Observability (every domain, every release):
+
+Trace coverage for golden journeys
+
+Metric SLOs and alert rules validated (no “silent failure”)
+
+Log correlation IDs consistent across TMF APIs and internal services
+
+5) Minimum artefacts to make it repeatable
+
+Test catalogue: all tests tagged by domain, layer, risk, owner
+
+Golden journey definitions (inputs, expected outputs, KPIs, run time)
+
+Contract packs:
+
+TMF Open API schemas + example payloads + negative cases 
+
+YANG models + datastore behaviour assertions 
+
+Evidence bundle per release: pass/fail, performance report, security report, rollback proof
