@@ -169,6 +169,10 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
+# Delivery pipeline outputs
+delivery_pipeline_output/
+job_data/
+
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

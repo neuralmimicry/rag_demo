@@ -34,10 +34,11 @@ The default Jira statistics workflow can (optionally) run discovery, refine your
 ## Workflow overview
 Workflow selection order (run_rag.py):
 1) --topic-research
-2) --project
-3) --analyze-confluence
-4) --analyze-jira
-5) Default Jira statistics workflow (unless --disable-jira is set)
+2) --delivery
+3) --project
+4) --analyze-confluence
+5) --analyze-jira
+6) Default Jira statistics workflow (unless --disable-jira is set)
 
 Summary of workflows:
 
@@ -47,6 +48,7 @@ Summary of workflows:
 | Jira quality analysis | --analyze-jira | jira_report.html | Interactive HTML report with optional LLM insights, action plan, and comment posting. |
 | Confluence space analysis | --analyze-confluence --space | confluence_report.html | Interactive HTML report with optional LLM/Rovo insights, action plan, and comment posting. |
 | Topic research | --topic-research | researched_document.md (+ references) | Iterative research with Jira/Confluence context and optional web search. |
+| Delivery pipeline | --delivery --project | delivery_pipeline_output/pipeline_report_*.json | Staged sandbox/dev/integration/staging/uat/deploy pipeline with approvals and artifact capture. |
 | Project solver | --project | project_solution.json | Requirements extraction, planning, and optional code changes/commands. |
 
 
@@ -57,15 +59,17 @@ flowchart TD
     A[Start: parse CLI arguments] --> B[Configure logging and environment overrides]
     B --> C{--topic-research provided?}
     C -- Yes --> TR[Topic research workflow]
-    C -- No --> D{--project provided?}
-    D -- Yes --> PS[Project solver workflow]
-    D -- No --> E{--analyze-confluence set?}
-    E -- Yes --> CF[Confluence space analysis workflow]
-    E -- No --> F{--analyze-jira set?}
-    F -- Yes --> JA[Jira quality analysis workflow]
-    F -- No --> G{--disable-jira set?}
-    G -- Yes --> H[Exit: Jira disabled]
-    G -- No --> JS[Default Jira statistics workflow]
+    C -- No --> D{--delivery set?}
+    D -- Yes --> DP[Delivery pipeline workflow]
+    D -- No --> E{--project provided?}
+    E -- Yes --> PS[Project solver workflow]
+    E -- No --> F{--analyze-confluence set?}
+    F -- Yes --> CF[Confluence space analysis workflow]
+    F -- No --> G{--analyze-jira set?}
+    G -- Yes --> JA[Jira quality analysis workflow]
+    G -- No --> H{--disable-jira set?}
+    H -- Yes --> I[Exit: Jira disabled]
+    H -- No --> JS[Default Jira statistics workflow]
 ```
 
 ### Jira statistics workflow (default)
@@ -134,6 +138,25 @@ flowchart TD
     G --> H[Write researched document + references]
 ```
 
+### Delivery pipeline workflow
+```mermaid
+flowchart TD
+    A[Load pipeline config + compute version] --> B[Prepare workspaces and approvals]
+    B --> C[Sandbox tests]
+    C --> D[Dev checks]
+    D --> E[Integration tests]
+    E --> F{Approval for staging?}
+    F -- Yes --> G[Staging smoke tests]
+    F -- No --> H[Halt for approval]
+    G --> I{Approval for UAT?}
+    I -- Yes --> J[UAT stage]
+    I -- No --> K[Halt for approval]
+    J --> L{Approval for deploy?}
+    L -- Yes --> M[Deploy stage]
+    L -- No --> N[Halt for approval]
+    M --> O[Write pipeline report]
+```
+
 ### Project solver workflow
 ```mermaid
 flowchart TD
@@ -173,6 +196,29 @@ flowchart TD
 - Templates: `--emit-templates` and `--templates-dir` for local template output.
 - Comment posting: `--post-comments`, `--post-exec-summary`, `--post-page-insights`, and `--dry-run-post`.
 
+### Delivery pipeline workflow
+- Trigger: `--delivery --project <PATH>`.
+- Config: `delivery_pipeline.json` by default (override with `--delivery-config`, or use `--delivery-config default` to force the bundled config).
+- Safety: commands only execute when `--delivery-run` is supplied; otherwise the pipeline is a dry-run plan.
+- Approvals: create `delivery_pipeline_output/approvals/<stage>.ok` (or set `approval_file` per stage) to unblock gated stages.
+- Optional solver integration: `--delivery-project-solution` overlays the solver workspace and records completion status in the report.
+- Override: use `--delivery-allow-unfinished` to permit deploy stages on incomplete code for interim validation.
+- Interim stages: use `--delivery-enable-interim` to enable the optional `interim_deploy` + `interim_teardown` stages without editing the config.
+- Versioning: computed from git (or timestamp fallback) and optionally written to `delivery_pipeline_output/VERSION` when `versioning.write_file` is enabled.
+- VCS integration: configure `vcs` in `delivery_pipeline.json` (defaults to `github.com/neuralmimicry`); supports pull/branch/commit/merge/push/tag/release actions.
+- You can gate VCS actions with `vcs.requires_approval` and `vcs.approval_file` if you want a manual check before git operations run.
+- Platform auto-selection: configure `platform` in `delivery_pipeline.json` to pick the lowest-cost viable tier based on detected tooling (QEMU, Podman, Docker, Kubernetes, OpenShift, GCP, AWS, Azure). The selection is exported via `PIPELINE_PLATFORM*` env vars for stage commands.
+- Solver gating: `solver_gate` controls how incomplete solver output affects deploy stages (`block_all`, `block_deploy`, `warn`). Use `--delivery-allow-unfinished` or `allow_unfinished_deploy` to allow deploy stages even when the project is still incomplete.
+- Stage kinds: `kind` influences solver gating (e.g., `deploy`, `staging`, `uat` are gated; `sandbox_deploy` or `test` are not), and is exposed as `PIPELINE_STAGE_KIND`.
+- Optional interim deploy/teardown: `interim_deploy` and `interim_teardown` stages are included in the default config but disabled (`enabled: false`) so teams can toggle them for iterative sandbox validation.
+- If any delivery flags are provided without `--delivery`, delivery mode is enabled automatically.
+- Auto-recovery: set `auto_recover` and `retry_attempts` in `delivery_pipeline.json` to enable intelligent retries for common failures (missing venv, missing requirements, missing pytest, missing pip/wheel, poetry/pipenv project detection, pytest retry of last failed tests, and missing toolchains detection).
+- Multi-language support: language/build-system detection is exported as `PIPELINE_LANGUAGES` and `PIPELINE_BUILD_SYSTEMS` for stage scripts, covering Python, JS/TS, Go, Rust, C/C++, Fortran, Pascal, Bash, and PowerShell.
+- Solver fallback: configure `solver_fallback` to invoke `project_solver` after build/test failures and retry the stage, logging each attempt in the pipeline report.
+- CLI overrides: `--delivery-solver-fallback` forces solver fallback on, `--delivery-no-solver-fallback` forces it off.
+- Solver focus: fallback attempts now extract file paths, symbols, and REQ IDs from failure logs to start the solver near the failing code, with file excerpts embedded in the solver context.
+- Diff-based prioritization: solver context includes recent git changes and recently touched workspace files so the solver can prioritise likely generated/modified files (without forcing a scope).
+
 ### Shared LLM and rate-limit controls
 - `--llm-provider`, `--llm-model`, `--fallback-llm-provider`, `--fallback-llm-model`, `--ollama-base-url`.
 - `--llm-max-tokens`, `--llm-chunk-size`, `--llm-temperature`, `--llm-timeout`, `--llm-inter-request-gap`, `--llm-reasoning-effort`.
@@ -180,6 +226,62 @@ flowchart TD
 
 ## Configuration
 This repository ships with a default config.json at the project root. You can tailor it per company or environment without changing code.
+The delivery pipeline uses `delivery_pipeline.json` (stages, approvals, artifacts, and workspace settings).
+
+Example VCS config (defaults to GitHub + NeuralMimicry owner):
+```json
+{
+  "vcs": {
+    "enabled": true,
+    "owner": "neuralmimicry",
+    "repo": "rag_demo",
+    "actions": [
+      {"type": "pull"},
+      {"type": "branch", "name": "solver/{version}"},
+      {"type": "commit", "message": "chore: solver {version}"},
+      {"type": "push"},
+      {"type": "tag", "name": "v{version}"}
+    ]
+  }
+}
+```
+
+Example platform config (auto-select lowest viable tier):
+```json
+{
+  "platform": {
+    "auto": true,
+    "preferred_order": ["local", "container", "k8s", "openshift", "cloud"],
+    "container_preference": ["podman", "docker"],
+    "cloud_preference": ["gcp", "aws", "azure"],
+    "require_emulation": false
+  }
+}
+```
+
+Example solver gate config:
+```json
+{
+  "solver_gate": "block_deploy",
+  "allow_unfinished_deploy": false
+}
+```
+
+Example solver fallback config:
+```json
+{
+  "solver_fallback": {
+    "enabled": true,
+    "max_attempts": 2,
+    "on_failure_types": ["test_failure", "pytest_import_error"],
+    "requirements_only": true,
+    "allow_run": false,
+    "max_steps": 25,
+    "max_iterations": 2,
+    "use_workspace": true
+  }
+}
+```
 
 Example config.json
 ```json

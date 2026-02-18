@@ -1,0 +1,195 @@
+{
+  "output_dir": "delivery_pipeline_output",
+  "approvals": {
+    "base_dir": "delivery_pipeline_output/approvals",
+    "default_suffix": ".ok"
+  },
+  "versioning": {
+    "strategy": "git_or_timestamp",
+    "prefix": "v",
+    "file": "VERSION",
+    "write_file": true,
+    "location": "output"
+  },
+  "overlay_solver_workspace": true,
+  "require_solver_completion": false,
+  "clean_workspaces": false,
+  "stages": [
+    {
+      "name": "sandbox",
+      "description": "Isolated unit tests in a clean workspace",
+      "workspace_mode": "copy",
+      "commands": [
+        "python -m venv .venv",
+        ".venv/bin/python -m pip install -r requirements.txt",
+        ".venv/bin/python -m pytest -q"
+      ],
+      "artifacts": [
+        "coverage.xml"
+      ],
+      "kind": "test"
+    },
+    {
+      "name": "dev",
+      "description": "Developer integration checks in the project workspace",
+      "workspace_mode": "project",
+      "commands": [
+        "python -m pytest -q"
+      ],
+      "kind": "test"
+    },
+    {
+      "name": "integration",
+      "description": "Integration testing and service-level checks",
+      "workspace_mode": "copy",
+      "commands": [
+        "python -m pytest -q -m integration"
+      ],
+      "kind": "test"
+    },
+    {
+      "name": "interim_deploy",
+      "kind": "sandbox_deploy",
+      "description": "Optional interim deploy for sandbox validation",
+      "workspace_mode": "copy",
+      "enabled": false,
+      "commands": [
+        "echo \"Interim deploy step goes here\""
+      ]
+    },
+    {
+      "name": "interim_teardown",
+      "kind": "teardown",
+      "description": "Optional teardown after interim deploy",
+      "workspace_mode": "copy",
+      "enabled": false,
+      "commands": [
+        "echo \"Interim teardown step goes here\""
+      ]
+    },
+    {
+      "name": "staging",
+      "description": "Staging build and smoke tests",
+      "workspace_mode": "copy",
+      "requires_approval": true,
+      "commands": [
+        "python -m pytest -q -m smoke"
+      ],
+      "artifacts": [
+        "dist",
+        "build"
+      ],
+      "kind": "staging"
+    },
+    {
+      "name": "uat",
+      "description": "User acceptance testing",
+      "workspace_mode": "copy",
+      "requires_approval": true,
+      "commands": [],
+      "kind": "uat"
+    },
+    {
+      "name": "deploy",
+      "description": "Deployment step (replace with deployment command)",
+      "workspace_mode": "project",
+      "requires_approval": true,
+      "commands": [
+        "echo \"Deploy step goes here\""
+      ],
+      "kind": "deploy"
+    }
+  ],
+  "vcs": {
+    "enabled": true,
+    "provider": "github",
+    "base_url": "https://github.com",
+    "owner": "neuralmimicry",
+    "repo": "rag_demo",
+    "remote": "origin",
+    "default_branch": "main",
+    "ensure_remote": true,
+    "require_clean": true,
+    "block_on_failure": true,
+    "actions": [
+      {
+        "type": "pull"
+      },
+      {
+        "type": "branch",
+        "name": "solver/{version}",
+        "checkout": true
+      },
+      {
+        "type": "commit",
+        "message": "chore: solver {version}",
+        "paths": [
+          "."
+        ]
+      },
+      {
+        "type": "merge",
+        "source": "solver/{version}",
+        "target": "main",
+        "checkout_target": true,
+        "no_ff": true,
+        "enabled": false
+      },
+      {
+        "type": "push",
+        "set_upstream": true
+      },
+      {
+        "type": "tag",
+        "name": "v{version}",
+        "message": "release {version}",
+        "push": true
+      },
+      {
+        "type": "release",
+        "tag": "v{version}",
+        "use_gh": false,
+        "notes_file": "CHANGELOG.md",
+        "enabled": false
+      }
+    ]
+  },
+  "platform": {
+    "auto": true,
+    "preferred_order": [
+      "local",
+      "container",
+      "k8s",
+      "openshift",
+      "cloud"
+    ],
+    "container_preference": [
+      "podman",
+      "docker"
+    ],
+    "cloud_preference": [
+      "gcp",
+      "aws",
+      "azure"
+    ],
+    "require_emulation": false
+  },
+  "solver_gate": "block_deploy",
+  "allow_unfinished_deploy": false,
+  "auto_recover": true,
+  "retry_attempts": 1,
+  "retry_delay_sec": 2,
+  "solver_fallback": {
+    "enabled": true,
+    "max_attempts": 2,
+    "on_failure_types": [
+      "test_failure",
+      "pytest_import_error"
+    ],
+    "requirements_only": true,
+    "allow_run": false,
+    "max_steps": 25,
+    "max_iterations": 2,
+    "use_workspace": true
+  }
+}
