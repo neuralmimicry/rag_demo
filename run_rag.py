@@ -5,13 +5,15 @@ CLI entry point to run Rag_Demo workflows:
 - Confluence space quality analysis (interactive HTML + optional LLM/Rovo)
 - Topic research (LLM-backed RAG, optional web search)
 - Project solver (scan a local project for requirements and apply an LLM plan)
+- Delivery pipeline (sandbox/dev/integration/staging/uat/deploy)
 
 Workflow selection order:
 1) --topic-research
-2) --project
-3) --analyze-confluence
-4) --analyze-jira
-5) Default Jira statistics workflow (unless --disable-jira is set)
+2) --delivery
+3) --project
+4) --analyze-confluence
+5) --analyze-jira
+6) Default Jira statistics workflow (unless --disable-jira is set)
 
 Usage examples:
   - Classic Jira stats (legacy behaviour):
@@ -24,6 +26,9 @@ Usage examples:
   - Project solver (scan local folder for requirements, propose/apply plan):
       python run_rag.py --project /path/to/project --llm-provider openai
 
+  - Delivery pipeline (sandbox/dev/staging/uat/deploy):
+      python run_rag.py --delivery --project /path/to/project
+
 Notes:
   - Configure credentials via environment (JIRA_USERNAME/JIRA_PASSWORD or token)
     and config.json. Confluence in Atlassian Cloud is assumed under the same base
@@ -33,14 +38,73 @@ Notes:
     gracefully to heuristic analysis via the Confluence REST APIs.
 """
 
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 import json
 import os
 import argparse
 import logging
+import sys
+import time
 from logging_utils import setup_logging
 
 logger = logging.getLogger(__name__)
+
+
+class EventEmitter:
+    def __init__(self, enabled: bool = False, stream=None, file_path: Optional[str] = None):
+        self.enabled = bool(enabled)
+        self.stream = stream or sys.stdout
+        self.file_handle = None
+        if file_path:
+            try:
+                self.file_handle = open(file_path, "a", encoding="utf-8")
+            except Exception as exc:
+                logger.warning("Failed to open events file %s: %s", file_path, exc)
+
+    def emit(self, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        if not (self.enabled or self.file_handle):
+            return
+        record = {"type": event_type, "ts": time.time()}
+        if payload:
+            record.update(payload)
+        if self.enabled:
+            try:
+                self.stream.write("__RAG_EVENT__ " + json.dumps(record) + "\n")
+                self.stream.flush()
+            except Exception:
+                pass
+        if self.file_handle:
+            try:
+                self.file_handle.write(json.dumps(record) + "\n")
+                self.file_handle.flush()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self.file_handle:
+            try:
+                self.file_handle.close()
+            except Exception:
+                pass
+            self.file_handle = None
+
+
+def _emit_stage(
+    emitter: Optional[EventEmitter],
+    workflow: str,
+    stage: str,
+    status: str,
+    progress: Optional[int] = None,
+    message: Optional[str] = None,
+) -> None:
+    if not emitter:
+        return
+    payload: Dict[str, Any] = {"workflow": workflow, "stage": stage, "status": status}
+    if progress is not None:
+        payload["progress"] = progress
+    if message:
+        payload["message"] = message
+    emitter.emit("stage", payload)
 
 
 def _parse_agent_role_overrides(raw_items: Optional[List[str]]) -> Dict[str, Dict[str, str]]:
@@ -591,6 +655,79 @@ def _run_project_solver(
     return exit_code
 
 
+def _run_delivery_pipeline(
+    project_root: str,
+    config_path: Optional[str],
+    output: Optional[str],
+    allow_run: bool,
+    project_solution_path: Optional[str],
+    allow_unfinished: bool,
+    enable_interim: bool,
+    llm_provider: Optional[str],
+    llm_model: Optional[str],
+    fallback_llm_provider: Optional[str],
+    fallback_llm_model: Optional[str],
+    ollama_base_url: Optional[str],
+    llm_max_tokens: Optional[int],
+    llm_temperature: float,
+    llm_timeout: Optional[int],
+    llm_reasoning_effort: Optional[str],
+    codingagent: Optional[str],
+    codingagent_fallback: Optional[str],
+    codingagent_model: Optional[str],
+    codingagent_reasoning_effort: Optional[str],
+    project_output_dir: Optional[str],
+    solver_fallback_override: Optional[bool],
+) -> int:
+    from delivery_pipeline import run_delivery_pipeline
+    from credentials import get_llm_credentials
+
+    llm_api_key = get_llm_credentials(None, llm_provider) if llm_provider else None
+    fallback_llm_api_key = get_llm_credentials(None, fallback_llm_provider) if fallback_llm_provider else None
+
+    if config_path and str(config_path).strip().lower() == "default":
+        resolved_config = os.path.join(os.path.dirname(__file__), "delivery_pipeline.json")
+    else:
+        resolved_config = config_path or os.path.join(project_root, "delivery_pipeline.json")
+    if not os.path.exists(resolved_config):
+        fallback = os.path.join(os.path.dirname(__file__), "delivery_pipeline.json")
+        if os.path.exists(fallback):
+            resolved_config = fallback
+        else:
+            raise FileNotFoundError(
+                "Delivery pipeline config not found. Looked in: "
+                f"{resolved_config} and {fallback}. "
+                "Pass --delivery-config to specify a config."
+            )
+    logger.info("Delivery pipeline config: %s", resolved_config)
+    return run_delivery_pipeline(
+        project_root,
+        config_path=resolved_config,
+        output_path=output,
+        allow_run=allow_run,
+        project_solution_path=project_solution_path,
+        allow_unfinished=allow_unfinished,
+        enable_interim=enable_interim,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        fallback_llm_provider=fallback_llm_provider,
+        fallback_llm_model=fallback_llm_model,
+        ollama_base_url=ollama_base_url,
+        llm_max_tokens=llm_max_tokens,
+        llm_temperature=llm_temperature,
+        llm_timeout=llm_timeout,
+        llm_reasoning_effort=llm_reasoning_effort,
+        llm_api_key=llm_api_key,
+        fallback_llm_api_key=fallback_llm_api_key,
+        codingagent=codingagent,
+        codingagent_fallback=codingagent_fallback,
+        codingagent_model=codingagent_model,
+        codingagent_reasoning_effort=codingagent_reasoning_effort,
+        project_output_dir=project_output_dir,
+        solver_fallback_override=solver_fallback_override,
+    )
+
+
 def run(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Rag_Demo reporter, Jira quality analyser, and Confluence space analyser")
     parser.add_argument("--analyze-confluence", action="store_true", help="Run Confluence space quality analysis instead of Jira statistics")
@@ -607,6 +744,14 @@ def run(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--project-max-steps", dest="project_max_steps", type=int, default=25, help="Max steps to apply for project solving (default: 25)")
     parser.add_argument("--project-iterations", dest="project_iterations", type=int, default=3, help="Max planning iterations for project solving (default: 3)")
     parser.add_argument("--project-output-dir", dest="project_output_dir", help="Output directory for generated code/virtual environments (absolute path allowed)")
+    parser.add_argument("--delivery", dest="delivery", action="store_true", help="Run delivery pipeline for a project (requires --project)")
+    parser.add_argument("--delivery-config", dest="delivery_config", help="Path to delivery pipeline config (default: <project>/delivery_pipeline.json, or 'default' to force bundled config)")
+    parser.add_argument("--delivery-run", dest="delivery_run", action="store_true", help="Execute delivery pipeline commands (default: dry-run)")
+    parser.add_argument("--delivery-allow-unfinished", dest="delivery_allow_unfinished", action="store_true", help="Allow deploy stages even if the project solver reports incomplete work")
+    parser.add_argument("--delivery-enable-interim", dest="delivery_enable_interim", action="store_true", help="Enable interim deploy/teardown stages in the delivery pipeline")
+    parser.add_argument("--delivery-solver-fallback", dest="delivery_solver_fallback", action="store_true", help="Enable project_solver fallback on delivery failures (overrides config)")
+    parser.add_argument("--delivery-no-solver-fallback", dest="delivery_no_solver_fallback", action="store_true", help="Disable project_solver fallback on delivery failures (overrides config)")
+    parser.add_argument("--delivery-project-solution", dest="delivery_project_solution", help="Path to project solver output JSON for overlay/gating")
     parser.add_argument(
         "--codingagent",
         dest="codingagent",
@@ -629,7 +774,8 @@ def run(argv: Optional[List[str]] = None) -> int:
         help=(
             "Output path for the selected workflow. Defaults: "
             "confluence_report.html (Confluence), jira_report.html (Jira analysis), "
-            "researched_document.md (topic research), project_solution.json (project solver)."
+            "researched_document.md (topic research), project_solution.json (project solver), "
+            "pipeline report JSON (delivery pipeline)."
         ),
     )
     parser.add_argument("--use-rovo", dest="use_rovo", action="store_true", help="Prefer Atlassian Rovo/AI endpoints when available")
@@ -683,17 +829,53 @@ def run(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose status updates (INFO level)")
     parser.add_argument("--debug", "-d", action="store_true", help="Enable detailed debug logging (DEBUG level)")
     parser.add_argument("--log-file", dest="log_file", default="rag_demo.log", help="Path to the log file (default: rag_demo.log)")
+    parser.add_argument("--emit-events", dest="emit_events", action="store_true", help="Emit machine-readable workflow events to stdout")
+    parser.add_argument("--events-file", dest="events_file", help="Optional JSONL file to write workflow events")
 
     args = parser.parse_args(argv)
 
     # Initialize logging
     setup_logging(verbose=args.verbose, debug=args.debug, log_file=args.log_file)
     agent_role_overrides = _parse_agent_role_overrides(args.agent_role)
+    emitter = EventEmitter(enabled=args.emit_events, file_path=args.events_file)
+
+    def _run_with_events(workflow_name: str, func, *f_args, **f_kwargs) -> int:
+        emitter.emit("workflow_selected", {"workflow": workflow_name})
+        _emit_stage(emitter, workflow_name, "prepare", "running", progress=5)
+        _emit_stage(emitter, workflow_name, "prepare", "completed", progress=10)
+        _emit_stage(emitter, workflow_name, "execute", "running", progress=15)
+        try:
+            result = func(*f_args, **f_kwargs)
+        except Exception as exc:
+            _emit_stage(emitter, workflow_name, "execute", "failed", progress=100, message=str(exc))
+            _emit_stage(emitter, workflow_name, "finalize", "failed", progress=100)
+            emitter.emit("workflow_complete", {"workflow": workflow_name, "status": "failed"})
+            raise
+        status = "completed" if result == 0 else "failed"
+        _emit_stage(emitter, workflow_name, "execute", status, progress=90)
+        _emit_stage(emitter, workflow_name, "finalize", status, progress=100)
+        emitter.emit("workflow_complete", {"workflow": workflow_name, "status": status, "exit_code": result})
+        return result
+
+    delivery_flag_set = any(
+        [
+            args.delivery_config,
+            args.delivery_run,
+            args.delivery_allow_unfinished,
+            args.delivery_enable_interim,
+            args.delivery_project_solution,
+        ]
+    )
+    if delivery_flag_set and not args.delivery:
+        args.delivery = True
+        logger.info("Delivery flags detected without --delivery; enabling delivery mode.")
 
     if args.requirements_path and not args.project_root:
         parser.error("--requirements requires --project")
     if args.project_output_dir and not args.project_root:
         parser.error("--project-output-dir requires --project")
+    if args.delivery and not args.project_root:
+        parser.error("--delivery requires --project")
 
     # Set environment variables from CLI args if provided
     if args.gemini_api_key:
@@ -705,133 +887,175 @@ def run(argv: Optional[List[str]] = None) -> int:
     if args.disable_confluence:
         os.environ["DISABLE_CONFLUENCE"] = "1"
 
-    if args.topic_research:
-        if args.clear_research_cache:
-            from topic_researcher import RESEARCH_CACHE_ROOT
-            import shutil
-            if os.path.exists(RESEARCH_CACHE_ROOT):
-                logger.info(f"Clearing research cache at {RESEARCH_CACHE_ROOT}")
-                shutil.rmtree(RESEARCH_CACHE_ROOT)
+    try:
+        if args.topic_research:
+            if args.clear_research_cache:
+                from topic_researcher import RESEARCH_CACHE_ROOT
+                import shutil
+                if os.path.exists(RESEARCH_CACHE_ROOT):
+                    logger.info(f"Clearing research cache at {RESEARCH_CACHE_ROOT}")
+                    shutil.rmtree(RESEARCH_CACHE_ROOT)
 
-        return _run_topic_research(
-            args.topic_research,
-            args.output or "researched_document.md",
-            llm_provider=args.llm_provider,
-            llm_model=args.llm_model,
-            ollama_base_url=args.ollama_base_url,
-            llm_max_tokens=args.llm_max_tokens,
-            llm_temperature=args.llm_temperature,
-            llm_timeout=args.llm_timeout,
-            llm_reasoning_effort=args.llm_reasoning_effort,
-            max_iterations=args.max_iterations,
-            context_sources=args.context_sources,
-            google_api_key=args.google_api_key,
-            google_cse_id=args.google_cse_id,
-            fallback_llm_provider=args.fallback_llm_provider,
-            fallback_llm_model=args.fallback_llm_model,
-            references_output=args.references_output,
-            llm_inter_request_gap=args.llm_inter_request_gap,
-            cache_ttl_hours=args.research_cache_ttl,
-            disable_jira=args.disable_jira,
-            disable_confluence=args.disable_confluence,
-            agentic_role_overrides=agent_role_overrides,
-        )
+            return _run_with_events(
+                "topic_research",
+                _run_topic_research,
+                args.topic_research,
+                args.output or "researched_document.md",
+                llm_provider=args.llm_provider,
+                llm_model=args.llm_model,
+                ollama_base_url=args.ollama_base_url,
+                llm_max_tokens=args.llm_max_tokens,
+                llm_temperature=args.llm_temperature,
+                llm_timeout=args.llm_timeout,
+                llm_reasoning_effort=args.llm_reasoning_effort,
+                max_iterations=args.max_iterations,
+                context_sources=args.context_sources,
+                google_api_key=args.google_api_key,
+                google_cse_id=args.google_cse_id,
+                fallback_llm_provider=args.fallback_llm_provider,
+                fallback_llm_model=args.fallback_llm_model,
+                references_output=args.references_output,
+                llm_inter_request_gap=args.llm_inter_request_gap,
+                cache_ttl_hours=args.research_cache_ttl,
+                disable_jira=args.disable_jira,
+                disable_confluence=args.disable_confluence,
+                agentic_role_overrides=agent_role_overrides,
+            )
 
-    if args.project_root:
-        return _run_project_solver(
-            project_root=args.project_root,
-            requirements_path=args.requirements_path,
-            output=args.output,
-            llm_provider=args.llm_provider,
-            llm_model=args.llm_model,
-            fallback_llm_provider=args.fallback_llm_provider,
-            fallback_llm_model=args.fallback_llm_model,
-            ollama_base_url=args.ollama_base_url,
-            llm_max_tokens=args.llm_max_tokens,
-            llm_temperature=args.llm_temperature,
-            llm_timeout=args.llm_timeout,
-            llm_reasoning_effort=args.llm_reasoning_effort,
-            llm_inter_request_gap=args.llm_inter_request_gap,
-            allow_run=args.project_run,
-            max_steps=args.project_max_steps,
-            max_iterations=args.project_iterations,
-            project_output_dir=args.project_output_dir,
-            codingagent=args.codingagent,
-            codingagent_fallback=args.codingagent_fallback,
-            codingagent_model=args.codingagent_model,
-            codingagent_reasoning_effort=args.codingagent_reasoning_effort,
-            agentic_role_overrides=agent_role_overrides,
-        )
+        if args.delivery:
+            logger.info("Running delivery pipeline (project solver disabled for this run).")
+            return _run_with_events(
+                "delivery_pipeline",
+                _run_delivery_pipeline,
+                project_root=args.project_root,
+                config_path=args.delivery_config,
+                output=args.output,
+                allow_run=args.delivery_run,
+                project_solution_path=args.delivery_project_solution,
+                allow_unfinished=args.delivery_allow_unfinished,
+                enable_interim=args.delivery_enable_interim,
+                llm_provider=args.llm_provider,
+                llm_model=args.llm_model,
+                fallback_llm_provider=args.fallback_llm_provider,
+                fallback_llm_model=args.fallback_llm_model,
+                ollama_base_url=args.ollama_base_url,
+                llm_max_tokens=args.llm_max_tokens,
+                llm_temperature=args.llm_temperature,
+                llm_timeout=args.llm_timeout,
+                llm_reasoning_effort=args.llm_reasoning_effort,
+                codingagent=args.codingagent,
+                codingagent_fallback=args.codingagent_fallback,
+                codingagent_model=args.codingagent_model,
+                codingagent_reasoning_effort=args.codingagent_reasoning_effort,
+                project_output_dir=args.project_output_dir,
+                solver_fallback_override=(
+                    False if args.delivery_no_solver_fallback else (True if args.delivery_solver_fallback else None)
+                ),
+            )
 
-    if args.analyze_confluence:
-        if args.disable_confluence:
-            parser.error("Cannot run Confluence analysis because Confluence is disabled via --disable-confluence")
-        if not args.space:
-            parser.error("--space is required when --analyze-confluence is specified")
-        return _run_confluence_analysis(
-            args.space,
-            args.output,
-            args.use_rovo,
-            llm_provider=args.llm_provider,
-            llm_model=args.llm_model,
-            fallback_llm_provider=args.fallback_llm_provider,
-            fallback_llm_model=args.fallback_llm_model,
-            ollama_base_url=args.ollama_base_url,
-            selection_path=args.selection,
-            tree_depth=args.tree_depth,
-            starting_depth=args.starting_depth,
-            emit_templates=args.emit_templates,
-            templates_dir=args.templates_dir,
-            llm_max_tokens=args.llm_max_tokens,
-            llm_chunk_size=args.llm_chunk_size,
-            llm_temperature=args.llm_temperature,
-            llm_timeout=args.llm_timeout,
-            llm_reasoning_effort=args.llm_reasoning_effort,
-            action_plan=args.action_plan,
-            dry_run=args.dry_run,
-            post_comments=args.post_comments,
-            post_target=args.post_target,
-            post_exec_summary=args.post_exec_summary,
-            post_page_insights=args.post_page_insights,
-            dry_run_post=args.dry_run_post,
-            llm_inter_request_gap=args.llm_inter_request_gap
-        )
+        if args.project_root:
+            return _run_with_events(
+                "project_solver",
+                _run_project_solver,
+                project_root=args.project_root,
+                requirements_path=args.requirements_path,
+                output=args.output,
+                llm_provider=args.llm_provider,
+                llm_model=args.llm_model,
+                fallback_llm_provider=args.fallback_llm_provider,
+                fallback_llm_model=args.fallback_llm_model,
+                ollama_base_url=args.ollama_base_url,
+                llm_max_tokens=args.llm_max_tokens,
+                llm_temperature=args.llm_temperature,
+                llm_timeout=args.llm_timeout,
+                llm_reasoning_effort=args.llm_reasoning_effort,
+                llm_inter_request_gap=args.llm_inter_request_gap,
+                allow_run=args.project_run,
+                max_steps=args.project_max_steps,
+                max_iterations=args.project_iterations,
+                project_output_dir=args.project_output_dir,
+                codingagent=args.codingagent,
+                codingagent_fallback=args.codingagent_fallback,
+                codingagent_model=args.codingagent_model,
+                codingagent_reasoning_effort=args.codingagent_reasoning_effort,
+                agentic_role_overrides=agent_role_overrides,
+            )
 
-    if args.analyze_jira:
+        if args.analyze_confluence:
+            if args.disable_confluence:
+                parser.error("Cannot run Confluence analysis because Confluence is disabled via --disable-confluence")
+            if not args.space:
+                parser.error("--space is required when --analyze-confluence is specified")
+            return _run_with_events(
+                "confluence_analysis",
+                _run_confluence_analysis,
+                args.space,
+                args.output,
+                args.use_rovo,
+                llm_provider=args.llm_provider,
+                llm_model=args.llm_model,
+                fallback_llm_provider=args.fallback_llm_provider,
+                fallback_llm_model=args.fallback_llm_model,
+                ollama_base_url=args.ollama_base_url,
+                selection_path=args.selection,
+                tree_depth=args.tree_depth,
+                starting_depth=args.starting_depth,
+                emit_templates=args.emit_templates,
+                templates_dir=args.templates_dir,
+                llm_max_tokens=args.llm_max_tokens,
+                llm_chunk_size=args.llm_chunk_size,
+                llm_temperature=args.llm_temperature,
+                llm_timeout=args.llm_timeout,
+                llm_reasoning_effort=args.llm_reasoning_effort,
+                action_plan=args.action_plan,
+                dry_run=args.dry_run,
+                post_comments=args.post_comments,
+                post_target=args.post_target,
+                post_exec_summary=args.post_exec_summary,
+                post_page_insights=args.post_page_insights,
+                dry_run_post=args.dry_run_post,
+                llm_inter_request_gap=args.llm_inter_request_gap
+            )
+
+        if args.analyze_jira:
+            if args.disable_jira:
+                parser.error("Cannot run Jira analysis because Jira is disabled via --disable-jira")
+            # Output default for Jira analyser if none specified
+            if not args.projects and not args.jql:
+                # Allow empty selection; jira_analysis will fall back to discovery or safe default JQL
+                pass
+            return _run_with_events(
+                "jira_analysis",
+                _run_jira_analysis,
+                projects=args.projects,
+                jql=args.jql,
+                output=(args.output or "jira_report.html"),
+                llm_provider=args.llm_provider,
+                llm_model=args.llm_model,
+                fallback_llm_provider=args.fallback_llm_provider,
+                fallback_llm_model=args.fallback_llm_model,
+                ollama_base_url=args.ollama_base_url,
+                selection_path=args.selection,
+                llm_max_tokens=args.llm_max_tokens,
+                llm_chunk_size=args.llm_chunk_size,
+                llm_temperature=args.llm_temperature,
+                llm_timeout=args.llm_timeout,
+                llm_reasoning_effort=args.llm_reasoning_effort,
+                action_plan=args.action_plan,
+                dry_run=args.dry_run,
+                post_comments=args.post_comments,
+                post_target=args.post_target,
+                dry_run_post=args.dry_run_post,
+                llm_inter_request_gap=args.llm_inter_request_gap
+            )
+
         if args.disable_jira:
-            parser.error("Cannot run Jira analysis because Jira is disabled via --disable-jira")
-        # Output default for Jira analyser if none specified
-        if not args.projects and not args.jql:
-            # Allow empty selection; jira_analysis will fall back to discovery or safe default JQL
-            pass
-        return _run_jira_analysis(
-            projects=args.projects,
-            jql=args.jql,
-            output=(args.output or "jira_report.html"),
-            llm_provider=args.llm_provider,
-            llm_model=args.llm_model,
-            fallback_llm_provider=args.fallback_llm_provider,
-            fallback_llm_model=args.fallback_llm_model,
-            ollama_base_url=args.ollama_base_url,
-            selection_path=args.selection,
-            llm_max_tokens=args.llm_max_tokens,
-            llm_chunk_size=args.llm_chunk_size,
-            llm_temperature=args.llm_temperature,
-            llm_timeout=args.llm_timeout,
-            llm_reasoning_effort=args.llm_reasoning_effort,
-            action_plan=args.action_plan,
-            dry_run=args.dry_run,
-            post_comments=args.post_comments,
-            post_target=args.post_target,
-            dry_run_post=args.dry_run_post,
-            llm_inter_request_gap=args.llm_inter_request_gap
-        )
+            logger.info("Jira is disabled; skipping default Jira stats workflow.")
+            return 0
 
-    if args.disable_jira:
-        logger.info("Jira is disabled; skipping default Jira stats workflow.")
-        return 0
-
-    return _run_jira_workflow()
+        return _run_with_events("jira_stats", _run_jira_workflow)
+    finally:
+        emitter.close()
 
 
 if __name__ == "__main__":

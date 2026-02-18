@@ -29,6 +29,7 @@ DEFAULT_IGNORED_DIRS = {
     "build",
     "test_output",
     "project_solver_output",
+    "delivery_pipeline_output",
 }
 
 CODE_EXTS = {
@@ -56,7 +57,7 @@ CODE_EXTS = {
 def _tokenize(text: str) -> Set[str]:
     if not text:
         return set()
-    cleaned = re.sub(r"[^A-Za-z0-9_\\-/]", " ", text)
+    cleaned = re.sub(r"[^-A-Za-z0-9_/\\]", " ", text)
     tokens = set()
     for chunk in cleaned.split():
         lower = chunk.strip().lower()

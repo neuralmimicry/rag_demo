@@ -68,6 +68,7 @@ IGNORED_DIRS = {
     "build",
     "test_output",
     "project_solver_output",
+    "delivery_pipeline_output",
 }
 
 DEFAULT_SOLVER_OUTPUT_DIR = "project_solver_output"
@@ -2369,10 +2370,12 @@ def _rephrase_json_payload(
         actions_log.append(f"JSON repair request failed ({label}): {exc}")
         return None
     try:
-        return _parse_json_payload(resp.text or "{}")
+        parsed = _parse_json_payload(resp.text or "{}")
     except json.JSONDecodeError as exc:
         actions_log.append(f"JSON repair parse failed ({label}): {exc}")
         return None
+    logger.info("Recovered via JSON repair (%s).", label)
+    return parsed
 
 
 def _coerce_plan_payload(payload: object) -> Optional[Dict[str, object]]:
@@ -2402,6 +2405,16 @@ def _plan_has_code_changes(plan_steps: List[Dict[str, object]]) -> bool:
             continue
         _, ext = os.path.splitext(path)
         if ext.lower() in CODE_FILE_EXTS:
+            return True
+    return False
+
+
+def _plan_has_file_changes(plan_steps: List[Dict[str, object]]) -> bool:
+    for step in plan_steps:
+        if not isinstance(step, dict):
+            continue
+        step_type = _normalize_step_type(step.get("type"))
+        if step_type in {"write_file", "append_file", "replace_in_file"}:
             return True
     return False
 
@@ -2656,9 +2669,33 @@ def _split_verification_steps(plan_steps: List[Dict[str, object]]) -> Tuple[List
     return non_verification, verification
 
 
+def _looks_like_failure_context(source: RequirementSource) -> bool:
+    path = (source.path or "").lower()
+    if "failure_context" in path or "solver_context" in path:
+        return True
+    text = (source.requirements_text or "").lower()
+    if not text:
+        return False
+    failure_markers = (
+        "failure summary",
+        "traceback",
+        "assertionerror",
+        "attributeerror",
+        "typeerror",
+        "valueerror",
+        "pytest",
+        "failed tests",
+        "error during collection",
+        "test failure",
+    )
+    return any(marker in text for marker in failure_markers)
+
+
 def _source_requires_code(source: RequirementSource) -> bool:
     _, ext = os.path.splitext(source.path or "")
     if ext.lower() in CODE_FILE_EXTS:
+        return True
+    if _looks_like_failure_context(source):
         return True
     if source.requirement_lines:
         combined = " ".join(source.requirement_lines)
@@ -6020,6 +6057,7 @@ def run_project_solver(
     project_root: str,
     *,
     requirements_path: Optional[str],
+    requirements_only: bool = False,
     output_path: str,
     llm_provider: str,
     llm_model: Optional[str],
@@ -6049,7 +6087,9 @@ def run_project_solver(
     Iteratively requests plans from the LLM, applies steps per requirement
     source, and writes a JSON report with the plan history and a log of applied
     actions. An optional project_output_dir overrides the default solver
-    workspace and can be an absolute path outside the project root.
+    workspace and can be an absolute path outside the project root. When
+    requirements_only is True, project/workspace requirement scans are skipped
+    and only the provided requirements_path is used.
     """
     if not os.path.isdir(project_root):
         raise ValueError(f"Project root is not a directory: {project_root}")
@@ -6209,12 +6249,15 @@ def run_project_solver(
         solver_workspace_rel = os.path.relpath(abs_workspace, project_root) if solver_workspace_within_project else abs_workspace
         if solver_workspace_within_project:
             extra_ignored.append(solver_workspace_rel)
+    requirements_only = bool(requirements_only)
     if requirements_path:
         converter = FileConverter()
         requirements_text = converter.convert(requirements_path)
         if requirements_text.startswith("Error:"):
             raise ValueError(requirements_text)
         context_summary = "Requirements provided directly; no project scan performed."
+        if requirements_only:
+            actions_log.append("Requirements-only mode enabled; skipping project/workspace requirement scans.")
         excerpt = "\n".join(requirements_text.splitlines()[:40]).strip()
         requirement_sources = [
             RequirementSource(
@@ -6245,27 +6288,28 @@ def run_project_solver(
         requirements_material = context_summary or "No explicit requirement statements found."
 
     if not solver_workspace_rel:
-        implied_workspace = _find_existing_output_dir_from_requirements(requirements_material, project_root)
-        if implied_workspace:
-            solver_workspace = implied_workspace
-            solver_workspace_within_project = _is_subpath(project_root, solver_workspace)
-            solver_workspace_rel = (
-                os.path.relpath(implied_workspace, project_root)
-                if solver_workspace_within_project
-                else implied_workspace
-            )
-            if solver_workspace_within_project:
-                extra_ignored.append(solver_workspace_rel)
-                requirement_sources = [
-                    src
-                    for src in requirement_sources
-                    if not _source_is_under_root(src.path, solver_workspace_rel)
-                ]
-            output_dir_implied = True
-            actions_log.append(f"Using output dir implied by requirements: {solver_workspace_rel}")
-        elif _requirements_specify_output_dir(requirements_material):
-            actions_log.append("Requirements specify output location; no solver workspace created.")
-        else:
+        if not requirements_only:
+            implied_workspace = _find_existing_output_dir_from_requirements(requirements_material, project_root)
+            if implied_workspace:
+                solver_workspace = implied_workspace
+                solver_workspace_within_project = _is_subpath(project_root, solver_workspace)
+                solver_workspace_rel = (
+                    os.path.relpath(implied_workspace, project_root)
+                    if solver_workspace_within_project
+                    else implied_workspace
+                )
+                if solver_workspace_within_project:
+                    extra_ignored.append(solver_workspace_rel)
+                    requirement_sources = [
+                        src
+                        for src in requirement_sources
+                        if not _source_is_under_root(src.path, solver_workspace_rel)
+                    ]
+                output_dir_implied = True
+                actions_log.append(f"Using output dir implied by requirements: {solver_workspace_rel}")
+            elif _requirements_specify_output_dir(requirements_material):
+                actions_log.append("Requirements specify output location; no solver workspace created.")
+        if not solver_workspace_rel:
             solver_workspace_rel = DEFAULT_SOLVER_OUTPUT_DIR
             solver_workspace = os.path.join(project_root, solver_workspace_rel)
             solver_workspace_within_project = True
@@ -6284,7 +6328,7 @@ def run_project_solver(
             logger.info(f"Created solver workspace: {solver_workspace_rel}")
 
     workspace_sources: List[RequirementSource] = []
-    if solver_workspace and os.path.isdir(solver_workspace):
+    if solver_workspace and os.path.isdir(solver_workspace) and not requirements_only:
         if _looks_like_venv_dir(solver_workspace):
             actions_log.append("Solver workspace appears to be a virtual environment; skipping requirement scan there.")
         else:
@@ -7155,6 +7199,32 @@ def run_project_solver(
                         f"Appended {added} verification step(s) from payload.",
                         source_actions_log,
                     )
+
+            if source_requires_code:
+                lacks_actionable = not _plan_has_actionable_steps(plan_steps)
+                lacks_file_changes = not _plan_has_file_changes(plan_steps)
+                needs_file_changes = not allow_run
+                if lacks_actionable or (needs_file_changes and lacks_file_changes):
+                    reason = (
+                        "no actionable steps in plan"
+                        if lacks_actionable
+                        else "no file changes in plan while run_command disabled"
+                    )
+                    fallback_payload = _maybe_codingagent_fallback(
+                        reason,
+                        requires_code=True,
+                    )
+                    if fallback_payload:
+                        payload = fallback_payload
+                        plan_steps = payload.get("plan", [])
+                        if not isinstance(plan_steps, list):
+                            continue
+                    else:
+                        _record_action(
+                            "No usable file edits in plan for code-required source; retrying.",
+                            source_actions_log,
+                        )
+                        continue
 
             plan_entry_id = None
             parent_path_id = progress_last_id_by_source.get(source.path)
@@ -8031,6 +8101,7 @@ def run_project_solver(
         "run_config": {
             "project_root": project_root,
             "requirements_path": requirements_path,
+            "requirements_only": requirements_only,
             "output_path": output_path,
             "project_output_dir": project_output_dir,
             "max_steps": max_steps,
