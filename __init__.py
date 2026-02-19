@@ -1,5 +1,5 @@
 """
-Rag_Demo package initialiser.
+Refiner package initialiser.
 
 Exposes a small, stable API surface for programmatic use while keeping the
 existing script structure intact. This enables reuse from other tools without

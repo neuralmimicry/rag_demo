@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+for candidate in /usr/bin/nvidia-smi /usr/local/nvidia/bin/nvidia-smi /usr/local/cuda/bin/nvidia-smi; do
+  if [ -x "$candidate" ]; then
+    exec "$candidate" "$@"
+  fi
+done
+
+echo "nvidia-smi is not available in this container. Ensure NVIDIA drivers are installed on the host and the container runtime exposes the GPU tools." >&2
+exit 127

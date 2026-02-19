@@ -1,6 +1,6 @@
-# Rag_Demo
+# Refiner
 
-Rag_Demo is a lightweight reporting and analysis toolkit for Jira and Confluence. It discovers relevant scope (projects, epics, and spaces), fetches only the necessary data, and produces CSV/HTML reports on throughput, timelines, and resourcing. It also includes LLM-backed workflows for topic research and project solving.
+Refiner is a lightweight reporting and analysis toolkit for Jira and Confluence. It discovers relevant scope (projects, epics, and spaces), fetches only the necessary data, and produces CSV/HTML reports on throughput, timelines, and resourcing. It also includes LLM-backed workflows for topic research and project solving.
 
 Key aspects:
 - Configuration-driven: company names, Jira URL, custom field IDs, engineer lists, and issue schemas live outside the code in config.json and environment variables.
@@ -22,17 +22,82 @@ Key aspects:
 - Optionally export environment variables (see below) to supply credentials and overrides.
 
 3) Run (choose a workflow)
-- Default Jira statistics: rag_demo (or python run_rag.py)
-- Jira quality analysis: rag_demo --analyze-jira --projects CAT --output jira_report.html
-- Confluence analysis: rag_demo --analyze-confluence --space CAT --output confluence_report.html --use-rovo
-- Topic research: rag_demo --topic-research req.txt --output researched_document.md --llm-provider openai
-- Project solver: rag_demo --project /path/to/project --llm-provider openai --output project_solution.json
+- Default Jira statistics: refiner (or python run_refiner.py)
+- Jira quality analysis: refiner --analyze-jira --projects CAT --output jira_report.html
+- Confluence analysis: refiner --analyze-confluence --space CAT --output confluence_report.html --use-rovo
+- Topic research: refiner --topic-research req.txt --output researched_document.md --llm-provider openai
+- Project solver: refiner --project /path/to/project --llm-provider openai --output project_solution.json
+
+## Web UI + API auth
+The web UI is backed by the same Flask server (`refiner_web.py`). It uses session cookies, with dedicated JSON endpoints for headless or cloud-hosted frontends.
+
+### API auth endpoints
+- `POST /api/login` with JSON `{ "username": "...", "password": "..." }` sets the session cookie.
+- `POST /api/logout` clears the session cookie.
+- `GET /api/session` returns `{ authenticated, user, role }`.
+- `POST /api/setup` creates the first admin account (only allowed when no users exist).
+
+The web login and setup pages now call these endpoints directly.
+
+### Cross-origin setup (cloud frontend + public backend)
+Set these environment variables on the backend:
+- `REFINER_CORS_ORIGINS`: comma-separated allowlist of frontend origins, e.g. `https://app.example.com`.
+- `REFINER_ENFORCE_HTTPS`: set to `1` to require HTTPS (recommended for public endpoints).
+- `REFINER_TRUST_PROXY`: set to `1` if TLS is terminated by a proxy/load balancer.
+- `REFINER_HOST`: set to `0.0.0.0` for public bind.
+
+Cookies default to `SameSite=None` + `Secure` when CORS is enabled. Use `REFINER_COOKIE_SAMESITE` / `REFINER_SECURE_COOKIES` to override.
+
+On the frontend, set the API base:
+- Add `<meta name="rag-api-base" content="https://api.example.com">` to the page, or
+- Set `window.__RAG_API_BASE = "https://api.example.com"` before loading the scripts.
+
+### Deployment (cloud UI + public API)
+1) Run the backend behind TLS (reverse proxy or managed load balancer) and expose it on a public domain.
+2) Configure the backend:
+   - `REFINER_HOST=0.0.0.0`
+   - `REFINER_ENFORCE_HTTPS=1`
+   - `REFINER_TRUST_PROXY=1` (if TLS terminates upstream)
+   - `REFINER_CORS_ORIGINS=https://your-frontend.example`
+3) Point the frontend at the backend origin using `rag-api-base` or `window.__RAG_API_BASE`.
+4) Bootstrap the first user with `POST /api/setup`, then log in with `POST /api/login`.
+
+### Prometheus/Grafana metrics
+Refiner exposes Prometheus-compatible metrics on `GET /metrics` by default (same port as the web server).
+- Disable or change the path with `REFINER_METRICS_ENABLED` or `REFINER_METRICS_PATH`.
+- The backend exports request counts/latency, in-flight requests, uptime, job counts by status, queue depth, and worker threads.
+- The frontend-only server exports its own request/latency/uptime metrics with a `refiner_frontend_*` prefix.
+
+### Container image (multi-arch)
+Build the Podman/Docker image from `Containerfile` for multiple architectures:
+- Podman (multi-arch with buildx-style output):
+  - `podman build --platform linux/amd64,linux/arm64 -t refiner:latest -f Containerfile .`
+- Docker buildx:
+  - `docker buildx build --platform linux/amd64,linux/arm64 -t refiner:latest -f Containerfile .`
+
+Run the image (choose one mode):
+- Backend only: `podman run -p 5001:5001 refiner:latest backend`
+- Frontend only: `podman run -p 8080:8080 -e REFINER_API_BASE=https://api.example.com refiner:latest frontend`
+- Combined: `podman run -p 5001:5001 refiner:latest full`
+
+Publish to GitHub Container Registry (GHCR) (default org: `neuralmimicry`, user: `masterkiga`):
+- Log in (use a GitHub PAT with `write:packages`):
+  - `GHCR_USER=masterkiga; echo "$GHCR_TOKEN" | podman login ghcr.io -u "$GHCR_USER" --password-stdin`
+  - `GHCR_USER=masterkiga; echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin`
+- Tag the image:
+  - `podman tag refiner:latest ghcr.io/neuralmimicry/refiner:latest`
+  - `docker tag refiner:latest ghcr.io/neuralmimicry/refiner:latest`
+- Push:
+  - `podman push ghcr.io/neuralmimicry/refiner:latest`
+  - `docker push ghcr.io/neuralmimicry/refiner:latest`
+- Or build + push multi-arch in one step (Docker buildx):
+  - `docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/neuralmimicry/refiner:latest -f Containerfile . --push`
 
 The default Jira statistics workflow can (optionally) run discovery, refine your JQL, fetch issues, generate monthly CSVs and a leaderboard, and write a consolidated timelines.csv. If the refined JQL returns no results, the tool automatically retries with your base JQL to avoid empty runs due to over-filtering.
 
 
 ## Workflow overview
-Workflow selection order (run_rag.py):
+Workflow selection order (run_refiner.py):
 1) --topic-research
 2) --delivery
 3) --project
@@ -53,7 +118,7 @@ Summary of workflows:
 
 
 ## Workflow diagrams
-### Workflow selection (run_rag.py)
+### Workflow selection (run_refiner.py)
 ```mermaid
 flowchart TD
     A[Start: parse CLI arguments] --> B[Configure logging and environment overrides]
@@ -234,7 +299,7 @@ Example VCS config (defaults to GitHub + NeuralMimicry owner):
   "vcs": {
     "enabled": true,
     "owner": "neuralmimicry",
-    "repo": "rag_demo",
+    "repo": "refiner",
     "actions": [
       {"type": "pull"},
       {"type": "branch", "name": "solver/{version}"},
@@ -464,7 +529,7 @@ Example `jira_insights` block
 The tool can perform iterative research on a specific topic and requirements, gathering data from Jira, Confluence, LLMs, and optional web search to formulate a comprehensive document in professional British English.
 
 ```bash
-rag_demo --topic-research topic_requirements.txt --context https://example.com/context --context local_doc.pdf --output researched_doc.md --llm-provider openai
+refiner --topic-research topic_requirements.txt --context https://example.com/context --context local_doc.pdf --output researched_doc.md --llm-provider openai
 ```
 
 - `--topic-research`: Path or URL to a file containing a topic (first line) and requirements (remaining lines). Supports `.txt`, `.docx`, `.pdf`, `.odf`, `.html`, `.jpg`, `.png`, `.svg`, `.mp3`, and `.mp4`.
@@ -495,7 +560,7 @@ Config example (`config.json`):
 
 CLI override (repeatable):
 ```bash
-rag_demo --agent-role planner=openai:gpt-4o --agent-role reviewer=gemini:gemini-1.5-pro
+refiner --agent-role planner=openai:gpt-4o --agent-role reviewer=gemini:gemini-1.5-pro
 ```
 
 Supported roles: `planner`, `researcher`, `reviewer`, `critic`, `editor`. Roles fall back to the main LLM provider if not configured.
@@ -506,18 +571,18 @@ The tool provides detailed status updates and debug logging to monitor progress 
 
 ```bash
 # Standard run with real-time status updates
-rag_demo --topic-research req.txt --output report.md
+refiner --topic-research req.txt --output report.md
 
 # Verbose run (includes INFO level logs)
-rag_demo --topic-research req.txt --output report.md --verbose
+refiner --topic-research req.txt --output report.md --verbose
 
 # Debug run (detailed logs for all API and LLM calls)
-rag_demo --topic-research req.txt --output report.md --debug --log-file my_research.log
+refiner --topic-research req.txt --output report.md --debug --log-file my_research.log
 ```
 
 - `--verbose` (-v): Enables INFO level status updates on the console.
 - `--debug` (-d): Enables detailed DEBUG level logging, including truncated LLM payloads and API interactions.
-- `--log-file`: Path to the file where all logs (up to DEBUG level) are saved (default: `rag_demo.log`).
+- `--log-file`: Path to the file where all logs (up to DEBUG level) are saved (default: `refiner.log`).
 - Status updates prefixed with `[*]` are shown on the console during long-running tasks like topic research.
 
 
@@ -525,9 +590,9 @@ rag_demo --topic-research req.txt --output report.md --debug --log-file my_resea
 The tool can scan a local project folder for requirements and use an LLM to produce and apply an action plan. If a requirements document is provided, the scan is skipped and the requirements document is used directly.
 
 ```bash
-rag_demo --project /path/to/project --llm-provider openai --output project_solution.json
-rag_demo --project /path/to/project --requirements req.txt --llm-provider openai --project-run
-rag_demo --project /path/to/project --project-output-dir /tmp/solver_workspace --project-run --project-iterations 3
+refiner --project /path/to/project --llm-provider openai --output project_solution.json
+refiner --project /path/to/project --requirements req.txt --llm-provider openai --project-run
+refiner --project /path/to/project --project-output-dir /tmp/solver_workspace --project-run --project-iterations 3
 ```
 
 Inputs
@@ -613,15 +678,15 @@ Inputs
 
 ## Packaging and CLI
 - Install in editable mode: pip install -e .
-- Console entry point: rag_demo
-- Module entry point: python -m rag_demo.cli
-- run_rag.py remains for convenience and defers to the same workflow.
+- Console entry point: refiner
+- Module entry point: python -m refiner.cli
+- run_refiner.py remains for convenience and defers to the same workflow.
 
 
 ## Project structure (high level)
 - __init__.py: exposes a minimal API
-- run_rag.py: unified CLI workflow selector (Jira stats, Jira analysis, Confluence analysis, topic research, project solver)
-- cli.py: console entry point that delegates to run_rag.run()
+- run_refiner.py: unified CLI workflow selector (Jira stats, Jira analysis, Confluence analysis, topic research, project solver)
+- cli.py: console entry point that delegates to run_refiner.run()
 - main.py: orchestrates configuration, discovery, fetching, processing, and outputs for the default Jira statistics workflow
 - jira_analysis.py: Jira project/issue quality analysis and HTML report generation
 - confluence_analysis.py: Confluence space quality analysis and HTML report generation
