@@ -13,3 +13,4 @@ odfpy
 beautifulsoup4
 Pillow
 cryptography
+prometheus-client

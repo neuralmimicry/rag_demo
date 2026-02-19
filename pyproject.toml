@@ -3,11 +3,11 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rag_demo"
+name = "refiner"
 version = "0.1.0"
 description = "Jira reporting and analytics utilities with discovery-driven JQL refinement"
 readme = "README.md"
-authors = [{ name = "Rag_Demo Maintainers" }]
+authors = [{ name = "neuralmimicry" }]
 license = { file = "LICENSE" }
 requires-python = ">=3.8"
 keywords = ["jira", "reporting", "analytics", "confluence", "worklogs"]
@@ -23,13 +23,13 @@ classifiers = [
 Homepage = "https://example.com/"
 
 [project.scripts]
-rag_demo = "rag_demo.cli:main"
+refiner = "refiner.cli:main"
 # Preferred namespaced CLI (best practice):
-# Users can also call `python -m rag_demo.cli`
+# Users can also call `python -m refiner.cli`
 
 [tool.setuptools]
 include-package-data = true
-packages = ["rag_demo"]
+packages = ["refiner"]
 
 [tool.setuptools.package-dir]
-"rag_demo" = "."
+"refiner" = "."

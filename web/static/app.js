@@ -10,6 +10,7 @@ const workerCountEl = document.getElementById('workerCount');
 const jobCountEl = document.getElementById('jobCount');
 const statusFiltersEl = document.getElementById('statusFilters');
 const cliBubblesEl = document.getElementById('cliBubbles');
+const logoutLink = document.getElementById('logoutLink');
 const bubblePopover = document.getElementById('bubblePopover');
 const bubbleTitleEl = document.getElementById('bubbleTitle');
 const bubbleHelpEl = document.getElementById('bubbleHelp');
@@ -85,6 +86,31 @@ const formAssistantClearBtn = document.getElementById('formAssistantClear');
 const formAssistantListEl = document.getElementById('formAssistantList');
 const formAssistantStatusEl = document.getElementById('formAssistantStatus');
 
+const API_BASE = (() => {
+  if (typeof window !== 'undefined' && typeof window.__RAG_API_BASE === 'string' && window.__RAG_API_BASE.trim()) {
+    return window.__RAG_API_BASE.trim().replace(/\/+$/, '');
+  }
+  const meta = document.querySelector('meta[name="rag-api-base"]');
+  if (meta && meta.content) {
+    const value = meta.content.trim();
+    if (value && !value.includes('{{')) {
+      return value.replace(/\/+$/, '');
+    }
+  }
+  return '';
+})();
+
+const apiUrl = (path) => {
+  const suffix = path.startsWith('/') ? path : `/${path}`;
+  return `${API_BASE}${suffix}`;
+};
+
+const apiFetch = (path, options = {}) => {
+  return fetch(apiUrl(path), { ...options, credentials: 'include' });
+};
+
+const apiEventSource = (path) => new EventSource(apiUrl(path), { withCredentials: true });
+
 const assistantState = {
   messages: [],
   lastResponse: '',
@@ -106,7 +132,7 @@ const CLI_BUBBLES = [
     label: 'LLM Provider',
     type: 'select',
     flag: '--llm-provider',
-    help: 'Override the LLM provider used by run_rag.py.',
+    help: 'Override the LLM provider used by run_refiner.py.',
     options: [
       { label: 'OpenAI', value: 'openai' },
       { label: 'Gemini', value: 'gemini' },
@@ -491,7 +517,7 @@ function clearJobSecretForm() {
 async function fetchSecrets() {
   if (!secretListEl) return;
   try {
-    const res = await fetch('/api/secrets');
+    const res = await apiFetch('/api/secrets');
     if (!res.ok) return;
     const data = await res.json();
     renderSecrets(data.secrets || []);
@@ -528,7 +554,7 @@ async function submitSecret() {
   const value = secretValueEl.value.trim();
   if (!name || !value) return;
   try {
-    const res = await fetch('/api/secrets', {
+    const res = await apiFetch('/api/secrets', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, value }),
@@ -548,7 +574,7 @@ async function submitSecret() {
 async function deleteSecret(name) {
   if (!name) return;
   try {
-    const res = await fetch(`/api/secrets/${encodeURIComponent(name)}`, {
+    const res = await apiFetch(`/api/secrets/${encodeURIComponent(name)}`, {
       method: 'DELETE',
     });
     if (!res.ok) {
@@ -585,7 +611,7 @@ function setActiveTab(tabKey) {
     panel.classList.toggle('active', panel.dataset.tab === tabKey);
   });
   try {
-    localStorage.setItem('rag_demo_active_tab', tabKey);
+    localStorage.setItem('refiner_active_tab', tabKey);
   } catch (err) {
     // ignore storage failures
   }
@@ -677,7 +703,7 @@ async function sendAssistant(mode) {
 
   showAssistantStatus('Thinking...');
   try {
-    const res = await fetch('/api/assistant/requirements', {
+    const res = await apiFetch('/api/assistant/requirements', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -876,7 +902,7 @@ async function requestFormSuggestions() {
 
   showFormAssistantStatus('Requesting suggestions...');
   try {
-    const res = await fetch('/api/assistant/form-fill', {
+    const res = await apiFetch('/api/assistant/form-fill', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -971,7 +997,7 @@ async function openRepoBrowser(targetId, mode, context) {
   clearRepoStatus();
   showRepoStatus('Loading repo tree...');
   try {
-    const res = await fetch('/api/github/tree', {
+    const res = await apiFetch('/api/github/tree', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ repo_url: repoUrl, branch: repoBranch }),
@@ -1118,7 +1144,7 @@ function renderJobs() {
 
 async function fetchJobs() {
   try {
-    const res = await fetch('/api/jobs');
+    const res = await apiFetch('/api/jobs');
     const data = await res.json();
     jobs = data.jobs || [];
     jobCountEl.textContent = jobs.length;
@@ -1138,7 +1164,7 @@ async function fetchJobs() {
 }
 
 async function fetchHealth() {
-  const res = await fetch('/api/health');
+  const res = await apiFetch('/api/health');
   const data = await res.json();
   workerCountEl.textContent = data.workers;
 }
@@ -1146,7 +1172,7 @@ async function fetchHealth() {
 async function selectJob(jobId) {
   selectedJobId = jobId;
   renderJobs();
-  const res = await fetch(`/api/jobs/${jobId}`);
+  const res = await apiFetch(`/api/jobs/${jobId}`);
   if (!res.ok) {
     return;
   }
@@ -1158,7 +1184,7 @@ async function selectJob(jobId) {
 
 async function refreshSelectedJob() {
   if (!selectedJobId) return;
-  const res = await fetch(`/api/jobs/${selectedJobId}`);
+  const res = await apiFetch(`/api/jobs/${selectedJobId}`);
   if (!res.ok) return;
   const job = await res.json();
   renderJobDetail(job);
@@ -1218,7 +1244,7 @@ function renderJobDetail(job) {
 }
 
 async function loadLogs(jobId) {
-  const res = await fetch(`/api/jobs/${jobId}/logs`);
+  const res = await apiFetch(`/api/jobs/${jobId}/logs`);
   const data = await res.json();
   logOutputEl.textContent = '';
   if (data.logs) {
@@ -1230,7 +1256,7 @@ function startLogStream(jobId) {
   if (logStream) {
     logStream.close();
   }
-  logStream = new EventSource(`/api/jobs/${jobId}/logs/stream`);
+  logStream = apiEventSource(`/api/jobs/${jobId}/logs/stream`);
   logStream.onmessage = (event) => {
     const entry = JSON.parse(event.data);
     appendLog(entry);
@@ -1250,7 +1276,7 @@ function appendLog(entry) {
 }
 
 async function postAction(jobId, action) {
-  const res = await fetch(`/api/jobs/${jobId}/actions`, {
+  const res = await apiFetch(`/api/jobs/${jobId}/actions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action }),
@@ -1370,7 +1396,7 @@ async function submitJob(event) {
   }
   showJobStatus('Submitting job...');
   try {
-    const res = await fetch('/api/jobs', {
+    const res = await apiFetch('/api/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1440,7 +1466,7 @@ function persistFormState() {
         state[el.id] = el.value;
       }
     });
-    localStorage.setItem('rag_demo_form_state', JSON.stringify(state));
+    localStorage.setItem('refiner_form_state', JSON.stringify(state));
   } catch (err) {
     // ignore storage errors
   }
@@ -1448,7 +1474,7 @@ function persistFormState() {
 
 function restoreFormState() {
   try {
-    const raw = localStorage.getItem('rag_demo_form_state');
+    const raw = localStorage.getItem('refiner_form_state');
     if (!raw) return;
     const state = JSON.parse(raw);
     const form = document.getElementById('jobForm');
@@ -1488,6 +1514,19 @@ resetButton.addEventListener('click', resetForm);
 clearLogsButton.addEventListener('click', () => {
   logOutputEl.textContent = '';
 });
+
+if (logoutLink) {
+  logoutLink.addEventListener('click', async (event) => {
+    event.preventDefault();
+    try {
+      await apiFetch('/api/logout', { method: 'POST' });
+    } catch (err) {
+      // ignore logout failures
+    } finally {
+      window.location.href = '/login';
+    }
+  });
+}
 
 applyCliArgsBtn.addEventListener('click', applyCliArgs);
 clearCliArgsBtn.addEventListener('click', clearCliArgs);
@@ -1567,7 +1606,7 @@ setInterval(fetchHealth, 15000);
 tabButtons.forEach((btn) => {
   btn.addEventListener('click', () => setActiveTab(btn.dataset.tab));
 });
-const savedTab = localStorage.getItem('rag_demo_active_tab') || 'job';
+const savedTab = localStorage.getItem('refiner_active_tab') || 'job';
 setActiveTab(savedTab);
 closeRepoBrowser();
 

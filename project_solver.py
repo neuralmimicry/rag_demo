@@ -1,5 +1,5 @@
 """
-Project solver pipeline for Rag_Demo.
+Project solver pipeline for Refiner.
 
 Scans a local project folder (or uses an explicit requirements document),
 derives candidate requirements and context per source file, prompts an LLM for
@@ -6201,7 +6201,7 @@ def run_project_solver(
     audit_agent_mode = (os.getenv("SOLVER_AUDIT_AGENT", "auto") or "auto").strip().lower()
     audit_enabled = audit_every_iterations > 0 or audit_every_steps > 0
     audit_max_chars = _env_int("SOLVER_AUDIT_MAX_CHARS", 1200)
-    audit_log_path = os.getenv("SOLVER_AUDIT_LOG_PATH", "rag_demo.log") or ""
+    audit_log_path = os.getenv("SOLVER_AUDIT_LOG_PATH", "refiner.log") or ""
     web_research_mode = os.getenv("SOLVER_WEB_RESEARCH", "auto") or "auto"
     web_research_every_iterations = _env_int("SOLVER_WEB_RESEARCH_EVERY_ITERATIONS", 4)
     web_research_every_steps = _env_int("SOLVER_WEB_RESEARCH_EVERY_STEPS", 60)

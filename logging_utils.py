@@ -2,9 +2,9 @@ import logging
 import sys
 import os
 
-def setup_logging(verbose: bool = False, debug: bool = False, log_file: str = "rag_demo.log"):
+def setup_logging(verbose: bool = False, debug: bool = False, log_file: str = "refiner.log"):
     """
-    Configures logging for the rag_demo project.
+    Configures logging for the refiner project.
     
     - verbose: If True, set console level to INFO.
     - debug: If True, set console level to DEBUG.
