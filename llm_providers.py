@@ -1095,12 +1095,21 @@ class OpenAIProvider(LLMProvider):
                             and _env_bool("OPENAI_RESPONSES_AUTO_RETRY_INCOMPLETE", True)
                         ):
                             incomplete_retry_used = True
-                            cap = _env_int("OPENAI_RESPONSES_RETRY_MAX_OUTPUT_TOKENS", 4096)
+                            cap = _env_int("OPENAI_RESPONSES_RETRY_MAX_OUTPUT_TOKENS", 49152)
                             target = recommended or 0
                             if current_max and target <= current_max:
                                 target = max(current_max + bump, current_max * 2)
+                            if cap and current_max and cap < current_max:
+                                logger.info(
+                                    "OpenAI retry cap %s lower than current max_output_tokens %s; ignoring cap for this retry.",
+                                    cap,
+                                    current_max,
+                                )
+                                cap = current_max
                             if cap:
                                 target = min(target, cap)
+                            if current_max and target < current_max:
+                                target = current_max
                             if target and target != current_max:
                                 max_tokens_override = target
                                 logger.info(
@@ -1138,6 +1147,13 @@ class OpenAIProvider(LLMProvider):
                         extra = _env_int("OPENAI_RESPONSES_RETRY_EXTRA_TOKENS", 512)
                         cap = _env_int("OPENAI_RESPONSES_RETRY_MAX_OUTPUT_TOKENS", 49152)
                         target = max(base * max(1, multiplier), base + extra)
+                        if cap and current_max and cap < current_max:
+                            logger.info(
+                                "OpenAI empty-text retry cap %s lower than current max_output_tokens %s; ignoring cap for this retry.",
+                                cap,
+                                current_max,
+                            )
+                            cap = current_max
                         max_tokens_override = min(target, cap)
                         if _env_bool("OPENAI_RESPONSES_RETRY_LOWER_EFFORT", True) and effort_override in {"medium", "high", "xhigh"}:
                             effort_override = "low"

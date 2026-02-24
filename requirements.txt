@@ -10,7 +10,11 @@ python-Levenshtein
 pypdf
 python-docx
 odfpy
+openpyxl
+xlrd
+xlwt
 beautifulsoup4
 Pillow
 cryptography
 prometheus-client
+redis

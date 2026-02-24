@@ -187,6 +187,29 @@ class GoogleSearchEngine(SearchEngine):
         except Exception:
             return
 
+    @staticmethod
+    def _format_error(resp: requests.Response) -> str:
+        message = ""
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                error = data.get("error") or {}
+                if isinstance(error, dict):
+                    message = str(error.get("message") or "").strip()
+                    if not message:
+                        errors = error.get("errors") or []
+                        if errors and isinstance(errors, list):
+                            message = str(errors[0].get("message") or "").strip()
+        except Exception:
+            message = ""
+        if not message:
+            text = (resp.text or "").strip()
+            if text:
+                message = text[:512]
+        if not message:
+            message = resp.reason or "Unknown error"
+        return message
+
     def search(self, query: str) -> List[Dict[str, str]]:
         if not self.api_key or not self.cse_id:
             logger.warning("Google Search credentials missing. Falling back.")
@@ -224,7 +247,10 @@ class GoogleSearchEngine(SearchEngine):
                     params["q"] = reduced
                     normalized_query = reduced
                     resp = requests.get(url, params=params, timeout=self.timeout)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                message = self._format_error(resp)
+                logger.error(f"Google Search failed: HTTP {resp.status_code} {message}")
+                return []
             data = resp.json()
             results = []
             for item in data.get("items", []):
@@ -237,7 +263,10 @@ class GoogleSearchEngine(SearchEngine):
                 self._write_cache(normalized_query, results)
             return results
         except Exception as e:
-            logger.error(f"Google Search failed: {e}")
+            message = e.__class__.__name__
+            if hasattr(e, "response") and e.response is not None:
+                message = self._format_error(e.response)
+            logger.error(f"Google Search failed: {message}")
             return []
 
     def verify(self) -> Tuple[bool, str]:
@@ -254,17 +283,14 @@ class GoogleSearchEngine(SearchEngine):
         }
         try:
             resp = requests.get(url, params=params, timeout=self.timeout)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                return False, f"HTTP {resp.status_code}: {self._format_error(resp)}"
             return True, "Success"
         except Exception as e:
-            msg = str(e)
+            message = e.__class__.__name__
             if hasattr(e, "response") and e.response is not None:
-                try:
-                    error_data = e.response.json()
-                    msg = error_data.get("error", {}).get("message", msg)
-                except Exception:
-                    pass
-            return False, msg
+                message = self._format_error(e.response)
+            return False, message
 
 
 def search_web(

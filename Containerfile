@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=python:3.11-slim
+ARG BASE_IMAGE=ghcr.io/snakepacker/python/3.11
 FROM ${BASE_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -9,14 +9,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN apt-get update \
+RUN sed -i '/-proposed/d' /etc/apt/sources.list /etc/apt/sources.list.d/*.list || true \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         gcc \
         g++ \
+        python3 \
+        python3-pip \
         libffi-dev \
         libssl-dev \
-        libjpeg62-turbo-dev \
+        libjpeg-dev \
         zlib1g-dev \
         libfreetype6-dev \
         libpng-dev \
@@ -25,15 +28,12 @@ RUN apt-get update \
         ocl-icd-opencl-dev \
         opencl-headers \
         clinfo \
-    && if apt-cache show nvidia-utils >/dev/null 2>&1; then \
-        apt-get install -y --no-install-recommends nvidia-utils; \
-    elif apt-cache show nvidia-utils-535 >/dev/null 2>&1; then \
-        apt-get install -y --no-install-recommends nvidia-utils-535; \
-    elif apt-cache show nvidia-utils-525 >/dev/null 2>&1; then \
-        apt-get install -y --no-install-recommends nvidia-utils-525; \
+    && NVIDIA_PKG="$(apt-cache search '^nvidia-utils-[0-9]+' | awk '{print $1}' | sort -V | tail -n1)" \
+    && if [ -n "$NVIDIA_PKG" ]; then \
+        apt-get install -y --no-install-recommends "$NVIDIA_PKG"; \
     fi \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir -r /app/requirements.txt
+    && python3 -m pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 RUN chmod +x /app/container/entrypoint.sh \

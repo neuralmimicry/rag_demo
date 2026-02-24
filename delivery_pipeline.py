@@ -10,6 +10,7 @@ configured via the pipeline config.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 import json
 import logging
@@ -20,6 +21,9 @@ import subprocess
 import time
 
 from agentic_workflow import AgenticWorkflow, PhaseResult
+from logging_utils import UK_TZ, UK_DATETIME_FORMAT
+from mcp_client import MCPClient, MCPServerConfig
+from rag_engine import RagDocument, RagIndex
 from vcs_workflow import run_vcs_workflow
 from platform_selector import select_platform
 from project_solver import _find_workspace_venv, run_project_solver
@@ -51,6 +55,9 @@ class PipelineStage:
     retry_attempts: int = 0
     retry_delay_sec: int = 0
     auto_recover: Optional[bool] = None
+    rag: Dict[str, Any] = field(default_factory=dict)
+    mcp_calls: List[Dict[str, Any]] = field(default_factory=list)
+    remediation: List[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -73,6 +80,8 @@ class PipelineConfig:
     clean_workspaces: bool = False
     stages: List[PipelineStage] = field(default_factory=list)
     extra_ignored: List[str] = field(default_factory=list)
+    rag: Dict[str, Any] = field(default_factory=dict)
+    mcp: Dict[str, Any] = field(default_factory=dict)
 
 
 def _safe_mkdir(path: str) -> None:
@@ -107,6 +116,11 @@ def _normalise_stage(entry: Dict[str, Any]) -> PipelineStage:
         retry_attempts=int(entry.get("retry_attempts") or 0),
         retry_delay_sec=int(entry.get("retry_delay_sec") or 0),
         auto_recover=entry.get("auto_recover"),
+        rag=entry.get("rag") if isinstance(entry.get("rag"), dict) else {},
+        mcp_calls=[
+            item for item in (entry.get("mcp_calls") or entry.get("mcp") or []) if isinstance(item, dict)
+        ],
+        remediation=list(entry.get("remediation") or []),
     )
 
 
@@ -139,6 +153,8 @@ def load_pipeline_config(path: str) -> PipelineConfig:
         clean_workspaces=bool(raw.get("clean_workspaces", False)),
         stages=stages,
         extra_ignored=list(raw.get("extra_ignored") or []),
+        rag=raw.get("rag") or {},
+        mcp=raw.get("mcp") or {},
     )
 
 
@@ -248,6 +264,335 @@ def _trim_output(text: str, limit: int = 4000) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+def _read_text_file(path: str, max_bytes: int) -> str:
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(max_bytes)
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _resolve_rag_documents(
+    project_root: str,
+    rag_cfg: Dict[str, Any],
+    ignored_dirs: List[str],
+) -> List[RagDocument]:
+    max_docs = int(rag_cfg.get("max_docs") or 40)
+    max_bytes = int(rag_cfg.get("max_doc_bytes") or 400000)
+    docs: List[RagDocument] = []
+    sources = rag_cfg.get("sources") or []
+    if isinstance(sources, dict):
+        sources = [sources]
+    if isinstance(sources, str):
+        sources = [sources]
+
+    def _add_doc(source: str, text: str) -> None:
+        if not text:
+            return
+        doc_id = f"doc-{len(docs) + 1:03d}"
+        docs.append(RagDocument(doc_id=doc_id, source=source, text=text, metadata={}))
+
+    for entry in sources:
+        if len(docs) >= max_docs:
+            break
+        if isinstance(entry, str):
+            path = entry
+            abs_path = path if os.path.isabs(path) else os.path.join(project_root, path)
+            if not os.path.isfile(abs_path):
+                continue
+            text = _read_text_file(abs_path, max_bytes)
+            rel = os.path.relpath(abs_path, project_root)
+            _add_doc(rel, text)
+            continue
+        if isinstance(entry, dict):
+            text = str(entry.get("text") or "").strip()
+            name = str(entry.get("name") or entry.get("source") or "").strip()
+            if text:
+                source = name or f"inline-{len(docs) + 1:02d}"
+                _add_doc(source, text)
+                continue
+            path = entry.get("path")
+            if path:
+                abs_path = path if os.path.isabs(path) else os.path.join(project_root, str(path))
+                if not os.path.isfile(abs_path):
+                    continue
+                text = _read_text_file(abs_path, max_bytes)
+                rel = os.path.relpath(abs_path, project_root)
+                _add_doc(rel, text)
+
+    auto_sources = bool(rag_cfg.get("auto_sources", True))
+    if auto_sources and len(docs) < max_docs:
+        patterns = [
+            "readme",
+            "changelog",
+            "release",
+            "runbook",
+            "deploy",
+            "notes",
+            "requirements",
+            "spec",
+            "docs",
+        ]
+        allowed_exts = {
+            ".md",
+            ".txt",
+            ".rst",
+            ".adoc",
+            ".yml",
+            ".yaml",
+            ".json",
+        }
+        ignored = set(ignored_dirs or [])
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            dirnames[:] = [d for d in dirnames if d not in ignored and not d.startswith(".")]
+            for filename in filenames:
+                if len(docs) >= max_docs:
+                    break
+                lower = filename.lower()
+                if not any(token in lower for token in patterns):
+                    continue
+                ext = os.path.splitext(lower)[1]
+                if ext and ext not in allowed_exts:
+                    continue
+                abs_path = os.path.join(dirpath, filename)
+                try:
+                    if os.path.getsize(abs_path) > max_bytes:
+                        continue
+                except Exception:
+                    continue
+                text = _read_text_file(abs_path, max_bytes)
+                rel = os.path.relpath(abs_path, project_root)
+                _add_doc(rel, text)
+            if len(docs) >= max_docs:
+                break
+    return docs
+
+
+def _build_rag_index(
+    project_root: str,
+    rag_cfg: Dict[str, Any],
+    ignored_dirs: List[str],
+) -> Tuple[Optional[RagIndex], Dict[str, Any]]:
+    if not rag_cfg or not rag_cfg.get("enabled", False):
+        return None, {}
+    docs = _resolve_rag_documents(project_root, rag_cfg, ignored_dirs)
+    if not docs:
+        return None, {"documents": 0, "chunks": 0, "sources": []}
+    chunk_size = int(rag_cfg.get("chunk_size") or 1200)
+    chunk_overlap = int(rag_cfg.get("chunk_overlap") or 200)
+    max_chunks = rag_cfg.get("max_chunks")
+    max_chunks = int(max_chunks) if max_chunks is not None else None
+    index = RagIndex.build(
+        name=str(rag_cfg.get("name") or "delivery"),
+        documents=docs,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        max_chunks=max_chunks,
+    )
+    meta = {
+        "documents": len(docs),
+        "chunks": len(index.chunks),
+        "sources": [doc.source for doc in docs],
+    }
+    return index, meta
+
+
+def _write_rag_context(
+    *,
+    output_dir: str,
+    stage_name: str,
+    query: str,
+    matches: List[Dict[str, Any]],
+    context: str,
+    context_file: Optional[str],
+) -> Dict[str, Any]:
+    rag_root = os.path.join(output_dir, "rag")
+    _safe_mkdir(rag_root)
+    if context_file:
+        context_path = context_file
+        if not os.path.isabs(context_path):
+            context_path = os.path.join(output_dir, context_path)
+    else:
+        context_path = os.path.join(rag_root, f"{stage_name}_context.md")
+    meta_path = os.path.join(rag_root, f"{stage_name}_matches.json")
+    with open(context_path, "w", encoding="utf-8") as handle:
+        handle.write(context.strip() + "\n")
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "query": query,
+                "matches": matches,
+            },
+            handle,
+            indent=2,
+        )
+    return {"context_path": context_path, "meta_path": meta_path}
+
+
+def _stage_rag_context(
+    *,
+    stage: PipelineStage,
+    rag_index: Optional[RagIndex],
+    rag_cfg: Dict[str, Any],
+    output_dir: str,
+) -> Dict[str, Any]:
+    stage_cfg = stage.rag if isinstance(stage.rag, dict) else {}
+    if not rag_index or not stage_cfg:
+        return {"status": "skipped"}
+    query = stage_cfg.get("query") or rag_cfg.get("default_query") or ""
+    if isinstance(query, list):
+        query = " ".join([str(item) for item in query if item])
+    query = str(query).strip()
+    if not query:
+        return {"status": "skipped"}
+    top_k = int(stage_cfg.get("top_k") or rag_cfg.get("top_k") or 4)
+    min_score = float(stage_cfg.get("min_score") or rag_cfg.get("min_score") or 0.0)
+    matches = rag_index.search(query, limit=top_k, min_score=min_score)
+    match_payload = [
+        {
+            "chunk_id": m.chunk_id,
+            "source": m.source,
+            "score": round(m.score, 4),
+            "metadata": m.metadata,
+            "text": m.text,
+        }
+        for m in matches
+    ]
+    context = "\n\n".join([f"[{m.source}]\n{m.text}" for m in matches])
+    files = _write_rag_context(
+        output_dir=output_dir,
+        stage_name=stage.name,
+        query=query,
+        matches=match_payload,
+        context=context,
+        context_file=stage_cfg.get("context_file"),
+    )
+    return {
+        "status": "ok",
+        "query": query,
+        "matches": match_payload,
+        "context_path": files.get("context_path"),
+        "meta_path": files.get("meta_path"),
+    }
+
+
+def _render_template(value: Any, context: Dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        try:
+            return value.format(**context)
+        except Exception:
+            return value
+    if isinstance(value, list):
+        return [_render_template(item, context) for item in value]
+    if isinstance(value, dict):
+        return {key: _render_template(val, context) for key, val in value.items()}
+    return value
+
+
+def _resolve_mcp_servers(mcp_cfg: Dict[str, Any]) -> Dict[str, MCPServerConfig]:
+    if not mcp_cfg:
+        return {}
+    if mcp_cfg.get("enabled") is False:
+        return {}
+    servers_cfg = mcp_cfg.get("servers") or []
+    servers: Dict[str, MCPServerConfig] = {}
+    for entry in servers_cfg:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        base_url = str(entry.get("base_url") or "").strip()
+        if not name or not base_url:
+            continue
+        auth_type = str(entry.get("auth_type") or "bearer").strip().lower()
+        auth_token = entry.get("auth_token")
+        auth_env = entry.get("auth_token_env")
+        if not auth_token and auth_env:
+            auth_token = os.environ.get(str(auth_env))
+        headers = entry.get("headers") if isinstance(entry.get("headers"), dict) else None
+        timeout = int(entry.get("timeout") or mcp_cfg.get("timeout") or 20)
+        servers[name] = MCPServerConfig(
+            name=name,
+            base_url=base_url,
+            auth_type=auth_type,
+            auth_token=auth_token,
+            headers=headers,
+            timeout=timeout,
+        )
+    return servers
+
+
+def _run_mcp_calls(
+    *,
+    calls: List[Dict[str, Any]],
+    when: str,
+    allow_run: bool,
+    servers: Dict[str, MCPServerConfig],
+    context: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    results: List[Dict[str, Any]] = []
+    failed = False
+    for entry in calls or []:
+        if not isinstance(entry, dict):
+            continue
+        call_when = str(entry.get("when") or "pre").strip().lower()
+        if call_when not in {when, "both"}:
+            continue
+        name = str(entry.get("name") or entry.get("tool") or "").strip()
+        server_name = str(entry.get("server") or "").strip()
+        tool = str(entry.get("tool") or "").strip()
+        required = bool(entry.get("required", False))
+        allow_failure = bool(entry.get("allow_failure", False))
+        result = {
+            "name": name or tool,
+            "server": server_name,
+            "tool": tool,
+            "when": call_when,
+            "status": "planned",
+            "duration_sec": 0.0,
+        }
+        if not server_name or not tool:
+            result["status"] = "invalid"
+            result["error"] = "server and tool are required"
+            results.append(result)
+            if required and not allow_failure:
+                failed = True
+            continue
+        server = servers.get(server_name)
+        if not server:
+            result["status"] = "skipped_missing_server"
+            result["error"] = "server not configured"
+            results.append(result)
+            if required and not allow_failure:
+                failed = True
+            continue
+        arguments = entry.get("arguments") if isinstance(entry.get("arguments"), dict) else {}
+        arguments = _render_template(arguments, context)
+        if not allow_run:
+            results.append(result)
+            continue
+        started = time.time()
+        try:
+            client = MCPClient(server)
+            client.initialize({"name": "delivery_pipeline"})
+            response = client.call_tool(tool, arguments or {})
+            payload_text = json.dumps(response, ensure_ascii=True)
+            result["status"] = "ok"
+            if len(payload_text) > 4000:
+                result["response_excerpt"] = payload_text[:4000] + "..."
+                result["response_truncated"] = True
+            else:
+                result["response"] = response
+        except Exception as exc:
+            result["status"] = "failed"
+            result["error"] = str(exc)
+            if not allow_failure:
+                failed = True
+        result["duration_sec"] = round(time.time() - started, 2)
+        results.append(result)
+    return results, failed
 
 
 def _tail_output(text: str, max_lines: int = 20, max_chars: int = 800) -> str:
@@ -955,6 +1300,64 @@ def _is_deploy_stage(stage: PipelineStage) -> bool:
     return kind in deploy_kinds
 
 
+def _is_security_stage(stage: PipelineStage) -> bool:
+    kind = (stage.kind or stage.name or "").strip().lower()
+    return kind == "security" or "security" in kind or "security" in (stage.name or "").lower()
+
+
+def _run_remediation_commands(
+    commands: List[Any],
+    *,
+    workspace: str,
+    env: Dict[str, str],
+    timeout_sec: int,
+    stage_name: str,
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    for item in commands or []:
+        if isinstance(item, dict):
+            command = item.get("command") or item.get("cmd") or ""
+            timeout = int(item.get("timeout_sec") or timeout_sec)
+        else:
+            command = str(item)
+            timeout = timeout_sec
+        command = command.strip()
+        if not command:
+            continue
+        result = _run_command(
+            command,
+            workdir=workspace,
+            env=env,
+            timeout_sec=timeout,
+            stage_name=stage_name,
+            attempt=None,
+        )
+        result["kind"] = "remediation"
+        results.append(result)
+    return results
+
+
+def _append_security_issue(
+    output_dir: str,
+    *,
+    stage_name: str,
+    command_results: List[Dict[str, Any]],
+    remediation_results: List[Dict[str, Any]],
+) -> str:
+    _safe_mkdir(output_dir)
+    issue_path = os.path.join(output_dir, "security_issues.jsonl")
+    issue = {
+        "timestamp": datetime.now(UK_TZ).strftime(UK_DATETIME_FORMAT),
+        "stage": stage_name,
+        "command_results": command_results,
+        "remediation_results": remediation_results,
+    }
+    with open(issue_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(issue) + "\n")
+    logger.warning("Security scan failed; logged issue to %s", issue_path)
+    return issue_path
+
+
 def run_delivery_pipeline(
     project_root: str,
     *,
@@ -1139,7 +1542,23 @@ def run_delivery_pipeline(
             json.dump(report, handle, indent=2)
         return 2 if vcs_result.status == "blocked" else 1
 
+    ignored_dirs = set(DEFAULT_IGNORED_DIRS)
+    ignored_dirs.add(DEFAULT_OUTPUT_DIR)
+    for item in config.extra_ignored:
+        if item:
+            ignored_dirs.add(item)
+    if output_dir:
+        try:
+            rel = os.path.relpath(output_dir, project_root)
+        except Exception:
+            rel = None
+        if rel and not rel.startswith(".."):
+            ignored_dirs.add(rel.split(os.sep)[0])
     ignore = _build_ignore(project_root, output_dir, config.extra_ignored)
+
+    rag_index, rag_meta = _build_rag_index(project_root, config.rag or {}, sorted(ignored_dirs))
+    mcp_servers = _resolve_mcp_servers(config.mcp or {})
+    mcp_server_masks = [server.masked() for server in mcp_servers.values()]
 
     workflow = AgenticWorkflow(
         phases=[stage.name for stage in config.stages],
@@ -1184,6 +1603,8 @@ def run_delivery_pipeline(
                 "command_results": [],
                 "recovery_actions": [],
                 "solver_attempts": [],
+                "rag": {},
+                "mcp_calls": [],
                 "artifacts": [],
                 "notes": stage_notes + ["disabled"],
                 "duration_sec": round(time.time() - stage_start, 2),
@@ -1198,6 +1619,8 @@ def run_delivery_pipeline(
             command_results: List[Dict[str, Any]] = []
             stage_recoveries: List[Dict[str, Any]] = []
             stage_solver_attempts: List[Dict[str, Any]] = []
+            stage_rag_info: Dict[str, Any] = {}
+            stage_mcp_results: List[Dict[str, Any]] = []
             workspace = None
             artifacts = []
         elif allow_run and stage.requires_approval and not approval_present:
@@ -1207,6 +1630,8 @@ def run_delivery_pipeline(
             command_results = []
             stage_recoveries = []
             stage_solver_attempts = []
+            stage_rag_info = {}
+            stage_mcp_results = []
             workspace = None
             artifacts = []
         else:
@@ -1226,10 +1651,16 @@ def run_delivery_pipeline(
             stage_status = "skipped"
             stage_recoveries: List[Dict[str, Any]] = []
             stage_solver_attempts: List[Dict[str, Any]] = []
+            stage_rag_info: Dict[str, Any] = {}
+            stage_mcp_results: List[Dict[str, Any]] = []
             stage_retry_attempts = stage.retry_attempts if stage.retry_attempts else config.retry_attempts
             stage_retry_delay = stage.retry_delay_sec if stage.retry_delay_sec else config.retry_delay_sec
             stage_auto_recover = config.auto_recover if stage.auto_recover is None else bool(stage.auto_recover)
             solver_attempts_used = 0
+            security_stage = _is_security_stage(stage)
+            security_failed = False
+            remediation_results: List[Dict[str, Any]] = []
+            security_issue_path: Optional[str] = None
 
             if allow_run:
                 env = os.environ.copy()
@@ -1248,7 +1679,44 @@ def run_delivery_pipeline(
                         "PIPELINE_BUILD_SYSTEMS": ",".join(language_details.get("build_systems") or []),
                     }
                 )
-                if stage.commands:
+                context_map = {
+                    "version": version,
+                    "stage": stage.name,
+                    "kind": stage_kind,
+                    "project_root": project_root,
+                    "workspace": workspace,
+                    "output_dir": output_dir,
+                }
+                if rag_index and stage.rag:
+                    stage_rag_info = _stage_rag_context(
+                        stage=stage,
+                        rag_index=rag_index,
+                        rag_cfg=config.rag or {},
+                        output_dir=output_dir,
+                    )
+                    if stage_rag_info.get("context_path"):
+                        env["PIPELINE_RAG_CONTEXT"] = str(stage_rag_info.get("context_path"))
+                    if stage_rag_info.get("meta_path"):
+                        env["PIPELINE_RAG_METADATA"] = str(stage_rag_info.get("meta_path"))
+                    if stage_rag_info.get("query"):
+                        env["PIPELINE_RAG_QUERY"] = str(stage_rag_info.get("query"))
+                mcp_failed = False
+                if stage.mcp_calls:
+                    mcp_results, mcp_failed = _run_mcp_calls(
+                        calls=stage.mcp_calls,
+                        when="pre",
+                        allow_run=allow_run,
+                        servers=mcp_servers,
+                        context=context_map,
+                    )
+                    stage_mcp_results.extend(mcp_results)
+                    if mcp_failed and not stage.allow_failure:
+                        stage_status = "failed"
+                        stage_notes.append("mcp calls failed")
+                        failed = True
+                if stage_status == "failed" and failed:
+                    pass
+                elif stage.commands:
                     stage_status = "ok"
                     for item in stage.commands:
                         if isinstance(item, dict):
@@ -1384,7 +1852,9 @@ def run_delivery_pipeline(
                                         attempt = 0
                                         continue
                                 stage_status = "failed"
-                                if not stage.allow_failure:
+                                if security_stage:
+                                    security_failed = True
+                                elif not stage.allow_failure:
                                     failed = True
                                 break
                             recovery = None
@@ -1435,9 +1905,68 @@ def run_delivery_pipeline(
                 else:
                     stage_status = "no_op"
 
+                if stage_status in {"ok", "no_op"} and stage.mcp_calls:
+                    post_results, post_failed = _run_mcp_calls(
+                        calls=stage.mcp_calls,
+                        when="post",
+                        allow_run=allow_run,
+                        servers=mcp_servers,
+                        context=context_map,
+                    )
+                    stage_mcp_results.extend(post_results)
+                    if post_failed and not stage.allow_failure:
+                        stage_status = "failed"
+                        failed = True
+
+                if security_stage and security_failed:
+                    if stage.remediation:
+                        remediation_results = _run_remediation_commands(
+                            stage.remediation,
+                            workspace=workspace,
+                            env=env,
+                            timeout_sec=stage.timeout_sec,
+                            stage_name=stage.name,
+                        )
+                        rerun_ok = True
+                        for item in stage.commands:
+                            if isinstance(item, dict):
+                                command = item.get("command") or item.get("cmd") or ""
+                                timeout = int(item.get("timeout_sec") or stage.timeout_sec)
+                            else:
+                                command = str(item)
+                                timeout = stage.timeout_sec
+                            command = command.strip()
+                            if not command:
+                                continue
+                            retry_result = _run_command(
+                                command,
+                                workdir=workspace,
+                                env=env,
+                                timeout_sec=timeout,
+                                stage_name=stage.name,
+                                attempt=None,
+                            )
+                            retry_result["remediation_retry"] = True
+                            command_results.append(retry_result)
+                            if retry_result["status"] != "ok":
+                                rerun_ok = False
+                        if rerun_ok:
+                            stage_status = "ok"
+                            security_failed = False
+                    if security_failed:
+                        security_issue_path = _append_security_issue(
+                            output_dir,
+                            stage_name=stage.name,
+                            command_results=command_results,
+                            remediation_results=remediation_results,
+                        )
+                        stage_notes.append("security scan failed; continuing")
+
+                effective_allow_failure = stage.allow_failure or (security_stage and stage_status == "failed")
+
                 if stage_status in {"ok", "no_op"}:
                     phase_result = PhaseResult.ok("stage completed")
-                elif stage.allow_failure:
+                elif effective_allow_failure:
                     phase_result = PhaseResult.ok("stage failed (allowed)")
                 else:
                     phase_result = PhaseResult.error("stage failed")
@@ -1466,6 +1995,13 @@ def run_delivery_pipeline(
             "command_results": command_results,
             "recovery_actions": stage_recoveries,
             "solver_attempts": stage_solver_attempts,
+            "rag": stage_rag_info,
+            "mcp_calls": stage_mcp_results,
+            "remediation": {
+                "commands": stage.remediation,
+                "results": remediation_results,
+                "issue_path": security_issue_path,
+            },
             "artifacts": artifacts,
             "notes": stage_notes,
             "duration_sec": round(time.time() - stage_start, 2),
@@ -1503,6 +2039,7 @@ def run_delivery_pipeline(
     logger.info("Delivery pipeline summary: status=%s stages=%s solver_attempts=%s", pipeline_status, stage_counts, len(solver_fallback_log))
 
     report = {
+        "generated_at": datetime.now(UK_TZ).strftime(UK_DATETIME_FORMAT),
         "status": pipeline_status,
         "version": version,
         "project_root": project_root,
@@ -1526,6 +2063,8 @@ def run_delivery_pipeline(
             "attempts": solver_fallback_log,
             "attempt_count": len(solver_fallback_log),
         },
+        "rag": rag_meta,
+        "mcp": {"servers": mcp_server_masks},
         "summary": run_summary,
         "stages": stage_results,
         "workflow": workflow.export(),

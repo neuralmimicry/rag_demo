@@ -43,6 +43,11 @@ def index() -> str:
     return render_template("index.html", current_user=None, api_base=API_BASE)
 
 
+@app.route("/playground")
+def playground() -> str:
+    return render_template("playground.html", current_user=None, api_base=API_BASE)
+
+
 @app.route("/public/<path:filename>")
 def public_asset(filename: str):
     return send_from_directory(PUBLIC_DIR, filename)

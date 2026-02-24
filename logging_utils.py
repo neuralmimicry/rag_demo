@@ -1,6 +1,19 @@
 import logging
 import sys
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+UK_TZ = ZoneInfo("Europe/London")
+UK_DATETIME_FORMAT = "%d/%m/%Y %H:%M:%S"
+
+
+class LondonFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, UK_TZ)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime(UK_DATETIME_FORMAT)
 
 def setup_logging(verbose: bool = False, debug: bool = False, log_file: str = "refiner.log"):
     """
@@ -29,7 +42,7 @@ def setup_logging(verbose: bool = False, debug: bool = False, log_file: str = "r
     console_handler.setLevel(level)
     
     if debug:
-        console_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        console_format = LondonFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt=UK_DATETIME_FORMAT)
     else:
         # Cleaner format for standard/verbose output
         console_format = logging.Formatter('%(message)s')
@@ -44,7 +57,7 @@ def setup_logging(verbose: bool = False, debug: bool = False, log_file: str = "r
     try:
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
-        file_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_format = LondonFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt=UK_DATETIME_FORMAT)
         file_handler.setFormatter(file_format)
         root_logger.addHandler(file_handler)
     except Exception as e:

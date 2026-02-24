@@ -32,6 +32,7 @@ import requests
 
 from agentic_workflow import AgenticWorkflow, PhaseResult, ProgressTracker
 from file_converter import FileConverter
+from language_detector import detect_languages
 from llm_providers import get_provider, LLMQuotaError, LLMError, request_category
 from repo_context import RepoIndex
 from web_research import (
@@ -72,6 +73,74 @@ IGNORED_DIRS = {
 }
 
 DEFAULT_SOLVER_OUTPUT_DIR = "project_solver_output"
+
+GITIGNORE_ALWAYS = (
+    ".research_cache/",
+    ".venv/",
+    "project_solver_output/",
+    "delivery_pipeline_output/",
+)
+
+GITIGNORE_BY_LANGUAGE = {
+    "python": [
+        "venv/",
+        "__pycache__/",
+        ".pytest_cache/",
+        ".mypy_cache/",
+        ".ruff_cache/",
+        ".tox/",
+        ".nox/",
+        "dist/",
+        "build/",
+        "*.egg-info/",
+        ".eggs/",
+    ],
+    "node": [
+        "node_modules/",
+        "dist/",
+        "build/",
+        ".cache/",
+        ".next/",
+        ".nuxt/",
+        ".turbo/",
+        "coverage/",
+    ],
+    "rust": [
+        "target/",
+    ],
+    "go": [
+        "bin/",
+        "pkg/",
+    ],
+    "c": [
+        "build/",
+    ],
+    "cpp": [
+        "build/",
+    ],
+}
+
+GITIGNORE_BY_BUILD_SYSTEM = {
+    "python": [
+        "dist/",
+        "build/",
+    ],
+    "node": [
+        "node_modules/",
+        "dist/",
+        "build/",
+    ],
+    "cmake": [
+        "build/",
+        "cmake-build-*/",
+    ],
+    "meson": [
+        "build/",
+    ],
+    "ninja": [
+        "build/",
+    ],
+}
 
 PYPI_JSON_CACHE: Dict[str, Dict[str, object]] = {}
 CODEX_PREFLIGHT_STATE: Optional[Dict[str, object]] = None
@@ -230,6 +299,22 @@ GLOBAL_REQUIREMENTS = [
         "notes": "Global requirement.",
     },
     {
+        "key": "language_translation_equivalence",
+        "title": "Language translation must preserve functionality",
+        "description": (
+            "If translating generated code to a different language for efficiency, performance, or scalability, "
+            "the result must be verifiably equivalent in functionality and integrate with the rest of the project."
+        ),
+        "type": "constraint",
+        "priority": "must",
+        "acceptance_criteria": [
+            "Language changes are justified by measurable or well-reasoned efficiency, performance, or scalability gains.",
+            "Equivalent functionality is validated with tests or runnable examples that pass in the new language.",
+            "Required libraries or ecosystem equivalents are identified and integration constraints are documented.",
+        ],
+        "notes": "Global requirement.",
+    },
+    {
         "key": "best_practices",
         "title": "Follow best practices and industry knowledge",
         "description": "Implement solutions that align with established software engineering best practices and relevant industry standards.",
@@ -238,6 +323,23 @@ GLOBAL_REQUIREMENTS = [
         "acceptance_criteria": [
             "Design decisions reference a relevant best practice, standard, or rationale note.",
             "Implementation avoids known anti-patterns and uses proven approaches where applicable.",
+        ],
+        "notes": "Global requirement.",
+    },
+    {
+        "key": "refinement_principle",
+        "title": "Refinement principle: measurable improvement",
+        "description": (
+            "Each run should refine the solution by improving it in a measurable, qualitative, and quantifiable way, "
+            "with attention to efficiency and performance where applicable."
+        ),
+        "type": "non-functional",
+        "priority": "must",
+        "acceptance_criteria": [
+            "Each change targets at least one improvement dimension (correctness, robustness, maintainability, efficiency, or performance).",
+            "Where metrics exist, include before/after measurements or a quantified estimate of impact.",
+            "Where quantitative metrics are unavailable, document qualitative improvements and why measurement is impractical.",
+            "Changes must not introduce regressions in performance or efficiency relative to the baseline.",
         ],
         "notes": "Global requirement.",
     },
@@ -288,6 +390,38 @@ GLOBAL_REQUIREMENTS = [
         "acceptance_criteria": [
             "Logic is decomposed into cohesive components.",
             "Reusable utilities are extracted where appropriate and duplication is minimal.",
+        ],
+        "notes": "Global requirement.",
+    },
+    {
+        "key": "module_traceability_reuse",
+        "title": "Module reuse and traceability",
+        "description": (
+            "Generated or updated modules must be modular, reusable, and tracked with purpose summaries and "
+            "requirement IDs to enable cross-project matching. Each module must include tests and runnable examples."
+        ),
+        "type": "non-functional",
+        "priority": "must",
+        "acceptance_criteria": [
+            "Each generated/updated module has a concise purpose summary and associated requirement IDs recorded in the module registry output.",
+            "Module documentation or docstrings reference relevant REQ-### IDs when practical.",
+            "Each module has corresponding tests and runnable examples; gaps are documented when unavoidable.",
+        ],
+        "notes": "Global requirement.",
+    },
+    {
+        "key": "module_privacy_safety",
+        "title": "No identifiable user or company information in reusable modules",
+        "description": (
+            "Reusable modules must not contain user-identifiable or company-identifiable information so private data "
+            "does not leak across projects."
+        ),
+        "type": "constraint",
+        "priority": "must",
+        "acceptance_criteria": [
+            "Reusable modules avoid personal names, emails, phone numbers, internal hostnames, private URLs, or company names.",
+            "Any required identifiers are abstracted via configuration or placeholders.",
+            "Tests/examples use sanitized, non-identifying data.",
         ],
         "notes": "Global requirement.",
     },
@@ -403,6 +537,14 @@ TEST_FILE_RE = re.compile(
     r"(^|/|\\\\)(tests|test)(/|\\\\)|(^|/|\\\\)(test_|spec_)|(_test\.|_spec\.)",
     re.IGNORECASE,
 )
+EXAMPLE_FILE_RE = re.compile(
+    r"(^|/|\\\\)(examples?|samples?)(/|\\\\)|(^|/|\\\\)(example_|sample_)|(_example\.)",
+    re.IGNORECASE,
+)
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+SAFE_URL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0"}
+SAFE_URL_DOMAINS = {"example.com", "example.org", "example.net"}
 
 VERIFICATION_ERROR_RE = re.compile(
     r"(traceback \(most recent call last\)|\bexception\b|\bassertionerror\b|\berror processing\b|\berror:)",
@@ -3016,6 +3158,43 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return cleaned[:max_chars].rstrip() + "...(truncated)"
 
 
+def _split_text_pages(text: str, max_chars: int) -> List[str]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return []
+    if max_chars <= 0 or len(cleaned) <= max_chars:
+        return [cleaned]
+    pages: List[str] = []
+    start = 0
+    length = len(cleaned)
+    while start < length:
+        end = min(length, start + max_chars)
+        if end < length:
+            split_at = cleaned.rfind("\n", start, end)
+            if split_at > start + max_chars * 0.5:
+                end = split_at
+        chunk = cleaned[start:end].strip()
+        if chunk:
+            pages.append(chunk)
+        start = end
+    return pages if pages else [cleaned]
+
+
+def _paged_requirements_text(
+    text: str,
+    *,
+    iteration: int,
+    page_chars: int,
+) -> Tuple[str, Optional[Dict[str, int]]]:
+    pages = _split_text_pages(text, max(800, int(page_chars or 0)))
+    if not pages:
+        return "", None
+    if len(pages) == 1:
+        return pages[0], None
+    idx = max(0, int(iteration or 1) - 1) % len(pages)
+    return pages[idx], {"page": idx + 1, "total": len(pages)}
+
+
 def _build_requirements_corpus(
     requirement_sources: List[RequirementSource],
     context_summary: str,
@@ -4343,6 +4522,17 @@ def _extract_requirement_refs_from_step(step: Dict[str, object]) -> List[str]:
     return sorted(refs)
 
 
+def _step_summary(step: Dict[str, object], max_chars: int = 240) -> str:
+    if not isinstance(step, dict):
+        return ""
+    summary = _safe_str(step.get("step") or step.get("note"))
+    if not summary:
+        summary = _safe_str(step.get("command") or step.get("path"))
+    if not summary:
+        summary = _safe_str(step.get("content") or step.get("find") or step.get("replace"))
+    return _truncate_text(summary, max_chars) if summary else ""
+
+
 def _plan_steps_missing_requirement_refs(plan_steps: List[Dict[str, object]]) -> List[int]:
     missing: List[int] = []
     for idx, step in enumerate(plan_steps):
@@ -4886,6 +5076,300 @@ def _build_requirement_traceability(
     return {
         "summary": summary,
         "requirements": requirements_trace,
+    }
+
+
+def _module_kind_for_path(path: str) -> str:
+    if TEST_FILE_RE.search(path):
+        return "test"
+    if EXAMPLE_FILE_RE.search(path):
+        return "example"
+    return "module"
+
+
+def _is_safe_url_host(host: str) -> bool:
+    lowered = (host or "").strip().lower()
+    if not lowered:
+        return True
+    if lowered in SAFE_URL_HOSTS:
+        return True
+    return any(lowered == domain or lowered.endswith("." + domain) for domain in SAFE_URL_DOMAINS)
+
+
+def _scan_module_for_privacy_issues(abs_path: str) -> List[Dict[str, object]]:
+    text = _read_text_file(abs_path, max_bytes=200_000)
+    if not text:
+        return []
+    emails = set(EMAIL_RE.findall(text))
+    non_local_urls = 0
+    for match in URL_RE.findall(text):
+        try:
+            host = urlparse(match).hostname or ""
+        except Exception:
+            host = ""
+        if _is_safe_url_host(host):
+            continue
+        non_local_urls += 1
+    flags: List[Dict[str, object]] = []
+    if emails:
+        flags.append({"type": "email", "count": len(emails)})
+    if non_local_urls:
+        flags.append({"type": "url", "count": non_local_urls, "note": "non-local"})
+    return flags
+
+
+def _extract_module_summary(abs_path: str, *, max_chars: int = 240) -> str:
+    text = _read_text_file(abs_path, max_bytes=200_000)
+    if not text:
+        return ""
+    ext = os.path.splitext(abs_path)[1].lower()
+    if ext == ".py":
+        try:
+            tree = ast.parse(text)
+            doc = ast.get_docstring(tree) or ""
+        except Exception:
+            doc = ""
+        if doc:
+            lines = [line.strip() for line in doc.splitlines() if line.strip()]
+            if lines:
+                return _truncate_text(" ".join(lines[:3]), max_chars)
+
+    lines = text.splitlines()
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx].strip()
+        if not line:
+            idx += 1
+            continue
+        if line.startswith("#!") or line.startswith("//!"):
+            idx += 1
+            continue
+        if line.startswith("#") and "coding" in line:
+            idx += 1
+            continue
+        break
+
+    if idx < len(lines) and lines[idx].lstrip().startswith("/*"):
+        block: List[str] = []
+        while idx < len(lines):
+            raw = lines[idx]
+            block.append(raw)
+            if "*/" in raw:
+                break
+            idx += 1
+        cleaned = []
+        for raw in block:
+            line = raw.strip()
+            line = line.lstrip("/*").rstrip("*/").strip()
+            if line.startswith("*"):
+                line = line.lstrip("*").strip()
+            if line:
+                cleaned.append(line)
+        if cleaned:
+            return _truncate_text(" ".join(cleaned[:3]), max_chars)
+
+    comment_prefixes = ("#", "//", ";", "--")
+    comment_lines: List[str] = []
+    while idx < len(lines):
+        raw = lines[idx]
+        stripped = raw.strip()
+        if not stripped:
+            idx += 1
+            if comment_lines:
+                break
+            continue
+        if not stripped.startswith(comment_prefixes):
+            break
+        cleaned = stripped
+        for prefix in comment_prefixes:
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix) :].strip()
+                break
+        if cleaned:
+            comment_lines.append(cleaned)
+        idx += 1
+    if comment_lines:
+        return _truncate_text(" ".join(comment_lines[:3]), max_chars)
+
+    fallback_lines = [line.strip() for line in lines if line.strip()]
+    if fallback_lines:
+        return _truncate_text(" ".join(fallback_lines[:2]), max_chars)
+    return ""
+
+
+def _build_module_registry(
+    requirements_register: Optional[Dict[str, object]],
+    applied_steps_by_source: Dict[str, List[Dict[str, object]]],
+    project_root: str,
+) -> Dict[str, object]:
+    register_reqs = []
+    if isinstance(requirements_register, dict):
+        register_reqs = requirements_register.get("requirements") or []
+    if not isinstance(register_reqs, list):
+        register_reqs = []
+
+    req_meta: Dict[str, Dict[str, str]] = {}
+    for req in register_reqs:
+        if not isinstance(req, dict):
+            continue
+        req_id = _safe_str(req.get("id")).upper()
+        if not req_id:
+            continue
+        req_meta[req_id] = {
+            "title": _safe_str(req.get("title")),
+            "description": _safe_str(req.get("description")),
+        }
+
+    entries: Dict[str, Dict[str, object]] = {}
+    tests_by_req: Dict[str, set] = {}
+    examples_by_req: Dict[str, set] = {}
+    tests_by_source: Dict[str, set] = {}
+    examples_by_source: Dict[str, set] = {}
+
+    for source_path, steps in applied_steps_by_source.items():
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            if not step.get("is_code"):
+                continue
+            raw_path = step.get("abs_path") or step.get("path")
+            if not isinstance(raw_path, str):
+                continue
+            abs_path = raw_path
+            if not os.path.isabs(abs_path):
+                abs_path = os.path.abspath(os.path.join(project_root, abs_path))
+            display_path = _display_path_for_report(project_root, abs_path)
+            kind = _module_kind_for_path(display_path)
+            entry = entries.setdefault(
+                display_path,
+                {
+                    "path": display_path,
+                    "abs_path": abs_path,
+                    "kind": kind,
+                    "requirement_ids": set(),
+                    "sources": set(),
+                    "step_summaries": [],
+                },
+            )
+            entry["sources"].add(source_path)
+            summary = _safe_str(step.get("summary"))
+            if summary:
+                entry["step_summaries"].append(summary)
+            step_refs = step.get("requirement_ids")
+            if not isinstance(step_refs, list) or not step_refs:
+                step_refs = _extract_requirement_refs_from_step(step)
+            step_refs = [r for r in step_refs if isinstance(r, str)]
+            for req_id in step_refs:
+                req_id = req_id.upper()
+                entry["requirement_ids"].add(req_id)
+                if kind == "test":
+                    tests_by_req.setdefault(req_id, set()).add(display_path)
+                elif kind == "example":
+                    examples_by_req.setdefault(req_id, set()).add(display_path)
+            if kind == "test":
+                tests_by_source.setdefault(source_path, set()).add(display_path)
+            elif kind == "example":
+                examples_by_source.setdefault(source_path, set()).add(display_path)
+
+    modules: List[Dict[str, object]] = []
+    tests: List[Dict[str, object]] = []
+    examples: List[Dict[str, object]] = []
+    missing_tests: List[Dict[str, object]] = []
+    missing_examples: List[Dict[str, object]] = []
+    privacy_flags: List[Dict[str, object]] = []
+
+    for entry in entries.values():
+        kind = entry.get("kind")
+        req_ids = sorted(entry.get("requirement_ids") or [])
+        req_details = []
+        for req_id in req_ids:
+            meta = req_meta.get(req_id, {})
+            req_details.append(
+                {
+                    "id": req_id,
+                    "title": meta.get("title"),
+                    "description": meta.get("description"),
+                }
+            )
+        summary = _extract_module_summary(entry["abs_path"])
+        if not summary:
+            summaries = entry.get("step_summaries") or []
+            if summaries:
+                summary = _truncate_text(" ".join(summaries[:3]), 240)
+        privacy_issues = _scan_module_for_privacy_issues(entry["abs_path"])
+        payload = {
+            "path": entry.get("path"),
+            "summary": summary,
+            "requirement_ids": req_ids,
+            "requirements": req_details,
+            "sources": sorted(entry.get("sources") or []),
+            "privacy_flags": privacy_issues,
+        }
+        if kind == "test":
+            tests.append(payload)
+            continue
+        if kind == "example":
+            examples.append(payload)
+            continue
+
+        linked_tests: set = set()
+        linked_examples: set = set()
+        for req_id in req_ids:
+            linked_tests |= tests_by_req.get(req_id, set())
+            linked_examples |= examples_by_req.get(req_id, set())
+        if not linked_tests:
+            for source in payload["sources"]:
+                linked_tests |= tests_by_source.get(source, set())
+        if not linked_examples:
+            for source in payload["sources"]:
+                linked_examples |= examples_by_source.get(source, set())
+
+        module_entry = dict(payload)
+        module_entry["tests"] = sorted(linked_tests)
+        module_entry["examples"] = sorted(linked_examples)
+        modules.append(module_entry)
+
+        if not module_entry["tests"]:
+            missing_tests.append(
+                {
+                    "path": module_entry["path"],
+                    "requirement_ids": req_ids,
+                }
+            )
+        if not module_entry["examples"]:
+            missing_examples.append(
+                {
+                    "path": module_entry["path"],
+                    "requirement_ids": req_ids,
+                }
+            )
+        if module_entry.get("privacy_flags"):
+            privacy_flags.append(
+                {
+                    "path": module_entry["path"],
+                    "privacy_flags": module_entry["privacy_flags"],
+                    "requirement_ids": req_ids,
+                }
+            )
+
+    summary = {
+        "modules": len(modules),
+        "tests": len(tests),
+        "examples": len(examples),
+        "modules_missing_tests": len(missing_tests),
+        "modules_missing_examples": len(missing_examples),
+        "modules_with_privacy_flags": len(privacy_flags),
+    }
+    return {
+        "summary": summary,
+        "modules": modules,
+        "tests": tests,
+        "examples": examples,
+        "missing_tests": missing_tests,
+        "missing_examples": missing_examples,
+        "privacy_flags": privacy_flags,
     }
 
 
@@ -5666,6 +6150,130 @@ def _is_third_party_path(path: str) -> bool:
     return _is_path_under_venv(norm)
 
 
+def _looks_like_git_repo(project_root: str) -> bool:
+    dot_git = os.path.join(project_root, ".git")
+    return os.path.isdir(dot_git) or os.path.isfile(dot_git)
+
+
+def _strip_gitignore_comment(line: str) -> str:
+    if not line:
+        return ""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return ""
+    escaped = False
+    result: List[str] = []
+    for ch in line:
+        if escaped:
+            result.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            result.append(ch)
+            continue
+        if ch == "#":
+            break
+        result.append(ch)
+    return "".join(result).strip()
+
+
+def _normalize_gitignore_entry(entry: str) -> str:
+    if not entry:
+        return ""
+    normalized = entry.strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if normalized.startswith("/"):
+        normalized = normalized[1:]
+    if normalized.endswith("/"):
+        normalized = normalized[:-1]
+    return normalized
+
+
+def _collect_gitignore_entries(lines: List[str]) -> set:
+    entries = set()
+    for line in lines:
+        cleaned = _strip_gitignore_comment(line)
+        if not cleaned:
+            continue
+        normalized = _normalize_gitignore_entry(cleaned)
+        if normalized:
+            entries.add(normalized)
+    return entries
+
+
+def _build_gitignore_entries(project_root: str) -> List[str]:
+    info = detect_languages(project_root)
+    languages = set(info.get("languages", []))
+    build_systems = set(info.get("build_systems", []))
+    entries: List[str] = list(GITIGNORE_ALWAYS)
+    for language in sorted(languages):
+        entries.extend(GITIGNORE_BY_LANGUAGE.get(language, []))
+    for system in sorted(build_systems):
+        entries.extend(GITIGNORE_BY_BUILD_SYSTEM.get(system, []))
+
+    deduped: List[str] = []
+    seen: set = set()
+    for entry in entries:
+        normalized = _normalize_gitignore_entry(entry)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(entry)
+    return deduped
+
+
+def _ensure_gitignore(project_root: str, actions_log: List[str]) -> Optional[Dict[str, object]]:
+    if not _looks_like_git_repo(project_root):
+        return None
+    gitignore_path = os.path.join(project_root, ".gitignore")
+    file_existed = os.path.exists(gitignore_path)
+    existing_lines: List[str] = []
+    if file_existed:
+        try:
+            with open(gitignore_path, "r", encoding="utf-8") as handle:
+                existing_lines = handle.read().splitlines()
+        except Exception as exc:
+            actions_log.append(f"Failed to read .gitignore: {exc}")
+            return None
+
+    existing_entries = _collect_gitignore_entries(existing_lines)
+    desired_entries = _build_gitignore_entries(project_root)
+    missing = [
+        entry
+        for entry in desired_entries
+        if _normalize_gitignore_entry(entry) not in existing_entries
+    ]
+    if not missing:
+        return {"changed": False, "added": []}
+
+    lines_to_write: List[str] = []
+    if not existing_lines:
+        lines_to_write.append("# Added by project_solver to ignore local artifacts")
+    elif existing_lines and existing_lines[-1].strip():
+        lines_to_write.append("")
+    lines_to_write.append("# project_solver ignore additions")
+    lines_to_write.extend(missing)
+    payload = "\n".join(lines_to_write).rstrip() + "\n"
+    try:
+        with open(gitignore_path, "a", encoding="utf-8") as handle:
+            handle.write(payload)
+    except Exception as exc:
+        actions_log.append(f"Failed to update .gitignore: {exc}")
+        return None
+
+    if file_existed:
+        actions_log.append(
+            f"Updated .gitignore with {len(missing)} entries: {', '.join(missing)}"
+        )
+    else:
+        actions_log.append(
+            f"Created .gitignore with {len(missing)} entries: {', '.join(missing)}"
+        )
+    return {"changed": True, "added": missing}
+
+
 def _source_is_under_root(source_path: str, root_path: str) -> bool:
     norm_source = os.path.normpath(source_path)
     norm_root = os.path.normpath(root_path)
@@ -5805,6 +6413,7 @@ def _apply_step(
                             "abs_path": abs_path,
                             "line": 1,
                             "note": "write_file",
+                            "summary": _step_summary(step),
                             "is_code": os.path.splitext(rel_path)[1].lower() in CODE_FILE_EXTS
                             or bool(TEST_FILE_RE.search(rel_path)),
                             "requirement_ids": step_requirement_ids,
@@ -5868,6 +6477,7 @@ def _apply_step(
                             "abs_path": abs_path,
                             "line": start_line,
                             "note": "append_file",
+                            "summary": _step_summary(step),
                             "is_code": os.path.splitext(rel_path)[1].lower() in CODE_FILE_EXTS
                             or bool(TEST_FILE_RE.search(rel_path)),
                             "requirement_ids": step_requirement_ids,
@@ -5943,6 +6553,7 @@ def _apply_step(
                             "abs_path": abs_path,
                             "line": _line_number_for_text(updated, target_text),
                             "note": "replace_in_file",
+                            "summary": _step_summary(step),
                             "is_code": os.path.splitext(rel_path)[1].lower() in CODE_FILE_EXTS
                             or bool(TEST_FILE_RE.search(rel_path)),
                             "requirement_ids": step_requirement_ids,
@@ -6202,6 +6813,7 @@ def run_project_solver(
     audit_enabled = audit_every_iterations > 0 or audit_every_steps > 0
     audit_max_chars = _env_int("SOLVER_AUDIT_MAX_CHARS", 1200)
     audit_log_path = os.getenv("SOLVER_AUDIT_LOG_PATH", "refiner.log") or ""
+    requirements_page_chars = _env_int("SOLVER_REQUIREMENTS_PAGE_CHARS", 4000)
     web_research_mode = os.getenv("SOLVER_WEB_RESEARCH", "auto") or "auto"
     web_research_every_iterations = _env_int("SOLVER_WEB_RESEARCH_EVERY_ITERATIONS", 4)
     web_research_every_steps = _env_int("SOLVER_WEB_RESEARCH_EVERY_STEPS", 60)
@@ -6806,6 +7418,18 @@ def run_project_solver(
             source_context = source.context_excerpt or "No source-specific context available."
             source_index = source_index_map.get(source.path, 1)
             requirements_label = f"Requirement source {source_index}/{source_count}: {source.path}"
+            paged_requirements, page_meta = _paged_requirements_text(
+                source.requirements_text or "",
+                iteration=iteration,
+                page_chars=requirements_page_chars,
+            )
+            requirements_page_note = ""
+            if page_meta:
+                requirements_label = f"{requirements_label} (page {page_meta['page']}/{page_meta['total']})"
+                requirements_page_note = (
+                    "Note: Requirements are provided in pages to manage context size. "
+                    "If important details are missing, they will appear in later iterations.\n"
+                )
             requirements_register_section = _build_requirements_register_section(
                 requirements_register, source.path
             )
@@ -6881,7 +7505,8 @@ def run_project_solver(
                 f"{repo_section}"
                 f"{sample_section}"
                 f"{test_section}"
-                f"{requirements_label}:\n{source.requirements_text}\n\n"
+                f"{requirements_page_note}"
+                f"{requirements_label}:\n{paged_requirements}\n\n"
                 "Source context excerpt:\n"
                 f"{source_context}\n\n"
                 f"{research_section}"
@@ -7836,6 +8461,11 @@ def run_project_solver(
         applied_steps_by_source,
         project_root,
     )
+    module_registry = _build_module_registry(
+        requirements_register,
+        applied_steps_by_source,
+        project_root,
+    )
     refs_in_plans = _collect_requirement_refs_from_plans(all_plans)
     requirements_missing_ids: List[str] = []
     requirements_referenced = 0
@@ -7991,6 +8621,66 @@ def run_project_solver(
                 + (" ...(truncated)" if len(requirements_missing_ids) > 20 else ""),
             }
         )
+    for entry in module_registry.get("missing_tests", []):
+        if not isinstance(entry, dict):
+            continue
+        req_ids = entry.get("requirement_ids") if isinstance(entry.get("requirement_ids"), list) else []
+        notes = "No tests linked to module."
+        if req_ids:
+            notes = "No tests linked to module requirements: " + ", ".join(req_ids)
+        todo_items.append(
+            {
+                "type": "module_missing_tests",
+                "source": entry.get("path"),
+                "status": "open",
+                "notes": notes,
+            }
+        )
+    for entry in module_registry.get("missing_examples", []):
+        if not isinstance(entry, dict):
+            continue
+        req_ids = entry.get("requirement_ids") if isinstance(entry.get("requirement_ids"), list) else []
+        notes = "No examples linked to module."
+        if req_ids:
+            notes = "No examples linked to module requirements: " + ", ".join(req_ids)
+        todo_items.append(
+            {
+                "type": "module_missing_examples",
+                "source": entry.get("path"),
+                "status": "open",
+                "notes": notes,
+            }
+        )
+    for entry in module_registry.get("privacy_flags", []):
+        if not isinstance(entry, dict):
+            continue
+        flags = entry.get("privacy_flags") if isinstance(entry.get("privacy_flags"), list) else []
+        parts = []
+        for flag in flags:
+            if not isinstance(flag, dict):
+                continue
+            label = _safe_str(flag.get("type"))
+            count = flag.get("count")
+            note = _safe_str(flag.get("note"))
+            if label and isinstance(count, int):
+                suffix = f"{label}({count})"
+            else:
+                suffix = label or "identifier"
+            if note:
+                suffix = f"{suffix}:{note}" if suffix else note
+            if suffix:
+                parts.append(suffix)
+        notes = "Potential identifiers detected; sanitize reusable module."
+        if parts:
+            notes = "Potential identifiers detected: " + ", ".join(parts)
+        todo_items.append(
+            {
+                "type": "module_privacy_review",
+                "source": entry.get("path"),
+                "status": "open",
+                "notes": notes,
+            }
+        )
     for gap in sequence_gaps:
         prefix = _safe_str(gap.get("prefix"))
         missing = gap.get("missing") if isinstance(gap.get("missing"), list) else []
@@ -8021,12 +8711,23 @@ def run_project_solver(
             "requirements_sanity_missing": sum(
                 1 for item in todo_items if item.get("type") == "requirements_sanity_missing"
             ),
+            "module_missing_tests": sum(
+                1 for item in todo_items if item.get("type") == "module_missing_tests"
+            ),
+            "module_missing_examples": sum(
+                1 for item in todo_items if item.get("type") == "module_missing_examples"
+            ),
+            "module_privacy_review": sum(
+                1 for item in todo_items if item.get("type") == "module_privacy_review"
+            ),
         },
     }
     actions_log.append(
         f"TODO summary: {todo_summary['counts']['total']} items "
         f"({todo_summary['counts']['unresolved_failures']} unresolved failures)."
     )
+
+    _ensure_gitignore(project_root, actions_log)
 
     output_data = {
         "summary": all_plans[-1].get("summary") if all_plans else None,
@@ -8050,6 +8751,7 @@ def run_project_solver(
         "sequence_gaps": sequence_gaps,
         "dataset_summary": dataset_summary,
         "helper_modules": helper_modules,
+        "module_registry": module_registry,
         "todo_summary": todo_summary,
         "todo_table_markdown": _format_todo_markdown(todo_summary),
         "actions_log": actions_log,
