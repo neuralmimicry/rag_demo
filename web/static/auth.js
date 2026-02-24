@@ -8,6 +8,7 @@
   const errorEl = document.getElementById('authError');
   const submitBtn = form.querySelector('button[type="submit"]');
   const usernameEl = document.getElementById('username');
+  const emailEl = document.getElementById('email');
   const passwordEl = document.getElementById('password');
   const confirmEl = document.getElementById('confirm');
 
@@ -47,6 +48,7 @@
       invalid_username: 'Username must be 3-32 chars (letters, numbers, underscore, dash).',
       password_too_short: 'Password must be at least 8 characters.',
       password_mismatch: 'Passwords do not match.',
+      invalid_email: 'Please enter a valid email address.',
     };
     return map[code] || 'Request failed. Please try again.';
   };
@@ -64,6 +66,7 @@
     };
     if (authType === 'setup') {
       payload.confirm = confirmEl?.value || '';
+      payload.email = (emailEl?.value || '').trim();
     }
 
     try {

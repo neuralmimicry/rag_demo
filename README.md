@@ -10,6 +10,9 @@ Key aspects:
 - Multi-workflow CLI: a single entry point drives Jira statistics, Jira quality analysis, Confluence space analysis, topic research, and project solving.
 - Project solver: scan a local folder for requirement signals, derive a plan with an LLM, and optionally apply file edits/run commands.
 - Agentic workflows: explicit plan → act → verify → reflect loops, verification-first execution, and role-based LLM overrides for planning/review.
+- Refinement principle: every run should improve the solution in a measurable, qualitative, and quantifiable way, with attention to efficiency and performance where applicable. This principle is core to the Refiner name.
+- Reuse & traceability: generated/updated modules are intended to be modular, tracked against requirement IDs, and paired with tests/examples to aid cross-project reuse.
+- Privacy for reuse: reusable modules must be scrubbed of user/company-identifying information to prevent cross-project leakage.
 
 
 ## Quickstart
@@ -31,11 +34,45 @@ Key aspects:
 ## Web UI + API auth
 The web UI is backed by the same Flask server (`refiner_web.py`). It uses session cookies, with dedicated JSON endpoints for headless or cloud-hosted frontends.
 
+## RAG + MCP integrations
+Refiner now includes lightweight RAG indexing (for unstructured documents) and MCP connectivity (for structured, action-oriented external systems).
+
+### RAG (Retrieval-Augmented Generation)
+- `POST /api/rag/index` — build an index from local files or inline text.
+- `POST /api/rag/query` — retrieve the top matches and a combined context block.
+- `GET /api/rag/indexes` — list your indexes.
+- `DELETE /api/rag/index/<name>` — delete an index.
+ - `POST /api/assistant/rag-mcp` — ask a question with optional RAG context and optional MCP tool data.
+
+RAG indexes are stored per user under `job_data/rag/` and only accept file paths within `REFINER_RAG_ALLOWED_ROOTS` (defaults to the repo root + `job_data`). Chunk sizes and limits can be tuned via:
+- `REFINER_RAG_CHUNK_SIZE` (default 1200 chars)
+- `REFINER_RAG_CHUNK_OVERLAP` (default 200 chars)
+- `REFINER_RAG_MAX_CHUNKS` (default 2000)
+- `REFINER_RAG_MAX_DOCS` (default 60)
+- `REFINER_RAG_MAX_DOC_BYTES` (default 600000)
+
+### MCP (Model Context Protocol)
+- `POST /api/mcp/servers` — register an MCP server (admin only).
+- `GET /api/mcp/servers` — list MCP servers (admin only).
+- `DELETE /api/mcp/servers/<name>` — remove an MCP server (admin only).
+- `GET /api/mcp/servers/<name>/tools` — list tools exposed by the MCP server.
+- `POST /api/mcp/servers/<name>/call` — call a tool with arguments.
+- `GET /api/mcp/servers/<name>/resources` — list available resources.
+- `POST /api/mcp/servers/<name>/resource` — read a resource by URI.
+
+MCP endpoints are admin-only because they can execute actions in external systems. Store OAuth/Bearer tokens when registering the server; responses mask secrets.
+
+### Capability inventory
+- `GET /api/capabilities` — returns a snapshot of detected workflows, features, and API groups.
+- Add `?refresh=1` to rescan the codebase.
+
 ### API auth endpoints
 - `POST /api/login` with JSON `{ "username": "...", "password": "..." }` sets the session cookie.
 - `POST /api/logout` clears the session cookie.
 - `GET /api/session` returns `{ authenticated, user, role }`.
 - `POST /api/setup` creates the first admin account (only allowed when no users exist).
+- `POST /api/sso/issue` issues a short-lived, one-time SSO token (requires an authenticated session).
+- `GET /sso?token=...&next=/` exchanges the SSO token for a first-party session and redirects.
 
 The web login and setup pages now call these endpoints directly.
 
@@ -47,6 +84,14 @@ Set these environment variables on the backend:
 - `REFINER_HOST`: set to `0.0.0.0` for public bind.
 
 Cookies default to `SameSite=None` + `Secure` when CORS is enabled. Use `REFINER_COOKIE_SAMESITE` / `REFINER_SECURE_COOKIES` to override.
+
+### SSO token storage (optional Redis)
+For multi-instance deployments, store one-time SSO tokens in Redis:
+- `REFINER_SSO_STORE`: `auto` (default), `redis`, or `memory`.
+- `REFINER_SSO_REDIS_URL`: Redis URL (e.g., `redis://:password@host:6379/0`).
+- `REFINER_SSO_REDIS_PREFIX`: key prefix (default `refiner:sso:`).
+- `REFINER_SSO_TTL`: token lifetime in seconds (default `300`).
+The `/api/health` endpoint now returns SSO store status under the `sso` field.
 
 On the frontend, set the API base:
 - Add `<meta name="rag-api-base" content="https://api.example.com">` to the page, or
@@ -68,12 +113,49 @@ Refiner exposes Prometheus-compatible metrics on `GET /metrics` by default (same
 - The backend exports request counts/latency, in-flight requests, uptime, job counts by status, queue depth, and worker threads.
 - The frontend-only server exports its own request/latency/uptime metrics with a `refiner_frontend_*` prefix.
 
+### Job completion notifications
+Refiner can email users when a job finishes and they are not active in the web UI.
+
+Backend SMTP configuration (set on the API server):
+- `REFINER_SMTP_HOST`: SMTP hostname (required to enable email).
+- `REFINER_SMTP_PORT`: SMTP port (default `587`).
+- `REFINER_SMTP_USER` / `REFINER_SMTP_PASS`: SMTP auth credentials (optional).
+- `REFINER_SMTP_FROM`: From address (defaults to `REFINER_SMTP_USER`).
+- `REFINER_SMTP_TLS`: set to `1` to enable STARTTLS (default).
+- `REFINER_SMTP_SSL`: set to `1` to use SMTP over SSL instead of STARTTLS.
+- `REFINER_SMTP_TIMEOUT`: connection timeout seconds (default `20`).
+- `REFINER_ACTIVE_WINDOW_SEC`: activity window in seconds for suppressing emails when the UI is active (default `120`).
+
+User email configuration:
+- Set the Notification Email under **Global Settings → Notifications** in the web UI, or
+- Bootstrap via environment with `REFINER_ADMIN_EMAIL`.
+- API jobs can provide `notify_email` in the job payload to override per job.
+
+### Token ledger & billing integration
+Refiner exposes a token ledger used by the commercial portal.
+
+Key endpoints:
+- `GET /api/tokens` — current balance, reserved, in‑use, capacity, and low threshold.
+- `POST /api/tokens` — actions: `review`, `add`, `cashout`, `sync` (balance reconciliation).
+- `GET /api/tokens/ledger` — recent ledger entries for audit.
+- `POST /api/jobs/estimate` — heuristic token estimate for a job payload.
+
+Notes:
+- Job submission is blocked if `estimate > available`.
+- Balance never goes negative; any shortfall is recorded on the ledger entry.
+- BTC conversion rate defaults to `0.000016` BTC per LLM token (override with `REFINER_TOKEN_BTC_RATE`).
+- Admins can grant free (non-cashable) tokens via `POST /api/tokens` with action `grant`.
+- Cashout operations only draw down paid token balance; free grants are not cashable.
+
 ### Container image (multi-arch)
 Build the Podman/Docker image from `Containerfile` for multiple architectures:
 - Podman (multi-arch with buildx-style output):
   - `podman build --platform linux/amd64,linux/arm64 -t refiner:latest -f Containerfile .`
 - Docker buildx:
   - `docker buildx build --platform linux/amd64,linux/arm64 -t refiner:latest -f Containerfile .`
+Note: The default `BASE_IMAGE` now pulls from GHCR (`ghcr.io/snakepacker/python/3.11`). If you see a `403 Forbidden` while pulling from GHCR, ensure your PAT includes `read:packages` and you are logged in to `ghcr.io`. If you override `BASE_IMAGE` to a Docker Hub image, Docker Hub requires a Personal Access Token (PAT) for multi-arch pulls. Log in with a PAT before building:
+- `podman login docker.io -u <dockerhub_user> --password-stdin`
+- `docker login docker.io -u <dockerhub_user> --password-stdin`
 
 Run the image (choose one mode):
 - Backend only: `podman run -p 5001:5001 refiner:latest backend`
@@ -210,16 +292,20 @@ flowchart TD
     B --> C[Sandbox tests]
     C --> D[Dev checks]
     D --> E[Integration tests]
-    E --> F{Approval for staging?}
-    F -- Yes --> G[Staging smoke tests]
-    F -- No --> H[Halt for approval]
-    G --> I{Approval for UAT?}
-    I -- Yes --> J[UAT stage]
-    I -- No --> K[Halt for approval]
-    J --> L{Approval for deploy?}
-    L -- Yes --> M[Deploy stage]
-    L -- No --> N[Halt for approval]
-    M --> O[Write pipeline report]
+    E --> F[Security scan]
+    F --> G{Approval for staging?}
+    G -- Yes --> H[Staging smoke tests]
+    G -- No --> I[Halt for approval]
+    H --> J{Approval for canary?}
+    J -- Yes --> K[Canary release]
+    J -- No --> L[Halt for approval]
+    K --> M{Approval for UAT?}
+    M -- Yes --> N[UAT stage]
+    M -- No --> O[Halt for approval]
+    N --> P{Approval for deploy?}
+    P -- Yes --> Q[Deploy stage]
+    P -- No --> R[Halt for approval]
+    Q --> S[Write pipeline report]
 ```
 
 ### Project solver workflow
@@ -276,6 +362,8 @@ flowchart TD
 - Solver gating: `solver_gate` controls how incomplete solver output affects deploy stages (`block_all`, `block_deploy`, `warn`). Use `--delivery-allow-unfinished` or `allow_unfinished_deploy` to allow deploy stages even when the project is still incomplete.
 - Stage kinds: `kind` influences solver gating (e.g., `deploy`, `staging`, `uat` are gated; `sandbox_deploy` or `test` are not), and is exposed as `PIPELINE_STAGE_KIND`.
 - Optional interim deploy/teardown: `interim_deploy` and `interim_teardown` stages are included in the default config but disabled (`enabled: false`) so teams can toggle them for iterative sandbox validation.
+- RAG context injection: enable `rag` in `delivery_pipeline.json` and add a `rag` block to any stage to generate a context file. The pipeline exports `PIPELINE_RAG_CONTEXT` and `PIPELINE_RAG_METADATA` env vars for downstream scripts.
+- MCP actions: configure `mcp.servers` and attach `mcp_calls` to stages to run pre/post tool calls (e.g., create change records or announce releases). Use `auth_token_env` to supply tokens via environment variables.
 - If any delivery flags are provided without `--delivery`, delivery mode is enabled automatically.
 - Auto-recovery: set `auto_recover` and `retry_attempts` in `delivery_pipeline.json` to enable intelligent retries for common failures (missing venv, missing requirements, missing pytest, missing pip/wheel, poetry/pipenv project detection, pytest retry of last failed tests, and missing toolchains detection).
 - Multi-language support: language/build-system detection is exported as `PIPELINE_LANGUAGES` and `PIPELINE_BUILD_SYSTEMS` for stage scripts, covering Python, JS/TS, Go, Rust, C/C++, Fortran, Pascal, Bash, and PowerShell.

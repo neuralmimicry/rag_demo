@@ -14,6 +14,16 @@
   "overlay_solver_workspace": true,
   "require_solver_completion": false,
   "clean_workspaces": false,
+  "rag": {
+    "enabled": true,
+    "auto_sources": true,
+    "max_docs": 40,
+    "chunk_size": 1200,
+    "chunk_overlap": 200
+  },
+  "mcp": {
+    "servers": []
+  },
   "stages": [
     {
       "name": "sandbox",
@@ -46,6 +56,22 @@
         "python -m pytest -q -m integration"
       ],
       "kind": "test"
+    },
+    {
+      "name": "security_scan",
+      "description": "Security and dependency scanning",
+      "workspace_mode": "copy",
+      "commands": [
+        "if command -v pip-audit >/dev/null 2>&1; then if [ -f requirements.txt ]; then pip-audit -r requirements.txt; elif [ -f requirements-dev.txt ]; then pip-audit -r requirements-dev.txt; elif [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then pip-audit; else echo \"pip-audit skipped: no Python dependency files\"; fi; else echo \"pip-audit not installed; skipping\"; fi",
+        "if command -v npm >/dev/null 2>&1; then if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm audit --audit-level=high; else echo \"npm audit skipped: no lockfile\"; fi; else echo \"npm not installed; skipping\"; fi",
+        "if command -v trivy >/dev/null 2>&1; then trivy fs --scanners vuln,secret,config --severity HIGH,CRITICAL --exit-code 1 .; else echo \"trivy not installed; skipping\"; fi"
+      ],
+      "remediation": [
+        "if command -v pip-audit >/dev/null 2>&1; then if [ -f requirements.txt ]; then pip-audit --fix -r requirements.txt; elif [ -f requirements-dev.txt ]; then pip-audit --fix -r requirements-dev.txt; elif [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then pip-audit --fix; else echo \"pip-audit fix skipped: no Python dependency files\"; fi; else echo \"pip-audit not installed; skipping\"; fi",
+        "if command -v npm >/dev/null 2>&1; then if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm audit fix || npm audit fix --force; else echo \"npm audit fix skipped: no lockfile\"; fi; else echo \"npm not installed; skipping\"; fi",
+        "if command -v trivy >/dev/null 2>&1; then trivy --download-db-only; else echo \"trivy not installed; skipping\"; fi"
+      ],
+      "kind": "security"
     },
     {
       "name": "interim_deploy",
@@ -82,6 +108,34 @@
       "kind": "staging"
     },
     {
+      "name": "canary",
+      "description": "Canary release validation",
+      "workspace_mode": "project",
+      "requires_approval": true,
+      "commands": [
+        "echo \"Canary deploy step goes here\""
+      ],
+      "kind": "canary",
+      "rag": {
+        "query": "canary deployment runbook checklist",
+        "context_file": "delivery_pipeline_output/rag/canary_context.md"
+      },
+      "mcp_calls": [
+        {
+          "name": "create_canary_change",
+          "server": "change_mgmt",
+          "tool": "change/create",
+          "arguments": {
+            "title": "Canary release {version}",
+            "stage": "{stage}",
+            "project": "{project_root}"
+          },
+          "when": "pre",
+          "required": false
+        }
+      ]
+    },
+    {
       "name": "uat",
       "description": "User acceptance testing",
       "workspace_mode": "copy",
@@ -97,7 +151,24 @@
       "commands": [
         "echo \"Deploy step goes here\""
       ],
-      "kind": "deploy"
+      "kind": "deploy",
+      "rag": {
+        "query": "deployment runbook and release checklist",
+        "context_file": "delivery_pipeline_output/rag/deploy_context.md"
+      },
+      "mcp_calls": [
+        {
+          "name": "announce_release",
+          "server": "release_ops",
+          "tool": "release/announce",
+          "arguments": {
+            "version": "{version}",
+            "notes_path": "{output_dir}/rag/deploy_context.md"
+          },
+          "when": "post",
+          "required": false
+        }
+      ]
     }
   ],
   "vcs": {
