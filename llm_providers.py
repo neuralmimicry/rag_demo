@@ -884,6 +884,12 @@ class OpenAIProvider(LLMProvider):
             effort_override = effort
             empty_retry_used = False
             incomplete_retry_used = False
+            replay_attempted = False
+            replay_response_id: Optional[str] = None
+            replay_prompt: Optional[str] = None
+            force_prompt_cache_retention: Optional[str] = None
+            disable_prompt_cache = False
+            replay_enabled = _env_bool("OPENAI_RESPONSES_REPLAY_INCOMPLETE", True)
             background_forced = _env_bool("OPENAI_RESPONSES_BACKGROUND", False) or _env_bool("OPENAI_BACKGROUND", False)
             background_enabled, background_reasons = _should_use_background_auto(
                 total_chars=total_chars,
@@ -971,10 +977,24 @@ class OpenAIProvider(LLMProvider):
                     time.sleep(poll_interval)
 
             def _build_payload() -> Dict[str, Any]:
-                payload: Dict[str, Any] = {
-                    "model": self.model,
-                    "input": _messages_to_responses_input(messages, system),
-                }
+                use_replay = bool(replay_response_id and replay_prompt)
+                if use_replay:
+                    replay_items: List[Dict[str, str]] = []
+                    if system:
+                        replay_items.append({"role": "system", "content": system})
+                    replay_items.append({"role": "user", "content": replay_prompt})
+                    payload: Dict[str, Any] = {
+                        "model": self.model,
+                        "input": replay_items,
+                    }
+                else:
+                    payload = {
+                        "model": self.model,
+                        "input": _messages_to_responses_input(messages, system),
+                    }
+                if use_replay:
+                    payload["previous_response_id"] = replay_response_id
+                    payload["store"] = True
                 if effort_override:
                     payload["reasoning"] = {"effort": effort_override}
                 if max_tokens_override:
@@ -986,14 +1006,17 @@ class OpenAIProvider(LLMProvider):
                     payload["store"] = True
                 if effort in (None, "", "none"):
                     payload["temperature"] = temperature
-                cache_key = _build_prompt_cache_key(system, messages, model=self.model, kind="responses")
-                if cache_key:
-                    payload["prompt_cache_key"] = cache_key
-                cache_retention = _normalize_prompt_cache_retention(
-                    os.getenv("OPENAI_PROMPT_CACHE_RETENTION") or os.getenv("PROMPT_CACHE_RETENTION")
-                )
-                if cache_retention:
-                    payload["prompt_cache_retention"] = cache_retention
+                if not use_replay and not disable_prompt_cache:
+                    cache_key = _build_prompt_cache_key(system, messages, model=self.model, kind="responses")
+                    if cache_key:
+                        payload["prompt_cache_key"] = cache_key
+                    cache_retention = _normalize_prompt_cache_retention(
+                        os.getenv("OPENAI_PROMPT_CACHE_RETENTION") or os.getenv("PROMPT_CACHE_RETENTION")
+                    )
+                    if cache_retention is None and force_prompt_cache_retention:
+                        cache_retention = force_prompt_cache_retention
+                    if cache_retention:
+                        payload["prompt_cache_retention"] = cache_retention
                 issues = _validate_openai_responses_payload(payload)
                 issues.extend(_check_openai_payload_semantics(payload, kind="responses"))
                 if issues:
@@ -1005,9 +1028,10 @@ class OpenAIProvider(LLMProvider):
             for attempt in range(3):
                 payload = _build_payload()
                 if logger.isEnabledFor(logging.DEBUG):
+                    summary = _summarize_openai_payload(payload, kind="responses")
                     logger.debug(
                         "OpenAI request (responses) summary: %s",
-                        _summarize_openai_payload(payload, kind="responses"),
+                        json.dumps(summary, default=str),
                     )
                     logger.debug(
                         "OpenAI request (responses) meta: model=%s api_key_hash=%s source=%s timeout=%s",
@@ -1036,6 +1060,38 @@ class OpenAIProvider(LLMProvider):
                     raise
                 latency_ms = int((time.time() - start) * 1000)
                 if resp.status_code >= 300:
+                    if replay_response_id and replay_prompt:
+                        message = _extract_error_message(resp)
+                        haystack = (message or resp.text or "").lower()
+                        if resp.status_code in (400, 404, 422) and (
+                            "previous_response_id" in haystack
+                            or "response_id" in haystack
+                            or "unknown" in haystack
+                            or "unrecognized" in haystack
+                            or "unsupported" in haystack
+                        ):
+                            logger.info(
+                                "OpenAI replay unsupported; retrying with full prompt and prompt cache."
+                            )
+                            replay_response_id = None
+                            replay_prompt = None
+                            force_prompt_cache_retention = force_prompt_cache_retention or "in_memory"
+                            continue
+                    if not disable_prompt_cache:
+                        message = _extract_error_message(resp)
+                        haystack = (message or resp.text or "").lower()
+                        if resp.status_code in (400, 403, 404, 422) and (
+                            "prompt_cache" in haystack
+                            or "prompt cache" in haystack
+                            or "cache_key" in haystack
+                            or "cache retention" in haystack
+                        ):
+                            logger.info(
+                                "OpenAI prompt cache rejected; retrying without prompt cache."
+                            )
+                            disable_prompt_cache = True
+                            force_prompt_cache_retention = None
+                            continue
                     if attempt == 0 and _is_model_not_found(resp) and self.model != self.default_model:
                         logger.warning(
                             "OpenAI model not found (%s); falling back to default model %s.",
@@ -1112,10 +1168,24 @@ class OpenAIProvider(LLMProvider):
                                 target = current_max
                             if target and target != current_max:
                                 max_tokens_override = target
-                                logger.info(
-                                    "Retrying OpenAI response after incomplete output; max_output_tokens=%s",
-                                    max_tokens_override,
-                                )
+                                force_prompt_cache_retention = force_prompt_cache_retention or "in_memory"
+                                if replay_enabled and not replay_attempted and data.get("id"):
+                                    replay_attempted = True
+                                    replay_response_id = str(data.get("id"))
+                                    replay_prompt = os.getenv(
+                                        "OPENAI_RESPONSES_REPLAY_PROMPT",
+                                        "Replay your previous answer in full, preserving the exact format. "
+                                        "Do not omit steps or add commentary.",
+                                    )
+                                    logger.info(
+                                        "Retrying OpenAI response via replay; max_output_tokens=%s",
+                                        max_tokens_override,
+                                    )
+                                else:
+                                    logger.info(
+                                        "Retrying OpenAI response after incomplete output; max_output_tokens=%s",
+                                        max_tokens_override,
+                                    )
                                 continue
                 if not text:
                     status = data.get("status") if isinstance(data, dict) else None
@@ -1214,9 +1284,10 @@ class OpenAIProvider(LLMProvider):
         for attempt in range(2):
             payload = _build_chat_payload()
             if logger.isEnabledFor(logging.DEBUG):
+                summary = _summarize_openai_payload(payload, kind="chat")
                 logger.debug(
                     "OpenAI request (chat) summary: %s",
-                    _summarize_openai_payload(payload, kind="chat"),
+                    json.dumps(summary, default=str),
                 )
                 logger.debug(
                     "OpenAI request (chat) meta: model=%s api_key_hash=%s source=%s timeout=%s",

@@ -138,7 +138,8 @@ async function startBuild() {
     showStatus('Job queued. You can watch it in Control Room.');
     if (controlLinkEl) {
       if (controlLinkAnchor && data.id) {
-        controlLinkAnchor.setAttribute('href', `/?job_id=${encodeURIComponent(data.id)}`);
+        const params = new URLSearchParams({ job_id: data.id, scope: 'personal' });
+        controlLinkAnchor.setAttribute('href', `/?${params.toString()}`);
       }
       controlLinkEl.hidden = false;
     }

@@ -59,6 +59,18 @@
     "workstream_field": "customfield_10952",
     "universe_skill_name": "UniVerse"
   },
+  "skills_catalog": {
+    "index_path": "",
+    "auto_sync": true,
+    "sync_path": ".agent/skills",
+    "sync_repo_url": "https://github.com/sickn33/antigravity-awesome-skills.git",
+    "sync_ref": "main",
+    "sync_ttl_hours": 24,
+    "allow_categories": [],
+    "denylist": [],
+    "summary_max_chars": 180,
+    "max_external": 400
+  },
   "office_hours": {
     "start_hour": 9,
     "end_hour": 17,

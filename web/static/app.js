@@ -13,6 +13,7 @@ const queueRunningCountEl = document.getElementById('queueRunningCount');
 const queueFailedCountEl = document.getElementById('queueFailedCount');
 const queueCompletedCountEl = document.getElementById('queueCompletedCount');
 const statusFiltersEl = document.getElementById('statusFilters');
+const scopeFiltersEl = document.getElementById('scopeFilters');
 const deleteQueueBtn = document.getElementById('deleteQueue');
 const deleteArchiveBtn = document.getElementById('deleteArchive');
 const cliBubblesEl = document.getElementById('cliBubbles');
@@ -48,6 +49,18 @@ const useDefaultSecretsEl = document.getElementById('useDefaultSecrets');
 const projectSourceInputs = document.querySelectorAll('input[name="projectSource"]');
 const deliverySourceInputs = document.querySelectorAll('input[name="deliverySource"]');
 const sourcePanels = document.querySelectorAll('.source-panel');
+const projectIdEl = document.getElementById('projectId');
+const projectRoleHintEl = document.getElementById('projectRoleHint');
+const todoPanelEl = document.getElementById('todoPanel');
+const todoInputEl = document.getElementById('todoInput');
+const todoDeferInputEl = document.getElementById('todoDeferInput');
+const todoAddBtn = document.getElementById('todoAdd');
+const todoRefreshBtn = document.getElementById('todoRefresh');
+const todoNextIdleBtn = document.getElementById('todoNextIdle');
+const todoStatusFiltersEl = document.getElementById('todoStatusFilters');
+const todoDeferOnlyEl = document.getElementById('todoDeferOnly');
+const todoStatusEl = document.getElementById('todoStatus');
+const todoListEl = document.getElementById('todoList');
 
 const tokenPanelEl = document.getElementById('tokenPanel');
 const tokenBalanceEl = document.getElementById('tokenBalance');
@@ -58,6 +71,23 @@ const tokenThresholdEl = document.getElementById('tokenThreshold');
 const tokenAvailableLabelEl = document.getElementById('tokenAvailableLabel');
 const tokenEstimateLabelEl = document.getElementById('tokenEstimateLabel');
 const tokenInUseLabelEl = document.getElementById('tokenInUseLabel');
+const tokenScopeLabelEl = document.getElementById('tokenScopeLabel');
+const tokenBreakdownEl = document.getElementById('tokenBreakdown');
+const tokenUserBalanceEl = document.getElementById('tokenUserBalance');
+const tokenTeamBalanceEl = document.getElementById('tokenTeamBalance');
+const transferModalEl = document.getElementById('transferModal');
+const transferModalTitleEl = document.getElementById('transferModalTitle');
+const transferModalDescEl = document.getElementById('transferModalDesc');
+const transferTeamRowEl = document.getElementById('transferTeamRow');
+const transferTeamSelectEl = document.getElementById('transferTeamSelect');
+const transferProjectRowEl = document.getElementById('transferProjectRow');
+const transferProjectSelectEl = document.getElementById('transferProjectSelect');
+const transferUserRowEl = document.getElementById('transferUserRow');
+const transferUserSelectEl = document.getElementById('transferUserSelect');
+const transferModalStatusEl = document.getElementById('transferModalStatus');
+const transferModalConfirmBtn = document.getElementById('transferModalConfirm');
+const transferModalCancelBtn = document.getElementById('transferModalCancel');
+const transferModalCloseBtn = document.getElementById('transferModalClose');
 
 const repoUrlEl = document.getElementById('repoUrl');
 const repoBranchEl = document.getElementById('repoBranch');
@@ -114,6 +144,17 @@ let reqProgressTimer = null;
 const requirementsProgressCache = new Map();
 const requirementsSummaryCache = new Map();
 
+let currentScope = 'team';
+let projectOptions = [];
+let activeSessionId = null;
+let sessionStream = null;
+let sessionSnapshot = null;
+let workspaceSnapshot = null;
+let workspaceCapabilities = null;
+let jobsPollTimer = null;
+let todoFilterStatus = 'todo';
+let todoDeferOnly = false;
+
 const assistantMessagesEl = document.getElementById('assistantMessages');
 const assistantInputEl = document.getElementById('assistantInput');
 const assistantAskBtn = document.getElementById('assistantAsk');
@@ -124,6 +165,7 @@ const assistantStatusEl = document.getElementById('assistantStatus');
 const requirementsTextEl = document.getElementById('requirementsText');
 const reqGridBodyEl = document.getElementById('reqGridBody');
 const reqExtractBtn = document.getElementById('reqExtract');
+const reqExtractJobBtn = document.getElementById('reqExtractJob');
 const reqAddBtn = document.getElementById('reqAdd');
 const reqApplyBtn = document.getElementById('reqApply');
 const reqGridStatusEl = document.getElementById('reqGridStatus');
@@ -187,11 +229,22 @@ let refundPanelOpen = false;
 let refundPanelJobId = null;
 const refundDrafts = new Map();
 let pendingSelectJobId = null;
+let currentProfile = null;
+let accessTeams = [];
+let accessTeamIndex = {};
 
 (() => {
   if (typeof window === 'undefined') return;
   const params = new URLSearchParams(window.location.search);
+  const scopeParam = (params.get('scope') || '').toLowerCase();
   const jobId = params.get('job_id');
+  if (scopeParam === 'personal' || scopeParam === 'my') {
+    currentScope = 'personal';
+  } else if (scopeParam === 'team') {
+    currentScope = 'team';
+  } else if (jobId) {
+    currentScope = 'personal';
+  }
   if (jobId) {
     pendingSelectJobId = jobId;
   }
@@ -204,6 +257,7 @@ const FILTER_LABELS = {
 const REQ_LINE_RE = /^\s*(?:[-*+]\s*)?(REQ-\d{3,})\s*(?:[:\-–]\s*)?(.*)$/i;
 const REQ_BLOCK_START = '<!-- REQ-REGISTER START -->';
 const REQ_BLOCK_END = '<!-- REQ-REGISTER END -->';
+const EDITOR_WORKFLOWS = new Set(['project_solver', 'project', 'topic_research']);
 
 const CLI_BUBBLES = [
   {
@@ -667,12 +721,13 @@ async function deleteSecret(name) {
 }
 
 async function fetchProfile() {
-  if (!notifyEmailEl) return;
   try {
     const res = await apiFetch('/api/profile');
     if (!res.ok) return;
     const data = await res.json();
-    notifyEmailEl.value = data.email || '';
+    currentProfile = data;
+    if (notifyEmailEl) notifyEmailEl.value = data.email || '';
+    await fetchAccessTree();
   } catch (err) {
     console.error('Failed to fetch profile', err);
   }
@@ -772,6 +827,20 @@ function clearNotifyStatus() {
   notifyStatusEl.classList.remove('error');
 }
 
+function showTodoStatus(message, isError = false) {
+  if (!todoStatusEl) return;
+  todoStatusEl.textContent = message;
+  todoStatusEl.hidden = false;
+  todoStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function clearTodoStatus() {
+  if (!todoStatusEl) return;
+  todoStatusEl.hidden = true;
+  todoStatusEl.textContent = '';
+  todoStatusEl.classList.remove('error');
+}
+
 function showToast(title, message, tone = 'success', onClick = null) {
   if (!toastContainer) return;
   const toast = document.createElement('div');
@@ -798,6 +867,210 @@ function showToast(title, message, tone = 'success', onClick = null) {
   }, 7000);
 }
 
+function renderTodoList(items = []) {
+  if (!todoListEl) return;
+  todoListEl.innerHTML = '';
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'todo-empty';
+    empty.textContent = 'No thoughts captured yet.';
+    todoListEl.appendChild(empty);
+    return;
+  }
+  items.forEach((item) => {
+    const row = document.createElement('div');
+    row.className = 'todo-item';
+    row.dataset.todoId = item.id;
+    const status = item.status || 'todo';
+    const badge = `<span class="todo-badge ${status}">${status}</span>`;
+    const metaParts = [];
+    if (item.source) metaParts.push(`Source: ${item.source}`);
+    if (item.device) metaParts.push(`Device: ${item.device}`);
+    if (item.defer_until_idle) metaParts.push('Idle-only');
+    if (item.created_at) metaParts.push(`Created ${formatAbsoluteTime(item.created_at)}`);
+    row.innerHTML = `
+      <div class="todo-item-header">
+        <div class="todo-text">${escapeHtml(item.text || '')}</div>
+        ${badge}
+      </div>
+      <div class="todo-meta">${metaParts.join(' · ')}</div>
+      <div class="todo-actions">
+        ${status === 'todo' ? '<button type="button" class="ghost" data-todo-action="done">Done</button>' : ''}
+        ${status !== 'todo' ? '<button type="button" class="ghost" data-todo-action="reopen">Reopen</button>' : ''}
+        ${status !== 'archived' ? '<button type="button" class="ghost" data-todo-action="archive">Archive</button>' : ''}
+        <button type="button" class="ghost" data-todo-action="delete">Delete</button>
+      </div>
+    `;
+    todoListEl.appendChild(row);
+  });
+}
+
+async function fetchTodos(showStatus = false) {
+  if (!todoPanelEl) return;
+  const params = new URLSearchParams();
+  if (todoFilterStatus) params.set('status', todoFilterStatus);
+  if (todoDeferOnly) params.set('defer', '1');
+  params.set('limit', '50');
+  try {
+    const res = await apiFetch(`/api/todos?${params.toString()}`);
+    if (res.status === 401 || res.redirected) {
+      showTodoStatus('Sign in to view todos.', true);
+      return;
+    }
+    const data = await res.json();
+    if (!res.ok) {
+      showTodoStatus(data.error || 'Failed to load todos.', true);
+      return;
+    }
+    renderTodoList(data.items || []);
+    if (showStatus) {
+      clearTodoStatus();
+    }
+  } catch (err) {
+    showTodoStatus('Failed to load todos.', true);
+  }
+}
+
+async function createTodo(text, deferUntilIdle) {
+  const payload = {
+    text,
+    source: 'manual',
+    defer_until_idle: Boolean(deferUntilIdle),
+  };
+  const res = await apiFetch('/api/todos', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to add todo.');
+  }
+  return data.todo;
+}
+
+async function updateTodo(todoId, updates) {
+  const res = await apiFetch(`/api/todos/${todoId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to update todo.');
+  }
+  return data.todo;
+}
+
+async function deleteTodo(todoId) {
+  const res = await apiFetch(`/api/todos/${todoId}`, { method: 'DELETE' });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to delete todo.');
+  }
+  return data;
+}
+
+function initTodoPanel() {
+  if (!todoPanelEl) return;
+  if (todoStatusFiltersEl) {
+    todoStatusFiltersEl.addEventListener('click', (event) => {
+      const btn = event.target.closest('[data-status]');
+      if (!btn) return;
+      todoStatusFiltersEl.querySelectorAll('.filter-btn').forEach((el) => el.classList.remove('active'));
+      btn.classList.add('active');
+      todoFilterStatus = btn.dataset.status || 'todo';
+      fetchTodos(true);
+    });
+  }
+  if (todoDeferOnlyEl) {
+    todoDeferOnlyEl.addEventListener('change', () => {
+      todoDeferOnly = Boolean(todoDeferOnlyEl.checked);
+      fetchTodos(true);
+    });
+  }
+  if (todoRefreshBtn) {
+    todoRefreshBtn.addEventListener('click', () => fetchTodos(true));
+  }
+  if (todoAddBtn) {
+    todoAddBtn.addEventListener('click', async () => {
+      const text = todoInputEl?.value?.trim() || '';
+      if (!text) {
+        showTodoStatus('Enter a thought to capture.', true);
+        return;
+      }
+      showTodoStatus('Saving...');
+      try {
+        await createTodo(text, todoDeferInputEl?.checked);
+        if (todoInputEl) todoInputEl.value = '';
+        showTodoStatus('Captured.');
+        fetchTodos();
+        setTimeout(clearTodoStatus, 2000);
+      } catch (err) {
+        showTodoStatus(err.message || 'Failed to add todo.', true);
+      }
+    });
+  }
+  if (todoInputEl) {
+    todoInputEl.addEventListener('keydown', (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+        event.preventDefault();
+        todoAddBtn?.click();
+      }
+    });
+  }
+  if (todoNextIdleBtn) {
+    todoNextIdleBtn.addEventListener('click', async () => {
+      showTodoStatus('Checking idle queue...');
+      try {
+        const res = await apiFetch('/api/todos/next?idle=1');
+        const data = await res.json();
+        if (res.status === 409) {
+          showTodoStatus('Refiner is busy. Next idle thought will wait.', true);
+          return;
+        }
+        if (!res.ok) {
+          showTodoStatus(data.error || 'Failed to fetch next todo.', true);
+          return;
+        }
+        if (!data.todo) {
+          showTodoStatus('No idle-only todos queued.');
+          return;
+        }
+        showTodoStatus(`Next up: ${data.todo.text}`);
+        fetchTodos();
+      } catch (err) {
+        showTodoStatus('Failed to fetch next todo.', true);
+      }
+    });
+  }
+  if (todoListEl) {
+    todoListEl.addEventListener('click', async (event) => {
+      const btn = event.target.closest('[data-todo-action]');
+      if (!btn) return;
+      const card = btn.closest('[data-todo-id]');
+      const todoId = card?.dataset?.todoId;
+      if (!todoId) return;
+      const action = btn.dataset.todoAction;
+      try {
+        if (action === 'delete') {
+          await deleteTodo(todoId);
+        } else if (action === 'done') {
+          await updateTodo(todoId, { status: 'done' });
+        } else if (action === 'archive') {
+          await updateTodo(todoId, { status: 'archived' });
+        } else if (action === 'reopen') {
+          await updateTodo(todoId, { status: 'todo' });
+        }
+        fetchTodos();
+      } catch (err) {
+        showTodoStatus(err.message || 'Todo update failed.', true);
+      }
+    });
+  }
+  fetchTodos();
+}
+
 function updateTokenMeter(snapshot, estimate = null) {
   if (!tokenPanelEl || !snapshot) return;
   const balance = snapshot.balance ?? 0;
@@ -807,6 +1080,7 @@ function updateTokenMeter(snapshot, estimate = null) {
   const capacity = snapshot.display_capacity ?? snapshot.capacity ?? balance ?? 1;
   const displayCapacity = Math.max(1, capacity);
   const estimateOnly = Math.max(0, reserved - inUse);
+  const hasTeamScope = snapshot.scope === 'team' || snapshot.team_id || snapshot.team_balance !== undefined;
 
   const availablePct = Math.min(100, (available / displayCapacity) * 100);
   const estimatePct = Math.min(100, (estimateOnly / displayCapacity) * 100);
@@ -819,6 +1093,9 @@ function updateTokenMeter(snapshot, estimate = null) {
   tokenPanelEl.classList.toggle('low', snapshot.status === 'low');
   tokenPanelEl.classList.toggle('full', snapshot.capacity && balance >= snapshot.capacity);
   if (tokenBalanceEl) tokenBalanceEl.textContent = balance.toString();
+  if (tokenScopeLabelEl) {
+    tokenScopeLabelEl.textContent = hasTeamScope ? 'Token Balance (Personal + Team)' : 'Token Balance';
+  }
   if (tokenAvailableEl) {
     tokenAvailableEl.style.left = '0%';
     tokenAvailableEl.style.width = `${availablePct}%`;
@@ -835,6 +1112,16 @@ function updateTokenMeter(snapshot, estimate = null) {
   if (tokenAvailableLabelEl) tokenAvailableLabelEl.textContent = `Available: ${available}`;
   if (tokenEstimateLabelEl) tokenEstimateLabelEl.textContent = `In estimate: ${estimateOnly}`;
   if (tokenInUseLabelEl) tokenInUseLabelEl.textContent = `In use: ${inUse}`;
+  if (tokenBreakdownEl) {
+    tokenBreakdownEl.hidden = !hasTeamScope;
+  }
+  if (hasTeamScope) {
+    const userBalance = snapshot.user_balance ?? snapshot.balance ?? 0;
+    const teamBalance = snapshot.team_balance ?? 0;
+    const teamName = snapshot.team_name ? `Team (${snapshot.team_name})` : 'Team';
+    if (tokenUserBalanceEl) tokenUserBalanceEl.textContent = `Personal: ${userBalance}`;
+    if (tokenTeamBalanceEl) tokenTeamBalanceEl.textContent = `${teamName}: ${teamBalance}`;
+  }
 
   if (estimate !== null && Number.isFinite(estimate)) {
     showTokenEstimateStatus(`Current job estimate: ${estimate} tokens`);
@@ -1224,6 +1511,89 @@ function extractRequirementsFromField(force = false) {
   }
 }
 
+function mergeRequirementLists(existing, incoming) {
+  const merged = (existing || []).map((req) => ({
+    id: (req.id || '').trim().toUpperCase(),
+    title: req.title || '',
+    description: req.description || '',
+  }));
+  const used = new Set();
+  let max = 0;
+  merged.forEach((req) => {
+    if (req.id) {
+      used.add(req.id);
+      const match = /REQ-(\d+)/i.exec(req.id);
+      if (match) {
+        max = Math.max(max, parseInt(match[1], 10));
+      }
+    }
+  });
+  let counter = max + 1;
+  (incoming || []).forEach((req) => {
+    if (!req) return;
+    let id = String(req.id || '').trim().toUpperCase();
+    if (!id || used.has(id)) {
+      id = `REQ-${String(counter).padStart(3, '0')}`;
+      counter += 1;
+    }
+    used.add(id);
+    merged.push({
+      id,
+      title: req.title || '',
+      description: req.description || '',
+    });
+  });
+  return merged;
+}
+
+function requirementsFromSummaryItems(items) {
+  if (!Array.isArray(items)) return [];
+  let max = 0;
+  items.forEach((item) => {
+    const match = /REQ-(\d+)/i.exec(item?.id || '');
+    if (match) {
+      max = Math.max(max, parseInt(match[1], 10));
+    }
+  });
+  let counter = max + 1;
+  const mapped = [];
+  items.forEach((item) => {
+    const text = (item?.text || '').trim();
+    if (!text) return;
+    let title = text;
+    let description = '';
+    const splitIdx = text.indexOf('. ');
+    if (splitIdx > 0 && splitIdx < 160) {
+      title = text.slice(0, splitIdx).trim();
+      description = text.slice(splitIdx + 2).trim();
+    }
+    let id = String(item?.id || '').trim().toUpperCase();
+    if (!id) {
+      id = `REQ-${String(counter).padStart(3, '0')}`;
+      counter += 1;
+    }
+    mapped.push({ id, title, description });
+  });
+  return mapped;
+}
+
+async function loadRequirementSummary(jobId, force = false) {
+  if (!jobId) return null;
+  if (!force && requirementsSummaryCache.has(jobId)) {
+    const cached = requirementsSummaryCache.get(jobId);
+    if (cached?.data) return cached.data;
+  }
+  try {
+    const res = await apiFetch(`/api/jobs/${jobId}/requirements/summary`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    requirementsSummaryCache.set(jobId, { data, status: data.status || '', ts: Date.now() });
+    return data;
+  } catch (err) {
+    return null;
+  }
+}
+
 function showFormAssistantStatus(message, isError = false) {
   if (!formAssistantStatusEl) return;
   formAssistantStatusEl.textContent = message;
@@ -1459,6 +1829,115 @@ function setRepoBrowserOpen(isOpen) {
   repoBrowserEl.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
 }
 
+let transferModalState = null;
+
+function setTransferModalOpen(isOpen) {
+  if (!transferModalEl) return;
+  transferModalEl.hidden = !isOpen;
+  transferModalEl.dataset.open = isOpen ? 'true' : 'false';
+  transferModalEl.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
+}
+
+function clearTransferModalStatus() {
+  if (!transferModalStatusEl) return;
+  transferModalStatusEl.hidden = true;
+  transferModalStatusEl.textContent = '';
+  transferModalStatusEl.classList.remove('error');
+}
+
+function showTransferModalStatus(message, isError = false) {
+  if (!transferModalStatusEl) return;
+  transferModalStatusEl.textContent = message;
+  transferModalStatusEl.hidden = false;
+  transferModalStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function resetTransferModal() {
+  if (transferTeamSelectEl) transferTeamSelectEl.innerHTML = '';
+  if (transferProjectSelectEl) transferProjectSelectEl.innerHTML = '';
+  if (transferUserSelectEl) transferUserSelectEl.innerHTML = '';
+  if (transferTeamSelectEl) transferTeamSelectEl.disabled = false;
+  clearTransferModalStatus();
+}
+
+function closeTransferModal() {
+  setTransferModalOpen(false);
+  transferModalState = null;
+  resetTransferModal();
+}
+
+function populateSelect(selectEl, options, placeholder = null) {
+  if (!selectEl) return;
+  selectEl.innerHTML = '';
+  if (placeholder !== null) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = placeholder;
+    selectEl.appendChild(opt);
+  }
+  (options || []).forEach((item) => {
+    const opt = document.createElement('option');
+    opt.value = item.value;
+    opt.textContent = item.label;
+    selectEl.appendChild(opt);
+  });
+}
+
+function openTransferModal(mode, job) {
+  if (!transferModalEl || !job) return;
+  resetTransferModal();
+  transferModalState = { mode, job };
+  const transfer = job.transfer_request || {};
+  const teamId = transfer.team_id || job.team_id;
+
+  if (transferTeamRowEl) transferTeamRowEl.hidden = true;
+  if (transferProjectRowEl) transferProjectRowEl.hidden = true;
+  if (transferUserRowEl) transferUserRowEl.hidden = true;
+  if (transferModalConfirmBtn) transferModalConfirmBtn.disabled = false;
+
+  if (mode === 'invite') {
+    if (transferModalTitleEl) transferModalTitleEl.textContent = 'Invite Team Leader';
+    if (transferModalDescEl) transferModalDescEl.textContent = 'Select a team to invite its leader(s) to take over this job.';
+    if (transferTeamRowEl) transferTeamRowEl.hidden = false;
+    const eligible = accessTeams.filter((team) => isTeamMember(team.id));
+    const options = eligible.map((team) => ({ value: team.id, label: team.name }));
+    populateSelect(transferTeamSelectEl, options, 'Select a team');
+    if (!options.length && transferModalConfirmBtn) {
+      transferModalConfirmBtn.disabled = true;
+      showTransferModalStatus('No team memberships available for transfer.', true);
+    }
+  } else if (mode === 'accept') {
+    if (transferModalTitleEl) transferModalTitleEl.textContent = 'Accept Team Transfer';
+    if (transferModalDescEl) transferModalDescEl.textContent = `Assign this job to ${teamName(teamId)} and optionally attach it to a team project.`;
+    if (transferTeamRowEl) transferTeamRowEl.hidden = false;
+    populateSelect(transferTeamSelectEl, [{ value: teamId, label: teamName(teamId) }]);
+    if (transferTeamSelectEl) transferTeamSelectEl.disabled = true;
+    if (transferProjectRowEl) transferProjectRowEl.hidden = false;
+    const teamProjects = projectOptions.filter((project) => project.team_id === teamId);
+    const projectOptionsList = teamProjects.map((project) => ({ value: project.id, label: project.name }));
+    populateSelect(transferProjectSelectEl, projectOptionsList, 'No project');
+  } else if (mode === 'assign') {
+    if (transferModalTitleEl) transferModalTitleEl.textContent = 'Assign To Individual';
+    if (transferModalDescEl) transferModalDescEl.textContent = `Move this team job into an individual queue for ${teamName(teamId)}.`;
+    if (transferTeamRowEl) transferTeamRowEl.hidden = false;
+    populateSelect(transferTeamSelectEl, [{ value: teamId, label: teamName(teamId) }]);
+    if (transferTeamSelectEl) transferTeamSelectEl.disabled = true;
+    if (transferUserRowEl) transferUserRowEl.hidden = false;
+    const team = accessTeamIndex[teamId];
+    const candidates = team
+      ? [...new Set([...(team.leaders || []), ...(team.members || [])])]
+      : [];
+    const userOptions = candidates.map((user) => ({ value: user, label: user }));
+    populateSelect(transferUserSelectEl, userOptions, 'Select a user');
+    if (!userOptions.length && transferModalConfirmBtn) {
+      transferModalConfirmBtn.disabled = true;
+      showTransferModalStatus('No team members available for assignment.', true);
+    }
+  }
+
+  setTransferModalOpen(true);
+}
+
 async function openRepoBrowser(targetId, mode, context) {
   const selectedSource = context === 'delivery' ? getSelectedSource('delivery') : getSelectedSource('project');
   if (selectedSource !== 'github') {
@@ -1627,6 +2106,50 @@ function parseTimestamp(value) {
   const attempt = Date.parse(normalized);
   if (!Number.isNaN(attempt)) return attempt;
   return null;
+}
+
+function flattenTeams(nodes, acc = []) {
+  if (!Array.isArray(nodes)) return acc;
+  nodes.forEach((node) => {
+    if (!node || !node.id) return;
+    acc.push(node);
+    if (Array.isArray(node.children) && node.children.length) {
+      flattenTeams(node.children, acc);
+    }
+  });
+  return acc;
+}
+
+function buildTeamIndex(tree) {
+  const list = flattenTeams(tree || [], []);
+  const index = {};
+  list.forEach((team) => {
+    index[team.id] = team;
+  });
+  return { list, index };
+}
+
+function isTeamLeader(teamId) {
+  if (!teamId) return false;
+  if (currentProfile?.role === 'admin') return true;
+  const team = accessTeamIndex[teamId];
+  if (!team || !currentProfile?.user) return false;
+  return Array.isArray(team.leaders) && team.leaders.includes(currentProfile.user);
+}
+
+function isTeamMember(teamId) {
+  if (!teamId) return false;
+  if (currentProfile?.role === 'admin') return true;
+  const team = accessTeamIndex[teamId];
+  if (!team || !currentProfile?.user) return false;
+  const leaders = Array.isArray(team.leaders) ? team.leaders : [];
+  const members = Array.isArray(team.members) ? team.members : [];
+  return leaders.includes(currentProfile.user) || members.includes(currentProfile.user);
+}
+
+function teamName(teamId) {
+  const team = accessTeamIndex[teamId];
+  return team?.name || teamId || '--';
 }
 
 function computeRuntimeSeconds(startedAt, runtimeSec) {
@@ -1994,7 +2517,7 @@ async function submitRefundRequest(jobId) {
     }
     showRefundStatus('Refund request submitted.');
     refundDrafts.delete(jobId);
-    await refreshSelectedJob();
+    await refreshSelectedJob({ preserveEditor: true });
   } catch (err) {
     console.error(err);
     showRefundStatus('Refund request failed. Check console.', true);
@@ -2145,6 +2668,7 @@ function renderJobs() {
         <div>
           <strong>${job.workflow}</strong>
           <div class="job-id">${job.project_name || 'Untitled'}</div>
+          <div class="job-id">Owner: ${job.owner || '--'}${job.team_name ? ` · Team: ${job.team_name}` : ''}</div>
           <div class="job-id">${job.id.slice(0, 8)}</div>
         </div>
       </div>
@@ -2163,10 +2687,12 @@ function renderJobs() {
 
     const actions = document.createElement('div');
     actions.className = 'job-actions';
+    const canManageJob = Boolean(job.project_capabilities?.write);
     const archiveBtn = document.createElement('button');
     archiveBtn.type = 'button';
     archiveBtn.className = 'ghost';
     archiveBtn.textContent = job.archived ? 'Unarchive' : 'Archive';
+    archiveBtn.disabled = !canManageJob;
     archiveBtn.addEventListener('click', (event) => {
       event.stopPropagation();
       toggleArchive(job);
@@ -2175,6 +2701,7 @@ function renderJobs() {
     deleteBtn.type = 'button';
     deleteBtn.className = 'ghost danger';
     deleteBtn.textContent = 'Delete';
+    deleteBtn.disabled = !canManageJob;
     deleteBtn.addEventListener('click', (event) => {
       event.stopPropagation();
       deleteJob(job);
@@ -2185,6 +2712,27 @@ function renderJobs() {
 
     jobListEl.appendChild(card);
   });
+}
+
+function updateScopeFilters() {
+  if (!scopeFiltersEl) return;
+  scopeFiltersEl.querySelectorAll('button[data-scope]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.scope === currentScope);
+  });
+}
+
+function initScopeFilters() {
+  if (!scopeFiltersEl) return;
+  scopeFiltersEl.querySelectorAll('button[data-scope]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const scope = btn.dataset.scope;
+      if (!scope || scope === currentScope) return;
+      currentScope = scope;
+      updateScopeFilters();
+      fetchJobs();
+    });
+  });
+  updateScopeFilters();
 }
 
 function updateQueueSummary() {
@@ -2216,9 +2764,20 @@ function updateQueueSummary() {
   if (queueCompletedCountEl) queueCompletedCountEl.textContent = counts.completed;
 }
 
+function scheduleJobsPoll(delayMs) {
+  if (jobsPollTimer) {
+    clearTimeout(jobsPollTimer);
+    jobsPollTimer = null;
+  }
+  if (!delayMs && delayMs !== 0) return;
+  jobsPollTimer = setTimeout(() => {
+    fetchJobs();
+  }, delayMs);
+}
+
 async function fetchJobs() {
   try {
-    const res = await apiFetch('/api/jobs');
+    const res = await apiFetch(`/api/jobs?scope=${encodeURIComponent(currentScope)}`);
     const data = await res.json();
     const fetchedJobs = data.jobs || [];
     if (hasLoadedJobs && !document.hidden) {
@@ -2247,24 +2806,86 @@ async function fetchJobs() {
         selectJob(targetId).catch((err) => console.error('Failed to select job', err));
       }
     }
-    if (selectedJobId) {
-      const stillExists = jobs.find((job) => job.id === selectedJobId);
-      if (!stillExists) {
-        selectedJobId = null;
-        renderJobDetail(null);
-      } else {
-        refreshSelectedJob();
-      }
+  if (selectedJobId) {
+    const stillExists = jobs.find((job) => job.id === selectedJobId);
+    if (!stillExists) {
+      selectedJobId = null;
+      renderJobDetail(null);
+    } else {
+      refreshSelectedJob({ preserveEditor: true });
+    }
+  }
+    const hasActiveJobs = jobs.some((job) => ['queued', 'running', 'paused'].includes(job.status));
+    if (hasActiveJobs) {
+      scheduleJobsPoll(4000);
+    } else {
+      scheduleJobsPoll(null);
     }
   } catch (err) {
     console.error('Failed to fetch jobs', err);
   }
 }
 
+async function fetchProjects() {
+  if (!projectIdEl) return;
+  try {
+    const res = await apiFetch('/api/projects');
+    if (!res.ok) return;
+    const data = await res.json();
+    projectOptions = data.projects || [];
+    projectIdEl.innerHTML = '<option value="">Personal / Unassigned</option>';
+    projectOptions.forEach((project) => {
+      const option = document.createElement('option');
+      option.value = project.id;
+      const teamName = project.team_name ? ` · ${project.team_name}` : '';
+      option.textContent = `${project.name}${teamName}`;
+      option.dataset.role = project.role || '';
+      option.dataset.capRead = String(Boolean(project.capabilities?.read));
+      option.dataset.capWrite = String(Boolean(project.capabilities?.write));
+      option.dataset.capGrant = String(Boolean(project.capabilities?.grant));
+      projectIdEl.appendChild(option);
+    });
+    updateProjectRoleHint();
+  } catch (err) {
+    console.error('Failed to fetch projects', err);
+  }
+}
+
+async function fetchAccessTree() {
+  try {
+    const res = await apiFetch('/api/access/tree');
+    if (!res.ok) return;
+    const data = await res.json();
+    const tree = data.tree || [];
+    const built = buildTeamIndex(tree);
+    accessTeams = built.list;
+    accessTeamIndex = built.index;
+  } catch (err) {
+    console.error('Failed to fetch access tree', err);
+  }
+}
+
+function updateProjectRoleHint() {
+  if (!projectRoleHintEl || !projectIdEl) return;
+  const selected = projectIdEl.options[projectIdEl.selectedIndex];
+  if (!selected || !selected.value) {
+    projectRoleHintEl.textContent = 'Project access: personal';
+    return;
+  }
+  const role = selected.dataset.role || 'member';
+  const canRead = selected.dataset.capRead === 'true';
+  const canWrite = selected.dataset.capWrite === 'true';
+  const canGrant = selected.dataset.capGrant === 'true';
+  const caps = [canRead && 'read', canWrite && 'write', canGrant && 'grant'].filter(Boolean).join('/');
+  projectRoleHintEl.textContent = `Project access: ${role}${caps ? ` (${caps})` : ''}`;
+}
+
 async function fetchTokens() {
   if (!tokenPanelEl) return;
+  const projectId = projectIdEl?.value;
+  const tokenUrl = projectId ? `/api/tokens?project_id=${encodeURIComponent(projectId)}` : '/api/tokens';
   try {
-    const res = await apiFetch('/api/tokens');
+    const res = await apiFetch(tokenUrl);
     if (!res.ok) return;
     const data = await res.json();
     tokenSnapshot = data;
@@ -2406,17 +3027,19 @@ async function selectJob(jobId) {
   renderJobDetail(job);
   await loadLogs(jobId);
   startLogStream(jobId);
+  await startSession(job);
 }
 
-async function refreshSelectedJob() {
+async function refreshSelectedJob(options = {}) {
   if (!selectedJobId) return;
   const res = await apiFetch(`/api/jobs/${selectedJobId}`);
   if (!res.ok) return;
   const job = await res.json();
-  renderJobDetail(job);
+  renderJobDetail(job, options);
+  renderSessionPanel(sessionSnapshot);
 }
 
-function renderJobDetail(job) {
+function renderJobDetail(job, options = {}) {
   if (!job) {
     jobDetailEl.innerHTML = '';
     jobHintEl.style.display = 'block';
@@ -2424,6 +3047,7 @@ function renderJobDetail(job) {
     clearReqProgressTimer();
     refundPanelOpen = false;
     refundPanelJobId = null;
+    stopSession();
     return;
   }
   jobHintEl.style.display = 'none';
@@ -2439,7 +3063,50 @@ function renderJobDetail(job) {
   const tokensLiveRow = showLiveTokens
     ? `<div class="detail-card"><span class="label has-tip" data-tooltip="Live token usage reported during the run. Updates while the job is running.">Tokens (live)</span><div class="value">${formatTokens(job.metrics)}</div></div>`
     : '';
+  const transfer = job.transfer_request;
+  const isOwner = currentProfile?.user && job.owner === currentProfile.user;
+  const isAdmin = currentProfile?.role === 'admin';
+  const pendingTransfer = transfer?.status === 'pending';
+  const transferTeamId = transfer?.team_id;
+  const canAcceptTransfer = pendingTransfer && (isAdmin || isTeamLeader(transferTeamId));
+  const canCancelTransfer = pendingTransfer && isOwner;
+  const canRequestTransfer = !pendingTransfer && !job.team_id && isOwner;
+  const canAssignUser = job.team_id && (isAdmin || isTeamLeader(job.team_id));
+  let transferStatus = 'Personal queue entry.';
+  if (job.team_id) {
+    transferStatus = `Assigned to team ${teamName(job.team_id)}.`;
+  }
+  if (pendingTransfer) {
+    const requester = transfer?.requested_by || 'unknown';
+    transferStatus = `Pending invite to ${teamName(transferTeamId)} from ${requester}.`;
+  }
+  const transferActions = [];
+  if (canRequestTransfer) {
+    transferActions.push('<button type="button" class="ghost" id="transferInvite">Invite Team Leader</button>');
+  }
+  if (canCancelTransfer) {
+    transferActions.push('<button type="button" class="ghost danger" id="transferCancel">Cancel Invite</button>');
+  }
+  if (canAcceptTransfer) {
+    transferActions.push('<button type="button" class="ghost" id="transferAccept">Accept To Team</button>');
+    transferActions.push('<button type="button" class="ghost danger" id="transferDecline">Decline Invite</button>');
+  }
+  if (canAssignUser) {
+    transferActions.push('<button type="button" class="ghost" id="transferAssign">Assign To Individual</button>');
+  }
+  const transferPanelHtml = transferActions.length
+    ? `
+      <div class="transfer-panel">
+        <div class="label">Queue Assignment</div>
+        <div class="value">${transferStatus}</div>
+        <div class="transfer-actions">
+          ${transferActions.join('')}
+        </div>
+      </div>
+    `
+    : '';
   const repoInfo = job.repo_info || {};
+  const canManageJob = Boolean(job.project_capabilities?.write);
   const repoMeta = repoInfo.fork_org && repoInfo.fork_repo
     ? `${repoInfo.fork_org}/${repoInfo.fork_repo}`
     : (repoInfo.owner ? `${repoInfo.owner}/${repoInfo.repo}` : '--');
@@ -2451,6 +3118,11 @@ function renderJobDetail(job) {
   const refundApproved = refund?.approved_amount ?? refund?.admin_decision?.amount;
   const canRequestRefund = !refund || ['rejected', 'settled', 'partial-refund'].includes(refundStatus);
   const showRefundPanel = refundPanelOpen && refundPanelJobId === job.id;
+  const showEditor = EDITOR_WORKFLOWS.has(job.workflow);
+  const existingEditorPanel = document.getElementById('editorPanel');
+  const preserveEditor = Boolean(options.preserveEditor)
+    && existingEditorPanel
+    && existingEditorPanel.dataset.jobId === job.id;
   const refundSummary = refund ? `
       <div class="refund-meta">
         <div><span>Status</span><strong>${refundStatus}</strong></div>
@@ -2496,12 +3168,90 @@ function renderJobDetail(job) {
       <div id="refundStatus" class="status-banner" hidden></div>
     </div>
   `;
+  const workspaceHtml = `
+    <div class="workspace-panel" id="workspacePanel" data-job-id="${job.id}">
+      <div class="workspace-head">
+        <div>
+          <span class="label">Interactive IDE + Preview</span>
+          <div class="value" id="workspaceStatus">Loading...</div>
+        </div>
+        <div class="workspace-actions">
+          <button type="button" class="primary" id="workspaceLaunch">Launch IDE</button>
+          <button type="button" class="ghost" id="workspaceAttachToggle">Attach URLs</button>
+          <button type="button" class="ghost" id="workspaceRefresh">Refresh</button>
+          <button type="button" class="ghost" id="workspaceClear">Clear</button>
+        </div>
+      </div>
+      <div class="workspace-meta" id="workspaceMeta"></div>
+      <div class="workspace-attach" id="workspaceAttach" hidden>
+        <div class="field grid-2">
+          <div>
+            <label for="workspaceIdeInput">IDE URL</label>
+            <input id="workspaceIdeInput" type="url" placeholder="https://ide.example.com">
+          </div>
+          <div>
+            <label for="workspacePreviewInput">Preview URL</label>
+            <input id="workspacePreviewInput" type="url" placeholder="https://preview.example.com">
+          </div>
+        </div>
+        <div class="workspace-attach-actions">
+          <button type="button" class="primary" id="workspaceAttachSave">Save URLs</button>
+        </div>
+      </div>
+      <div class="workspace-links" id="workspaceLinks"></div>
+      <div class="workspace-frames" id="workspaceFrames"></div>
+      <div class="status-banner" id="workspaceStatusBanner" hidden></div>
+    </div>
+  `;
+  const editorHtml = showEditor
+    ? `
+      <div class="editor-panel" id="editorPanel" data-job-id="${job.id}">
+        <div class="card-header">
+          <h3>Workspace Editor</h3>
+          <p>Edit project files or research documents directly from Control Room.</p>
+        </div>
+        <div class="editor-toolbar">
+          <select id="editorRootSelect"></select>
+          <button type="button" class="ghost" id="editorUpBtn">Up</button>
+          <input id="editorPath" type="text" readonly placeholder="Select a file to edit">
+          <button type="button" class="ghost" id="editorReload">Reload</button>
+          <button type="button" class="primary" id="editorSave" disabled>Save</button>
+          <button type="button" class="ghost" id="editorNewFile">New File</button>
+          <button type="button" class="ghost" id="editorNewFolder">New Folder</button>
+          <button type="button" class="ghost" id="editorRename">Rename</button>
+          <button type="button" class="ghost" id="editorMove">Move</button>
+          <button type="button" class="ghost" id="editorDelete">Delete</button>
+        </div>
+        <div class="editor-body">
+          <div class="editor-sidebar">
+            <div id="editorFileList" class="editor-file-list"></div>
+          </div>
+          <div class="editor-main">
+            <textarea id="editorContent" spellcheck="false" placeholder="Select a file to edit."></textarea>
+          </div>
+        </div>
+        <div class="status-banner" id="editorStatus" hidden></div>
+      </div>
+    `
+    : '';
+  const editorBlock = showEditor
+    ? (preserveEditor ? '<div id="editorAnchor"></div>' : editorHtml)
+    : '';
 
+  const projectAccess = job.project_capabilities
+    ? [job.project_capabilities.read && 'read', job.project_capabilities.write && 'write', job.project_capabilities.grant && 'grant']
+      .filter(Boolean)
+      .join('/') || '--'
+    : '--';
   const detailHtml = `
     <div class="detail-grid">
       <div class="detail-card"><span class="label">Status</span><div class="value">${job.status}</div></div>
       <div class="detail-card"><span class="label">Workflow</span><div class="value">${job.workflow}</div></div>
       <div class="detail-card"><span class="label">Project</span><div class="value">${job.project_name || 'Untitled'}</div></div>
+      <div class="detail-card"><span class="label">Owner</span><div class="value">${job.owner || '--'}</div></div>
+      <div class="detail-card"><span class="label">Team</span><div class="value">${job.team_name || '--'}</div></div>
+      <div class="detail-card"><span class="label">Project Role</span><div class="value">${job.project_role || '--'}</div></div>
+      <div class="detail-card"><span class="label">Project Access</span><div class="value">${projectAccess}</div></div>
       <div class="detail-card"><span class="label">Started</span><div class="value">${formatAbsoluteTime(job.started_at)}</div></div>
       <div class="detail-card">
         <span class="label">Duration</span>
@@ -2523,6 +3273,22 @@ function renderJobDetail(job) {
       <div class="detail-card"><span class="label">Repo Link</span><div class="value">${repoLink}</div></div>
       <div class="detail-card"><span class="label">Branch</span><div class="value">${repoBranch}</div></div>
     </div>
+    ${transferPanelHtml}
+    <div class="session-panel" id="sessionPanel" data-job-id="${job.id}">
+      <div class="label">Workspace Session</div>
+      <div class="value" id="sessionStatus">Connecting...</div>
+      <div class="session-room">
+        <label for="sessionRoomInput">Room ID</label>
+        <div class="session-room-row">
+          <input id="sessionRoomInput" type="text" placeholder="Enter room ID">
+          <button type="button" class="ghost" id="sessionRoomJoin">Join</button>
+        </div>
+      </div>
+      <div class="session-participants" id="sessionParticipants"></div>
+      <div class="session-history" id="sessionHistory"></div>
+    </div>
+    ${workspaceHtml}
+    ${editorBlock}
     <div>
       <h3>Stages</h3>
       <div class="req-progress" id="reqProgress" data-job-id="${job.id}">
@@ -2556,14 +3322,23 @@ function renderJobDetail(job) {
     </div>
     ${refundHtml}
     <div class="actions">
-      <button type="button" class="ghost" data-action="pause">Pause</button>
-      <button type="button" class="ghost" data-action="resume">Resume</button>
-      <button type="button" class="ghost" data-action="stop">Stop</button>
+      <button type="button" class="ghost" data-action="pause"${canManageJob ? '' : ' disabled'}>Pause</button>
+      <button type="button" class="ghost" data-action="resume"${canManageJob ? '' : ' disabled'}>Resume</button>
+      <button type="button" class="ghost" data-action="stop"${canManageJob ? '' : ' disabled'}>Stop</button>
       <button type="button" class="ghost" id="refundToggle">Refund</button>
-      <button type="button" class="primary" data-action="restart">Restart</button>
+      <button type="button" class="primary" data-action="restart"${canManageJob ? '' : ' disabled'}>Restart</button>
     </div>
   `;
   jobDetailEl.innerHTML = detailHtml;
+  if (preserveEditor && existingEditorPanel) {
+    const anchor = document.getElementById('editorAnchor');
+    if (anchor) {
+      anchor.replaceWith(existingEditorPanel);
+      if (editorMirror) {
+        editorMirror.refresh();
+      }
+    }
+  }
   jobDetailEl.querySelectorAll('button[data-action]').forEach((btn) => {
     btn.addEventListener('click', () => postAction(job.id, btn.dataset.action));
   });
@@ -2603,6 +3378,46 @@ function renderJobDetail(job) {
     refundFilesEl.addEventListener('change', () => updateRefundFilesList(refundFilesEl.files));
     updateRefundFilesList(refundFilesEl.files);
   }
+  const transferInviteBtn = document.getElementById('transferInvite');
+  if (transferInviteBtn) {
+    transferInviteBtn.addEventListener('click', () => openTransferModal('invite', job));
+  }
+  const transferCancelBtn = document.getElementById('transferCancel');
+  if (transferCancelBtn) {
+    transferCancelBtn.addEventListener('click', async () => {
+      showJobStatus('Cancelling invite...');
+      const result = await postTransfer(job.id, { action: 'cancel' });
+      if (result) {
+        renderJobDetail(result);
+        await fetchJobs();
+      }
+    });
+  }
+  const transferAcceptBtn = document.getElementById('transferAccept');
+  if (transferAcceptBtn) {
+    transferAcceptBtn.addEventListener('click', () => openTransferModal('accept', job));
+  }
+  const transferDeclineBtn = document.getElementById('transferDecline');
+  if (transferDeclineBtn) {
+    transferDeclineBtn.addEventListener('click', async () => {
+      showJobStatus('Declining invite...');
+      const result = await postTransfer(job.id, { action: 'decline' });
+      if (result) {
+        renderJobDetail(result);
+        await fetchJobs();
+      }
+    });
+  }
+  const transferAssignBtn = document.getElementById('transferAssign');
+  if (transferAssignBtn) {
+    transferAssignBtn.addEventListener('click', () => openTransferModal('assign', job));
+  }
+  initWorkspaceControls(job);
+  renderWorkspacePanel(job.workspace_env || {}, {});
+  loadWorkspace(job.id);
+  if (EDITOR_WORKFLOWS.has(job.workflow) && !preserveEditor) {
+    initEditorControls(job, canManageJob);
+  }
   scheduleDurationUpdates();
   scheduleRequirementProgressUpdates(job);
   scheduleRequirementSummary(job);
@@ -2631,6 +3446,881 @@ function startLogStream(jobId) {
   };
 }
 
+async function startSession(job, roomId) {
+  if (!job || !job.id) return;
+  await stopSession();
+  try {
+    const res = await apiFetch('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: job.id, room_id: roomId }),
+    });
+    if (!res.ok) {
+      renderSessionPanel(null, 'Session unavailable');
+      return;
+    }
+    const data = await res.json();
+    activeSessionId = data.room_id || data.session_id;
+    sessionSnapshot = data;
+    renderSessionPanel(sessionSnapshot);
+    fetchSessionHistory(activeSessionId);
+    sessionStream = apiEventSource(`/api/sessions/${activeSessionId}/stream`);
+    sessionStream.addEventListener('presence', (event) => {
+      const payload = JSON.parse(event.data);
+      sessionSnapshot = payload;
+      renderSessionPanel(sessionSnapshot);
+    });
+    sessionStream.addEventListener('job', (event) => {
+      const payload = JSON.parse(event.data);
+      if (payload.job_id === selectedJobId) {
+        refreshSelectedJob({ preserveEditor: true });
+      }
+    });
+    sessionStream.onerror = () => {
+      if (sessionStream) {
+        sessionStream.close();
+      }
+    };
+  } catch (err) {
+    console.error('Failed to start session', err);
+    renderSessionPanel(null, 'Session unavailable');
+  }
+}
+
+async function stopSession() {
+  if (sessionStream) {
+    sessionStream.close();
+    sessionStream = null;
+  }
+  if (activeSessionId) {
+    try {
+      await apiFetch(`/api/sessions/${activeSessionId}/leave`, { method: 'POST' });
+    } catch (err) {
+      // ignore
+    }
+    activeSessionId = null;
+  }
+  sessionSnapshot = null;
+  renderSessionPanel(null);
+  renderSessionHistory([]);
+}
+
+function renderSessionPanel(snapshot, overrideStatus) {
+  const statusEl = document.getElementById('sessionStatus');
+  const participantsEl = document.getElementById('sessionParticipants');
+  const roomInputEl = document.getElementById('sessionRoomInput');
+  const roomJoinBtn = document.getElementById('sessionRoomJoin');
+  if (!statusEl || !participantsEl) return;
+  if (!snapshot) {
+    statusEl.textContent = overrideStatus || 'No active session';
+    participantsEl.innerHTML = '<span class="subtitle">No participants yet.</span>';
+    if (roomInputEl) roomInputEl.value = '';
+    return;
+  }
+  const participantCount = Array.isArray(snapshot.participants) ? snapshot.participants.length : 0;
+  const sessionLabel = snapshot.room_id || snapshot.session_id || '--';
+  statusEl.textContent = overrideStatus || `Session ${sessionLabel} · ${participantCount} participant${participantCount === 1 ? '' : 's'}`;
+  if (roomInputEl) {
+    roomInputEl.value = snapshot.room_id || snapshot.session_id || '';
+  }
+  if (roomJoinBtn) {
+    roomJoinBtn.onclick = () => {
+      const value = (roomInputEl?.value || '').trim();
+      if (!value || !selectedJobId) return;
+      const currentJob = jobs.find((j) => j.id === selectedJobId);
+      if (currentJob) {
+        startSession(currentJob, value);
+      }
+    };
+  }
+  if (!participantCount) {
+    participantsEl.innerHTML = '<span class="subtitle">No participants yet.</span>';
+    return;
+  }
+  participantsEl.innerHTML = snapshot.participants
+    .map((entry) => {
+      const name = escapeHtml(entry.user || '');
+      const role = entry.role ? ` (${escapeHtml(entry.role)})` : '';
+      return `<span class="session-pill">${name}${role}</span>`;
+    })
+    .join('');
+}
+
+async function fetchSessionHistory(roomId) {
+  if (!roomId) return;
+  try {
+    const res = await apiFetch(`/api/sessions/${roomId}/history`);
+    if (!res.ok) {
+      renderSessionHistory([]);
+      return;
+    }
+    const data = await res.json();
+    renderSessionHistory(data.history || []);
+  } catch (err) {
+    renderSessionHistory([]);
+  }
+}
+
+function renderSessionHistory(events) {
+  const historyEl = document.getElementById('sessionHistory');
+  if (!historyEl) return;
+  if (!Array.isArray(events) || !events.length) {
+    historyEl.innerHTML = '<span class="subtitle">No session history yet.</span>';
+    return;
+  }
+  const recent = events.slice(-12).reverse();
+  historyEl.innerHTML = recent
+    .map((event) => {
+      const when = escapeHtml(event.ts || '');
+      const type = escapeHtml(event.type || '');
+      const user = escapeHtml(event.user || 'system');
+      const detail = event.detail ? escapeHtml(JSON.stringify(event.detail)) : '';
+      return `<div class="session-history-item"><strong>${type}</strong> · ${user} · ${when}${detail ? ` · ${detail}` : ''}</div>`;
+    })
+    .join('');
+}
+
+function showWorkspaceStatus(message, isError = false) {
+  const statusEl = document.getElementById('workspaceStatusBanner');
+  if (!statusEl) return;
+  statusEl.textContent = message;
+  statusEl.hidden = false;
+  statusEl.classList.toggle('error', Boolean(isError));
+}
+
+function clearWorkspaceStatus() {
+  const statusEl = document.getElementById('workspaceStatusBanner');
+  if (!statusEl) return;
+  statusEl.textContent = '';
+  statusEl.hidden = true;
+  statusEl.classList.remove('error');
+}
+
+function buildWorkspaceFrame(label, url) {
+  const safeLabel = escapeHtml(label);
+  const safeUrl = escapeHtml(url || '');
+  if (!url) {
+    return `
+      <div class="workspace-frame empty">
+        <div class="frame-header">${safeLabel}</div>
+        <div class="frame-body">
+          <p class="subtitle">No ${safeLabel.toLowerCase()} URL configured.</p>
+        </div>
+      </div>
+    `;
+  }
+  return `
+    <div class="workspace-frame">
+      <div class="frame-header">${safeLabel}</div>
+      <div class="frame-body">
+        <iframe src="${safeUrl}" title="${safeLabel}" loading="lazy" referrerpolicy="no-referrer"></iframe>
+      </div>
+    </div>
+  `;
+}
+
+function renderWorkspacePanel(workspace, capabilities) {
+  const statusEl = document.getElementById('workspaceStatus');
+  const metaEl = document.getElementById('workspaceMeta');
+  const linksEl = document.getElementById('workspaceLinks');
+  const framesEl = document.getElementById('workspaceFrames');
+  const ideInput = document.getElementById('workspaceIdeInput');
+  const previewInput = document.getElementById('workspacePreviewInput');
+  const launchBtn = document.getElementById('workspaceLaunch');
+  const refreshBtn = document.getElementById('workspaceRefresh');
+  const clearBtn = document.getElementById('workspaceClear');
+  workspaceSnapshot = workspace && typeof workspace === 'object' ? workspace : {};
+  workspaceCapabilities = capabilities && typeof capabilities === 'object' ? capabilities : {};
+
+  const provider = workspaceSnapshot.provider || '';
+  const status = workspaceSnapshot.status || '';
+  let statusLabel = '';
+  if (provider || status) {
+    statusLabel = [provider, status].filter(Boolean).join(' · ');
+  } else if (workspaceCapabilities?.continuum_ready) {
+    statusLabel = 'No workspace yet';
+  } else if (workspaceCapabilities?.continuum) {
+    statusLabel = 'Continuum missing configuration';
+  } else {
+    statusLabel = 'No workspace configured';
+  }
+  if (statusEl) statusEl.textContent = statusLabel;
+
+  const metaParts = [];
+  if (workspaceSnapshot.vm_id) metaParts.push(`VM: ${workspaceSnapshot.vm_id}`);
+  if (workspaceSnapshot.updated_at) metaParts.push(`Updated: ${formatAbsoluteTime(workspaceSnapshot.updated_at)}`);
+  if (workspaceSnapshot.details) metaParts.push(workspaceSnapshot.details);
+  if (!metaParts.length) {
+    metaParts.push('Attach URLs or launch a Continuum workspace.');
+  }
+  if (metaEl) {
+    metaEl.innerHTML = metaParts.map((entry) => `<span>${escapeHtml(entry)}</span>`).join('');
+  }
+
+  if (ideInput) ideInput.value = workspaceSnapshot.ide_url || '';
+  if (previewInput) previewInput.value = workspaceSnapshot.preview_url || '';
+
+  if (linksEl) {
+    const linkParts = [];
+    if (workspaceSnapshot.ide_url) {
+      linkParts.push(`<a class="link-inline" href="${escapeHtml(workspaceSnapshot.ide_url)}" target="_blank" rel="noopener">Open IDE</a>`);
+    }
+    if (workspaceSnapshot.preview_url) {
+      linkParts.push(`<a class="link-inline" href="${escapeHtml(workspaceSnapshot.preview_url)}" target="_blank" rel="noopener">Open Preview</a>`);
+    }
+    linksEl.innerHTML = linkParts.length ? linkParts.join(' · ') : '<span class="subtitle">No workspace links yet.</span>';
+  }
+
+  if (framesEl) {
+    framesEl.innerHTML = `${buildWorkspaceFrame('IDE', workspaceSnapshot.ide_url)}${buildWorkspaceFrame('Preview', workspaceSnapshot.preview_url)}`;
+  }
+
+  if (launchBtn) {
+    const canLaunch = Boolean(workspaceCapabilities?.continuum_ready);
+    launchBtn.disabled = !canLaunch;
+    launchBtn.title = canLaunch ? 'Launch a Continuum workspace' : 'Continuum not configured';
+  }
+  if (refreshBtn) {
+    refreshBtn.disabled = !(workspaceSnapshot.provider || workspaceSnapshot.vm_id || workspaceCapabilities?.continuum_ready);
+  }
+  if (clearBtn) {
+    clearBtn.disabled = !workspaceSnapshot || (!workspaceSnapshot.ide_url && !workspaceSnapshot.preview_url && !workspaceSnapshot.vm_id);
+  }
+}
+
+async function loadWorkspace(jobId) {
+  if (!jobId) return;
+  clearWorkspaceStatus();
+  try {
+    const res = await apiFetch(`/api/jobs/${jobId}/workspace`);
+    const data = await res.json();
+    if (selectedJobId !== jobId) return;
+    if (!res.ok) {
+      showWorkspaceStatus(data.details || data.error || 'Workspace unavailable.', true);
+      renderWorkspacePanel(null, data.capabilities || {});
+      return;
+    }
+    renderWorkspacePanel(data.workspace || {}, data.capabilities || {});
+  } catch (err) {
+    if (selectedJobId !== jobId) return;
+    showWorkspaceStatus('Workspace unavailable.', true);
+  }
+}
+
+async function postWorkspaceAction(jobId, body) {
+  if (!jobId) return null;
+  clearWorkspaceStatus();
+  try {
+    const res = await apiFetch(`/api/jobs/${jobId}/workspace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (selectedJobId !== jobId) return data;
+    if (!res.ok) {
+      showWorkspaceStatus(data.details || data.error || 'Workspace update failed.', true);
+      return null;
+    }
+    renderWorkspacePanel(data.workspace || {}, data.capabilities || {});
+    if (data.status) {
+      showWorkspaceStatus(`Workspace ${data.status}.`);
+    } else {
+      showWorkspaceStatus('Workspace updated.');
+    }
+    return data;
+  } catch (err) {
+    if (selectedJobId === jobId) {
+      showWorkspaceStatus('Workspace update failed.', true);
+    }
+    return null;
+  }
+}
+
+function initWorkspaceControls(job) {
+  const launchBtn = document.getElementById('workspaceLaunch');
+  const attachToggleBtn = document.getElementById('workspaceAttachToggle');
+  const attachEl = document.getElementById('workspaceAttach');
+  const attachSaveBtn = document.getElementById('workspaceAttachSave');
+  const refreshBtn = document.getElementById('workspaceRefresh');
+  const clearBtn = document.getElementById('workspaceClear');
+  const ideInput = document.getElementById('workspaceIdeInput');
+  const previewInput = document.getElementById('workspacePreviewInput');
+
+  if (launchBtn) {
+    launchBtn.addEventListener('click', async () => {
+      showWorkspaceStatus('Launching workspace...');
+      await postWorkspaceAction(job.id, { action: 'create' });
+    });
+  }
+  if (attachToggleBtn && attachEl) {
+    attachToggleBtn.addEventListener('click', () => {
+      attachEl.hidden = !attachEl.hidden;
+    });
+  }
+  if (attachSaveBtn) {
+    attachSaveBtn.addEventListener('click', async () => {
+      const ideUrl = ideInput ? ideInput.value.trim() : '';
+      const previewUrl = previewInput ? previewInput.value.trim() : '';
+      showWorkspaceStatus('Saving workspace URLs...');
+      await postWorkspaceAction(job.id, { action: 'attach', ide_url: ideUrl, preview_url: previewUrl });
+    });
+  }
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', async () => {
+      showWorkspaceStatus('Refreshing workspace...');
+      await postWorkspaceAction(job.id, { action: 'refresh' });
+    });
+  }
+  if (clearBtn) {
+    clearBtn.addEventListener('click', async () => {
+      showWorkspaceStatus('Clearing workspace...');
+      await postWorkspaceAction(job.id, { action: 'clear' });
+    });
+  }
+}
+
+const editorState = {
+  jobId: null,
+  rootId: null,
+  cwd: '',
+  openPath: '',
+  dirty: false,
+  canWrite: false,
+  selectedPath: '',
+  selectedType: '',
+  suspendChange: false,
+  lastEditorError: '',
+};
+let editorMirror = null;
+
+function setEditorStatus(message, isError = false) {
+  const statusEl = document.getElementById('editorStatus');
+  if (!statusEl) return;
+  statusEl.textContent = message;
+  statusEl.hidden = false;
+  statusEl.classList.toggle('error', Boolean(isError));
+}
+
+function clearEditorStatus() {
+  const statusEl = document.getElementById('editorStatus');
+  if (!statusEl) return;
+  statusEl.textContent = '';
+  statusEl.hidden = true;
+  statusEl.classList.remove('error');
+  editorState.lastEditorError = '';
+}
+
+function editorModeForPath(path) {
+  const lowered = (path || '').toLowerCase();
+  if (lowered.endsWith('.md') || lowered.endsWith('.markdown')) return 'markdown';
+  if (lowered.endsWith('.js') || lowered.endsWith('.jsx') || lowered.endsWith('.ts') || lowered.endsWith('.tsx')) return 'javascript';
+  if (lowered.endsWith('.json')) return { name: 'javascript', json: true };
+  if (lowered.endsWith('.py')) return 'python';
+  if (lowered.endsWith('.css')) return 'css';
+  if (lowered.endsWith('.html') || lowered.endsWith('.htm')) return 'htmlmixed';
+  if (lowered.endsWith('.xml') || lowered.endsWith('.svg')) return 'xml';
+  if (lowered.endsWith('.yml') || lowered.endsWith('.yaml')) return 'yaml';
+  if (lowered.endsWith('.sh') || lowered.endsWith('.bash')) return 'shell';
+  if (lowered.endsWith('.sql')) return 'sql';
+  return 'text/plain';
+}
+
+function ensureEditorMirror() {
+  if (editorMirror || typeof window === 'undefined') return;
+  const textarea = document.getElementById('editorContent');
+  if (!textarea || !window.CodeMirror) return;
+  editorMirror = window.CodeMirror.fromTextArea(textarea, {
+    lineNumbers: true,
+    lineWrapping: true,
+    theme: 'material-darker',
+    mode: 'text/plain',
+  });
+  editorMirror.on('change', () => {
+    if (editorState.suspendChange) return;
+    editorState.dirty = true;
+    updateEditorSaveState();
+  });
+  editorMirror.on('blur', () => {
+    if (editorState.suspendChange) return;
+    editorState.dirty = true;
+    updateEditorSaveState();
+  });
+}
+
+function setEditorContent(value, path = '') {
+  if (editorMirror) {
+    editorState.suspendChange = true;
+    editorMirror.setOption('mode', editorModeForPath(path));
+    editorMirror.setValue(value || '');
+    editorMirror.refresh();
+    editorState.suspendChange = false;
+  } else {
+    const textarea = document.getElementById('editorContent');
+    if (textarea) textarea.value = value || '';
+  }
+}
+
+function getEditorContent() {
+  if (editorMirror) {
+    return editorMirror.getValue();
+  }
+  const textarea = document.getElementById('editorContent');
+  return textarea ? textarea.value : '';
+}
+
+function updateEditorSaveState() {
+  const saveBtn = document.getElementById('editorSave');
+  if (!saveBtn) return;
+  if (!editorState.openPath || !editorState.canWrite) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Save';
+    return;
+  }
+  saveBtn.disabled = false;
+  saveBtn.textContent = editorState.dirty ? 'Save *' : 'Save';
+}
+
+function renderEditorEntries(entries, truncated) {
+  const listEl = document.getElementById('editorFileList');
+  if (!listEl) return;
+  if (!entries.length) {
+    listEl.innerHTML = '<span class="subtitle">No files found.</span>';
+    return;
+  }
+  const rows = entries.map((entry) => {
+    const type = entry.type || 'file';
+    const name = escapeHtml(entry.name || entry.path || '');
+    const path = escapeHtml(entry.path || '');
+    const size = entry.size ? `${entry.size}b` : '';
+    const selected = entry.path && (entry.path === editorState.selectedPath || entry.path === editorState.openPath);
+    return `
+      <button type="button" class="editor-entry ${type}${selected ? ' selected' : ''}" data-path="${path}" data-type="${type}">
+        <span class="entry-name">${name}</span>
+        ${size ? `<span class="entry-meta">${size}</span>` : ''}
+      </button>
+    `;
+  });
+  if (truncated) {
+    rows.push('<span class="subtitle">Listing truncated.</span>');
+  }
+  listEl.innerHTML = rows.join('');
+  listEl.querySelectorAll('.editor-entry').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const path = btn.dataset.path || '';
+      const type = btn.dataset.type || 'file';
+      if (!editorState.jobId || !editorState.rootId) return;
+      listEl.querySelectorAll('.editor-entry').forEach((entry) => entry.classList.remove('selected'));
+      btn.classList.add('selected');
+      editorState.selectedPath = path;
+      editorState.selectedType = type;
+      if (type === 'dir') {
+        listEditorDir(editorState.jobId, editorState.rootId, path);
+        editorState.selectedPath = '';
+        editorState.selectedType = '';
+      } else {
+        openEditorFile(editorState.jobId, editorState.rootId, path);
+      }
+    });
+    btn.addEventListener('dblclick', () => {
+      const path = btn.dataset.path || '';
+      const type = btn.dataset.type || 'file';
+      if (type !== 'file') return;
+      if (!editorState.jobId || !editorState.rootId) return;
+      openFileInIDE(editorState.jobId, editorState.rootId, path);
+    });
+  });
+}
+
+function updateEditorPathDisplay() {
+  const pathEl = document.getElementById('editorPath');
+  if (!pathEl) return;
+  pathEl.value = editorState.openPath || editorState.cwd || '';
+}
+
+async function loadEditorRoots(job) {
+  if (!job?.id) return;
+  try {
+    const res = await apiFetch(`/api/jobs/${job.id}/editor/roots`);
+    const data = await res.json();
+    if (!res.ok) {
+      setEditorStatus(data.details || data.error || 'Editor unavailable.', true);
+      return;
+    }
+    const roots = Array.isArray(data.roots) ? data.roots : [];
+    const selectEl = document.getElementById('editorRootSelect');
+    if (!selectEl) return;
+    selectEl.innerHTML = '';
+    roots.forEach((root, idx) => {
+      const opt = document.createElement('option');
+      opt.value = root.id;
+      opt.textContent = root.label || root.id;
+      opt.dataset.defaultPath = root.default_path || '';
+      selectEl.appendChild(opt);
+      if (idx === 0) {
+        editorState.rootId = root.id;
+      }
+    });
+    if (!roots.length) {
+      setEditorStatus('No editable roots available.', true);
+      return;
+    }
+    selectEl.onchange = () => {
+      editorState.rootId = selectEl.value;
+      editorState.cwd = '';
+      editorState.openPath = '';
+      editorState.dirty = false;
+      updateEditorSaveState();
+      updateEditorPathDisplay();
+      const nextDefault = selectEl.selectedOptions[0]?.dataset?.defaultPath || '';
+      if (nextDefault) {
+        openEditorFile(job.id, editorState.rootId, nextDefault);
+      } else {
+        listEditorDir(job.id, editorState.rootId, '');
+      }
+    };
+    const defaultPath = selectEl.selectedOptions[0]?.dataset?.defaultPath || '';
+    if (defaultPath) {
+      const opened = await openEditorFile(job.id, editorState.rootId, defaultPath);
+      if (!opened) {
+        await listEditorDir(job.id, editorState.rootId, '');
+      }
+    } else {
+      await listEditorDir(job.id, editorState.rootId, '');
+    }
+  } catch (err) {
+    setEditorStatus('Editor unavailable.', true);
+  }
+}
+
+async function listEditorDir(jobId, rootId, path) {
+  clearEditorStatus();
+  try {
+    const params = new URLSearchParams({ root: rootId, path: path || '' });
+    const res = await apiFetch(`/api/jobs/${jobId}/editor/list?${params.toString()}`);
+    const data = await res.json();
+    if (!res.ok) {
+      editorState.lastEditorError = data.error || '';
+      setEditorStatus(data.details || data.error || 'Unable to list directory.', true);
+      return;
+    }
+    editorState.cwd = data.path || '';
+    renderEditorEntries(Array.isArray(data.entries) ? data.entries : [], Boolean(data.truncated));
+    updateEditorPathDisplay();
+  } catch (err) {
+    setEditorStatus('Unable to list directory.', true);
+  }
+}
+
+async function postEditorOp(jobId, payload) {
+  try {
+    const res = await apiFetch(`/api/jobs/${jobId}/editor/ops`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      editorState.lastEditorError = data.error || '';
+      setEditorStatus(data.details || data.error || 'Editor operation failed.', true);
+      return null;
+    }
+    return data;
+  } catch (err) {
+    editorState.lastEditorError = 'request_failed';
+    setEditorStatus('Editor operation failed.', true);
+    return null;
+  }
+}
+
+function editorResolvePath(input) {
+  if (!input) return '';
+  const trimmed = input.replace(/^\/+/, '');
+  if (trimmed.includes('/')) return trimmed;
+  if (editorState.cwd) return `${editorState.cwd}/${trimmed}`;
+  return trimmed;
+}
+
+async function createEditorFile(jobId) {
+  if (!editorState.rootId) {
+    setEditorStatus('Select a root first.', true);
+    return;
+  }
+  const name = window.prompt('New file path (relative to root or current folder):');
+  if (!name) return;
+  const rel = editorResolvePath(name.trim());
+  if (!rel) return;
+  clearEditorStatus();
+  const data = await postEditorOp(jobId, { action: 'create', root: editorState.rootId, path: rel });
+  if (!data) return;
+  await openEditorFile(jobId, editorState.rootId, data.path || rel);
+}
+
+async function createEditorFolder(jobId) {
+  if (!editorState.rootId) {
+    setEditorStatus('Select a root first.', true);
+    return;
+  }
+  const name = window.prompt('New folder path (relative to root or current folder):');
+  if (!name) return;
+  const rel = editorResolvePath(name.trim());
+  if (!rel) return;
+  clearEditorStatus();
+  const data = await postEditorOp(jobId, { action: 'mkdir', root: editorState.rootId, path: rel });
+  if (!data) return;
+  const parent = rel.includes('/') ? rel.split('/').slice(0, -1).join('/') : '';
+  await listEditorDir(jobId, editorState.rootId, parent);
+}
+
+async function renameEditorEntry(jobId) {
+  if (!editorState.rootId) {
+    setEditorStatus('Select a root first.', true);
+    return;
+  }
+  const target = editorState.openPath || editorState.selectedPath;
+  if (!target) {
+    setEditorStatus('Select a file or folder to rename.', true);
+    return;
+  }
+  const baseDir = target.includes('/') ? target.split('/').slice(0, -1).join('/') : '';
+  const name = window.prompt('New name or path:', target);
+  if (!name) return;
+  const rel = name.includes('/') ? name.replace(/^\/+/, '') : (baseDir ? `${baseDir}/${name}` : name);
+  clearEditorStatus();
+  const data = await postEditorOp(jobId, { action: 'rename', root: editorState.rootId, path: target, new_path: rel });
+  if (!data) return;
+  editorState.openPath = data.path || rel;
+  editorState.selectedPath = '';
+  const newDir = editorState.openPath.includes('/') ? editorState.openPath.split('/').slice(0, -1).join('/') : '';
+  await listEditorDir(jobId, editorState.rootId, newDir);
+  updateEditorPathDisplay();
+  if (editorState.openPath) {
+    openEditorFile(jobId, editorState.rootId, editorState.openPath);
+  }
+}
+
+async function moveEditorEntry(jobId) {
+  if (!editorState.rootId) {
+    setEditorStatus('Select a root first.', true);
+    return;
+  }
+  const target = editorState.openPath || editorState.selectedPath;
+  if (!target) {
+    setEditorStatus('Select a file or folder to move.', true);
+    return;
+  }
+  const destDir = window.prompt('Move to folder (relative to root):', editorState.cwd || '');
+  if (!destDir) return;
+  const normalized = destDir.replace(/^\/+/, '').replace(/\/+$/, '');
+  const name = target.split('/').slice(-1)[0];
+  const newPath = normalized ? `${normalized}/${name}` : name;
+  clearEditorStatus();
+  const data = await postEditorOp(jobId, { action: 'move', root: editorState.rootId, path: target, new_path: newPath });
+  if (!data) return;
+  editorState.openPath = data.path || newPath;
+  editorState.selectedPath = '';
+  const newDir = editorState.openPath.includes('/') ? editorState.openPath.split('/').slice(0, -1).join('/') : '';
+  await listEditorDir(jobId, editorState.rootId, newDir);
+  updateEditorPathDisplay();
+  if (editorState.openPath) {
+    openEditorFile(jobId, editorState.rootId, editorState.openPath);
+  }
+}
+
+async function deleteEditorEntry(jobId) {
+  if (!editorState.rootId) {
+    setEditorStatus('Select a root first.', true);
+    return;
+  }
+  const target = editorState.openPath || editorState.selectedPath;
+  if (!target) {
+    setEditorStatus('Select a file or folder to delete.', true);
+    return;
+  }
+  const confirmed = window.confirm(`Delete ${target}?`);
+  if (!confirmed) return;
+  clearEditorStatus();
+  let data = await postEditorOp(jobId, { action: 'delete', root: editorState.rootId, path: target });
+  if (!data && editorState.canWrite && editorState.lastEditorError === 'dir_not_empty') {
+    const forceConfirm = window.confirm('Folder not empty. Delete everything inside?');
+    if (!forceConfirm) return;
+    clearEditorStatus();
+    data = await postEditorOp(jobId, { action: 'delete', root: editorState.rootId, path: target, force: true });
+    if (!data) return;
+  }
+  if (editorState.openPath === target) {
+    editorState.openPath = '';
+    editorState.dirty = false;
+    setEditorContent('', '');
+    updateEditorSaveState();
+  }
+  await listEditorDir(jobId, editorState.rootId, editorState.cwd);
+}
+
+async function openEditorFile(jobId, rootId, path) {
+  clearEditorStatus();
+  try {
+    const params = new URLSearchParams({ root: rootId, path });
+    const res = await apiFetch(`/api/jobs/${jobId}/editor/file?${params.toString()}`);
+    const data = await res.json();
+    if (!res.ok) {
+      editorState.lastEditorError = data.error || '';
+      setEditorStatus(data.details || data.error || 'Unable to open file.', true);
+      return false;
+    }
+    editorState.openPath = data.path || path;
+    editorState.selectedPath = editorState.openPath;
+    editorState.selectedType = 'file';
+    editorState.dirty = false;
+    setEditorContent(data.content || '', editorState.openPath);
+    const parent = editorState.openPath.includes('/') ? editorState.openPath.split('/').slice(0, -1).join('/') : '';
+    await listEditorDir(jobId, rootId, parent);
+    updateEditorSaveState();
+    updateEditorPathDisplay();
+    return true;
+  } catch (err) {
+    setEditorStatus('Unable to open file.', true);
+    return false;
+  }
+}
+
+async function openFileInIDE(jobId, rootId, path) {
+  if (!jobId || !rootId || !path) return;
+  clearWorkspaceStatus();
+  try {
+    if (!workspaceSnapshot?.ide_url && workspaceCapabilities?.continuum_ready) {
+      showWorkspaceStatus('Launching IDE...');
+      await postWorkspaceAction(jobId, { action: 'create' });
+      await loadWorkspace(jobId);
+    }
+    const res = await apiFetch(`/api/jobs/${jobId}/workspace/open`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root: rootId, path }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showWorkspaceStatus(data.details || data.error || 'Unable to open IDE.', true);
+      return;
+    }
+    const url = data.url || workspaceSnapshot?.ide_url;
+    if (url) {
+      window.open(url, '_blank', 'noopener');
+      if (!data.opened_file) {
+        showWorkspaceStatus('IDE opened. File open template not configured.');
+      }
+    } else {
+      showWorkspaceStatus('IDE URL not available.', true);
+    }
+  } catch (err) {
+    showWorkspaceStatus('Unable to open IDE.', true);
+  }
+}
+
+async function saveEditorFile(jobId) {
+  if (!editorState.openPath || !editorState.rootId) {
+    setEditorStatus('Select a file to save.', true);
+    return;
+  }
+  clearEditorStatus();
+  const content = getEditorContent();
+  try {
+    const res = await apiFetch(`/api/jobs/${jobId}/editor/file`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root: editorState.rootId, path: editorState.openPath, content }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      editorState.lastEditorError = data.error || '';
+      setEditorStatus(data.details || data.error || 'Unable to save file.', true);
+      return;
+    }
+    editorState.dirty = false;
+    updateEditorSaveState();
+    setEditorStatus('File saved.');
+  } catch (err) {
+    setEditorStatus('Unable to save file.', true);
+  }
+}
+
+function initEditorControls(job, canWrite) {
+  if (!EDITOR_WORKFLOWS.has(job.workflow)) return;
+  editorState.jobId = job.id;
+  editorState.rootId = null;
+  editorState.cwd = '';
+  editorState.openPath = '';
+  editorState.dirty = false;
+  editorState.canWrite = Boolean(canWrite);
+  editorState.selectedPath = '';
+  editorState.selectedType = '';
+  ensureEditorMirror();
+  const contentEl = document.getElementById('editorContent');
+  if (contentEl) {
+    if (!editorMirror) contentEl.value = '';
+    contentEl.readOnly = !editorState.canWrite;
+    contentEl.oninput = () => {
+      editorState.dirty = true;
+      updateEditorSaveState();
+    };
+  }
+  if (editorMirror) {
+    editorMirror.setOption('readOnly', !editorState.canWrite);
+  }
+  const saveBtn = document.getElementById('editorSave');
+  if (saveBtn) {
+    saveBtn.onclick = () => saveEditorFile(job.id);
+    saveBtn.disabled = !editorState.canWrite;
+  }
+  const pathEl = document.getElementById('editorPath');
+  if (pathEl) {
+    pathEl.title = editorState.canWrite ? 'Current file path' : 'Read-only';
+  }
+  const newBtn = document.getElementById('editorNewFile');
+  if (newBtn) {
+    newBtn.disabled = !editorState.canWrite;
+    newBtn.onclick = () => createEditorFile(job.id);
+  }
+  const renameBtn = document.getElementById('editorRename');
+  if (renameBtn) {
+    renameBtn.disabled = !editorState.canWrite;
+    renameBtn.onclick = () => renameEditorEntry(job.id);
+  }
+  const moveBtn = document.getElementById('editorMove');
+  if (moveBtn) {
+    moveBtn.disabled = !editorState.canWrite;
+    moveBtn.onclick = () => moveEditorEntry(job.id);
+  }
+  const newFolderBtn = document.getElementById('editorNewFolder');
+  if (newFolderBtn) {
+    newFolderBtn.disabled = !editorState.canWrite;
+    newFolderBtn.onclick = () => createEditorFolder(job.id);
+  }
+  const deleteBtn = document.getElementById('editorDelete');
+  if (deleteBtn) {
+    deleteBtn.disabled = !editorState.canWrite;
+    deleteBtn.onclick = () => deleteEditorEntry(job.id);
+  }
+  const reloadBtn = document.getElementById('editorReload');
+  if (reloadBtn) reloadBtn.onclick = () => {
+    if (editorState.openPath) {
+      openEditorFile(job.id, editorState.rootId, editorState.openPath);
+    } else if (editorState.rootId) {
+      listEditorDir(job.id, editorState.rootId, editorState.cwd);
+    }
+  };
+  const upBtn = document.getElementById('editorUpBtn');
+  if (upBtn) {
+    upBtn.onclick = () => {
+      if (!editorState.cwd) return;
+      const parent = editorState.cwd.includes('/') ? editorState.cwd.split('/').slice(0, -1).join('/') : '';
+      listEditorDir(job.id, editorState.rootId, parent);
+    };
+  }
+  updateEditorSaveState();
+  loadEditorRoots(job);
+}
+
 function appendLog(entry) {
   const line = `[${formatAbsoluteTime(entry.ts)}] ${entry.line}`;
   const shouldScroll = autoScrollCheckbox.checked && logOutputEl.scrollTop + logOutputEl.clientHeight >= logOutputEl.scrollHeight - 24;
@@ -2654,10 +4344,25 @@ async function postAction(jobId, action) {
   await fetchJobs();
 }
 
+async function postTransfer(jobId, payload) {
+  const res = await apiFetch(`/api/jobs/${jobId}/transfer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    showJobStatus(data.details || data.error || 'Transfer action failed.', true);
+    return null;
+  }
+  return data;
+}
+
 function buildPayload() {
   const workflow = workflowSelect.value;
   const payload = {
     workflow,
+    project_id: projectIdEl?.value || '',
     project_name: document.getElementById('projectName').value.trim(),
     project_root: document.getElementById('projectRoot').value.trim(),
     create_project: document.getElementById('createProject').checked,
@@ -2713,6 +4418,7 @@ function buildPayload() {
     payload.git_author_email = deliveryAuthorEmailEl?.value.trim();
     payload.delivery_project_root = '';
   }
+  if (!payload.project_id) delete payload.project_id;
   if (!payload.project_name) delete payload.project_name;
   if (!payload.project_root) delete payload.project_root;
   if (!payload.requirements_text) delete payload.requirements_text;
@@ -2936,8 +4642,57 @@ if (clearNotifyEmailBtn) {
 if (reqExtractBtn) {
   reqExtractBtn.addEventListener('click', () => {
     clearReqGridStatus();
-    requirementsGrid = [];
-    extractRequirementsFromField(true);
+    if (!requirementsTextEl) return;
+    const extracted = extractRequirementsFromText(requirementsTextEl.value);
+    if (!extracted.length) {
+      showReqGridStatus('No REQ items detected in the text.', true);
+      return;
+    }
+    if (requirementsGrid.length) {
+      const merge = window.confirm(
+        'Merge extracted requirements with existing ones?\nOK = merge, Cancel = replace.'
+      );
+      if (merge) {
+        requirementsGrid = mergeRequirementLists(requirementsGrid, extracted);
+        renderRequirementsGrid();
+        showReqGridStatus(`Merged ${extracted.length} requirement(s) into the register.`);
+        return;
+      }
+    }
+    requirementsGrid = extracted;
+    renderRequirementsGrid();
+    showReqGridStatus(`Detected ${extracted.length} requirement(s).`);
+  });
+}
+if (reqExtractJobBtn) {
+  reqExtractJobBtn.addEventListener('click', async () => {
+    clearReqGridStatus();
+    if (!selectedJobId) {
+      showReqGridStatus('Select a job in Job Detail first.', true);
+      return;
+    }
+    showReqGridStatus('Extracting requirements from job...');
+    const summary = await loadRequirementSummary(selectedJobId, true);
+    const items = summary?.items || [];
+    const extracted = requirementsFromSummaryItems(items);
+    if (!extracted.length) {
+      showReqGridStatus('No requirements found in the selected job summary.', true);
+      return;
+    }
+    if (requirementsGrid.length) {
+      const merge = window.confirm(
+        'Merge requirements from job summary with existing ones?\nOK = merge, Cancel = replace.'
+      );
+      if (merge) {
+        requirementsGrid = mergeRequirementLists(requirementsGrid, extracted);
+        renderRequirementsGrid();
+        showReqGridStatus(`Merged ${extracted.length} requirement(s) from job summary.`);
+        return;
+      }
+    }
+    requirementsGrid = extracted;
+    renderRequirementsGrid();
+    showReqGridStatus(`Loaded ${extracted.length} requirement(s) from job summary.`);
   });
 }
 if (reqAddBtn) {
@@ -3021,8 +4776,77 @@ if (deleteQueueBtn) {
 if (deleteArchiveBtn) {
   deleteArchiveBtn.addEventListener('click', () => deleteJobsBulk('archive'));
 }
+if (projectIdEl) {
+  projectIdEl.addEventListener('change', () => {
+    updateProjectRoleHint();
+    fetchTokens();
+    scheduleEstimate();
+  });
+}
+if (transferModalCancelBtn) {
+  transferModalCancelBtn.addEventListener('click', closeTransferModal);
+}
+if (transferModalCloseBtn) {
+  transferModalCloseBtn.addEventListener('click', closeTransferModal);
+}
+if (transferModalEl) {
+  transferModalEl.addEventListener('click', (event) => {
+    if (event.target === transferModalEl) {
+      closeTransferModal();
+    }
+  });
+}
+if (transferModalConfirmBtn) {
+  transferModalConfirmBtn.addEventListener('click', async () => {
+    if (!transferModalState?.job) return;
+    const { mode, job } = transferModalState;
+    clearTransferModalStatus();
+    showTransferModalStatus('Submitting...');
+    if (mode === 'invite') {
+      const teamId = transferTeamSelectEl?.value;
+      if (!teamId) {
+        showTransferModalStatus('Select a team.', true);
+        return;
+      }
+      const result = await postTransfer(job.id, { action: 'request', team_id: teamId });
+      if (result) {
+        closeTransferModal();
+        renderJobDetail(result);
+        await fetchJobs();
+      }
+      return;
+    }
+    if (mode === 'accept') {
+      const projectId = transferProjectSelectEl?.value;
+      const payload = { action: 'accept' };
+      if (projectId) payload.project_id = projectId;
+      const result = await postTransfer(job.id, payload);
+      if (result) {
+        closeTransferModal();
+        renderJobDetail(result);
+        await fetchJobs();
+      }
+      return;
+    }
+    if (mode === 'assign') {
+      const targetUser = transferUserSelectEl?.value;
+      if (!targetUser) {
+        showTransferModalStatus('Select a user.', true);
+        return;
+      }
+      const result = await postTransfer(job.id, { action: 'assign_user', target_user: targetUser });
+      if (result) {
+        closeTransferModal();
+        renderJobDetail(result);
+        await fetchJobs();
+      }
+    }
+  });
+}
 
 initFilters();
+initScopeFilters();
+initTodoPanel();
 updateWorkflowSections();
 if (cliBubblesEl) {
   renderCliBubbles();
@@ -3033,11 +4857,12 @@ renderAssistantMessages();
 renderFormSuggestions();
 fetchSecrets();
 fetchProfile();
+fetchProjects();
+fetchAccessTree();
 fetchJobs();
 fetchHealth();
 fetchCapabilities();
 fetchTokens();
-setInterval(fetchJobs, 4000);
 setInterval(fetchHealth, 15000);
 setInterval(fetchTokens, 12000);
 
@@ -3065,6 +4890,11 @@ if (requirementsTextEl) {
   });
 }
 restoreFormState();
+updateProjectRoleHint();
 scheduleEstimate();
 renderRequirementsGrid();
 extractRequirementsFromField();
+
+window.addEventListener('beforeunload', () => {
+  stopSession();
+});

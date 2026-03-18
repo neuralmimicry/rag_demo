@@ -15,6 +15,7 @@ import requests
 
 from file_converter import FileConverter
 from llm_providers import LLMProvider, LLMQuotaError
+from security_utils import url_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +372,8 @@ def fetch_url(
     headers_list: Optional[List[Dict[str, str]]] = None,
     get_fetch_advice: Optional[Callable[[str, str], Dict[str, Any]]] = None,
 ) -> requests.Response:
+    if not url_allowed(url):
+        raise requests.exceptions.RequestException("URL blocked by policy")
     headers_list = headers_list or [
         {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",

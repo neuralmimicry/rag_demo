@@ -19,6 +19,7 @@ from jira_analysis import fetch_issues as jira_fetch_issues, _jira_get, _extract
 from confluence_analysis import _conf_get, PageInfo
 from file_converter import FileConverter
 from web_research import MockSearchEngine, GoogleSearchEngine, search_web, fetch_url, heuristic_relevance_check
+from skills_engine import build_skill_context, format_skill_directives
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -2330,6 +2331,21 @@ class TopicResearcher:
             user_content = f"Company: {self.company_name}\n" + user_content
         if context:
             user_content += f"\nAdditional Context:\n{context}\n"
+        skill_context = build_skill_context(
+            topic,
+            requirements,
+            context or "",
+            target_section or "",
+            focus="topic_research",
+            limit=6,
+        )
+        skill_directives = format_skill_directives(
+            skill_context,
+            sections=("query_hints", "plan_hints", "safety_hints"),
+            include_skills=True,
+        )
+        if skill_directives:
+            user_content += f"\nSkill directives:\n{skill_directives}\n"
         
         if completeness_feedback:
             user_content += f"\nFEEDBACK ON MISSING AREAS (PRIORITISE THESE): {completeness_feedback}\n"
@@ -3581,7 +3597,22 @@ class TopicResearcher:
             
         if context:
             user_content += f"Additional Context:\n{context}\n"
-        
+        skill_context = build_skill_context(
+            topic,
+            requirements,
+            context or "",
+            target_section or "",
+            focus="topic_research",
+            limit=6,
+        )
+        skill_directives = format_skill_directives(
+            skill_context,
+            sections=("draft_hints", "safety_hints"),
+            include_skills=True,
+        )
+        if skill_directives:
+            user_content += f"\nSkill directives:\n{skill_directives}\n"
+
         user_content += f"Research Data: {json.dumps(results, indent=2)}\n"
         
         is_piecemeal = False

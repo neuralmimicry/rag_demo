@@ -1,0 +1,136 @@
+[
+  {
+    "id": "testing",
+    "match": {
+      "keywords": ["test", "testing", "pytest", "qa"]
+    },
+    "directives": {
+      "plan_hints": [
+        "Include unit tests for critical paths and edge cases."
+      ],
+      "verification_hints": [
+        "Add a verification command that runs the test suite covering new code."
+      ]
+    }
+  },
+  {
+    "id": "api",
+    "match": {
+      "keywords": ["api", "rest", "graphql", "endpoint"]
+    },
+    "directives": {
+      "plan_hints": [
+        "Validate request inputs and return structured error responses."
+      ],
+      "coding_hints": [
+        "Document the request/response schema in code comments or docstrings."
+      ]
+    }
+  },
+  {
+    "id": "security",
+    "match": {
+      "keywords": ["security", "auth", "authentication", "authorisation", "authorization"]
+    },
+    "directives": {
+      "safety_hints": [
+        "Validate and sanitise all external inputs; avoid logging secrets."
+      ],
+      "coding_hints": [
+        "Fail fast on missing credentials and provide clear error messages."
+      ]
+    }
+  },
+  {
+    "id": "performance",
+    "match": {
+      "keywords": ["performance", "latency", "throughput", "scalability", "scale"]
+    },
+    "directives": {
+      "plan_hints": [
+        "Avoid O(N^2) loops and consider caching expensive operations."
+      ],
+      "verification_hints": [
+        "Include a lightweight benchmark or profiling check where feasible."
+      ]
+    }
+  },
+  {
+    "id": "data-pipeline",
+    "match": {
+      "keywords": ["data", "etl", "pipeline", "dataset", "csv", "parquet"]
+    },
+    "directives": {
+      "plan_hints": [
+        "Validate schema and handle missing/invalid records explicitly."
+      ],
+      "coding_hints": [
+        "Provide clear error handling or quarantine logic for bad records."
+      ]
+    }
+  },
+  {
+    "id": "database",
+    "match": {
+      "keywords": ["database", "sql", "postgres", "mysql", "sqlite"]
+    },
+    "directives": {
+      "plan_hints": [
+        "Use parameterised queries and avoid string interpolation for SQL."
+      ],
+      "coding_hints": [
+        "Plan for migrations when changing schema or indexes."
+      ]
+    }
+  },
+  {
+    "id": "cli",
+    "match": {
+      "keywords": ["cli", "command-line", "argparse"]
+    },
+    "directives": {
+      "plan_hints": [
+        "Add clear CLI usage/help output and validate required arguments."
+      ],
+      "verification_hints": [
+        "Add a verification step that runs the CLI with --help or a sample input."
+      ]
+    }
+  },
+  {
+    "id": "documentation",
+    "match": {
+      "keywords": ["documentation", "docs", "readme", "report"]
+    },
+    "directives": {
+      "draft_hints": [
+        "Summarise changes in a concise, structured format with clear headings."
+      ],
+      "plan_hints": [
+        "Update README or inline docstrings for non-obvious logic."
+      ]
+    }
+  },
+  {
+    "id": "frontend",
+    "match": {
+      "keywords": ["frontend", "ui", "ux", "css", "html"]
+    },
+    "directives": {
+      "plan_hints": [
+        "Ensure responsive layout and basic accessibility (labels, contrast)."
+      ]
+    }
+  },
+  {
+    "id": "logging",
+    "match": {
+      "keywords": ["logging", "observability", "metrics", "monitoring"]
+    },
+    "directives": {
+      "coding_hints": [
+        "Use structured logging with consistent context fields."
+      ]
+    }
+  }
+]

@@ -3,6 +3,10 @@ import sys
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
+try:
+    from security_utils import attach_redaction_filter
+except Exception:
+    attach_redaction_filter = None
 
 UK_TZ = ZoneInfo("Europe/London")
 UK_DATETIME_FORMAT = "%d/%m/%Y %H:%M:%S"
@@ -62,6 +66,12 @@ def setup_logging(verbose: bool = False, debug: bool = False, log_file: str = "r
         root_logger.addHandler(file_handler)
     except Exception as e:
         print(f"Warning: Could not setup log file {log_file}: {e}", file=sys.stderr)
+
+    if attach_redaction_filter:
+        try:
+            attach_redaction_filter(root_logger)
+        except Exception:
+            pass
 
     # Suppress some noisy third-party loggers unless debugging
     if not debug:
