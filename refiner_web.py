@@ -1,8 +1,11 @@
 import json
+import base64
+import hashlib
 import csv
 import io
 import logging
 import os
+import posixpath
 import queue
 import re
 import shlex
@@ -19,29 +22,121 @@ from collections import deque
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from typing import Any, Deque, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode, quote
 from zoneinfo import ZoneInfo
 
 import requests
 import shutil
 import statistics
 import tempfile
-from flask import Flask, Response, jsonify, render_template, request, redirect, session, url_for, send_from_directory, g
+from flask import (
+    Flask,
+    Response,
+    jsonify,
+    render_template,
+    request,
+    redirect,
+    session,
+    url_for,
+    send_from_directory,
+    g,
+    has_request_context,
+)
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 from llm_providers import get_provider, LLMError
 from file_converter import FileConverter
 from rag_engine import RagDocument, RagIndex, RagStore
+from stt_learning import SttLearningStore
+from stt_gesture_planner import plan_stt_avatar_motion, sanitize_avatar_mode, sanitize_gesture_mode
+from stt_rust_contracts import RustGesturePlanRequest, sanitize_rust_motion_response
 from mcp_client import MCPClient, MCPServerConfig, MCPServerStore
 from capabilities import get_capabilities, capability_summary, select_skills, format_skill_brief
+from refiner_routes.voice import register_voice_routes
+from refiner_routes.assistant import register_assistant_routes
+from refiner_routes.admin import register_admin_routes
+from refiner_routes.auth import register_auth_routes
+from refiner_routes.jobs import register_jobs_routes
+from security_utils import (
+    AuditLogger,
+    attach_redaction_filter,
+    ensure_dir_permissions,
+    ensure_file_permissions,
+    hash_identifier,
+)
 
 logger = logging.getLogger(__name__)
+try:
+    attach_redaction_filter(logging.getLogger())
+except Exception:
+    pass
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        value = value.strip()
+        if value:
+            return value
+    return default
+
+
+def _normalize_opencode_server_url() -> Optional[str]:
+    raw = os.getenv("OPENCODE_SERVER_URL")
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    if "://" not in cleaned:
+        cleaned = f"http://{cleaned}"
+    parsed = urlparse(cleaned)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return cleaned
+
+
+def _opencode_available_for_playground() -> bool:
+    if _normalize_opencode_server_url():
+        return True
+    opencode_bin = os.getenv("OPENCODE_BIN", "opencode")
+    return bool(shutil.which(opencode_bin))
 
 try:
     import redis  # type: ignore
 except Exception:
     redis = None
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken  # type: ignore
+except Exception:
+    Fernet = None
+    InvalidToken = Exception
+try:
+    from cryptography import x509  # type: ignore
+    from cryptography.hazmat.primitives import hashes  # type: ignore
+    from cryptography.hazmat.primitives.asymmetric import padding  # type: ignore
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat  # type: ignore
+except Exception:
+    x509 = None
+    hashes = None
+    padding = None
+    Encoding = None
+    PublicFormat = None
+try:
+    import jwt  # type: ignore
+except Exception:
+    jwt = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PUBLIC_DIR = os.path.join(BASE_DIR, "web", "public")
@@ -50,6 +145,170 @@ PROJECTS_ROOT = os.path.join(JOB_ROOT, "projects")
 SECRET_STORE_ROOT = os.path.join(JOB_ROOT, "secrets")
 USERS_PATH = os.path.join(JOB_ROOT, "users.json")
 WORKSPACE_ROOT = os.path.join(JOB_ROOT, "workspaces")
+AUDIT_LOG_PATH = os.getenv("REFINER_AUDIT_LOG_PATH", os.path.join(JOB_ROOT, "audit.log"))
+ACCESS_STORE_PATH = os.path.join(JOB_ROOT, "access.json")
+SESSIONS_ROOT = os.path.join(JOB_ROOT, "sessions")
+TODO_ROOT = os.path.join(JOB_ROOT, "todos")
+VOICE_TOKEN_PATH = os.path.join(JOB_ROOT, "voice_tokens.json")
+VOICE_DEFAULT_USER = (os.getenv("REFINER_VOICE_DEFAULT_USER") or "").strip()
+VOICE_ENV_TOKEN = (os.getenv("REFINER_VOICE_TOKEN") or "").strip()
+VOICE_ENV_TOKENS = (os.getenv("REFINER_VOICE_TOKENS") or "").strip()
+VOICE_USER_MAP_RAW = (os.getenv("REFINER_VOICE_USER_MAP") or "").strip()
+VOICE_ALLOW_TOKENS = _env_flag("REFINER_VOICE_ALLOW_TOKENS", True)
+VOICE_ALLOW_TOKENS_WITH_SIGNATURE = _env_flag("REFINER_VOICE_ALLOW_TOKENS_WITH_SIGNATURE", False)
+VOICE_VERIFY_ALEXA = _env_flag("REFINER_VOICE_VERIFY_ALEXA", False)
+VOICE_VERIFY_GOOGLE = _env_flag("REFINER_VOICE_VERIFY_GOOGLE", False)
+VOICE_ALLOW_NETWORK = _env_flag("REFINER_VOICE_ALLOW_NETWORK", False)
+STT_PUBLIC = _env_flag("REFINER_STT_PUBLIC", False)
+STT_TOKEN = (os.getenv("REFINER_STT_TOKEN") or "").strip()
+STT_COMMAND = (os.getenv("REFINER_STT_COMMAND") or "").strip()
+STT_ARGS = (os.getenv("REFINER_STT_ARGS") or "{audio}").strip()
+STT_OUTPUT_MODE = (os.getenv("REFINER_STT_OUTPUT") or "stdout").strip().lower()
+STT_OUTPUT_PATH_TEMPLATE = (os.getenv("REFINER_STT_OUTPUT_PATH") or "{audio}.json").strip()
+STT_TIMEOUT = float(os.getenv("REFINER_STT_TIMEOUT", "30"))
+STT_MAX_BYTES = int(os.getenv("REFINER_STT_MAX_BYTES", "6000000"))
+STT_PREPROCESS_COMMAND = (os.getenv("REFINER_STT_PREPROCESS_COMMAND") or "").strip()
+STT_PREPROCESS_ARGS = (os.getenv("REFINER_STT_PREPROCESS_ARGS") or "{input} {output}").strip()
+STT_PREPROCESS_EXT = (os.getenv("REFINER_STT_PREPROCESS_EXT") or ".wav").strip()
+STT_LANG_DEFAULT = (os.getenv("REFINER_STT_LANG") or "en-GB").strip()
+STT_BACKEND = (os.getenv("REFINER_STT_BACKEND") or "command").strip().lower()
+STT_SERVER_URL = (os.getenv("REFINER_STT_SERVER_URL") or "").strip()
+STT_SERVER_TIMEOUT = float(os.getenv("REFINER_STT_SERVER_TIMEOUT", "25"))
+STT_SERVER_PREPROCESS = _env_flag("REFINER_STT_SERVER_PREPROCESS", False)
+STT_SERVER_SEND_PROMPT = _env_flag("REFINER_STT_SERVER_SEND_PROMPT", False)
+STT_SERVER_RETRIES = max(0, int(os.getenv("REFINER_STT_SERVER_RETRIES", "2")))
+STT_SERVER_BACKOFF_BASE = max(0.0, float(os.getenv("REFINER_STT_SERVER_BACKOFF_BASE", "0.2")))
+STT_SERVER_BACKOFF_MAX = max(
+    STT_SERVER_BACKOFF_BASE,
+    float(os.getenv("REFINER_STT_SERVER_BACKOFF_MAX", "1.5")),
+)
+STT_SERVER_POOL_CONNECTIONS = max(1, int(os.getenv("REFINER_STT_SERVER_POOL_CONNECTIONS", "16")))
+STT_SERVER_POOL_MAXSIZE = max(1, int(os.getenv("REFINER_STT_SERVER_POOL_MAXSIZE", "32")))
+STT_MAX_CONCURRENT = max(1, int(os.getenv("REFINER_STT_MAX_CONCURRENT", "8")))
+STT_CAPACITY_WAIT_SEC = max(0.0, float(os.getenv("REFINER_STT_CAPACITY_WAIT_SEC", "0.35")))
+STT_LEARNING_ENABLED = _env_flag("REFINER_STT_LEARNING_ENABLED", True)
+STT_LEARNING_ROOT = os.path.join(JOB_ROOT, "stt_learning")
+STT_LEARNING_ALLOW_NETWORK = _env_flag("REFINER_STT_LEARNING_ALLOW_NETWORK", True)
+STT_LEARNING_PROMPT_TERMS = int(os.getenv("REFINER_STT_LEARNING_PROMPT_TERMS", "40"))
+STT_LEARNING_MIN_COUNT = int(os.getenv("REFINER_STT_LEARNING_MIN_COUNT", "3"))
+STT_LEARNING_MAX_MEMORY_DOCS = int(os.getenv("REFINER_STT_LEARNING_MAX_MEMORY_DOCS", "350"))
+STT_GESTURE_ENABLED = _env_flag("REFINER_STT_GESTURE_ENABLED", True)
+STT_BSL_ENABLED = _env_flag("REFINER_STT_BSL_ENABLED", True)
+STT_GESTURE_PREFER_SERVER = _env_flag("REFINER_STT_GESTURE_PREFER_SERVER", True)
+STT_GESTURE_RUST_FALLBACK = _env_flag("REFINER_STT_GESTURE_RUST_FALLBACK", True)
+STT_GESTURE_RUST_TIMEOUT = max(0.1, float(os.getenv("REFINER_STT_GESTURE_RUST_TIMEOUT", "4.0")))
+STT_GESTURE_DEFAULT_MODE = (os.getenv("REFINER_STT_GESTURE_DEFAULT_MODE") or "gesticulation").strip().lower()
+STT_GESTURE_DEFAULT_AVATAR_MODE = (os.getenv("REFINER_STT_GESTURE_DEFAULT_AVATAR_MODE") or "chat").strip().lower()
+_STT_SERVER_SESSION_LOCAL = threading.local()
+ASSISTANT_MAX_CONCURRENT = max(1, int(os.getenv("REFINER_ASSISTANT_MAX_CONCURRENT", "6")))
+ASSISTANT_CAPACITY_WAIT_SEC = max(0.0, float(os.getenv("REFINER_ASSISTANT_CAPACITY_WAIT_SEC", "0.5")))
+_STT_REQUEST_CAPACITY = threading.BoundedSemaphore(STT_MAX_CONCURRENT)
+_ASSISTANT_REQUEST_CAPACITY = threading.BoundedSemaphore(ASSISTANT_MAX_CONCURRENT)
+JOB_ACTION_WORKERS = max(1, int(os.getenv("REFINER_JOB_ACTION_WORKERS", "2")))
+JOB_ACTION_MAX_QUEUE = max(1, int(os.getenv("REFINER_JOB_ACTION_MAX_QUEUE", "64")))
+JOB_ACTION_TASK_TTL_SEC = max(60, int(os.getenv("REFINER_JOB_ACTION_TASK_TTL_SEC", "1800")))
+JOB_ACTION_TIMEOUT_SEC = max(5.0, float(os.getenv("REFINER_JOB_ACTION_TIMEOUT_SEC", "45")))
+EXTERNAL_HTTP_RETRIES = max(0, int(os.getenv("REFINER_EXTERNAL_HTTP_RETRIES", "2")))
+EXTERNAL_HTTP_BACKOFF_BASE = max(0.0, float(os.getenv("REFINER_EXTERNAL_HTTP_BACKOFF_BASE", "0.25")))
+EXTERNAL_HTTP_BACKOFF_MAX = max(
+    EXTERNAL_HTTP_BACKOFF_BASE,
+    float(os.getenv("REFINER_EXTERNAL_HTTP_BACKOFF_MAX", "2.0")),
+)
+STT_KB_LOCAL_PATHS = [
+    p.strip()
+    for p in (os.getenv("REFINER_STT_KB_LOCAL_PATHS") or "/home/pbisaacs/Developer/neuralmimicry.ai-website").split(",")
+    if p.strip()
+]
+STT_KB_SEED_URLS = [
+    u.strip()
+    for u in (os.getenv("REFINER_STT_KB_SEED_URLS") or "https://neuralmimicry.ai").split(",")
+    if u.strip()
+]
+ALEXA_CERT_TTL_SEC = int(os.getenv("REFINER_ALEXA_CERT_TTL_SEC", "3600"))
+ALEXA_REQUEST_TTL_SEC = int(os.getenv("REFINER_ALEXA_REQUEST_TTL_SEC", "150"))
+ALEXA_CERT_CACHE_PATH = (os.getenv("REFINER_ALEXA_CERT_CACHE_PATH") or "").strip()
+GOOGLE_CERTS_URL = (os.getenv("REFINER_GOOGLE_CERTS_URL") or "https://www.googleapis.com/oauth2/v3/certs").strip()
+GOOGLE_CERTS_PATH = (os.getenv("REFINER_GOOGLE_CERTS_PATH") or "").strip()
+GOOGLE_AUDIENCE_RAW = (os.getenv("REFINER_GOOGLE_ASSISTANT_AUDIENCE") or os.getenv("REFINER_GOOGLE_PROJECT_ID") or "").strip()
+GOOGLE_ISSUERS_RAW = (os.getenv("REFINER_GOOGLE_ASSISTANT_ISSUERS") or "").strip()
+
+
+def _parse_voice_env_tokens(raw: str, default_user: str) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    if not raw:
+        return mapping
+    for item in raw.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        token = ""
+        user = ""
+        if ":" in item:
+            token, user = item.split(":", 1)
+        elif "=" in item:
+            token, user = item.split("=", 1)
+        else:
+            token = item
+            user = default_user
+        token = token.strip()
+        user = user.strip() if user else default_user
+        if token:
+            mapping[token] = user
+    return mapping
+
+
+VOICE_ENV_TOKEN_MAP = _parse_voice_env_tokens(VOICE_ENV_TOKENS, VOICE_DEFAULT_USER)
+if VOICE_ENV_TOKEN:
+    if VOICE_ENV_TOKEN not in VOICE_ENV_TOKEN_MAP:
+        VOICE_ENV_TOKEN_MAP[VOICE_ENV_TOKEN] = VOICE_DEFAULT_USER
+
+
+def _split_csv(value: str) -> List[str]:
+    return [item.strip() for item in value.split(",") if item and item.strip()]
+
+
+def _parse_voice_user_map(raw: str) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    if not raw:
+        return mapping
+    for entry in raw.replace(";", ",").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            continue
+        key, user = entry.split("=", 1)
+        key = key.strip()
+        user = user.strip()
+        if not key or not user:
+            continue
+        mapping[key] = user
+    return mapping
+
+
+VOICE_USER_MAP = _parse_voice_user_map(VOICE_USER_MAP_RAW)
+GOOGLE_AUDIENCES = _split_csv(GOOGLE_AUDIENCE_RAW)
+GOOGLE_ISSUERS = _split_csv(GOOGLE_ISSUERS_RAW) or [
+    "https://accounts.google.com",
+    "accounts.google.com",
+]
+
+# SHA-256 SPKI hashes from Amazon Trust Services for Alexa request validation.
+ALEXA_TRUSTED_ROOT_SPKI = {
+    "fbe3018031f9586bcbf41727e417b7d1c45c2f47f93be372a17b96b50757d5a2",
+    "7f4296fc5b6a4e3b35d3c369623e364ab1af381d8fa7121533c9d6c633ea2461",
+    "36abc32656acfc645c61b71613c4bf21c787f5cabbee48348d58597803d7abc9",
+    "f7ecded5c66047d28ed6466b543c40e0743abe81d109254dcf845d4c2c7853c5",
+    "2b071c59a0a0ae76b0eadb2bad23bad4580b69c3601b630c2eaf0613afa83f92",
+}
+_alexa_env_spki = _split_csv(os.getenv("REFINER_ALEXA_ROOT_SPKI") or "")
+if _alexa_env_spki:
+    ALEXA_TRUSTED_ROOT_SPKI = {item.replace(":", "").lower() for item in _alexa_env_spki if item}
+SECRET_STORE_KEY = (os.getenv("REFINER_SECRET_STORE_KEY") or "").strip()
+SECRET_STORE_REQUIRE_ENCRYPTION = _env_flag("REFINER_SECRET_STORE_REQUIRE_ENCRYPTION", False)
+SECRET_STORE_ALLOW_PLAINTEXT = _env_flag("REFINER_SECRET_STORE_ALLOW_PLAINTEXT", False)
+if SECRET_STORE_REQUIRE_ENCRYPTION and not SECRET_STORE_KEY:
+    raise RuntimeError("REFINER_SECRET_STORE_KEY is required when encryption is enforced.")
 DEFAULT_FORK_ORG = os.getenv("REFINER_FORK_ORG", "neuralmimicry")
 DEFAULT_WORKERS = int(os.getenv("REFINER_WORKERS", "2"))
 DEFAULT_TAIL = int(os.getenv("REFINER_LOG_TAIL", "200"))
@@ -63,14 +322,18 @@ JOB_META_FILENAME = "job.json"
 JOB_META_VERSION = 1
 ACTIVE_WINDOW_SEC = int(os.getenv("REFINER_ACTIVE_WINDOW_SEC", "120"))
 LEDGER_ROOT = os.path.join(JOB_ROOT, "ledger")
+TEAM_LEDGER_ROOT = os.path.join(JOB_ROOT, "team_ledger")
 ESTIMATE_REPO_TTL_SEC = int(os.getenv("REFINER_ESTIMATE_REPO_TTL", "30"))
 ESTIMATE_REPO_MAX_FILES = int(os.getenv("REFINER_ESTIMATE_REPO_MAX_FILES", "900"))
 ESTIMATE_REPO_MAX_SEC = float(os.getenv("REFINER_ESTIMATE_REPO_MAX_SEC", "0.35"))
 ESTIMATE_REPO_MAX_FILE_BYTES = int(os.getenv("REFINER_ESTIMATE_REPO_MAX_FILE_BYTES", "300000"))
 ESTIMATE_REPO_SAMPLE_MULTIPLIER = float(os.getenv("REFINER_ESTIMATE_REPO_SAMPLE_MULTIPLIER", "1.6"))
 ESTIMATE_CALIBRATION_TTL_SEC = int(os.getenv("REFINER_ESTIMATE_CALIBRATION_TTL", "90"))
-DEFAULT_LLM_MAX_TOKENS = int(os.getenv("REFINER_DEFAULT_LLM_MAX_TOKENS", "6000"))
-RESUME_LLM_MAX_TOKENS_CAP = int(os.getenv("REFINER_RESUME_LLM_MAX_TOKENS_CAP", "12000"))
+DEFAULT_LLM_MAX_TOKENS = int(os.getenv("REFINER_DEFAULT_LLM_MAX_TOKENS", "24000"))
+RESUME_LLM_MAX_TOKENS_CAP = int(os.getenv("REFINER_RESUME_LLM_MAX_TOKENS_CAP", "48000"))
+JOB_RETENTION_DAYS = int(os.getenv("REFINER_JOB_RETENTION_DAYS", "0"))
+SESSION_TTL_SEC = int(os.getenv("REFINER_SESSION_TTL_SEC", "14400"))
+SESSION_HISTORY_MAX = int(os.getenv("REFINER_SESSION_HISTORY_MAX", "200"))
 UK_TZ = ZoneInfo("Europe/London")
 UK_DATETIME_FORMAT = "%d/%m/%Y %H:%M:%S"
 RAG_STORE_ROOT = os.path.join(JOB_ROOT, "rag")
@@ -94,6 +357,441 @@ except Exception:
 PORTAL_WEBHOOK_URL = (os.getenv("REFINER_PORTAL_WEBHOOK") or "").strip()
 PORTAL_WEBHOOK_TOKEN = (os.getenv("REFINER_PORTAL_WEBHOOK_TOKEN") or "").strip()
 PORTAL_WEBHOOK_TIMEOUT = int(os.getenv("REFINER_PORTAL_WEBHOOK_TIMEOUT", "12"))
+CONTINUUM_API_BASE = _env_first("CONTINUUM_API_BASE", "NMC_API_BASE", "NMC_SERVER_URL", default="").rstrip("/")
+CONTINUUM_AUTH_TOKEN = _env_first(
+    "CONTINUUM_BEARER_TOKEN",
+    "CONTINUUM_AUTH_TOKEN",
+    "NMC_OIDC_ACCESS_TOKEN",
+    "NMC_BEARER_TOKEN",
+    "NMC_AUTH_TOKEN",
+    default="",
+)
+CONTINUUM_TIMEOUT = float(os.getenv("CONTINUUM_TIMEOUT", "20"))
+CONTINUUM_VM_REGION = _env_first("CONTINUUM_VM_REGION", "NMC_VM_REGION", default="gb-mids")
+CONTINUUM_VM_SKU = _env_first("CONTINUUM_VM_SKU", "NMC_VM_SKU", default="standard-a2")
+CONTINUUM_VM_OS = _env_first("CONTINUUM_VM_OS", "NMC_VM_OS", default="ubuntu-22.04")
+CONTINUUM_VM_PUBLIC_KEY_ID = _env_first("CONTINUUM_VM_PUBLIC_KEY_ID", "NMC_VM_PUBLIC_KEY_ID", default="")
+CONTINUUM_VM_INIT_SCRIPT = (os.getenv("CONTINUUM_VM_INIT_SCRIPT") or "").strip()
+CONTINUUM_IDE_URL_TEMPLATE = _env_first("REFINER_IDE_URL_TEMPLATE", "CONTINUUM_IDE_URL_TEMPLATE", default="")
+CONTINUUM_PREVIEW_URL_TEMPLATE = _env_first("REFINER_PREVIEW_URL_TEMPLATE", "CONTINUUM_PREVIEW_URL_TEMPLATE", default="")
+CONTINUUM_IDE_FILE_URL_TEMPLATE = _env_first(
+    "REFINER_IDE_FILE_URL_TEMPLATE",
+    "CONTINUUM_IDE_FILE_URL_TEMPLATE",
+    default="",
+)
+if CONTINUUM_API_BASE and "://" not in CONTINUUM_API_BASE:
+    CONTINUUM_API_BASE = f"http://{CONTINUUM_API_BASE}"
+EDITOR_MAX_BYTES = int(os.getenv("REFINER_EDITOR_MAX_BYTES", "400000"))
+EDITOR_MAX_LIST = int(os.getenv("REFINER_EDITOR_MAX_LIST", "400"))
+EDITOR_MAX_SCAN = int(os.getenv("REFINER_EDITOR_MAX_SCAN", "2000"))
+EDITOR_MAX_DEPTH = int(os.getenv("REFINER_EDITOR_MAX_DEPTH", "6"))
+EDITOR_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".idea",
+    ".vscode",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".cache",
+    "dist",
+    "build",
+    "coverage",
+}
+
+ensure_dir_permissions(JOB_ROOT, mode=0o700)
+ensure_dir_permissions(PROJECTS_ROOT, mode=0o700)
+ensure_dir_permissions(SECRET_STORE_ROOT, mode=0o700)
+ensure_dir_permissions(WORKSPACE_ROOT, mode=0o700)
+ensure_dir_permissions(TEAM_LEDGER_ROOT, mode=0o700)
+audit_logger = AuditLogger(AUDIT_LOG_PATH)
+
+
+class _SafeFormatDict(dict):
+    def __missing__(self, key: str) -> str:
+        return ""
+
+
+def _continuum_enabled() -> bool:
+    return bool(CONTINUUM_API_BASE)
+
+
+def _continuum_ready() -> bool:
+    return bool(CONTINUUM_API_BASE and CONTINUUM_VM_PUBLIC_KEY_ID)
+
+
+def _continuum_headers() -> Dict[str, str]:
+    headers: Dict[str, str] = {"Accept": "application/json"}
+    if CONTINUUM_AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {CONTINUUM_AUTH_TOKEN}"
+        headers["X-NMC-Token"] = CONTINUUM_AUTH_TOKEN
+    return headers
+
+
+def _http_request_with_retry(
+    method: str,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    data: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: float = 20.0,
+    retries: Optional[int] = None,
+    retryable_statuses: Optional[set[int]] = None,
+) -> requests.Response:
+    """Issue an outbound HTTP request with bounded retries and exponential backoff."""
+    attempts = max(1, (EXTERNAL_HTTP_RETRIES if retries is None else int(retries)) + 1)
+    retryable = retryable_statuses or {408, 429, 500, 502, 503, 504}
+    response: Optional[requests.Response] = None
+    for attempt in range(attempts):
+        try:
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=json_body,
+                data=data,
+                params=params,
+                timeout=max(0.1, float(timeout)),
+            )
+        except requests.RequestException:
+            if attempt + 1 >= attempts:
+                raise
+            delay = min(
+                EXTERNAL_HTTP_BACKOFF_MAX,
+                max(0.0, EXTERNAL_HTTP_BACKOFF_BASE * (2 ** max(0, attempt))),
+            )
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        if response.status_code in retryable and attempt + 1 < attempts:
+            retry_after = (response.headers.get("Retry-After") or "").strip()
+            delay = 0.0
+            if retry_after:
+                try:
+                    delay = max(0.0, float(retry_after))
+                except Exception:
+                    delay = 0.0
+            if delay <= 0:
+                delay = min(
+                    EXTERNAL_HTTP_BACKOFF_MAX,
+                    max(0.0, EXTERNAL_HTTP_BACKOFF_BASE * (2 ** max(0, attempt))),
+                )
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        return response
+    if response is None:
+        raise RuntimeError("HTTP request failed before receiving a response.")
+    return response
+
+
+def _format_workspace_template(template: str, values: Dict[str, Any]) -> str:
+    if not template:
+        return ""
+    try:
+        return template.format_map(_SafeFormatDict(values))
+    except Exception:
+        return template
+
+
+def _workspace_template_vars(job: "Job", vm_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    repo_info = job.repo_info if isinstance(job.repo_info, dict) else {}
+    vm_data = vm_data or {}
+    return {
+        "job_id": job.job_id,
+        "project_name": job.project_name or "",
+        "owner": job.owner or "",
+        "repo": repo_info.get("repo") or "",
+        "repo_url": repo_info.get("repo_url") or repo_info.get("clone_url") or "",
+        "branch": repo_info.get("branch") or "",
+        "fork_org": repo_info.get("fork_org") or "",
+        "fork_repo": repo_info.get("fork_repo") or "",
+        "vm_id": vm_data.get("id") or "",
+        "vm_name": vm_data.get("name") or "",
+        "vm_region": vm_data.get("region") or CONTINUUM_VM_REGION,
+        "vm_sku": vm_data.get("sku") or CONTINUUM_VM_SKU,
+        "vm_status": vm_data.get("status") or "",
+    }
+
+
+def _continuum_request(
+    method: str,
+    path: str,
+    *,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout_sec: Optional[float] = None,
+    retries: Optional[int] = None,
+) -> requests.Response:
+    url = f"{CONTINUUM_API_BASE}{path}"
+    timeout = CONTINUUM_TIMEOUT if timeout_sec is None else timeout_sec
+    return _http_request_with_retry(
+        method=method,
+        url=url,
+        headers=_continuum_headers(),
+        json_body=json_body,
+        timeout=timeout,
+        retries=retries,
+    )
+
+
+def _editor_allowed(job: "Job") -> bool:
+    workflow = (job.payload.get("workflow") or job.workflow or "").strip().lower()
+    return workflow in {"project_solver", "project", "topic_research"}
+
+
+def _editor_root_candidates(job: "Job") -> List[Dict[str, Any]]:
+    roots: List[Dict[str, Any]] = []
+    workflow = (job.payload.get("workflow") or job.workflow or "").strip().lower()
+    job_dir = os.path.join(JOB_ROOT, job.job_id)
+    project_root = (job.payload.get("project_root") or job.payload.get("delivery_project_root") or "").strip()
+    repo_workspace = ""
+    if isinstance(job.repo_info, dict):
+        repo_workspace = str(job.repo_info.get("workspace") or "").strip()
+
+    if workflow in {"project_solver", "project"}:
+        if project_root and os.path.isdir(project_root):
+            roots.append({"id": "project", "label": "Project", "path": project_root})
+        if repo_workspace and os.path.isdir(repo_workspace) and repo_workspace != project_root:
+            roots.append({"id": "repo", "label": "Repo Workspace", "path": repo_workspace})
+    if workflow == "topic_research" and os.path.isdir(job_dir):
+        roots.append({"id": "job", "label": "Research Output", "path": job_dir})
+    return roots
+
+
+def _is_under_root(path: str, root: str) -> bool:
+    try:
+        path_real = os.path.realpath(path)
+        root_real = os.path.realpath(root)
+        return os.path.commonpath([path_real, root_real]) == root_real
+    except Exception:
+        return False
+
+
+def _editor_default_path(job: "Job", root: str) -> Optional[str]:
+    workflow = (job.payload.get("workflow") or job.workflow or "").strip().lower()
+    output_path = job.output_paths.get("primary") if isinstance(job.output_paths, dict) else None
+    if output_path and _is_under_root(output_path, root):
+        return os.path.relpath(output_path, root)
+    if workflow in {"project_solver", "project"}:
+        req_path = (job.payload.get("requirements_path") or "").strip()
+        if req_path and _is_under_root(req_path, root):
+            return os.path.relpath(req_path, root)
+    return _editor_latest_file(root)
+
+
+def _editor_latest_file(root: str) -> Optional[str]:
+    latest_path = None
+    latest_mtime = -1.0
+    root_real = os.path.realpath(root)
+    scanned = 0
+    for dirpath, dirs, files in os.walk(root_real):
+        rel_dir = os.path.relpath(dirpath, root_real)
+        if rel_dir == ".":
+            rel_dir = ""
+        depth = rel_dir.count(os.sep)
+        if depth >= EDITOR_MAX_DEPTH:
+            dirs[:] = []
+        dirs[:] = [d for d in dirs if d not in EDITOR_SKIP_DIRS]
+        for filename in files:
+            scanned += 1
+            if EDITOR_MAX_SCAN and scanned > EDITOR_MAX_SCAN:
+                return latest_path
+            full_path = os.path.join(dirpath, filename)
+            try:
+                stat = os.stat(full_path)
+            except Exception:
+                continue
+            if stat.st_mtime > latest_mtime:
+                latest_mtime = stat.st_mtime
+                rel_path = os.path.relpath(full_path, root_real)
+                latest_path = rel_path.replace("\\", "/")
+    return latest_path
+
+
+def _editor_root_by_id(job: "Job", root_id: str) -> Optional[Dict[str, Any]]:
+    for entry in _editor_root_candidates(job):
+        if entry.get("id") == root_id:
+            return entry
+    return None
+
+
+def _editor_normalize_rel(path: Optional[str]) -> str:
+    raw = (path or "").strip().replace("\\", "/")
+    if not raw or raw == "." or raw == "/":
+        return ""
+    raw = raw.lstrip("/")
+    normal = os.path.normpath(raw)
+    if normal in {".", ""}:
+        return ""
+    if normal.startswith(".."):
+        raise ValueError("invalid path")
+    return normal.replace("\\", "/")
+
+
+def _editor_join(root: str, rel: str) -> str:
+    root_real = os.path.realpath(root)
+    candidate = os.path.realpath(os.path.join(root_real, rel))
+    if os.path.commonpath([root_real, candidate]) != root_real:
+        raise ValueError("invalid path")
+    return candidate
+
+
+def _editor_list_dir(root: str, rel: str) -> Tuple[List[Dict[str, Any]], bool]:
+    abs_path = _editor_join(root, rel)
+    if not os.path.isdir(abs_path):
+        raise FileNotFoundError("directory not found")
+    entries: List[Dict[str, Any]] = []
+    truncated = False
+    try:
+        names = sorted(os.listdir(abs_path))
+    except Exception:
+        names = []
+    for name in names:
+        if name in EDITOR_SKIP_DIRS:
+            continue
+        full_path = os.path.join(abs_path, name)
+        rel_path = os.path.join(rel, name) if rel else name
+        rel_path = rel_path.replace("\\", "/")
+        try:
+            stat = os.stat(full_path)
+        except Exception:
+            continue
+        if os.path.isdir(full_path):
+            entries.append({"name": name, "path": rel_path, "type": "dir", "modified": stat.st_mtime})
+        else:
+            entries.append(
+                {
+                    "name": name,
+                    "path": rel_path,
+                    "type": "file",
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                }
+            )
+        if EDITOR_MAX_LIST and len(entries) >= EDITOR_MAX_LIST:
+            truncated = True
+            break
+    entries.sort(key=lambda e: (0 if e.get("type") == "dir" else 1, e.get("name") or ""))
+    return entries, truncated
+
+
+def _editor_read_file(root: str, rel: str) -> Dict[str, Any]:
+    abs_path = _editor_join(root, rel)
+    if not os.path.exists(abs_path):
+        raise FileNotFoundError("file not found")
+    if not os.path.isfile(abs_path):
+        raise IsADirectoryError("path is a directory")
+    size = os.path.getsize(abs_path)
+    if EDITOR_MAX_BYTES and size > EDITOR_MAX_BYTES:
+        raise ValueError("file too large")
+    with open(abs_path, "rb") as handle:
+        data = handle.read(EDITOR_MAX_BYTES + 1)
+    if EDITOR_MAX_BYTES and len(data) > EDITOR_MAX_BYTES:
+        raise ValueError("file too large")
+    if b"\x00" in data:
+        raise ValueError("binary file")
+    content = data.decode("utf-8", errors="replace")
+    stat = os.stat(abs_path)
+    return {"content": content, "size": stat.st_size, "modified": stat.st_mtime}
+
+
+def _editor_write_file(root: str, rel: str, content: str) -> Dict[str, Any]:
+    abs_path = _editor_join(root, rel)
+    parent = os.path.dirname(abs_path)
+    os.makedirs(parent, exist_ok=True)
+    encoded = content.encode("utf-8")
+    if EDITOR_MAX_BYTES and len(encoded) > EDITOR_MAX_BYTES:
+        raise ValueError("file too large")
+    with open(abs_path, "wb") as handle:
+        handle.write(encoded)
+    stat = os.stat(abs_path)
+    return {"size": stat.st_size, "modified": stat.st_mtime}
+
+
+def _editor_create_file(root: str, rel: str, content: str = "") -> Dict[str, Any]:
+    abs_path = _editor_join(root, rel)
+    if os.path.exists(abs_path):
+        raise ValueError("already_exists")
+    parent = os.path.dirname(abs_path)
+    os.makedirs(parent, exist_ok=True)
+    encoded = content.encode("utf-8")
+    if EDITOR_MAX_BYTES and len(encoded) > EDITOR_MAX_BYTES:
+        raise ValueError("file too large")
+    with open(abs_path, "wb") as handle:
+        handle.write(encoded)
+    stat = os.stat(abs_path)
+    return {"size": stat.st_size, "modified": stat.st_mtime}
+
+
+def _editor_delete_path(root: str, rel: str, *, force: bool = False) -> Dict[str, Any]:
+    abs_path = _editor_join(root, rel)
+    if not os.path.exists(abs_path):
+        raise FileNotFoundError("not_found")
+    if os.path.isdir(abs_path):
+        if os.listdir(abs_path):
+            if not force:
+                raise ValueError("dir_not_empty")
+            shutil.rmtree(abs_path)
+            return {"deleted": True, "type": "dir", "recursive": True}
+        os.rmdir(abs_path)
+        return {"deleted": True, "type": "dir"}
+    os.remove(abs_path)
+    return {"deleted": True, "type": "file"}
+
+
+def _editor_rename_path(root: str, rel: str, new_rel: str) -> Dict[str, Any]:
+    src_path = _editor_join(root, rel)
+    dest_path = _editor_join(root, new_rel)
+    if not os.path.exists(src_path):
+        raise FileNotFoundError("not_found")
+    if os.path.exists(dest_path):
+        raise ValueError("already_exists")
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    os.rename(src_path, dest_path)
+    return {"renamed": True, "path": new_rel}
+
+
+def _editor_create_dir(root: str, rel: str) -> Dict[str, Any]:
+    abs_path = _editor_join(root, rel)
+    if os.path.exists(abs_path):
+        raise ValueError("already_exists")
+    os.makedirs(abs_path, exist_ok=False)
+    stat = os.stat(abs_path)
+    return {"created": True, "type": "dir", "modified": stat.st_mtime}
+
+
+def _workspace_file_open_url(
+    job: "Job",
+    root_entry: Dict[str, Any],
+    rel_path: str,
+) -> Tuple[Optional[str], bool]:
+    workspace_env = job.workspace_env if isinstance(job.workspace_env, dict) else {}
+    ide_url = str(workspace_env.get("ide_url") or "").strip()
+    if not ide_url:
+        return None, False
+    template = CONTINUUM_IDE_FILE_URL_TEMPLATE
+    if template:
+        vm_data = workspace_env.get("vm") if isinstance(workspace_env.get("vm"), dict) else {}
+        values = _workspace_template_vars(job, vm_data)
+        values.update(
+            {
+                "ide_url": ide_url,
+                "path": rel_path,
+                "path_url": quote(rel_path),
+                "root_id": root_entry.get("id") or "",
+                "root_label": root_entry.get("label") or "",
+            }
+        )
+        rendered = _format_workspace_template(template, values)
+        if rendered:
+            return rendered, True
+    return ide_url, False
 
 ESTIMATE_TEXT_EXTS = {
     ".py",
@@ -157,14 +855,13 @@ _estimate_repo_cache_lock = threading.Lock()
 _estimate_calibration_cache: Dict[str, Any] = {"ts": 0.0, "data": {}, "job_count": 0}
 
 app = Flask(__name__, static_folder="web/static", template_folder="web/templates")
-app.secret_key = os.getenv("REFINER_SECRET_KEY") or os.urandom(32)
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+SECRET_KEY_REQUIRED = _env_flag("REFINER_REQUIRE_SECRET_KEY", False)
+_secret_key_env = os.getenv("REFINER_SECRET_KEY")
+if SECRET_KEY_REQUIRED and not _secret_key_env:
+    raise RuntimeError("REFINER_SECRET_KEY is required for secure session management.")
+if not _secret_key_env:
+    logger.warning("REFINER_SECRET_KEY not set; using a transient session key.")
+app.secret_key = _secret_key_env or os.urandom(32)
 
 
 def _env_list(name: str) -> List[str]:
@@ -175,6 +872,18 @@ def _env_list(name: str) -> List[str]:
         if not entry:
             continue
         items.append(entry.rstrip("/"))
+    return items
+
+
+def _env_list_any(*names: str) -> List[str]:
+    items: List[str] = []
+    seen = set()
+    for name in names:
+        for entry in _env_list(name):
+            if entry in seen:
+                continue
+            items.append(entry)
+            seen.add(entry)
     return items
 
 
@@ -221,6 +930,8 @@ if METRICS_ENABLED:
     JOBS_BY_STATUS = Gauge("refiner_jobs_total", "Jobs by status", ["status"])
     JOB_QUEUE_DEPTH = Gauge("refiner_job_queue_depth", "Job queue depth")
     WORKER_COUNT = Gauge("refiner_worker_threads", "Worker threads")
+    JOB_ACTION_QUEUE_DEPTH = Gauge("refiner_job_action_queue_depth", "Job action queue depth")
+    JOB_ACTION_INFLIGHT = Gauge("refiner_job_action_inflight", "Job action tasks currently running")
     UPTIME = Gauge("refiner_uptime_seconds", "Application uptime in seconds")
 
 
@@ -236,6 +947,52 @@ if not COOKIE_SAMESITE:
     COOKIE_SAMESITE = "None" if CORS_ORIGINS else "Lax"
 SECURE_COOKIES = _env_flag("REFINER_SECURE_COOKIES", COOKIE_SAMESITE == "None")
 ENFORCE_HTTPS = _env_flag("REFINER_ENFORCE_HTTPS", False)
+CSRF_ORIGIN_CHECK = _env_flag("REFINER_CSRF_ORIGIN_CHECK", True)
+CSP_POLICY = (os.getenv("REFINER_CSP_POLICY") or "").strip()
+AUTH_MODE = _env_first("REFINER_AUTH_MODE", "NM_AUTH_MODE", default="local").strip().lower()
+
+OIDC_ENABLED = _env_flag("REFINER_OIDC_ENABLED", _env_flag("NM_OIDC_ENABLED", False))
+OIDC_ISSUER = _env_first("REFINER_OIDC_ISSUER", "NM_OIDC_ISSUER")
+OIDC_CLIENT_ID = _env_first("REFINER_OIDC_CLIENT_ID", "NM_OIDC_CLIENT_ID")
+OIDC_CLIENT_SECRET = _env_first("REFINER_OIDC_CLIENT_SECRET", "NM_OIDC_CLIENT_SECRET")
+OIDC_REDIRECT_URI = _env_first("REFINER_OIDC_REDIRECT_URI", "NM_OIDC_REDIRECT_URI", "NM_OIDC_REDIRECT_URL")
+OIDC_SCOPE = _env_first("REFINER_OIDC_SCOPE", "NM_OIDC_SCOPE", default="openid email profile")
+OIDC_USERNAME_CLAIM = _env_first("REFINER_OIDC_USERNAME_CLAIM", "NM_OIDC_USERNAME_CLAIM", default="email")
+OIDC_EMAIL_CLAIM = _env_first("REFINER_OIDC_EMAIL_CLAIM", "NM_OIDC_EMAIL_CLAIM", default="email")
+OIDC_GROUPS_CLAIM = _env_first("REFINER_OIDC_GROUPS_CLAIM", "NM_OIDC_GROUPS_CLAIM", default="groups")
+OIDC_ADMIN_DOMAINS = _env_list_any("REFINER_OIDC_ADMIN_DOMAINS", "NM_OIDC_ADMIN_DOMAINS")
+OIDC_ADMIN_GROUPS = _env_list_any("REFINER_OIDC_ADMIN_GROUPS", "NM_OIDC_ADMIN_GROUPS")
+OIDC_DISCOVERY_TTL = int(_env_first("REFINER_OIDC_DISCOVERY_TTL", "NM_OIDC_DISCOVERY_TTL", default="3600"))
+OIDC_JWT_LEEWAY = int(_env_first("REFINER_OIDC_JWT_LEEWAY", "NM_OIDC_JWT_LEEWAY", default="120"))
+OIDC_SKIP_JWT_VERIFY = _env_flag("REFINER_OIDC_SKIP_JWT_VERIFY", _env_flag("NM_OIDC_SKIP_JWT_VERIFY", False))
+OIDC_USE_USERINFO = _env_flag("REFINER_OIDC_USE_USERINFO", _env_flag("NM_OIDC_USE_USERINFO", False))
+OIDC_BUTTON_LABEL = _env_first("REFINER_OIDC_BUTTON_LABEL", "NM_OIDC_BUTTON_LABEL", default="Sign in with SSO")
+OIDC_REQUIRE_CONFIG = _env_flag("REFINER_OIDC_REQUIRE_CONFIG", _env_flag("NM_OIDC_REQUIRE_CONFIG", True))
+OIDC_CLIENT_AUTH = _env_first("REFINER_OIDC_CLIENT_AUTH", "NM_OIDC_CLIENT_AUTH", default="basic").strip().lower()
+OIDC_ALLOWED_AUDIENCES = _env_list_any(
+    "REFINER_OIDC_ALLOWED_AUDIENCES",
+    "REFINER_OIDC_AUDIENCE",
+    "NM_OIDC_ALLOWED_AUDIENCES",
+    "NM_OIDC_AUDIENCE",
+)
+OIDC_ALLOWED_REDIRECT_URIS = _env_list_any("REFINER_OIDC_ALLOWED_REDIRECT_URIS", "NM_OIDC_ALLOWED_REDIRECT_URIS")
+
+if AUTH_MODE not in {"local", "oidc", "mixed"}:
+    raise RuntimeError("REFINER_AUTH_MODE must be one of local, oidc, mixed.")
+if AUTH_MODE == "oidc":
+    OIDC_ENABLED = True
+if OIDC_ENABLED and OIDC_REQUIRE_CONFIG:
+    if not OIDC_ISSUER or not OIDC_CLIENT_ID:
+        raise RuntimeError("OIDC enabled but REFINER_OIDC_ISSUER or REFINER_OIDC_CLIENT_ID missing.")
+OIDC_EXCHANGE_ENABLED = _env_flag(
+    "REFINER_OIDC_EXCHANGE_ENABLED",
+    _env_flag("NM_OIDC_EXCHANGE_ENABLED", OIDC_ENABLED),
+)
+PASSWORD_MIN_LEN = int(os.getenv("REFINER_PASSWORD_MIN_LENGTH", "12"))
+LOGIN_WINDOW_SEC = int(os.getenv("REFINER_LOGIN_WINDOW_SEC", "300"))
+LOGIN_MAX_ATTEMPTS = int(os.getenv("REFINER_LOGIN_MAX_ATTEMPTS", "10"))
+
+_LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
 
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -243,6 +1000,106 @@ app.config.update(
     SESSION_COOKIE_SECURE=SECURE_COOKIES,
     SESSION_COOKIE_DOMAIN=COOKIE_DOMAIN,
 )
+
+def _client_ip() -> str:
+    forwarded = request.headers.get("X-Forwarded-For") if request else None
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
+def _login_key(username: str) -> str:
+    return f"{username}:{_client_ip()}"
+
+
+def _record_login_attempt(username: str, ok: bool) -> None:
+    key = _login_key(username)
+    now = time.time()
+    attempts = _LOGIN_ATTEMPTS.get(key, [])
+    attempts = [t for t in attempts if now - t < LOGIN_WINDOW_SEC]
+    if not ok:
+        attempts.append(now)
+    _LOGIN_ATTEMPTS[key] = attempts
+
+
+def _login_throttled(username: str) -> bool:
+    key = _login_key(username)
+    now = time.time()
+    attempts = _LOGIN_ATTEMPTS.get(key, [])
+    attempts = [t for t in attempts if now - t < LOGIN_WINDOW_SEC]
+    _LOGIN_ATTEMPTS[key] = attempts
+    return len(attempts) >= LOGIN_MAX_ATTEMPTS
+
+
+def _audit_event(action: str, *, actor: Optional[str], status: str, details: Optional[Dict[str, object]] = None) -> None:
+    safe_details = details or {}
+    if has_request_context():
+        ip = _client_ip()
+        if ip:
+            safe_details = dict(safe_details)
+            safe_details.setdefault("ip_hash", hash_identifier(ip))
+        agent = request.headers.get("User-Agent")
+        if agent:
+            safe_details = dict(safe_details)
+            safe_details.setdefault("user_agent", agent[:200])
+    audit_logger.log(action, actor=actor, status=status, details=safe_details)
+
+
+def _read_audit_entries(limit: int = 60, actions: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    if limit <= 0:
+        return []
+    action_set = {str(action).strip() for action in (actions or []) if str(action).strip()}
+    try:
+        lines = deque(maxlen=max(limit * 5, limit))
+        if not os.path.exists(AUDIT_LOG_PATH):
+            return []
+        with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    lines.append(line)
+        entries: List[Dict[str, Any]] = []
+        for line in reversed(lines):
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            if action_set and entry.get("action") not in action_set:
+                continue
+            entries.append(entry)
+            if len(entries) >= limit:
+                break
+        return entries
+    except Exception:
+        return []
+
+
+def _oidc_role_from_claims(claims: Dict[str, Any]) -> str:
+    if not claims:
+        return "user"
+    email = claims.get(OIDC_EMAIL_CLAIM) or claims.get("email")
+    if isinstance(email, str) and OIDC_ADMIN_DOMAINS:
+        domain = email.split("@")[-1].lower() if "@" in email else ""
+        if domain and domain in {d.lower() for d in OIDC_ADMIN_DOMAINS}:
+            return "admin"
+    groups = claims.get(OIDC_GROUPS_CLAIM) or claims.get("groups")
+    group_values: List[str] = []
+    if isinstance(groups, str):
+        group_values = [g.strip() for g in groups.split(",") if g.strip()]
+    elif isinstance(groups, list):
+        group_values = [str(g).strip() for g in groups if str(g).strip()]
+    if OIDC_ADMIN_GROUPS and group_values:
+        wanted = {g.lower() for g in OIDC_ADMIN_GROUPS}
+        if any(g.lower() in wanted for g in group_values):
+            return "admin"
+    return "user"
+
+
+def _oidc_username_from_claims(claims: Dict[str, Any]) -> str:
+    for key in (OIDC_USERNAME_CLAIM, "preferred_username", "email", "sub"):
+        value = claims.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 SSO_TTL_SECONDS = int(os.getenv("REFINER_SSO_TTL", "300"))
 SSO_STORE_MODE = (os.getenv("REFINER_SSO_STORE") or "auto").strip().lower()
@@ -522,17 +1379,217 @@ if _env_flag("REFINER_TRUST_PROXY", False):
 
 
 def _ensure_dirs() -> None:
-    os.makedirs(JOB_ROOT, exist_ok=True)
-    os.makedirs(PROJECTS_ROOT, exist_ok=True)
-    os.makedirs(SECRET_STORE_ROOT, exist_ok=True)
-    os.makedirs(WORKSPACE_ROOT, exist_ok=True)
-    os.makedirs(LEDGER_ROOT, exist_ok=True)
-    os.makedirs(RAG_STORE_ROOT, exist_ok=True)
-    os.makedirs(MCP_STORE_ROOT, exist_ok=True)
+    ensure_dir_permissions(JOB_ROOT, mode=0o700)
+    ensure_dir_permissions(PROJECTS_ROOT, mode=0o700)
+    ensure_dir_permissions(SECRET_STORE_ROOT, mode=0o700)
+    ensure_dir_permissions(WORKSPACE_ROOT, mode=0o700)
+    ensure_dir_permissions(LEDGER_ROOT, mode=0o700)
+    ensure_dir_permissions(TEAM_LEDGER_ROOT, mode=0o700)
+    ensure_dir_permissions(RAG_STORE_ROOT, mode=0o700)
+    ensure_dir_permissions(MCP_STORE_ROOT, mode=0o700)
+    ensure_dir_permissions(SESSIONS_ROOT, mode=0o700)
 
 
 def _now_iso() -> str:
     return dt.datetime.now(UK_TZ).strftime(UK_DATETIME_FORMAT)
+
+
+_OIDC_CACHE: Dict[str, Any] = {"ts": 0.0, "config": None, "jwks": None}
+
+
+def _oidc_discovery() -> Optional[Dict[str, Any]]:
+    if not OIDC_ENABLED or not OIDC_ISSUER:
+        return None
+    now = time.time()
+    cached = _OIDC_CACHE.get("config")
+    if cached and (now - float(_OIDC_CACHE.get("ts", 0.0)) < OIDC_DISCOVERY_TTL):
+        return cached
+    url = OIDC_ISSUER.rstrip("/") + "/.well-known/openid-configuration"
+    resp = requests.get(url, timeout=12)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("OIDC discovery failed (invalid JSON).")
+    issuer = data.get("issuer")
+    if issuer and issuer.rstrip("/") != OIDC_ISSUER.rstrip("/"):
+        raise RuntimeError("OIDC issuer mismatch.")
+    _OIDC_CACHE["config"] = data
+    _OIDC_CACHE["ts"] = now
+    return data
+
+
+def _oidc_jwks() -> Optional[Dict[str, Any]]:
+    config = _oidc_discovery()
+    if not config:
+        return None
+    jwks = _OIDC_CACHE.get("jwks")
+    if jwks and (time.time() - float(_OIDC_CACHE.get("ts", 0.0)) < OIDC_DISCOVERY_TTL):
+        return jwks
+    jwks_uri = config.get("jwks_uri")
+    if not jwks_uri:
+        return None
+    resp = requests.get(jwks_uri, timeout=12)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict):
+        _OIDC_CACHE["jwks"] = data
+        _OIDC_CACHE["ts"] = time.time()
+        return data
+    return None
+
+
+def _b64url_decode(value: str) -> bytes:
+    if not value:
+        return b""
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def _parse_jwt(token: str) -> Tuple[Dict[str, Any], Dict[str, Any], bytes, bytes]:
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise RuntimeError("Invalid JWT format.")
+    header = json.loads(_b64url_decode(parts[0]).decode("utf-8"))
+    payload = json.loads(_b64url_decode(parts[1]).decode("utf-8"))
+    signature = _b64url_decode(parts[2])
+    signing_input = ".".join(parts[:2]).encode("utf-8")
+    return header, payload, signature, signing_input
+
+
+def _jwk_to_public_key(jwk: Dict[str, Any]):
+    if not jwk:
+        return None
+    if jwk.get("kty") != "RSA":
+        return None
+    n = jwk.get("n")
+    e = jwk.get("e")
+    if not n or not e:
+        return None
+    n_int = int.from_bytes(_b64url_decode(n), "big")
+    e_int = int.from_bytes(_b64url_decode(e), "big")
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    public_numbers = rsa.RSAPublicNumbers(e_int, n_int)
+    return public_numbers.public_key()
+
+
+def _verify_jwt(token: str, *, nonce: Optional[str]) -> Dict[str, Any]:
+    header, payload, signature, signing_input = _parse_jwt(token)
+    if not OIDC_SKIP_JWT_VERIFY:
+        alg = header.get("alg")
+        if alg != "RS256":
+            raise RuntimeError("Unsupported JWT algorithm.")
+        jwks = _oidc_jwks() or {}
+        keys = jwks.get("keys") if isinstance(jwks, dict) else None
+        if not isinstance(keys, list) or not keys:
+            raise RuntimeError("JWKS missing.")
+        kid = header.get("kid")
+        jwk = None
+        if kid:
+            jwk = next((k for k in keys if k.get("kid") == kid), None)
+        if not jwk:
+            jwk = keys[0]
+        public_key = _jwk_to_public_key(jwk)
+        if not public_key:
+            raise RuntimeError("Unsupported JWKS key.")
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives import hashes
+
+        public_key.verify(signature, signing_input, padding.PKCS1v15(), hashes.SHA256())
+    now = int(time.time())
+    iss = payload.get("iss")
+    if iss and iss.rstrip("/") != OIDC_ISSUER.rstrip("/"):
+        raise RuntimeError("OIDC issuer mismatch.")
+    allowed_audiences = {OIDC_CLIENT_ID} if OIDC_CLIENT_ID else set()
+    if OIDC_ALLOWED_AUDIENCES:
+        allowed_audiences.update({aud.strip() for aud in OIDC_ALLOWED_AUDIENCES if aud and aud.strip()})
+    aud = payload.get("aud")
+    if isinstance(aud, list):
+        if allowed_audiences and not any(item in allowed_audiences for item in aud):
+            raise RuntimeError("OIDC audience mismatch.")
+    elif aud:
+        if allowed_audiences and aud not in allowed_audiences:
+            raise RuntimeError("OIDC audience mismatch.")
+    exp = payload.get("exp")
+    if exp and (now - OIDC_JWT_LEEWAY) > int(exp):
+        raise RuntimeError("OIDC token expired.")
+    if nonce:
+        token_nonce = payload.get("nonce")
+        if token_nonce and token_nonce != nonce:
+            raise RuntimeError("OIDC nonce mismatch.")
+    return payload
+
+
+def _oidc_maybe_enrich_claims(
+    claims: Dict[str, Any],
+    access_token: Optional[str],
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not claims or not access_token:
+        return claims
+    if not (OIDC_USE_USERINFO or not claims.get(OIDC_EMAIL_CLAIM)):
+        return claims
+    if config is None:
+        config = _oidc_discovery()
+    userinfo_endpoint = config.get("userinfo_endpoint") if isinstance(config, dict) else None
+    if not userinfo_endpoint:
+        return claims
+    try:
+        info_resp = requests.get(
+            userinfo_endpoint,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=12,
+        )
+    except Exception as exc:
+        logger.debug("OIDC userinfo request failed: %s", exc)
+        return claims
+    if info_resp.status_code >= 400:
+        return claims
+    try:
+        info_data = info_resp.json()
+    except Exception:
+        return claims
+    if isinstance(info_data, dict):
+        claims.update(info_data)
+    return claims
+
+
+def _oidc_redirect_uri() -> str:
+    if OIDC_REDIRECT_URI:
+        return OIDC_REDIRECT_URI
+    if SITE_BASE:
+        return f"{SITE_BASE.rstrip('/')}/oidc/callback"
+    if has_request_context():
+        return request.host_url.rstrip("/") + "/oidc/callback"
+    return "/oidc/callback"
+
+
+def _oidc_allowed_redirect_uris() -> List[str]:
+    candidates: List[str] = []
+    if OIDC_REDIRECT_URI:
+        candidates.append(OIDC_REDIRECT_URI)
+    if SITE_BASE:
+        candidates.append(f"{SITE_BASE.rstrip('/')}/oidc/callback")
+    if has_request_context():
+        candidates.append(request.host_url.rstrip("/") + "/oidc/callback")
+    candidates.extend([uri for uri in OIDC_ALLOWED_REDIRECT_URIS if uri])
+    seen: set[str] = set()
+    cleaned: List[str] = []
+    for uri in candidates:
+        value = uri.strip().rstrip("/")
+        if value and value not in seen:
+            cleaned.append(value)
+            seen.add(value)
+    return cleaned
+
+
+def _oidc_is_redirect_allowed(redirect_uri: str) -> bool:
+    if not redirect_uri:
+        return False
+    candidate = redirect_uri.strip().rstrip("/")
+    allowed = _oidc_allowed_redirect_uris()
+    return candidate in allowed
 
 
 def _parse_timestamp(value: Optional[str]) -> Optional[dt.datetime]:
@@ -609,6 +1666,24 @@ class SecretStore:
         self.path = path
         self.lock = threading.RLock()
         self.data: Dict[str, Dict[str, str]] = {}
+        self._fernet: Optional[object] = None
+        if SECRET_STORE_KEY:
+            if not Fernet:
+                if SECRET_STORE_REQUIRE_ENCRYPTION:
+                    raise RuntimeError("Secret store encryption required but cryptography is unavailable.")
+                logger.warning("Secret store encryption key provided but cryptography is unavailable.")
+            else:
+                try:
+                    key = SECRET_STORE_KEY.encode("utf-8")
+                    try:
+                        self._fernet = Fernet(key)
+                    except Exception:
+                        derived = base64.urlsafe_b64encode(hashlib.sha256(key).digest())
+                        self._fernet = Fernet(derived)
+                except Exception as exc:
+                    if SECRET_STORE_REQUIRE_ENCRYPTION:
+                        raise RuntimeError("Secret store encryption key invalid.") from exc
+                    logger.warning("Secret store encryption disabled due to key error: %s", exc)
         self._load()
 
     def _load(self) -> None:
@@ -621,6 +1696,30 @@ class SecretStore:
                 self.data = data
         except Exception:
             self.data = {}
+
+    def _encrypt_value(self, value: str) -> Dict[str, str]:
+        if not self._fernet:
+            return {"value": value}
+        token = self._fernet.encrypt(value.encode("utf-8")).decode("utf-8")
+        return {"value": token, "enc": "fernet"}
+
+    def _decrypt_entry(self, entry: Dict[str, str]) -> Optional[str]:
+        if not entry:
+            return None
+        enc = entry.get("enc")
+        value = entry.get("value") if isinstance(entry, dict) else None
+        if not enc:
+            if SECRET_STORE_KEY and not SECRET_STORE_ALLOW_PLAINTEXT:
+                return None
+            return value
+        if enc == "fernet":
+            if not self._fernet:
+                return None
+            try:
+                return self._fernet.decrypt(value.encode("utf-8")).decode("utf-8")
+            except Exception:
+                return None
+        return None
 
     def _write(self) -> None:
         tmp = f"{self.path}.tmp"
@@ -651,7 +1750,9 @@ class SecretStore:
 
     def set(self, name: str, value: str) -> None:
         with self.lock:
-            self.data[name] = {"value": value, "updated_at": _now_iso()}
+            payload = self._encrypt_value(value)
+            payload["updated_at"] = _now_iso()
+            self.data[name] = payload
             self._write()
 
     def delete(self, name: str) -> bool:
@@ -667,7 +1768,9 @@ class SecretStore:
             env = {}
             for name, entry in self.data.items():
                 if isinstance(entry, dict) and entry.get("value"):
-                    env[name] = entry["value"]
+                    value = self._decrypt_entry(entry)
+                    if value:
+                        env[name] = value
             return env
 
     @staticmethod
@@ -746,6 +1849,29 @@ class UserStore:
                 self.users[username]["email"] = email
             self._write()
 
+    def upsert_external_user(
+        self,
+        username: str,
+        *,
+        role: str = "user",
+        email: Optional[str] = None,
+        provider: str = "oidc",
+        subject: Optional[str] = None,
+    ) -> None:
+        with self.lock:
+            entry = self.users.get(username, {})
+            if "created_at" not in entry:
+                entry["created_at"] = _now_iso()
+            entry["role"] = role
+            entry["external"] = True
+            entry["provider"] = provider
+            if subject:
+                entry["subject"] = subject
+            if email:
+                entry["email"] = email
+            self.users[username] = entry
+            self._write()
+
     def set_email(self, username: str, email: Optional[str]) -> bool:
         with self.lock:
             entry = self.users.get(username)
@@ -776,6 +1902,936 @@ class UserStore:
             entry = self.users.get(username) or {}
             return entry.get("role")
 
+
+class AccessStore:
+    def __init__(self, path: str):
+        self.path = path
+        self.lock = threading.RLock()
+        self.data: Dict[str, Any] = {"version": 1, "teams": {}, "projects": {}}
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                self.data.update(data)
+        except Exception:
+            self.data = {"version": 1, "teams": {}, "projects": {}}
+
+    def _write(self) -> None:
+        tmp = f"{self.path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(self.data, handle, indent=2)
+            os.replace(tmp, self.path)
+            try:
+                os.chmod(self.path, 0o600)
+            except Exception:
+                pass
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _normalise_users(values: Optional[object]) -> List[str]:
+        if values is None:
+            return []
+        if isinstance(values, str):
+            values = [item.strip() for item in values.split(",") if item.strip()]
+        if not isinstance(values, list):
+            return []
+        seen = set()
+        cleaned: List[str] = []
+        for value in values:
+            name = str(value or "").strip()
+            if not name or name in seen:
+                continue
+            cleaned.append(name)
+            seen.add(name)
+        return cleaned
+
+    @staticmethod
+    def _normalise_permissions(value: Optional[Dict[str, Any]]) -> Dict[str, List[str]]:
+        if not isinstance(value, dict):
+            return {"read": [], "write": [], "grant": []}
+        read = AccessStore._normalise_users(value.get("read") if isinstance(value.get("read"), list) else value.get("read"))
+        write = AccessStore._normalise_users(value.get("write") if isinstance(value.get("write"), list) else value.get("write"))
+        grant = AccessStore._normalise_users(value.get("grant") if isinstance(value.get("grant"), list) else value.get("grant"))
+        return {"read": read, "write": write, "grant": grant}
+
+    def list_teams(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            return list(self.data.get("teams", {}).values())
+
+    def list_projects(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            return list(self.data.get("projects", {}).values())
+
+    def get_team(self, team_id: str) -> Optional[Dict[str, Any]]:
+        if not team_id:
+            return None
+        with self.lock:
+            return self.data.get("teams", {}).get(team_id)
+
+    def get_project(self, project_id: str) -> Optional[Dict[str, Any]]:
+        if not project_id:
+            return None
+        with self.lock:
+            return self.data.get("projects", {}).get(project_id)
+
+    def create_team(
+        self,
+        name: str,
+        *,
+        parent_id: Optional[str] = None,
+        leaders: Optional[List[str]] = None,
+        members: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        team_id = uuid.uuid4().hex
+        entry = {
+            "id": team_id,
+            "name": str(name or "").strip() or f"Team {team_id[:6]}",
+            "parent_id": parent_id,
+            "leaders": self._normalise_users(leaders),
+            "members": self._normalise_users(members),
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }
+        with self.lock:
+            self.data.setdefault("teams", {})[team_id] = entry
+            self._write()
+        return entry
+
+    def update_team(
+        self,
+        team_id: str,
+        *,
+        name: Optional[str] = None,
+        parent_id: Optional[str] = None,
+        leaders: Optional[List[str]] = None,
+        members: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            team = self.data.get("teams", {}).get(team_id)
+            if not team:
+                return None
+            if name is not None:
+                team["name"] = str(name).strip() or team.get("name")
+            if parent_id is not None:
+                team["parent_id"] = parent_id or None
+            if leaders is not None:
+                team["leaders"] = self._normalise_users(leaders)
+            if members is not None:
+                team["members"] = self._normalise_users(members)
+            team["updated_at"] = _now_iso()
+            self._write()
+            return dict(team)
+
+    def delete_team(self, team_id: str) -> bool:
+        with self.lock:
+            projects = self.data.get("projects", {})
+            for project in projects.values():
+                if project.get("team_id") == team_id:
+                    return False
+            if team_id not in self.data.get("teams", {}):
+                return False
+            self.data["teams"].pop(team_id, None)
+            self._write()
+            return True
+
+    def create_project(
+        self,
+        name: str,
+        *,
+        team_id: Optional[str] = None,
+        leaders: Optional[List[str]] = None,
+        contributors: Optional[List[str]] = None,
+        viewers: Optional[List[str]] = None,
+        permissions: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if team_id and not self.get_team(team_id):
+            raise ValueError("Unknown team_id")
+        project_id = uuid.uuid4().hex
+        entry = {
+            "id": project_id,
+            "name": str(name or "").strip() or f"Project {project_id[:6]}",
+            "team_id": team_id,
+            "leaders": self._normalise_users(leaders),
+            "contributors": self._normalise_users(contributors),
+            "viewers": self._normalise_users(viewers),
+            "permissions": self._normalise_permissions(permissions),
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }
+        with self.lock:
+            self.data.setdefault("projects", {})[project_id] = entry
+            self._write()
+        return entry
+
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        name: Optional[str] = None,
+        team_id: Optional[str] = None,
+        leaders: Optional[List[str]] = None,
+        contributors: Optional[List[str]] = None,
+        viewers: Optional[List[str]] = None,
+        permissions: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            project = self.data.get("projects", {}).get(project_id)
+            if not project:
+                return None
+            if name is not None:
+                project["name"] = str(name).strip() or project.get("name")
+            if team_id is not None:
+                if team_id and not self.get_team(team_id):
+                    raise ValueError("Unknown team_id")
+                project["team_id"] = team_id or None
+            if leaders is not None:
+                project["leaders"] = self._normalise_users(leaders)
+            if contributors is not None:
+                project["contributors"] = self._normalise_users(contributors)
+            if viewers is not None:
+                project["viewers"] = self._normalise_users(viewers)
+            if permissions is not None:
+                project["permissions"] = self._normalise_permissions(permissions)
+            project["updated_at"] = _now_iso()
+            self._write()
+            return dict(project)
+
+    def delete_project(self, project_id: str) -> bool:
+        with self.lock:
+            if project_id not in self.data.get("projects", {}):
+                return False
+            self.data["projects"].pop(project_id, None)
+            self._write()
+            return True
+
+    def _team_chain(self, team_id: Optional[str]) -> List[Dict[str, Any]]:
+        chain: List[Dict[str, Any]] = []
+        visited = set()
+        current = team_id
+        while current:
+            if current in visited:
+                break
+            visited.add(current)
+            team = self.get_team(current)
+            if not team:
+                break
+            chain.append(team)
+            current = team.get("parent_id")
+        return chain
+
+    def project_team(self, project_id: str) -> Optional[Dict[str, Any]]:
+        project = self.get_project(project_id)
+        if not project:
+            return None
+        team_id = project.get("team_id")
+        return self.get_team(team_id) if team_id else None
+
+    def _team_role(self, user: str, team_id: Optional[str]) -> Optional[str]:
+        if not user or not team_id:
+            return None
+        team_chain = self._team_chain(team_id)
+        for team in team_chain:
+            if user in (team.get("leaders") or []):
+                return "leader"
+        for team in team_chain:
+            if user in (team.get("members") or []):
+                return "member"
+        return None
+
+    def project_capabilities(self, user: str, project_id: Optional[str]) -> Dict[str, bool]:
+        capabilities = {"read": False, "write": False, "grant": False}
+        if not user or not project_id:
+            return capabilities
+        project = self.get_project(project_id)
+        if not project:
+            return capabilities
+        user = str(user).strip()
+        permissions = project.get("permissions") if isinstance(project.get("permissions"), dict) else {}
+        permissions = self._normalise_permissions(permissions)
+        if user in (permissions.get("grant") or []):
+            return {"read": True, "write": True, "grant": True}
+        if user in (permissions.get("write") or []):
+            capabilities["read"] = True
+            capabilities["write"] = True
+        if user in (permissions.get("read") or []):
+            capabilities["read"] = True
+        if user in (project.get("leaders") or []):
+            return {"read": True, "write": True, "grant": True}
+        if user in (project.get("contributors") or []):
+            return {"read": True, "write": True, "grant": False}
+        if user in (project.get("viewers") or []):
+            return {"read": True, "write": False, "grant": False}
+        team_role = self._team_role(user, project.get("team_id"))
+        if team_role == "leader":
+            return {"read": True, "write": True, "grant": True}
+        if team_role == "member":
+            return {"read": True, "write": True, "grant": False}
+        return capabilities
+
+    def can_create_project(self, user: str, team_id: Optional[str]) -> bool:
+        if not user or not team_id:
+            return False
+        if self._team_role(user, team_id) == "leader":
+            return True
+        for project in self.list_projects():
+            if project.get("team_id") != team_id:
+                continue
+            caps = self.project_capabilities(user, project.get("id"))
+            if caps.get("grant"):
+                return True
+        return False
+
+    def project_role(self, user: str, project_id: Optional[str]) -> Optional[str]:
+        if not user or not project_id:
+            return None
+        project = self.get_project(project_id)
+        if not project:
+            return None
+        user = str(user).strip()
+        if user in (project.get("leaders") or []):
+            return "leader"
+        if user in (project.get("contributors") or []):
+            return "contributor"
+        if user in (project.get("viewers") or []):
+            return "viewer"
+        permissions = project.get("permissions") if isinstance(project.get("permissions"), dict) else {}
+        permissions = self._normalise_permissions(permissions)
+        if user in (permissions.get("grant") or []):
+            return "grant"
+        if user in (permissions.get("write") or []):
+            return "writer"
+        if user in (permissions.get("read") or []):
+            return "reader"
+        team_role = self._team_role(user, project.get("team_id"))
+        if team_role == "leader":
+            return "leader"
+        if team_role == "member":
+            return "contributor"
+        return None
+
+    def can_view_project(self, user: str, project_id: Optional[str]) -> bool:
+        caps = self.project_capabilities(user, project_id)
+        return caps.get("read", False)
+
+    def can_submit_project(self, user: str, project_id: Optional[str]) -> bool:
+        caps = self.project_capabilities(user, project_id)
+        return caps.get("write", False)
+
+    def can_manage_project(self, user: str, project_id: Optional[str]) -> bool:
+        caps = self.project_capabilities(user, project_id)
+        return caps.get("grant", False)
+
+    def projects_for_user(self, user: str, include_viewers: bool = True) -> List[Dict[str, Any]]:
+        projects = self.list_projects()
+        visible: List[Dict[str, Any]] = []
+        for project in projects:
+            caps = self.project_capabilities(user, project.get("id"))
+            if not caps.get("read"):
+                continue
+            role = self.project_role(user, project.get("id"))
+            if not include_viewers and not caps.get("write") and role == "viewer":
+                continue
+            entry = dict(project)
+            entry["role"] = role
+            entry["capabilities"] = caps
+            team = self.get_team(project.get("team_id")) if project.get("team_id") else None
+            if team:
+                entry["team_name"] = team.get("name")
+            visible.append(entry)
+        return visible
+
+    def tree_for_user(self, user: str, include_viewers: bool = True) -> List[Dict[str, Any]]:
+        teams = {team.get("id"): dict(team) for team in self.list_teams() if team.get("id")}
+        projects = self.projects_for_user(user, include_viewers=include_viewers)
+        projects_by_team: Dict[Optional[str], List[Dict[str, Any]]] = {}
+        for project in projects:
+            projects_by_team.setdefault(project.get("team_id"), []).append(project)
+        children: Dict[Optional[str], List[Dict[str, Any]]] = {}
+        for team in teams.values():
+            parent_id = team.get("parent_id")
+            children.setdefault(parent_id, []).append(team)
+        for team_list in children.values():
+            team_list.sort(key=lambda t: t.get("name") or "")
+
+        def build_node(team: Dict[str, Any]) -> Dict[str, Any]:
+            node = dict(team)
+            node["projects"] = sorted(
+                projects_by_team.get(team.get("id"), []),
+                key=lambda p: p.get("name") or "",
+            )
+            node["children"] = [build_node(child) for child in children.get(team.get("id"), [])]
+            return node
+
+        roots = children.get(None, []) + children.get("", [])
+        tree = [build_node(team) for team in roots]
+        # Include projects without a team
+        unassigned = projects_by_team.get(None) or []
+        if unassigned:
+            tree.append({"id": None, "name": "Unassigned", "projects": unassigned, "children": []})
+        return tree
+
+    def tree_all(self) -> List[Dict[str, Any]]:
+        teams = {team.get("id"): dict(team) for team in self.list_teams() if team.get("id")}
+        projects = [dict(project) for project in self.list_projects()]
+        projects_by_team: Dict[Optional[str], List[Dict[str, Any]]] = {}
+        for project in projects:
+            projects_by_team.setdefault(project.get("team_id"), []).append(project)
+        children: Dict[Optional[str], List[Dict[str, Any]]] = {}
+        for team in teams.values():
+            parent_id = team.get("parent_id")
+            children.setdefault(parent_id, []).append(team)
+        for team_list in children.values():
+            team_list.sort(key=lambda t: t.get("name") or "")
+
+        def build_node(team: Dict[str, Any]) -> Dict[str, Any]:
+            node = dict(team)
+            node["projects"] = sorted(
+                projects_by_team.get(team.get("id"), []),
+                key=lambda p: p.get("name") or "",
+            )
+            node["children"] = [build_node(child) for child in children.get(team.get("id"), [])]
+            return node
+
+        roots = children.get(None, []) + children.get("", [])
+        tree = [build_node(team) for team in roots]
+        unassigned = projects_by_team.get(None) or []
+        if unassigned:
+            tree.append({"id": None, "name": "Unassigned", "projects": unassigned, "children": []})
+        return tree
+
+
+class VoiceTokenStore:
+    def __init__(self, path: str):
+        self.path = path
+        self.lock = threading.RLock()
+        self.data: Dict[str, Any] = {"version": 1, "tokens": []}
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                tokens = data.get("tokens")
+                if isinstance(tokens, list):
+                    self.data = {"version": int(data.get("version") or 1), "tokens": tokens}
+        except Exception:
+            self.data = {"version": 1, "tokens": []}
+
+    def _write(self) -> None:
+        _write_json_atomic(self.path, self.data)
+
+    @staticmethod
+    def _hash_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def issue(self, user: str, label: Optional[str] = None) -> Dict[str, Any]:
+        token = secrets_lib.token_urlsafe(32)
+        entry = {
+            "id": uuid.uuid4().hex,
+            "hash": self._hash_token(token),
+            "user": user,
+            "label": (label or "").strip() or None,
+            "created_at": _now_iso(),
+            "last_used_at": None,
+            "disabled": False,
+        }
+        with self.lock:
+            tokens = self.data.get("tokens")
+            if not isinstance(tokens, list):
+                tokens = []
+            tokens.append(entry)
+            self.data["tokens"] = tokens
+            self._write()
+        return {"token": token, **entry}
+
+    def verify(self, token: str) -> Optional[str]:
+        if not token:
+            return None
+        token_hash = self._hash_token(token)
+        with self.lock:
+            tokens = self.data.get("tokens")
+            if not isinstance(tokens, list):
+                return None
+            for entry in tokens:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("hash") == token_hash and not entry.get("disabled"):
+                    entry["last_used_at"] = _now_iso()
+                    self._write()
+                    return str(entry.get("user") or "").strip() or None
+        return None
+
+    def list_tokens(self, user: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self.lock:
+            tokens = list(self.data.get("tokens") or [])
+        filtered: List[Dict[str, Any]] = []
+        for entry in tokens:
+            if not isinstance(entry, dict):
+                continue
+            if user and entry.get("user") != user:
+                continue
+            filtered.append(
+                {
+                    "id": entry.get("id"),
+                    "user": entry.get("user"),
+                    "label": entry.get("label"),
+                    "created_at": entry.get("created_at"),
+                    "last_used_at": entry.get("last_used_at"),
+                    "disabled": bool(entry.get("disabled")),
+                }
+            )
+        filtered.sort(key=lambda t: _timestamp_sort_key(t.get("created_at")), reverse=True)
+        return filtered
+
+    def revoke(self, token_id: str) -> bool:
+        if not token_id:
+            return False
+        updated = False
+        with self.lock:
+            tokens = self.data.get("tokens")
+            if not isinstance(tokens, list):
+                return False
+            for entry in tokens:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("id") == token_id and not entry.get("disabled"):
+                    entry["disabled"] = True
+                    entry["disabled_at"] = _now_iso()
+                    updated = True
+            if updated:
+                self._write()
+        return updated
+
+
+class TodoStore:
+    def __init__(self, root: str):
+        self.root = root
+        self.lock = threading.RLock()
+        ensure_dir_permissions(root, mode=0o700)
+
+    def _safe_user(self, user: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", user or "unknown")
+
+    def _path(self, user: str) -> str:
+        return os.path.join(self.root, f"{self._safe_user(user)}.json")
+
+    def _load(self, user: str) -> Dict[str, Any]:
+        path = self._path(user)
+        if not os.path.exists(path):
+            return {"version": 1, "items": []}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                return {"version": 1, "items": []}
+            if not isinstance(data.get("items"), list):
+                data["items"] = []
+            if "version" not in data:
+                data["version"] = 1
+            return data
+        except Exception:
+            return {"version": 1, "items": []}
+
+    def _write(self, user: str, data: Dict[str, Any]) -> None:
+        _write_json_atomic(self._path(user), data)
+
+    def list_items(
+        self,
+        user: str,
+        *,
+        statuses: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        data = self._load(user)
+        items = [item for item in data.get("items", []) if isinstance(item, dict)]
+        if statuses:
+            wanted = {s.strip().lower() for s in statuses if s and str(s).strip()}
+            if wanted:
+                items = [item for item in items if str(item.get("status") or "todo").lower() in wanted]
+        items.sort(key=lambda item: _timestamp_sort_key(item.get("created_at")), reverse=True)
+        if limit is not None and limit >= 0:
+            items = items[:limit]
+        return items
+
+    def add_item(
+        self,
+        user: str,
+        text: str,
+        *,
+        source: Optional[str] = None,
+        device: Optional[str] = None,
+        meta: Optional[Dict[str, Any]] = None,
+        defer_until_idle: bool = True,
+    ) -> Dict[str, Any]:
+        now = _now_iso()
+        item = {
+            "id": uuid.uuid4().hex,
+            "text": text,
+            "status": "todo",
+            "source": source,
+            "device": device,
+            "defer_until_idle": bool(defer_until_idle),
+            "created_at": now,
+            "updated_at": now,
+        }
+        if meta:
+            item["meta"] = meta
+        with self.lock:
+            data = self._load(user)
+            items = data.get("items")
+            if not isinstance(items, list):
+                items = []
+            items.append(item)
+            data["items"] = items
+            data["updated_at"] = now
+            self._write(user, data)
+        return item
+
+    def update_item(self, user: str, todo_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not todo_id:
+            return None
+        allowed_keys = {"text", "status", "notes", "tags", "priority", "defer_until_idle"}
+        cleaned = {k: v for k, v in updates.items() if k in allowed_keys}
+        if not cleaned:
+            return None
+        with self.lock:
+            data = self._load(user)
+            items = data.get("items")
+            if not isinstance(items, list):
+                items = []
+            target = None
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("id") == todo_id:
+                    for key, value in cleaned.items():
+                        item[key] = value
+                    item["updated_at"] = _now_iso()
+                    target = dict(item)
+                    break
+            if target:
+                data["items"] = items
+                data["updated_at"] = _now_iso()
+                self._write(user, data)
+            return target
+
+    def delete_item(self, user: str, todo_id: str) -> bool:
+        if not todo_id:
+            return False
+        with self.lock:
+            data = self._load(user)
+            items = data.get("items")
+            if not isinstance(items, list):
+                items = []
+            next_items = [item for item in items if isinstance(item, dict) and item.get("id") != todo_id]
+            if len(next_items) == len(items):
+                return False
+            data["items"] = next_items
+            data["updated_at"] = _now_iso()
+            self._write(user, data)
+        return True
+
+
+class SessionHistoryStore:
+    def __init__(self, root: str, max_events: int = SESSION_HISTORY_MAX):
+        self.root = root
+        self.max_events = max_events
+        self.lock = threading.RLock()
+        ensure_dir_permissions(root, mode=0o700)
+
+    def _safe_room(self, room_id: str) -> str:
+        room_id = str(room_id or "").strip()
+        if not room_id:
+            return ""
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", room_id)
+
+    def _room_path(self, room_id: str) -> str:
+        safe = self._safe_room(room_id) or "room"
+        return os.path.join(self.root, f"{safe}.json")
+
+    def load(self, room_id: str) -> Optional[Dict[str, Any]]:
+        path = self._room_path(room_id)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def write(self, room_id: str, data: Dict[str, Any]) -> None:
+        path = self._room_path(room_id)
+        _write_json_atomic(path, data)
+
+    def append_event(self, room_id: str, event: Dict[str, Any]) -> None:
+        if not room_id:
+            return
+        with self.lock:
+            data = self.load(room_id) or {
+                "room_id": room_id,
+                "created_at": _now_iso(),
+                "updated_at": _now_iso(),
+                "events": [],
+            }
+            if event.get("job_id"):
+                data["job_id"] = event.get("job_id")
+            if event.get("project_id"):
+                data["project_id"] = event.get("project_id")
+            if event.get("user") and not data.get("created_by") and event.get("type") == "created":
+                data["created_by"] = event.get("user")
+            events = data.get("events")
+            if not isinstance(events, list):
+                events = []
+            events.append(event)
+            if self.max_events and len(events) > self.max_events:
+                events = events[-self.max_events :]
+            data["events"] = events
+            data["updated_at"] = event.get("ts") or _now_iso()
+            self.write(room_id, data)
+
+    def list_rooms(self, limit: int = 50, tail: int = 5) -> List[Dict[str, Any]]:
+        rooms: List[Dict[str, Any]] = []
+        try:
+            entries = [name for name in os.listdir(self.root) if name.endswith(".json")]
+        except Exception:
+            entries = []
+        for filename in entries:
+            path = os.path.join(self.root, filename)
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            events = data.get("events") if isinstance(data.get("events"), list) else []
+            last_event = events[-1] if events else None
+            tail_events = events[-tail:] if tail and events else []
+            rooms.append(
+                {
+                    "room_id": data.get("room_id") or os.path.splitext(filename)[0],
+                    "job_id": data.get("job_id"),
+                    "project_id": data.get("project_id"),
+                    "created_by": data.get("created_by"),
+                    "created_at": data.get("created_at"),
+                    "updated_at": data.get("updated_at"),
+                    "events_count": len(events),
+                    "last_event": last_event,
+                    "events_tail": tail_events,
+                }
+            )
+        rooms.sort(key=lambda r: _timestamp_sort_key(r.get("updated_at")), reverse=True)
+        if limit and len(rooms) > limit:
+            rooms = rooms[:limit]
+        return rooms
+
+
+class WorkspaceSession:
+    def __init__(self, room_id: str, job_id: str, project_id: Optional[str], created_by: str):
+        self.room_id = room_id
+        self.session_id = room_id
+        self.job_id = job_id
+        self.project_id = project_id
+        self.created_by = created_by
+        self.created_at = _now_iso()
+        self.updated_at = self.created_at
+        self.participants: Dict[str, Dict[str, Any]] = {}
+        self.listeners: List[queue.Queue] = []
+        self.lock = threading.RLock()
+
+    def add_listener(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue()
+        with self.lock:
+            self.listeners.append(q)
+        return q
+
+    def remove_listener(self, q: queue.Queue) -> None:
+        with self.lock:
+            if q in self.listeners:
+                self.listeners.remove(q)
+
+    def _notify(self, event: str, payload: Dict[str, Any]) -> None:
+        with self.lock:
+            listeners = list(self.listeners)
+        for listener in listeners:
+            try:
+                listener.put_nowait({"event": event, "payload": payload})
+            except queue.Full:
+                continue
+
+    def _record_event(self, event_type: str, user: Optional[str] = None, detail: Optional[Dict[str, Any]] = None) -> None:
+        payload = {
+            "ts": _now_iso(),
+            "type": event_type,
+            "user": user,
+            "job_id": self.job_id,
+            "project_id": self.project_id,
+        }
+        if detail:
+            payload["detail"] = detail
+        session_history.append_event(self.room_id, payload)
+
+    def join(self, user: str, role: Optional[str] = None) -> None:
+        now = _now_iso()
+        with self.lock:
+            entry = self.participants.get(user) or {"user": user, "joined_at": now}
+            entry["last_seen"] = now
+            if role:
+                entry["role"] = role
+            self.participants[user] = entry
+            self.updated_at = now
+            snapshot = self.snapshot()
+        self._notify("presence", snapshot)
+        self._record_event("join", user=user, detail={"role": role})
+
+    def leave(self, user: str) -> None:
+        with self.lock:
+            if user in self.participants:
+                self.participants.pop(user, None)
+                self.updated_at = _now_iso()
+                snapshot = self.snapshot()
+            else:
+                return
+        self._notify("presence", snapshot)
+        self._record_event("leave", user=user)
+
+    def heartbeat(self, user: str) -> None:
+        now = _now_iso()
+        with self.lock:
+            entry = self.participants.get(user)
+            if not entry:
+                return
+            entry["last_seen"] = now
+            self.participants[user] = entry
+            self.updated_at = now
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            participants = sorted(self.participants.values(), key=lambda p: p.get("user") or "")
+            return {
+                "session_id": self.session_id,
+                "room_id": self.room_id,
+                "job_id": self.job_id,
+                "project_id": self.project_id,
+                "created_by": self.created_by,
+                "created_at": self.created_at,
+                "updated_at": self.updated_at,
+                "participants": participants,
+            }
+
+
+class SessionStore:
+    def __init__(self, ttl_sec: int = SESSION_TTL_SEC):
+        self.sessions: Dict[str, WorkspaceSession] = {}
+        self.lock = threading.RLock()
+        self.ttl_sec = ttl_sec
+
+    def _now_ts(self) -> float:
+        return time.time()
+
+    def _parse_ts(self, value: Optional[str]) -> float:
+        if not value:
+            return 0.0
+        parsed = _parse_timestamp(value)
+        if not parsed:
+            return 0.0
+        return parsed.timestamp()
+
+    def prune(self) -> None:
+        cutoff = self._now_ts() - float(self.ttl_sec or 0)
+        if cutoff <= 0:
+            return
+        with self.lock:
+            for session_id, session in list(self.sessions.items()):
+                updated = self._parse_ts(session.updated_at)
+                if updated and updated < cutoff and not session.participants:
+                    self.sessions.pop(session_id, None)
+
+    def get(self, session_id: str) -> Optional[WorkspaceSession]:
+        if not session_id:
+            return None
+        with self.lock:
+            return self.sessions.get(session_id)
+
+    def _load_from_history(self, room_id: str) -> Optional[WorkspaceSession]:
+        data = session_history.load(room_id)
+        if not data:
+            return None
+        job_id = str(data.get("job_id") or "").strip()
+        project_id = data.get("project_id")
+        created_by = data.get("created_by") or "system"
+        session = WorkspaceSession(room_id, job_id, project_id, created_by)
+        session.created_at = data.get("created_at") or session.created_at
+        session.updated_at = data.get("updated_at") or session.updated_at
+        return session
+
+    def get_or_create(
+        self,
+        job_id: str,
+        project_id: Optional[str],
+        user: str,
+        role: Optional[str],
+        room_id: Optional[str] = None,
+    ) -> WorkspaceSession:
+        self.prune()
+        room_id = (room_id or "").strip() or None
+        with self.lock:
+            if room_id:
+                existing = self.sessions.get(room_id)
+                if not existing:
+                    existing = self._load_from_history(room_id)
+                    if existing:
+                        self.sessions[room_id] = existing
+                if existing:
+                    if job_id and job_id != existing.job_id:
+                        existing.job_id = job_id
+                        existing.project_id = project_id
+                        existing.updated_at = _now_iso()
+                        existing._record_event("job_bind", user=user, detail={"job_id": job_id})
+                    existing.join(user, role)
+                    return existing
+            for session in self.sessions.values():
+                if session.job_id == job_id and not room_id:
+                    session.join(user, role)
+                    return session
+            session_id = room_id or uuid.uuid4().hex
+            session = WorkspaceSession(session_id, job_id, project_id, user)
+            self.sessions[session_id] = session
+        session._record_event("created", user=user, detail={"job_id": job_id})
+        session.join(user, role)
+        return session
+
+    def join(self, session_id: str, user: str, role: Optional[str]) -> Optional[WorkspaceSession]:
+        session = self.get(session_id)
+        if not session:
+            session = self._load_from_history(session_id)
+            if not session:
+                return None
+            with self.lock:
+                self.sessions[session_id] = session
+        session.join(user, role)
+        return session
+
+    def leave(self, session_id: str, user: str) -> None:
+        session = self.get(session_id)
+        if not session:
+            return
+        session.leave(user)
 
 class TokenLedger:
     def __init__(self, root: str):
@@ -1079,11 +3135,20 @@ class Job:
     notification_error: Optional[str] = None
     token_estimate: Optional[int] = None
     token_reserved: int = 0
+    token_reserved_user: int = 0
+    token_reserved_team: int = 0
     token_actual: int = 0
     token_debited: int = 0
+    token_debited_user: int = 0
+    token_debited_team: int = 0
     token_shortfall: int = 0
+    token_shortfall_user: int = 0
+    token_shortfall_team: int = 0
     token_status: str = "none"
+    token_source: str = "none"
+    transfer_request: Optional[Dict[str, Any]] = None
     repo_info: Dict[str, Any] = field(default_factory=dict)
+    workspace_env: Dict[str, Any] = field(default_factory=dict)
     refunds: List[Dict[str, Any]] = field(default_factory=list)
     archived: bool = False
     archived_at: Optional[str] = None
@@ -1129,17 +3194,41 @@ class Job:
         if self.token_estimate is None:
             self.token_estimate = None
         self.token_reserved = int(self.token_reserved or 0)
+        self.token_reserved_user = int(self.token_reserved_user or 0)
+        self.token_reserved_team = int(self.token_reserved_team or 0)
         self.token_actual = int(self.token_actual or 0)
         self.token_debited = int(self.token_debited or 0)
+        self.token_debited_user = int(self.token_debited_user or 0)
+        self.token_debited_team = int(self.token_debited_team or 0)
         self.token_shortfall = int(self.token_shortfall or 0)
+        self.token_shortfall_user = int(self.token_shortfall_user or 0)
+        self.token_shortfall_team = int(self.token_shortfall_team or 0)
         if not self.token_status:
             self.token_status = "none"
+        if not self.token_source:
+            self.token_source = "none"
+        if self.token_reserved and self.token_reserved_user == 0 and self.token_reserved_team == 0:
+            self.token_reserved_user = self.token_reserved
+        if self.token_debited and self.token_debited_user == 0 and self.token_debited_team == 0:
+            self.token_debited_user = self.token_debited
+        if self.token_shortfall and self.token_shortfall_user == 0 and self.token_shortfall_team == 0:
+            self.token_shortfall_user = self.token_shortfall
+        if self.token_reserved != self.token_reserved_user + self.token_reserved_team:
+            self.token_reserved = self.token_reserved_user + self.token_reserved_team
+        if self.token_debited != self.token_debited_user + self.token_debited_team:
+            self.token_debited = self.token_debited_user + self.token_debited_team
+        if self.token_shortfall != self.token_shortfall_user + self.token_shortfall_team:
+            self.token_shortfall = self.token_shortfall_user + self.token_shortfall_team
+        if self.transfer_request is not None and not isinstance(self.transfer_request, dict):
+            self.transfer_request = None
         if self.refunds is None:
             self.refunds = []
         if self.archived is None:
             self.archived = False
         if not self.archived:
             self.archived_at = None
+        if self.workspace_env is None or not isinstance(self.workspace_env, dict):
+            self.workspace_env = {}
 
     @staticmethod
     def _derive_project_name(payload: Dict[str, Any]) -> str:
@@ -1229,12 +3318,19 @@ class Job:
         self.persist()
 
     def to_persisted_dict(self) -> Dict[str, Any]:
+        project_id = None
+        team_id = None
+        if isinstance(self.payload, dict):
+            project_id = self.payload.get("project_id") or self.payload.get("project")
+            team_id = self.payload.get("team_id")
         with self.lock:
             data = {
                 "version": JOB_META_VERSION,
                 "id": self.job_id,
                 "workflow": self.workflow,
                 "project_name": self.project_name,
+                "project_id": project_id,
+                "team_id": team_id,
                 "owner": self.owner,
                 "status": self.status,
                 "progress": self.progress,
@@ -1248,7 +3344,9 @@ class Job:
                 "metrics": dict(self.metrics),
                 "stages": [stage.__dict__ for stage in self.stages],
                 "repo_info": self.repo_info,
+                "workspace_env": self.workspace_env,
                 "refunds": list(self.refunds),
+                "transfer_request": self.transfer_request,
                 "archived": bool(self.archived),
                 "archived_at": self.archived_at,
                 "payload": _sanitize_payload(self.payload),
@@ -1261,10 +3359,17 @@ class Job:
                 "tokens": {
                     "estimate": self.token_estimate,
                     "reserved": self.token_reserved,
+                    "reserved_user": self.token_reserved_user,
+                    "reserved_team": self.token_reserved_team,
                     "actual": self.token_actual,
                     "debited": self.token_debited,
+                    "debited_user": self.token_debited_user,
+                    "debited_team": self.token_debited_team,
                     "shortfall": self.token_shortfall,
+                    "shortfall_user": self.token_shortfall_user,
+                    "shortfall_team": self.token_shortfall_team,
                     "status": self.token_status,
+                    "source": self.token_source,
                 },
             }
         return data
@@ -1307,7 +3412,9 @@ class Job:
         metrics = data.get("metrics") if isinstance(data.get("metrics"), dict) else {}
         output_paths = data.get("output_paths") if isinstance(data.get("output_paths"), dict) else {}
         repo_info = data.get("repo_info") if isinstance(data.get("repo_info"), dict) else {}
+        workspace_env = data.get("workspace_env") if isinstance(data.get("workspace_env"), dict) else {}
         refunds = data.get("refunds") if isinstance(data.get("refunds"), list) else []
+        transfer_request = data.get("transfer_request") if isinstance(data.get("transfer_request"), dict) else None
         archived = data.get("archived")
         archived_at = _normalise_timestamp(data.get("archived_at") or None)
         if refunds:
@@ -1348,16 +3455,25 @@ class Job:
             metrics=metrics,
             stages=stages,
             repo_info=repo_info,
+            workspace_env=workspace_env,
             notify_email=notification.get("email") or data.get("notify_email"),
             notified_at=_normalise_timestamp(notification.get("sent_at")),
             notified_via=notification.get("method"),
             notification_error=notification.get("error"),
             token_estimate=tokens.get("estimate"),
             token_reserved=int(tokens.get("reserved") or 0),
+            token_reserved_user=int(tokens.get("reserved_user") or 0),
+            token_reserved_team=int(tokens.get("reserved_team") or 0),
             token_actual=int(tokens.get("actual") or 0),
             token_debited=int(tokens.get("debited") or 0),
+            token_debited_user=int(tokens.get("debited_user") or 0),
+            token_debited_team=int(tokens.get("debited_team") or 0),
             token_shortfall=int(tokens.get("shortfall") or 0),
+            token_shortfall_user=int(tokens.get("shortfall_user") or 0),
+            token_shortfall_team=int(tokens.get("shortfall_team") or 0),
             token_status=tokens.get("status") or "none",
+            token_source=tokens.get("source") or "none",
+            transfer_request=transfer_request,
             refunds=refunds,
             archived=bool(archived) if archived is not None else False,
             archived_at=archived_at,
@@ -1366,11 +3482,18 @@ class Job:
         return job
 
     def to_dict(self, include_logs: bool = False, log_tail: int = DEFAULT_TAIL) -> Dict[str, Any]:
+        project_id = None
+        team_id = None
+        if isinstance(self.payload, dict):
+            project_id = self.payload.get("project_id") or self.payload.get("project")
+            team_id = self.payload.get("team_id")
         with self.lock:
             data = {
                 "id": self.job_id,
                 "workflow": self.workflow,
                 "project_name": self.project_name,
+                "project_id": project_id,
+                "team_id": team_id,
                 "owner": self.owner,
                 "status": self.status,
                 "progress": self.progress,
@@ -1385,21 +3508,264 @@ class Job:
                 "stages": [stage.__dict__ for stage in self.stages],
                 "pid": self.pid,
                 "repo_info": self.repo_info,
+                "workspace_env": self.workspace_env,
                 "refunds": list(self.refunds),
+                "transfer_request": self.transfer_request,
                 "archived": bool(self.archived),
                 "archived_at": self.archived_at,
                 "tokens": {
                     "estimate": self.token_estimate,
                     "reserved": self.token_reserved,
+                    "reserved_user": self.token_reserved_user,
+                    "reserved_team": self.token_reserved_team,
                     "actual": self.token_actual,
                     "debited": self.token_debited,
+                    "debited_user": self.token_debited_user,
+                    "debited_team": self.token_debited_team,
                     "shortfall": self.token_shortfall,
+                    "shortfall_user": self.token_shortfall_user,
+                    "shortfall_team": self.token_shortfall_team,
                     "status": self.token_status,
+                    "source": self.token_source,
                 },
             }
         if include_logs:
             data["logs"] = self.get_log_tail(log_tail)
         return data
+
+
+class JobActionExecutionError(RuntimeError):
+    """Typed failure for background actions with stable API error semantics."""
+
+    def __init__(self, code: str, details: Optional[str] = None, status_code: int = 400):
+        super().__init__(details or code)
+        self.code = code
+        self.details = details or code
+        self.status_code = int(status_code)
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "error": self.code,
+            "details": self.details,
+            "status_code": self.status_code,
+        }
+
+
+@dataclass
+class JobActionTask:
+    task_id: str
+    job_id: str
+    owner: str
+    action: str
+    payload: Dict[str, Any] = field(default_factory=dict)
+    status: str = "queued"
+    created_at: str = field(default_factory=_now_iso)
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    timeout_sec: float = JOB_ACTION_TIMEOUT_SEC
+    cancel_requested: bool = False
+    error: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+
+    def is_terminal(self) -> bool:
+        return self.status in {"completed", "failed", "cancelled"}
+
+    def to_dict(self, include_result: bool = True) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "task_id": self.task_id,
+            "job_id": self.job_id,
+            "owner": self.owner,
+            "action": self.action,
+            "status": self.status,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "timeout_sec": self.timeout_sec,
+            "cancel_requested": bool(self.cancel_requested),
+            "error": self.error,
+        }
+        if include_result and self.result is not None:
+            payload["result"] = self.result
+        return payload
+
+
+class JobActionManager:
+    """Bounded async execution pool for non-critical long-running API side actions."""
+
+    def __init__(
+        self,
+        *,
+        workers: int = JOB_ACTION_WORKERS,
+        max_queue: int = JOB_ACTION_MAX_QUEUE,
+        task_ttl_sec: int = JOB_ACTION_TASK_TTL_SEC,
+    ):
+        self.queue: queue.Queue = queue.Queue(maxsize=max(1, int(max_queue)))
+        self.task_ttl_sec = max(60, int(task_ttl_sec))
+        self.lock = threading.RLock()
+        self.tasks: Dict[str, JobActionTask] = {}
+        self.job_task_ids: Dict[str, Deque[str]] = {}
+        self.workers: List[threading.Thread] = []
+        self._inflight = 0
+        for idx in range(max(1, int(workers))):
+            worker = threading.Thread(target=self._worker_loop, args=(idx,), daemon=True)
+            worker.start()
+            self.workers.append(worker)
+
+    def queue_depth(self) -> int:
+        return self.queue.qsize()
+
+    def inflight(self) -> int:
+        with self.lock:
+            return int(self._inflight)
+
+    def submit(
+        self,
+        *,
+        job_id: str,
+        owner: str,
+        action: str,
+        payload: Optional[Dict[str, Any]] = None,
+        timeout_sec: Optional[float] = None,
+    ) -> JobActionTask:
+        task = JobActionTask(
+            task_id=uuid.uuid4().hex,
+            job_id=job_id,
+            owner=owner,
+            action=action,
+            payload=payload if isinstance(payload, dict) else {},
+            timeout_sec=max(1.0, float(timeout_sec or JOB_ACTION_TIMEOUT_SEC)),
+        )
+        with self.lock:
+            self._purge_expired_locked()
+            self.tasks[task.task_id] = task
+            task_ids = self.job_task_ids.get(job_id)
+            if task_ids is None:
+                task_ids = deque(maxlen=100)
+                self.job_task_ids[job_id] = task_ids
+            task_ids.appendleft(task.task_id)
+        try:
+            self.queue.put_nowait(task.task_id)
+        except queue.Full:
+            with self.lock:
+                self.tasks.pop(task.task_id, None)
+                task_ids = self.job_task_ids.get(job_id)
+                if task_ids and task.task_id in task_ids:
+                    task_ids.remove(task.task_id)
+            raise
+        return task
+
+    def get_task(self, task_id: str) -> Optional[JobActionTask]:
+        with self.lock:
+            self._purge_expired_locked()
+            return self.tasks.get(task_id)
+
+    def list_for_job(self, job_id: str, *, limit: int = 20, include_results: bool = False) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 200))
+        with self.lock:
+            self._purge_expired_locked()
+            task_ids = list(self.job_task_ids.get(job_id) or [])
+            results: List[Dict[str, Any]] = []
+            for task_id in task_ids:
+                task = self.tasks.get(task_id)
+                if not task:
+                    continue
+                results.append(task.to_dict(include_result=include_results))
+                if len(results) >= limit:
+                    break
+            return results
+
+    def cancel(self, task_id: str, *, job_id: Optional[str] = None) -> bool:
+        with self.lock:
+            task = self.tasks.get(task_id)
+            if not task:
+                return False
+            if job_id and task.job_id != job_id:
+                return False
+            if task.is_terminal():
+                return task.status == "cancelled"
+            task.cancel_requested = True
+            if task.status == "queued":
+                task.status = "cancelled"
+                task.finished_at = _now_iso()
+                task.error = "cancelled_by_user"
+            return True
+
+    def _purge_expired_locked(self) -> None:
+        now_ts = time.time()
+        expired: List[str] = []
+        for task_id, task in self.tasks.items():
+            if not task.is_terminal():
+                continue
+            anchor_ts = _timestamp_sort_key(task.finished_at or task.created_at)
+            if anchor_ts <= 0:
+                continue
+            if now_ts - anchor_ts >= self.task_ttl_sec:
+                expired.append(task_id)
+        if not expired:
+            return
+        for task_id in expired:
+            task = self.tasks.pop(task_id, None)
+            if not task:
+                continue
+            task_ids = self.job_task_ids.get(task.job_id)
+            if task_ids and task_id in task_ids:
+                task_ids.remove(task_id)
+                if not task_ids:
+                    self.job_task_ids.pop(task.job_id, None)
+
+    def _worker_loop(self, worker_id: int) -> None:
+        while True:
+            task_id = self.queue.get()
+            if task_id is None:
+                self.queue.task_done()
+                break
+            with self.lock:
+                task = self.tasks.get(task_id)
+                if not task:
+                    self.queue.task_done()
+                    continue
+                if task.status == "cancelled" or task.cancel_requested:
+                    task.status = "cancelled"
+                    task.finished_at = _now_iso()
+                    task.error = task.error or "cancelled_before_execution"
+                    self.queue.task_done()
+                    continue
+                task.status = "running"
+                task.started_at = _now_iso()
+                self._inflight += 1
+            try:
+                result = _execute_job_action_task(task)
+                with self.lock:
+                    if task.cancel_requested:
+                        task.status = "cancelled"
+                        task.error = "cancelled_during_execution"
+                        task.result = {
+                            "error": "cancelled",
+                            "details": "Cancellation was requested while the action was running.",
+                            "status_code": 409,
+                        }
+                    else:
+                        task.status = "completed"
+                        task.result = result if isinstance(result, dict) else {}
+                        task.error = None
+                    task.finished_at = _now_iso()
+            except JobActionExecutionError as exc:
+                with self.lock:
+                    task.status = "cancelled" if task.cancel_requested else "failed"
+                    task.error = exc.code
+                    task.result = exc.to_payload()
+                    task.finished_at = _now_iso()
+            except Exception as exc:
+                with self.lock:
+                    task.status = "cancelled" if task.cancel_requested else "failed"
+                    task.error = str(exc)
+                    task.result = {"error": "job_action_failed", "details": str(exc), "status_code": 500}
+                    task.finished_at = _now_iso()
+            finally:
+                with self.lock:
+                    self._inflight = max(0, self._inflight - 1)
+                    self._purge_expired_locked()
+                self.queue.task_done()
 
 
 class JobManager:
@@ -1410,6 +3776,7 @@ class JobManager:
         self.workers: List[threading.Thread] = []
         _ensure_dirs()
         self._load_jobs_from_disk()
+        self._cleanup_old_jobs()
         for idx in range(max(1, workers)):
             t = threading.Thread(target=self._worker_loop, args=(idx,), daemon=True)
             t.start()
@@ -1418,12 +3785,31 @@ class JobManager:
     def submit_job(self, payload: Dict[str, Any], owner: str) -> Job:
         job_id = uuid.uuid4().hex
         job_dir = os.path.join(JOB_ROOT, job_id)
-        os.makedirs(job_dir, exist_ok=True)
+        ensure_dir_permissions(job_dir, mode=0o700)
         log_path = os.path.join(job_dir, "job.log")
         events_path = os.path.join(job_dir, "events.jsonl")
+        project_id = None
+        if isinstance(payload, dict):
+            project_id = payload.get("project_id") or payload.get("project")
+            if project_id:
+                project = access_store.get_project(project_id)
+                if project:
+                    project_name = project.get("name")
+                    if project_name:
+                        payload["project_name"] = project_name
+                    if not payload.get("team_id"):
+                        payload["team_id"] = project.get("team_id")
         job = Job(job_id=job_id, payload=payload, owner=owner, log_path=log_path, events_path=events_path)
         job.output_paths = self._resolve_output_paths(job)
         job.meta_path = os.path.join(job_dir, JOB_META_FILENAME)
+        for path in (log_path, events_path, job.meta_path):
+            try:
+                if not os.path.exists(path):
+                    with open(path, "a", encoding="utf-8"):
+                        pass
+                ensure_file_permissions(path, mode=0o600)
+            except Exception:
+                pass
         notify_email = payload.get("notify_email") or payload.get("notification_email") or ""
         if isinstance(notify_email, str):
             notify_email = notify_email.strip()
@@ -1432,6 +3818,12 @@ class JobManager:
         if notify_email and EMAIL_RE.match(notify_email):
             job.notify_email = notify_email
         job.persist(force=True)
+        _audit_event(
+            "job_submit",
+            actor=owner,
+            status="success",
+            details={"job_id": job_id, "workflow": job.workflow},
+        )
         with self.lock:
             self.jobs[job_id] = job
         self.queue.put(job_id)
@@ -1455,29 +3847,106 @@ class JobManager:
             jobs = [job for job in jobs if job.status == status]
         return sorted(jobs, key=lambda j: _timestamp_sort_key(j.created_at), reverse=True)
 
-    def reserved_tokens(self, owner: Optional[str] = None) -> int:
+    @staticmethod
+    def _job_team_id(job: Job) -> Optional[str]:
+        if not isinstance(job.payload, dict):
+            return None
+        return job.payload.get("team_id")
+
+    @staticmethod
+    def _effective_team_id(job: Job) -> Optional[str]:
+        if not isinstance(job.payload, dict):
+            return None
+        if job.payload.get("token_scope") == "personal":
+            return None
+        return job.payload.get("team_id")
+
+    @staticmethod
+    def _reserved_split(job: Job) -> Tuple[int, int]:
+        reserved_user = int(getattr(job, "token_reserved_user", 0) or 0)
+        reserved_team = int(getattr(job, "token_reserved_team", 0) or 0)
+        if reserved_user == 0 and reserved_team == 0:
+            legacy = int(getattr(job, "token_reserved", 0) or 0)
+            if legacy:
+                reserved_user = legacy
+        return reserved_user, reserved_team
+
+    @staticmethod
+    def _split_usage(run_total: int, reserved_user: int, reserved_team: int, team_id: Optional[str]) -> Tuple[int, int]:
+        if run_total <= 0:
+            return 0, 0
+        total_reserved = reserved_user + reserved_team
+        if total_reserved > 0:
+            user_share = int(round(run_total * (reserved_user / total_reserved)))
+            user_share = max(0, min(user_share, run_total))
+            team_share = run_total - user_share
+            return user_share, team_share
+        if team_id:
+            return 0, run_total
+        return run_total, 0
+
+    def reserved_tokens(
+        self,
+        owner: Optional[str] = None,
+        *,
+        team_id: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> int:
         with self.lock:
             jobs = list(self.jobs.values())
         total = 0
         for job in jobs:
             if owner and job.owner != owner:
                 continue
-            if job.token_reserved and job.status in {"queued", "running", "paused"}:
+            if team_id and self._effective_team_id(job) != team_id:
+                continue
+            if job.status not in {"queued", "running", "paused"}:
+                continue
+            if source == "user":
+                reserved_user, _ = self._reserved_split(job)
+                if reserved_user:
+                    total += reserved_user
+                continue
+            if source == "team":
+                _, reserved_team = self._reserved_split(job)
+                if reserved_team:
+                    total += reserved_team
+                continue
+            if job.token_reserved:
                 total += int(job.token_reserved or 0)
         return total
 
-    def in_use_tokens(self, owner: Optional[str] = None) -> int:
+    def in_use_tokens(
+        self,
+        owner: Optional[str] = None,
+        *,
+        team_id: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> int:
         with self.lock:
             jobs = list(self.jobs.values())
         total = 0
         for job in jobs:
             if owner and job.owner != owner:
                 continue
-            if job.status in {"running", "paused"}:
-                usage = job.metrics.get("token_usage") if isinstance(job.metrics, dict) else {}
-                run_total = usage.get("total") if isinstance(usage, dict) else None
-                if run_total:
-                    total += int(run_total or 0)
+            if team_id and self._effective_team_id(job) != team_id:
+                continue
+            if job.status not in {"running", "paused"}:
+                continue
+            usage = job.metrics.get("token_usage") if isinstance(job.metrics, dict) else {}
+            run_total = usage.get("total") if isinstance(usage, dict) else None
+            if not run_total:
+                continue
+            run_total = int(run_total or 0)
+            if source is None:
+                total += run_total
+                continue
+            reserved_user, reserved_team = self._reserved_split(job)
+            user_share, team_share = self._split_usage(run_total, reserved_user, reserved_team, self._effective_team_id(job))
+            if source == "user":
+                total += user_share
+            elif source == "team":
+                total += team_share
         return total
 
     def reconcile_tokens(self) -> None:
@@ -1524,6 +3993,34 @@ class JobManager:
                 if not job.finished_at:
                     job.finished_at = job.updated_at
                 job.persist(force=True)
+
+    def _cleanup_old_jobs(self) -> None:
+        if JOB_RETENTION_DAYS <= 0:
+            return
+        cutoff = time.time() - JOB_RETENTION_DAYS * 86400
+        removed = 0
+        for job in list(self.jobs.values()):
+            if job.status not in {"completed", "failed", "stopped"}:
+                continue
+            finished = _parse_timestamp(job.finished_at) if job.finished_at else None
+            ts = finished.timestamp() if finished else None
+            if ts is None:
+                try:
+                    ts = os.path.getmtime(os.path.join(JOB_ROOT, job.job_id))
+                except Exception:
+                    ts = None
+            if ts is None or ts >= cutoff:
+                continue
+            try:
+                job_dir = os.path.join(JOB_ROOT, job.job_id)
+                shutil.rmtree(job_dir, ignore_errors=True)
+                with self.lock:
+                    self.jobs.pop(job.job_id, None)
+                removed += 1
+            except Exception:
+                continue
+        if removed:
+            _audit_event("job_retention_cleanup", actor=None, status="success", details={"removed": removed})
 
     def pause_job(self, job_id: str) -> bool:
         job = self.get_job(job_id)
@@ -1727,7 +4224,11 @@ class JobManager:
         job.stages = []
         job.token_actual = 0
         job.token_debited = 0
+        job.token_debited_user = 0
+        job.token_debited_team = 0
         job.token_shortfall = 0
+        job.token_shortfall_user = 0
+        job.token_shortfall_team = 0
         if job.token_reserved:
             job.token_status = "reserved"
         job.metrics = {
@@ -1927,27 +4428,79 @@ class JobManager:
 
     def _reserve_tokens(self, job: Job, estimate: int) -> None:
         job.token_estimate = int(estimate or 0)
-        job.token_reserved = int(estimate or 0)
-        job.token_status = "reserved"
-        job.append_log(f"Reserved {job.token_reserved} tokens for estimate.")
-        token_ledger.record(
-            job.owner,
-            "reserve",
-            0,
-            {"job_id": job.job_id, "estimate": job.token_estimate, "workflow": job.workflow},
-        )
+        token_scope = None
+        if isinstance(job.payload, dict):
+            token_scope = job.payload.get("token_scope")
+        team_id = None if token_scope == "personal" else self._job_team_id(job)
+        team_available = 0
+        if team_id:
+            team_snapshot = _team_token_snapshot(team_id)
+            team_available = int(team_snapshot.get("available") or 0)
+        remaining = int(job.token_estimate or 0)
+        team_reserved = min(remaining, team_available) if team_id else 0
+        remaining = max(0, remaining - team_reserved)
+        user_reserved = remaining
+        job.token_reserved_team = int(team_reserved)
+        job.token_reserved_user = int(user_reserved)
+        job.token_reserved = int(team_reserved + user_reserved)
+        if team_reserved and user_reserved:
+            job.token_source = "split"
+        elif team_reserved:
+            job.token_source = "team"
+        elif user_reserved:
+            job.token_source = "user"
+        else:
+            job.token_source = "none"
+        job.token_status = "reserved" if job.token_reserved > 0 else "none"
+        if team_reserved and user_reserved:
+            job.append_log(
+                f"Reserved {job.token_reserved} tokens for estimate (team {team_reserved}, personal {user_reserved})."
+            )
+        elif team_reserved:
+            job.append_log(f"Reserved {job.token_reserved} team tokens for estimate.")
+        elif user_reserved:
+            job.append_log(f"Reserved {job.token_reserved} personal tokens for estimate.")
+        else:
+            job.append_log("No tokens reserved for estimate.")
+        base_meta = {"job_id": job.job_id, "estimate": job.token_estimate, "workflow": job.workflow}
+        if team_reserved and team_id:
+            team_token_ledger.record(
+                team_id,
+                "reserve",
+                0,
+                {**base_meta, "reserved": team_reserved, "team_id": team_id, "source": "team"},
+            )
+        if user_reserved:
+            token_ledger.record(
+                job.owner,
+                "reserve",
+                0,
+                {**base_meta, "reserved": user_reserved, "team_id": team_id, "source": "user"},
+            )
         job.persist(force=True)
 
     def _release_tokens(self, job: Job, reason: str = "release") -> None:
-        if job.token_reserved <= 0:
+        if job.token_reserved <= 0 and not job.token_reserved_user and not job.token_reserved_team:
             return
-        token_ledger.record(
-            job.owner,
-            "release",
-            0,
-            {"job_id": job.job_id, "reserved": job.token_reserved, "reason": reason},
-        )
+        team_id = self._effective_team_id(job)
+        reserved_user, reserved_team = self._reserved_split(job)
+        if reserved_team and team_id:
+            team_token_ledger.record(
+                team_id,
+                "release",
+                0,
+                {"job_id": job.job_id, "reserved": reserved_team, "reason": reason, "team_id": team_id},
+            )
+        if reserved_user:
+            token_ledger.record(
+                job.owner,
+                "release",
+                0,
+                {"job_id": job.job_id, "reserved": reserved_user, "reason": reason, "team_id": team_id},
+            )
         job.token_reserved = 0
+        job.token_reserved_user = 0
+        job.token_reserved_team = 0
         job.persist(force=True)
 
     def _settle_tokens(self, job: Job) -> None:
@@ -1955,19 +4508,56 @@ class JobManager:
             return
         actual = int(job.metrics.get("token_usage", {}).get("total") or 0)
         job.token_actual = actual
+        team_id = self._effective_team_id(job)
+        reserved_user, reserved_team = self._reserved_split(job)
         if job.token_reserved:
             self._release_tokens(job, reason="settle")
         if actual > 0:
-            entry = token_ledger.record(
-                job.owner,
-                "debit",
-                -actual,
-                {"job_id": job.job_id, "estimate": job.token_estimate, "workflow": job.workflow},
-            )
-            shortfall = int(entry.get("shortfall") or 0)
-            job.token_debited = actual - shortfall
-            job.token_shortfall = shortfall
-            job.append_log(f"Debited {job.token_debited} tokens (shortfall {job.token_shortfall}).")
+            user_share, team_share = self._split_usage(actual, reserved_user, reserved_team, team_id)
+            base_meta = {"job_id": job.job_id, "estimate": job.token_estimate, "workflow": job.workflow}
+            team_shortfall = 0
+            team_debited = 0
+            if team_id and team_share > 0:
+                entry_team = team_token_ledger.record(
+                    team_id,
+                    "debit",
+                    -team_share,
+                    {**base_meta, "team_id": team_id, "source": "team"},
+                )
+                team_shortfall = int(entry_team.get("shortfall") or 0)
+                team_debited = team_share - team_shortfall
+            user_request = int(user_share + team_shortfall)
+            user_shortfall = 0
+            user_debited = 0
+            if user_request > 0:
+                entry_user = token_ledger.record(
+                    job.owner,
+                    "debit",
+                    -user_request,
+                    {**base_meta, "team_id": team_id, "source": "user"},
+                )
+                user_shortfall = int(entry_user.get("shortfall") or 0)
+                user_debited = user_request - user_shortfall
+            total_shortfall = user_shortfall if user_request > 0 else team_shortfall
+            job.token_debited_user = user_debited
+            job.token_debited_team = team_debited
+            job.token_debited = team_debited + user_debited
+            job.token_shortfall_user = user_shortfall
+            job.token_shortfall_team = team_shortfall
+            job.token_shortfall = total_shortfall
+            if team_debited and user_debited:
+                job.token_source = "split"
+            elif team_debited:
+                job.token_source = "team"
+            elif user_debited:
+                job.token_source = "user"
+            else:
+                job.token_source = "none"
+            if team_debited or user_debited or total_shortfall:
+                job.append_log(
+                    "Debited "
+                    f"{job.token_debited} tokens (team {team_debited}, personal {user_debited}, shortfall {total_shortfall})."
+                )
         job.token_status = "settled"
         job.persist(force=True)
         _notify_portal_usage(job)
@@ -2379,7 +4969,7 @@ class JobManager:
         headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
         fork_url = f"https://api.github.com/repos/{fork_org}/{fork_repo}"
         parent_full_name = f"{owner}/{repo}"
-        resp = requests.get(fork_url, headers=headers, timeout=20)
+        resp = _http_request_with_retry("GET", fork_url, headers=headers, timeout=20)
         if resp.status_code == 200:
             data = resp.json()
             parent = data.get("parent") or {}
@@ -2388,17 +4978,23 @@ class JobManager:
             return data
         create_url = f"https://api.github.com/repos/{owner}/{repo}/forks"
         payload = {"organization": fork_org}
-        create_resp = requests.post(create_url, headers=headers, json=payload, timeout=20)
+        create_resp = _http_request_with_retry(
+            "POST",
+            create_url,
+            headers=headers,
+            json_body=payload,
+            timeout=20,
+        )
         if create_resp.status_code not in (202, 201):
             raise ValueError(f"Fork failed: {create_resp.status_code} {create_resp.text}")
         for _ in range(20):
             time.sleep(2)
-            resp = requests.get(fork_url, headers=headers, timeout=20)
+            resp = _http_request_with_retry("GET", fork_url, headers=headers, timeout=20, retries=0)
             if resp.status_code == 200:
                 return resp.json()
         # Fork may exist under default name; attempt rename if needed
         default_fork_url = f"https://api.github.com/repos/{fork_org}/{repo}"
-        resp = requests.get(default_fork_url, headers=headers, timeout=20)
+        resp = _http_request_with_retry("GET", default_fork_url, headers=headers, timeout=20)
         if resp.status_code == 200:
             data = resp.json()
             parent = data.get("parent") or {}
@@ -2406,7 +5002,13 @@ class JobManager:
                 raise ValueError(f"Existing fork {fork_org}/{repo} is not based on {parent_full_name}.")
             if fork_repo != repo:
                 rename_url = f"https://api.github.com/repos/{fork_org}/{repo}"
-                rename_resp = requests.patch(rename_url, headers=headers, json={"name": fork_repo}, timeout=20)
+                rename_resp = _http_request_with_retry(
+                    "PATCH",
+                    rename_url,
+                    headers=headers,
+                    json_body={"name": fork_repo},
+                    timeout=20,
+                )
                 if rename_resp.status_code not in (200, 201):
                     raise ValueError(f"Fork rename failed: {rename_resp.status_code} {rename_resp.text}")
                 return rename_resp.json()
@@ -2423,7 +5025,7 @@ class JobManager:
     ) -> Dict[str, Any]:
         headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
         repo_url = f"https://api.github.com/repos/{org}/{repo_name}"
-        resp = requests.get(repo_url, headers=headers, timeout=20)
+        resp = _http_request_with_retry("GET", repo_url, headers=headers, timeout=20)
         if resp.status_code == 200:
             return resp.json()
         private_flag = payload.get("repo_private")
@@ -2436,7 +5038,13 @@ class JobManager:
             "auto_init": True,
             "description": payload.get("repo_description") or "Refiner starter repo",
         }
-        create_resp = requests.post(create_url, headers=headers, json=body, timeout=20)
+        create_resp = _http_request_with_retry(
+            "POST",
+            create_url,
+            headers=headers,
+            json_body=body,
+            timeout=20,
+        )
         if create_resp.status_code not in (201, 202):
             raise ValueError(f"Repo create failed: {create_resp.status_code} {create_resp.text}")
         return create_resp.json()
@@ -2602,15 +5210,38 @@ class JobManager:
             return None
 
 
+access_store = AccessStore(ACCESS_STORE_PATH)
 manager = JobManager()
+job_action_manager = JobActionManager()
 user_store = UserStore(USERS_PATH)
 user_store.ensure_admin_from_env()
 _secret_stores: Dict[str, SecretStore] = {}
 _user_activity: Dict[str, float] = {}
 _user_activity_lock = threading.Lock()
 token_ledger = TokenLedger(LEDGER_ROOT)
+team_token_ledger = TokenLedger(TEAM_LEDGER_ROOT)
 rag_store = RagStore(RAG_STORE_ROOT)
 mcp_store = MCPServerStore(MCP_STORE_ROOT)
+session_history = SessionHistoryStore(SESSIONS_ROOT)
+session_store = SessionStore()
+voice_token_store = VoiceTokenStore(VOICE_TOKEN_PATH)
+todo_store = TodoStore(TODO_ROOT)
+if STT_LEARNING_ENABLED:
+    try:
+        stt_learning_store: Optional[SttLearningStore] = SttLearningStore(
+            STT_LEARNING_ROOT,
+            seed_paths=STT_KB_LOCAL_PATHS,
+            seed_urls=STT_KB_SEED_URLS,
+            allow_network=STT_LEARNING_ALLOW_NETWORK,
+            prompt_terms=STT_LEARNING_PROMPT_TERMS,
+            learn_min_count=STT_LEARNING_MIN_COUNT,
+            max_memory_docs=STT_LEARNING_MAX_MEMORY_DOCS,
+        )
+    except Exception as exc:
+        logger.warning("STT learning disabled after init failure: %s", exc)
+        stt_learning_store = None
+else:
+    stt_learning_store = None
 
 
 def _get_secret_store(user: str) -> SecretStore:
@@ -2746,6 +5377,25 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+    return False
 
 
 def _requirements_progress_from_solution(solution: Dict[str, Any]) -> Dict[str, Any]:
@@ -3013,6 +5663,100 @@ def _is_admin_user(user: Optional[str]) -> bool:
     return bool(user) and user_store.get_role(user) == "admin"
 
 
+def _job_project_id(job: "Job") -> Optional[str]:
+    if not job or not isinstance(job.payload, dict):
+        return None
+    return job.payload.get("project_id") or job.payload.get("project")
+
+
+def _job_team_id(job: "Job") -> Optional[str]:
+    if not job or not isinstance(job.payload, dict):
+        return None
+    return job.payload.get("team_id")
+
+
+def _job_role_for_user(user: Optional[str], job: "Job") -> Optional[str]:
+    if not user or not job:
+        return None
+    if _is_admin_user(user):
+        return "admin"
+    if job.owner == user:
+        return "owner"
+    project_id = _job_project_id(job)
+    if not project_id:
+        team_id = _job_team_id(job)
+        if team_id:
+            team_role = access_store._team_role(user, team_id)
+            if team_role == "leader":
+                return "leader"
+            if team_role == "member":
+                return "contributor"
+        return None
+    return access_store.project_role(user, project_id)
+
+
+def _job_capabilities_for_user(user: Optional[str], job: "Job") -> Dict[str, bool]:
+    if not user or not job:
+        return {"read": False, "write": False, "grant": False}
+    if _is_admin_user(user):
+        return {"read": True, "write": True, "grant": True}
+    if job.owner == user:
+        return {"read": True, "write": True, "grant": True}
+    project_id = _job_project_id(job)
+    if project_id:
+        return access_store.project_capabilities(user, project_id)
+    team_id = _job_team_id(job)
+    if team_id:
+        team_role = access_store._team_role(user, team_id)
+        if team_role == "leader":
+            return {"read": True, "write": True, "grant": True}
+        if team_role == "member":
+            return {"read": True, "write": True, "grant": False}
+    return {"read": False, "write": False, "grant": False}
+
+
+def _can_view_job(user: Optional[str], job: "Job") -> bool:
+    caps = _job_capabilities_for_user(user, job)
+    if caps.get("read"):
+        return True
+    transfer = getattr(job, "transfer_request", None)
+    if isinstance(transfer, dict) and transfer.get("status") == "pending":
+        team_id = transfer.get("team_id")
+        if _is_admin_user(user) or access_store._team_role(user, team_id) == "leader":
+            return True
+    return False
+
+
+def _can_manage_job(user: Optional[str], job: "Job") -> bool:
+    caps = _job_capabilities_for_user(user, job)
+    return bool(caps.get("write"))
+
+
+def _augment_job_dict_for_user(data: Dict[str, Any], user: Optional[str], job: "Job") -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return data
+    project_id = _job_project_id(job)
+    team_id = _job_team_id(job)
+    data["project_id"] = project_id
+    data["team_id"] = team_id
+    role = _job_role_for_user(user, job)
+    if role:
+        data["project_role"] = role
+    data["project_capabilities"] = _job_capabilities_for_user(user, job)
+    if project_id:
+        project = access_store.get_project(project_id)
+        if project:
+            data["project_name"] = project.get("name") or data.get("project_name")
+            team = access_store.get_team(project.get("team_id")) if project.get("team_id") else None
+            if team:
+                data["team_name"] = team.get("name")
+    elif team_id:
+        team = access_store.get_team(team_id)
+        if team:
+            data["team_name"] = team.get("name")
+    return data
+
+
 def _is_global_summary_item(item: Dict[str, Any]) -> bool:
     req_id = str(item.get("id") or "").strip().upper()
     if req_id.startswith("GLOBAL-"):
@@ -3184,6 +5928,24 @@ def _sanitize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
     cleaned = dict(payload)
+    sensitive_keys = {
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "password",
+        "secret",
+        "token",
+        "llm_api_key",
+        "fallback_llm_api_key",
+        "gemini_api_key",
+        "gemini_access_token",
+        "google_api_key",
+        "github_token",
+    }
+    for key in list(cleaned.keys()):
+        if key.lower() in sensitive_keys:
+            cleaned[key] = "***"
     if "job_secrets" in cleaned:
         secrets = cleaned.get("job_secrets")
         if isinstance(secrets, list):
@@ -3202,6 +5964,1125 @@ def _sanitize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "requirements_text" in cleaned:
         cleaned["requirements_text"] = "[redacted]"
     return cleaned
+
+
+VOICE_TEXT_KEYS = ("text", "thought", "todo", "note", "input", "query", "message", "content")
+
+
+def _extract_bearer_token(auth_header: Optional[str]) -> Optional[str]:
+    if not auth_header:
+        return None
+    parts = auth_header.strip().split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1].strip()
+    return auth_header.strip()
+
+
+def _extract_voice_tokens(payload: Optional[Dict[str, Any]] = None) -> List[str]:
+    candidates: List[str] = []
+    auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+    token = _extract_bearer_token(auth_header)
+    if token:
+        candidates.append(token)
+    for header in ("X-Voice-Token", "X-Api-Key", "X-Api-Token"):
+        value = request.headers.get(header)
+        if value:
+            candidates.append(value.strip())
+    for key in ("token", "voice_token", "api_key", "key"):
+        value = request.args.get(key)
+        if value:
+            candidates.append(str(value).strip())
+    for key in ("token", "voice_token", "api_key", "key"):
+        value = request.form.get(key)
+        if value:
+            candidates.append(str(value).strip())
+    if isinstance(payload, dict):
+        for key in ("token", "auth_token", "access_token"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+        session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        value = user.get("accessToken")
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        system = context.get("System") if isinstance(context.get("System"), dict) else {}
+        system_user = system.get("user") if isinstance(system.get("user"), dict) else {}
+        value = system_user.get("accessToken")
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+        original = payload.get("originalDetectIntentRequest") if isinstance(payload.get("originalDetectIntentRequest"), dict) else {}
+        orig_payload = original.get("payload") if isinstance(original.get("payload"), dict) else {}
+        orig_user = orig_payload.get("user") if isinstance(orig_payload.get("user"), dict) else {}
+        value = orig_user.get("accessToken")
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+    seen = set()
+    unique: List[str] = []
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        unique.append(candidate)
+        seen.add(candidate)
+    return unique
+
+
+def _voice_user_from_request(payload: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    for token in _extract_voice_tokens(payload):
+        user = voice_token_store.verify(token) or VOICE_ENV_TOKEN_MAP.get(token)
+        if user:
+            user = str(user).strip()
+            if not user:
+                continue
+            if user_store.has_users() and not user_store.get_role(user):
+                continue
+            return user
+    return None
+
+
+def _validate_voice_user(user: Optional[str]) -> Optional[str]:
+    if not user:
+        return None
+    user = str(user).strip()
+    if not user:
+        return None
+    if user_store.has_users() and not user_store.get_role(user):
+        return None
+    return user
+
+
+def _extract_alexa_user_id(payload: Dict[str, Any]) -> Optional[str]:
+    session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+    session_user = session.get("user") if isinstance(session.get("user"), dict) else {}
+    user_id = session_user.get("userId")
+    if isinstance(user_id, str) and user_id.strip():
+        return user_id.strip()
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    system = context.get("System") if isinstance(context.get("System"), dict) else {}
+    system_user = system.get("user") if isinstance(system.get("user"), dict) else {}
+    user_id = system_user.get("userId")
+    if isinstance(user_id, str) and user_id.strip():
+        return user_id.strip()
+    return None
+
+
+def _extract_google_user_id(payload: Dict[str, Any]) -> Optional[str]:
+    original = payload.get("originalDetectIntentRequest") if isinstance(payload.get("originalDetectIntentRequest"), dict) else {}
+    orig_payload = original.get("payload") if isinstance(original.get("payload"), dict) else {}
+    orig_user = orig_payload.get("user") if isinstance(orig_payload.get("user"), dict) else {}
+    user_id = orig_user.get("userId")
+    if isinstance(user_id, str) and user_id.strip():
+        return user_id.strip()
+    user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+    user_id = user.get("userId")
+    if isinstance(user_id, str) and user_id.strip():
+        return user_id.strip()
+    return None
+
+
+def _map_voice_user(provider: str, external_id: Optional[str]) -> Optional[str]:
+    if external_id:
+        key = f"{provider}:{external_id}"
+        if key in VOICE_USER_MAP:
+            return VOICE_USER_MAP.get(key)
+        generic_key = f"voice:{external_id}"
+        if generic_key in VOICE_USER_MAP:
+            return VOICE_USER_MAP.get(generic_key)
+    return VOICE_DEFAULT_USER or None
+
+
+def _voice_user_from_provider(
+    provider: str,
+    payload: Dict[str, Any],
+    *,
+    allow_tokens: bool = False,
+) -> Optional[str]:
+    external_id = None
+    if provider == "alexa":
+        external_id = _extract_alexa_user_id(payload)
+    elif provider == "google":
+        external_id = _extract_google_user_id(payload)
+    user = _validate_voice_user(_map_voice_user(provider, external_id))
+    if user:
+        return user
+    if allow_tokens:
+        return _voice_user_from_request(payload)
+    return None
+
+
+def _stt_learning_context(payload: Optional[Dict[str, Any]] = None) -> str:
+    snippets: List[str] = []
+    if isinstance(payload, dict):
+        for key in ("context", "prompt", "hint", "topic", "query", "message", "text"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                snippets.append(value.strip())
+    for key in ("context", "prompt", "hint", "topic", "query", "message"):
+        value = request.values.get(key)
+        if isinstance(value, str) and value.strip():
+            snippets.append(value.strip())
+    combined = " ".join(snippets)
+    combined = re.sub(r"\s+", " ", combined).strip()
+    if len(combined) > 800:
+        combined = combined[:800].rstrip()
+    return combined
+
+
+def _stt_prompt_hint(payload: Optional[Dict[str, Any]] = None) -> str:
+    if not stt_learning_store:
+        return ""
+    context = _stt_learning_context(payload)
+    try:
+        return stt_learning_store.build_prompt_hint(context=context)
+    except Exception:
+        return ""
+
+
+def _stt_record_learning(text: Optional[str], source: str) -> None:
+    if not text or not stt_learning_store:
+        return
+    try:
+        stt_learning_store.learn_from_text(text, source=source)
+    except Exception as exc:
+        logger.debug("STT learning update skipped: %s", exc)
+
+
+STT_ALLOWED_MIME = {
+    "audio/webm",
+    "audio/ogg",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/aac",
+}
+
+
+def _stt_authorized(payload: Optional[Dict[str, Any]] = None) -> bool:
+    if _current_user():
+        return True
+    if STT_TOKEN:
+        for token in _extract_voice_tokens(payload):
+            if secrets_lib.compare_digest(token, STT_TOKEN):
+                return True
+        return False
+    if STT_PUBLIC:
+        return True
+    return False
+
+
+def _sanitize_lang(value: Optional[str]) -> str:
+    if not value:
+        return STT_LANG_DEFAULT or "en-GB"
+    cleaned = str(value).strip()
+    if not cleaned:
+        return STT_LANG_DEFAULT or "en-GB"
+    if not re.match(r"^[A-Za-z0-9_.-]+$", cleaned):
+        return STT_LANG_DEFAULT or "en-GB"
+    return cleaned
+
+
+def _parse_boolish(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    if not cleaned:
+        return None
+    if cleaned in {"1", "true", "yes", "on", "office"}:
+        return True
+    if cleaned in {"0", "false", "no", "off", "chat"}:
+        return False
+    return None
+
+
+def _stt_option(payload: Optional[Dict[str, Any]], *keys: str) -> str:
+    for key in keys:
+        value = request.form.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        value = request.args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _stt_motion_context(payload: Optional[Dict[str, Any]]) -> Tuple[str, str, Optional[bool]]:
+    gesture_raw = _stt_option(
+        payload,
+        "gesture_mode",
+        "gestureMode",
+        "motion_style",
+        "motionStyle",
+        "motion-style",
+    )
+    avatar_raw = _stt_option(payload, "avatar_mode", "avatarMode")
+    office_raw = _stt_option(payload, "office_mode", "officeMode")
+    office_flag = _parse_boolish(office_raw)
+    if office_flag is None and isinstance(payload, dict):
+        office_flag = _parse_boolish(payload.get("office_mode"))
+        if office_flag is None:
+            office_flag = _parse_boolish(payload.get("officeMode"))
+    gesture_mode = sanitize_gesture_mode(
+        gesture_raw,
+        default_mode=STT_GESTURE_DEFAULT_MODE,
+        bsl_enabled=STT_BSL_ENABLED,
+    )
+    avatar_mode = sanitize_avatar_mode(
+        avatar_raw,
+        office_mode=office_flag,
+        default_mode=STT_GESTURE_DEFAULT_AVATAR_MODE,
+    )
+    return gesture_mode, avatar_mode, office_flag
+
+
+def _stt_collaboration_mode(payload: Optional[Dict[str, Any]]) -> bool:
+    raw = _stt_option(
+        payload,
+        "collaboration_mode",
+        "collaborationMode",
+        "collaboration",
+        "multi_speaker",
+        "multiSpeaker",
+        "multi_speaker_mode",
+        "multiSpeakerMode",
+    )
+    parsed = _parse_boolish(raw)
+    if parsed is not None:
+        return parsed
+    if isinstance(payload, dict):
+        for key in (
+            "collaboration_mode",
+            "collaborationMode",
+            "collaboration",
+            "multi_speaker",
+            "multiSpeaker",
+            "multi_speaker_mode",
+            "multiSpeakerMode",
+        ):
+            parsed = _parse_boolish(payload.get(key))
+            if parsed is not None:
+                return parsed
+    return False
+
+
+def _extract_audio_bytes(payload: Optional[Dict[str, Any]] = None) -> Tuple[Optional[bytes], str, Optional[str]]:
+    file = request.files.get("audio")
+    if file and file.filename:
+        data = file.read()
+        mime = (file.mimetype or "").lower()
+        if mime and STT_ALLOWED_MIME and mime not in STT_ALLOWED_MIME:
+            return None, "", "unsupported_format"
+        ext = os.path.splitext(file.filename)[1].lower()
+        if not ext:
+            ext = ".webm" if "webm" in mime else ".wav" if "wav" in mime else ".ogg" if "ogg" in mime else ".bin"
+        return data, ext, None
+    if isinstance(payload, dict):
+        b64 = payload.get("audio_base64") or payload.get("audio")
+        if isinstance(b64, str) and b64.strip():
+            try:
+                data = base64.b64decode(b64)
+            except Exception:
+                return None, "", "invalid_audio_base64"
+            ext = ".webm"
+            return data, ext, None
+    raw = request.get_data(cache=True)
+    if raw:
+        mime = (request.headers.get("Content-Type") or "").split(";")[0].lower()
+        ext = ".webm" if "webm" in mime else ".wav" if "wav" in mime else ".ogg" if "ogg" in mime else ".bin"
+        return raw, ext, None
+    return None, "", "audio_required"
+
+
+def _write_audio_temp(data: bytes, ext: str) -> str:
+    suffix = ext if ext.startswith(".") else f".{ext}"
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        handle.write(data)
+    finally:
+        handle.close()
+    return handle.name
+
+
+def _build_command(command: str, args_template: str, **kwargs: str) -> List[str]:
+    args = shlex.split(args_template) if args_template else []
+    formatted: List[str] = []
+    for arg in args:
+        try:
+            formatted.append(arg.format(**kwargs))
+        except Exception:
+            formatted.append(arg)
+    return [command] + formatted
+
+
+def _run_preprocess(input_path: str) -> Tuple[str, Optional[str]]:
+    if STT_BACKEND == "server" and not STT_SERVER_PREPROCESS:
+        return input_path, None
+    if not STT_PREPROCESS_COMMAND:
+        return input_path, None
+    ext = STT_PREPROCESS_EXT or ".wav"
+    if not ext.startswith("."):
+        ext = f".{ext}"
+    output_path = f"{input_path}{ext}"
+    cmd = _build_command(STT_PREPROCESS_COMMAND, STT_PREPROCESS_ARGS, input=input_path, output=output_path)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=STT_TIMEOUT)
+    except Exception:
+        return input_path, "stt_preprocess_failed"
+    if result.returncode != 0:
+        return input_path, "stt_preprocess_failed"
+    if not os.path.exists(output_path):
+        return input_path, "stt_preprocess_missing_output"
+    return output_path, None
+
+
+def _run_stt(
+    audio_path: str,
+    lang: str,
+    prompt_hint: Optional[str] = None,
+    *,
+    gesture_mode: Optional[str] = None,
+    avatar_mode: Optional[str] = None,
+    office_mode: Optional[bool] = None,
+    collaboration_mode: Optional[bool] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+    if STT_BACKEND == "server" and STT_SERVER_URL:
+        return _run_stt_server(
+            audio_path,
+            lang,
+            prompt_hint=prompt_hint,
+            gesture_mode=gesture_mode,
+            avatar_mode=avatar_mode,
+            office_mode=office_mode,
+            collaboration_mode=collaboration_mode,
+        )
+    transcript, error = _run_stt_command(audio_path, lang, prompt_hint=prompt_hint)
+    return transcript, error, None
+
+
+def _run_stt_command(audio_path: str, lang: str, prompt_hint: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    if not STT_COMMAND:
+        return None, "stt_not_configured"
+    cmd = _build_command(STT_COMMAND, STT_ARGS, audio=audio_path, lang=lang, prompt=prompt_hint or "")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=STT_TIMEOUT)
+    except Exception:
+        return None, "stt_command_failed"
+    if result.returncode != 0:
+        return None, "stt_command_failed"
+    if STT_OUTPUT_MODE == "json":
+        output_path = STT_OUTPUT_PATH_TEMPLATE.format(audio=audio_path)
+        if not os.path.exists(output_path):
+            return None, "stt_output_missing"
+        try:
+            with open(output_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                text = data.get("text") or data.get("transcript") or data.get("result")
+                if isinstance(text, str) and text.strip():
+                    return text.strip(), None
+        except Exception:
+            return None, "stt_output_invalid"
+        return None, "stt_output_empty"
+    transcript = (result.stdout or "").strip()
+    if not transcript:
+        transcript = (result.stderr or "").strip()
+    if not transcript:
+        return None, "stt_output_empty"
+    return transcript, None
+
+
+def _acquire_request_capacity(semaphore: threading.BoundedSemaphore, wait_seconds: float) -> bool:
+    if wait_seconds > 0:
+        return bool(semaphore.acquire(timeout=wait_seconds))
+    return bool(semaphore.acquire(blocking=False))
+
+
+def _stt_server_session() -> requests.Session:
+    """
+    Return a per-thread session for STT server calls.
+
+    `requests.Session` gives us keep-alive connection reuse for lower latency.
+    We keep one session per thread to avoid cross-thread mutation issues.
+    """
+    session = getattr(_STT_SERVER_SESSION_LOCAL, "session", None)
+    if isinstance(session, requests.Session):
+        return session
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=STT_SERVER_POOL_CONNECTIONS,
+        pool_maxsize=STT_SERVER_POOL_MAXSIZE,
+        max_retries=0,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    _STT_SERVER_SESSION_LOCAL.session = session
+    return session
+
+
+def _stt_server_request_data(
+    lang: str,
+    prompt_hint: Optional[str] = None,
+    *,
+    gesture_mode: Optional[str] = None,
+    avatar_mode: Optional[str] = None,
+    office_mode: Optional[bool] = None,
+    collaboration_mode: Optional[bool] = None,
+) -> Dict[str, str]:
+    """Builds a multi-alias form payload so Rust/Python/frontends remain schema-compatible."""
+    data: Dict[str, str] = {"lang": lang}
+    if prompt_hint and STT_SERVER_SEND_PROMPT:
+        data["prompt"] = prompt_hint
+    if gesture_mode:
+        gesture = str(gesture_mode).strip()
+        data["gesture_mode"] = gesture
+        data["gestureMode"] = gesture
+        data["motion_style"] = gesture
+        data["motionStyle"] = gesture
+    if avatar_mode:
+        avatar = str(avatar_mode).strip()
+        data["avatar_mode"] = avatar
+        data["avatarMode"] = avatar
+    if office_mode is not None:
+        office = "1" if office_mode else "0"
+        data["office_mode"] = office
+        data["officeMode"] = office
+    if collaboration_mode is not None:
+        collab = "1" if collaboration_mode else "0"
+        data["collaboration_mode"] = collab
+        data["collaborationMode"] = collab
+        data["multi_speaker"] = collab
+        data["multiSpeaker"] = collab
+    return data
+
+
+def _stt_server_mime(ext: str) -> str:
+    suffix = ext.strip().lower()
+    return {
+        ".wav": "audio/wav",
+        ".webm": "audio/webm",
+        ".ogg": "audio/ogg",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".flac": "audio/flac",
+    }.get(suffix, "application/octet-stream")
+
+
+def _stt_server_retry_delay_seconds(attempt: int, resp: Optional[requests.Response]) -> float:
+    """Use Retry-After when available, otherwise exponential backoff bounded by env caps."""
+    if resp is not None:
+        retry_after = (resp.headers.get("Retry-After") or "").strip()
+        if retry_after:
+            try:
+                return min(STT_SERVER_BACKOFF_MAX, max(0.0, float(retry_after)))
+            except Exception:
+                pass
+    delay = STT_SERVER_BACKOFF_BASE * (2 ** max(0, attempt))
+    return min(STT_SERVER_BACKOFF_MAX, max(0.0, delay))
+
+
+def _is_stt_server_retryable_status(code: int) -> bool:
+    return code in {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _run_stt_server_bytes(
+    audio_bytes: bytes,
+    ext: str,
+    lang: str,
+    prompt_hint: Optional[str] = None,
+    *,
+    gesture_mode: Optional[str] = None,
+    avatar_mode: Optional[str] = None,
+    office_mode: Optional[bool] = None,
+    collaboration_mode: Optional[bool] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Call the STT server directly from in-memory audio bytes.
+
+    This avoids temporary file round-trips when preprocess is not required and
+    adds bounded retries for transient transport/server failures.
+    """
+    if not STT_SERVER_URL:
+        return None, "stt_server_not_configured", None
+    endpoint = STT_SERVER_URL.rstrip("/") + "/transcribe"
+    data = _stt_server_request_data(
+        lang,
+        prompt_hint=prompt_hint,
+        gesture_mode=gesture_mode,
+        avatar_mode=avatar_mode,
+        office_mode=office_mode,
+        collaboration_mode=collaboration_mode,
+    )
+    suffix = ext if isinstance(ext, str) and ext.startswith(".") else f".{(ext or 'bin').lstrip('.')}"
+    files = {"audio": (f"audio{suffix}", audio_bytes, _stt_server_mime(suffix))}
+    attempts = max(1, STT_SERVER_RETRIES + 1)
+    session = _stt_server_session()
+    resp: Optional[requests.Response] = None
+    for attempt in range(attempts):
+        try:
+            resp = session.post(endpoint, files=files, data=data, timeout=STT_SERVER_TIMEOUT)
+        except requests.RequestException:
+            if attempt + 1 >= attempts:
+                return None, "stt_server_unreachable", None
+            delay = _stt_server_retry_delay_seconds(attempt, None)
+            if delay > 0:
+                time.sleep(delay)
+            continue
+
+        if resp.status_code >= 400 and _is_stt_server_retryable_status(resp.status_code) and attempt + 1 < attempts:
+            delay = _stt_server_retry_delay_seconds(attempt, resp)
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        break
+
+    if resp is None:
+        return None, "stt_server_unreachable", None
+    if resp.status_code >= 400:
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {}
+        return None, payload.get("error") or "stt_server_error", None
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {}
+    text = payload.get("text") or payload.get("transcript")
+    if not isinstance(text, str) or not text.strip():
+        return None, "stt_output_empty", None
+
+    server_payload = sanitize_rust_motion_response(payload)
+    if "collaboration_mode" not in server_payload:
+        collab_flag = _parse_boolish(payload.get("collaboration_mode"))
+        if collab_flag is not None:
+            server_payload["collaboration_mode"] = collab_flag
+
+    return text.strip(), None, server_payload or None
+
+
+def _run_rust_gesture_plan(
+    text: str,
+    *,
+    gesture_mode: str,
+    avatar_mode: str,
+    office_mode: Optional[bool],
+) -> Optional[Dict[str, Any]]:
+    """Ask the Rust STT service to plan avatar gestures for an already-known transcript."""
+    if not STT_SERVER_URL or not STT_GESTURE_RUST_FALLBACK:
+        return None
+    transcript = str(text or "").strip()
+    if not transcript:
+        return None
+    endpoint = STT_SERVER_URL.rstrip("/") + "/gesture-plan"
+    request_payload = RustGesturePlanRequest(
+        text=transcript,
+        gesture_mode=str(gesture_mode or "").strip(),
+        avatar_mode=str(avatar_mode or "").strip(),
+        office_mode=office_mode,
+    )
+    attempts = max(1, STT_SERVER_RETRIES + 1)
+    session = _stt_server_session()
+    resp: Optional[requests.Response] = None
+    for attempt in range(attempts):
+        try:
+            resp = session.post(endpoint, json=request_payload.as_dict(), timeout=STT_GESTURE_RUST_TIMEOUT)
+        except requests.RequestException:
+            if attempt + 1 >= attempts:
+                return None
+            delay = _stt_server_retry_delay_seconds(attempt, None)
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        if resp.status_code >= 400 and _is_stt_server_retryable_status(resp.status_code) and attempt + 1 < attempts:
+            delay = _stt_server_retry_delay_seconds(attempt, resp)
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        break
+    if resp is None or resp.status_code >= 400:
+        return None
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    out = sanitize_rust_motion_response(data)
+    return out or None
+
+
+def _run_stt_server(
+    audio_path: str,
+    lang: str,
+    prompt_hint: Optional[str] = None,
+    *,
+    gesture_mode: Optional[str] = None,
+    avatar_mode: Optional[str] = None,
+    office_mode: Optional[bool] = None,
+    collaboration_mode: Optional[bool] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+    try:
+        with open(audio_path, "rb") as handle:
+            audio_bytes = handle.read()
+    except Exception:
+        return None, "invalid_audio", None
+    ext = os.path.splitext(audio_path)[1] or ".bin"
+    return _run_stt_server_bytes(
+        audio_bytes,
+        ext,
+        lang,
+        prompt_hint=prompt_hint,
+        gesture_mode=gesture_mode,
+        avatar_mode=avatar_mode,
+        office_mode=office_mode,
+        collaboration_mode=collaboration_mode,
+    )
+
+
+def _extract_text_from_dict(payload: Dict[str, Any]) -> str:
+    for key in VOICE_TEXT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _extract_voice_text(payload: Optional[Dict[str, Any]] = None) -> str:
+    if isinstance(payload, dict):
+        text = _extract_text_from_dict(payload)
+        if text:
+            return text
+    for key in VOICE_TEXT_KEYS:
+        value = request.values.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raw = request.get_data(cache=True, as_text=True)
+    if raw:
+        raw = raw.strip()
+        if raw and not raw.startswith("{") and not raw.startswith("["):
+            return raw
+    return ""
+
+
+def _extract_alexa_text(payload: Dict[str, Any]) -> str:
+    request_payload = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    intent = request_payload.get("intent") if isinstance(request_payload.get("intent"), dict) else {}
+    slots = intent.get("slots") if isinstance(intent.get("slots"), dict) else {}
+    for slot in slots.values():
+        if not isinstance(slot, dict):
+            continue
+        value = slot.get("value")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    text = _extract_text_from_dict(intent)
+    if text:
+        return text
+    return _extract_text_from_dict(payload)
+
+
+def _extract_google_text(payload: Dict[str, Any]) -> str:
+    query_result = payload.get("queryResult") if isinstance(payload.get("queryResult"), dict) else {}
+    text = query_result.get("queryText")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    params = query_result.get("parameters") if isinstance(query_result.get("parameters"), dict) else {}
+    text = _extract_text_from_dict(params)
+    if text:
+        return text
+    return _extract_text_from_dict(payload)
+
+
+def _infer_device_from_user_agent(user_agent: str) -> Optional[str]:
+    if not user_agent:
+        return None
+    ua = user_agent.lower()
+    if "carplay" in ua:
+        return "carplay"
+    if "watch" in ua:
+        return "watch"
+    if "iphone" in ua:
+        return "iphone"
+    if "ipad" in ua:
+        return "ipad"
+    return None
+
+
+def _extract_voice_device(payload: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    if isinstance(payload, dict):
+        for key in ("device", "source_device", "client_device", "client"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+    for key in ("device", "source_device", "client_device", "client"):
+        value = request.values.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    inferred = _infer_device_from_user_agent(request.headers.get("User-Agent") or "")
+    return inferred
+
+
+def _alexa_response(text: str, *, end_session: bool = True) -> Response:
+    return jsonify(
+        {
+            "version": "1.0",
+            "response": {
+                "outputSpeech": {"type": "PlainText", "text": text},
+                "shouldEndSession": bool(end_session),
+            },
+        }
+    )
+
+
+def _google_response(text: str) -> Response:
+    return jsonify({"fulfillmentText": text})
+
+
+_ALEXA_CERT_CACHE: Dict[str, Dict[str, Any]] = {}
+_ALEXA_CERT_CACHE_LOCK = threading.Lock()
+_GOOGLE_CERT_CACHE: Dict[str, Any] = {"expires_at": 0.0, "keys": {}}
+_GOOGLE_CERT_CACHE_LOCK = threading.Lock()
+
+
+def _load_alexa_cert_cache() -> Dict[str, Any]:
+    if not ALEXA_CERT_CACHE_PATH:
+        return {}
+    try:
+        with open(ALEXA_CERT_CACHE_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return {}
+    return {}
+
+
+def _write_alexa_cert_cache(cache: Dict[str, Any]) -> None:
+    if not ALEXA_CERT_CACHE_PATH:
+        return
+    _write_json_atomic(ALEXA_CERT_CACHE_PATH, cache)
+
+
+def _parse_iso8601(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value or not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(cleaned)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def _spki_sha256(cert: Any) -> Optional[str]:
+    if not cert or not Encoding or not PublicFormat:
+        return None
+    try:
+        spki = cert.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+    except Exception:
+        return None
+    return hashlib.sha256(spki).hexdigest()
+
+
+def _alexa_cert_url_valid(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme.lower() != "https":
+        return False
+    if parsed.hostname not in {"s3.amazonaws.com"}:
+        return False
+    if parsed.port not in (None, 443):
+        return False
+    path = posixpath.normpath(parsed.path or "")
+    if not path.startswith("/"):
+        path = f"/{path}"
+    if not (path == "/echo.api" or path.startswith("/echo.api/")):
+        return False
+    if parsed.query or parsed.fragment:
+        return False
+    return True
+
+
+def _alexa_parse_cert_chain(pem_text: str) -> List[Any]:
+    if not x509:
+        return []
+    matches = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem_text, re.S)
+    certs: List[Any] = []
+    for block in matches:
+        try:
+            certs.append(x509.load_pem_x509_certificate(block.encode("utf-8")))
+        except Exception:
+            continue
+    return certs
+
+
+def _alexa_fetch_cert_chain(url: str) -> List[Any]:
+    if not url:
+        return []
+    now = time.time()
+    if ALEXA_CERT_CACHE_PATH:
+        disk_cache = _load_alexa_cert_cache()
+        if isinstance(disk_cache, dict):
+            entry = disk_cache.get(url)
+            if isinstance(entry, dict) and entry.get("expires_at", 0) > now:
+                pem_text = entry.get("pem") or ""
+                if isinstance(pem_text, str) and pem_text.strip():
+                    return _alexa_parse_cert_chain(pem_text)
+    with _ALEXA_CERT_CACHE_LOCK:
+        cached = _ALEXA_CERT_CACHE.get(url)
+        if cached and cached.get("expires_at", 0) > now:
+            return cached.get("certs", [])
+    if not VOICE_ALLOW_NETWORK:
+        return []
+    try:
+        resp = requests.get(url, timeout=10)
+    except Exception:
+        return []
+    if resp.status_code >= 400:
+        return []
+    certs = _alexa_parse_cert_chain(resp.text or "")
+    ttl = ALEXA_CERT_TTL_SEC
+    cache_control = resp.headers.get("Cache-Control") or ""
+    match = re.search(r"max-age=(\d+)", cache_control)
+    if match:
+        try:
+            ttl = max(60, min(int(match.group(1)), 86400))
+        except Exception:
+            ttl = ALEXA_CERT_TTL_SEC
+    with _ALEXA_CERT_CACHE_LOCK:
+        _ALEXA_CERT_CACHE[url] = {"certs": certs, "expires_at": now + float(ttl)}
+    if ALEXA_CERT_CACHE_PATH:
+        disk_cache = _load_alexa_cert_cache()
+        if not isinstance(disk_cache, dict):
+            disk_cache = {}
+        disk_cache[url] = {"pem": resp.text or "", "expires_at": now + float(ttl)}
+        _write_alexa_cert_cache(disk_cache)
+    return certs
+
+
+def _alexa_verify_cert_chain(certs: List[Any]) -> bool:
+    if not certs or not x509 or not padding or not hashes:
+        return False
+    now = dt.datetime.utcnow()
+    for cert in certs:
+        try:
+            if now < cert.not_valid_before or now > cert.not_valid_after:
+                return False
+        except Exception:
+            return False
+    leaf = certs[0]
+    try:
+        san = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        dns_names = san.get_values_for_type(x509.DNSName)
+        if "echo-api.amazon.com" not in dns_names:
+            return False
+    except Exception:
+        return False
+    for idx in range(len(certs) - 1):
+        issuer = certs[idx + 1]
+        try:
+            issuer.public_key().verify(
+                certs[idx].signature,
+                certs[idx].tbs_certificate_bytes,
+                padding.PKCS1v15(),
+                certs[idx].signature_hash_algorithm,
+            )
+        except Exception:
+            return False
+    root = certs[-1]
+    try:
+        root.public_key().verify(
+            root.signature,
+            root.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            root.signature_hash_algorithm,
+        )
+    except Exception:
+        return False
+    spki_hash = _spki_sha256(root)
+    if ALEXA_TRUSTED_ROOT_SPKI and (not spki_hash or spki_hash.lower() not in ALEXA_TRUSTED_ROOT_SPKI):
+        return False
+    return True
+
+
+def _alexa_verify_request(payload: Dict[str, Any], body: bytes) -> Tuple[bool, str]:
+    if not x509 or not padding or not hashes:
+        return False, "crypto_unavailable"
+    if not VOICE_ALLOW_NETWORK and not ALEXA_CERT_CACHE_PATH:
+        return False, "network_disabled"
+    cert_url = request.headers.get("SignatureCertChainUrl") or request.headers.get("signaturecertchainurl")
+    signature = request.headers.get("Signature-256") or request.headers.get("Signature") or request.headers.get("signature")
+    if not cert_url or not signature:
+        return False, "missing_signature_headers"
+    if not _alexa_cert_url_valid(cert_url):
+        return False, "invalid_cert_url"
+    certs = _alexa_fetch_cert_chain(cert_url)
+    if not certs or not _alexa_verify_cert_chain(certs):
+        return False, "invalid_cert_chain"
+    request_payload = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    timestamp = _parse_iso8601(request_payload.get("timestamp") if isinstance(request_payload.get("timestamp"), str) else None)
+    if not timestamp:
+        return False, "missing_timestamp"
+    now = dt.datetime.now(dt.timezone.utc)
+    delta = abs((now - timestamp).total_seconds())
+    if ALEXA_REQUEST_TTL_SEC > 0 and delta > ALEXA_REQUEST_TTL_SEC:
+        return False, "stale_timestamp"
+    try:
+        signature_bytes = base64.b64decode(signature)
+    except Exception:
+        return False, "invalid_signature"
+    try:
+        certs[0].public_key().verify(signature_bytes, body, padding.PKCS1v15(), hashes.SHA256())
+    except Exception:
+        return False, "signature_mismatch"
+    return True, "ok"
+
+
+def _google_fetch_keys() -> Dict[str, Any]:
+    if GOOGLE_CERTS_PATH:
+        try:
+            with open(GOOGLE_CERTS_PATH, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            data = {}
+        keys: Dict[str, Any] = {}
+        if isinstance(data, dict) and "keys" in data and isinstance(data.get("keys"), list):
+            for entry in data.get("keys"):
+                if not isinstance(entry, dict):
+                    continue
+                kid = entry.get("kid")
+                if not kid:
+                    continue
+                try:
+                    key_obj = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(entry)) if jwt else None
+                except Exception:
+                    key_obj = None
+                if key_obj:
+                    keys[kid] = key_obj
+        elif isinstance(data, dict):
+            for kid, pem in data.items():
+                if isinstance(kid, str) and isinstance(pem, str):
+                    keys[kid] = pem
+        return keys
+    if not GOOGLE_CERTS_URL or not VOICE_ALLOW_NETWORK:
+        return {}
+    now = time.time()
+    with _GOOGLE_CERT_CACHE_LOCK:
+        cached = _GOOGLE_CERT_CACHE
+        if cached.get("expires_at", 0) > now and cached.get("keys"):
+            return cached["keys"]
+    try:
+        resp = requests.get(GOOGLE_CERTS_URL, timeout=10)
+    except Exception:
+        return {}
+    if resp.status_code >= 400:
+        return {}
+    try:
+        data = resp.json()
+    except Exception:
+        return {}
+    keys: Dict[str, Any] = {}
+    if isinstance(data, dict) and "keys" in data and isinstance(data.get("keys"), list):
+        for entry in data.get("keys"):
+            if not isinstance(entry, dict):
+                continue
+            kid = entry.get("kid")
+            if not kid:
+                continue
+            try:
+                key_obj = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(entry)) if jwt else None
+            except Exception:
+                key_obj = None
+            if key_obj:
+                keys[kid] = key_obj
+    elif isinstance(data, dict):
+        for kid, pem in data.items():
+            if isinstance(kid, str) and isinstance(pem, str):
+                keys[kid] = pem
+    ttl = 3600
+    cache_control = resp.headers.get("Cache-Control") or ""
+    match = re.search(r"max-age=(\d+)", cache_control)
+    if match:
+        try:
+            ttl = max(60, min(int(match.group(1)), 86400))
+        except Exception:
+            ttl = 3600
+    with _GOOGLE_CERT_CACHE_LOCK:
+        _GOOGLE_CERT_CACHE["keys"] = keys
+        _GOOGLE_CERT_CACHE["expires_at"] = now + float(ttl)
+    return keys
+
+
+def _extract_google_jwt() -> Optional[str]:
+    header_token = request.headers.get("Google-Assistant-Signature") or request.headers.get("google-assistant-signature")
+    if isinstance(header_token, str) and header_token.strip():
+        return header_token.strip()
+    auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+    token = _extract_bearer_token(auth_header)
+    if token:
+        return token
+    return None
+
+
+def _google_verify_request() -> Tuple[bool, str]:
+    if not jwt:
+        return False, "pyjwt_missing"
+    if not GOOGLE_AUDIENCES:
+        return False, "audience_missing"
+    token = _extract_google_jwt()
+    if not token:
+        return False, "missing_jwt"
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception:
+        header = {}
+    kid = header.get("kid") if isinstance(header, dict) else None
+    keys = _google_fetch_keys()
+    if not keys:
+        return False, "no_keys"
+    key = keys.get(kid) if kid else None
+    if not key and keys:
+        key = next(iter(keys.values()))
+    if not key:
+        return False, "key_not_found"
+    try:
+        jwt.decode(
+            token,
+            key=key,
+            algorithms=["RS256"],
+            audience=GOOGLE_AUDIENCES,
+            issuer=GOOGLE_ISSUERS,
+        )
+    except Exception:
+        return False, "jwt_invalid"
+    return True, "ok"
+
+
+def _busy_jobs_snapshot(exclude_user: Optional[str] = None) -> List[Job]:
+    busy: List[Job] = []
+    for job in manager.list_jobs():
+        if job.status in {"queued", "running", "paused"}:
+            if exclude_user and job.owner == exclude_user:
+                continue
+            busy.append(job)
+    return busy
 
 
 
@@ -3948,10 +7829,18 @@ def _active_users_snapshot(window_seconds: Optional[int] = None) -> List[Dict[st
     return active
 
 
-def _token_snapshot(user: str) -> Dict[str, Any]:
+def _max_timestamp(left: Optional[str], right: Optional[str]) -> Optional[str]:
+    if not left:
+        return right
+    if not right:
+        return left
+    return left if _timestamp_sort_key(left) >= _timestamp_sort_key(right) else right
+
+
+def _user_token_snapshot(user: str) -> Dict[str, Any]:
     summary = token_ledger.get_summary(user)
-    reserved = manager.reserved_tokens(user)
-    in_use = manager.in_use_tokens(user)
+    reserved = manager.reserved_tokens(owner=user, source="user")
+    in_use = manager.in_use_tokens(owner=user, source="user")
     balance = int(summary.get("balance") or 0)
     paid_balance = int(summary.get("paid_balance") or balance)
     free_balance = int(summary.get("free_balance") or 0)
@@ -3972,10 +7861,120 @@ def _token_snapshot(user: str) -> Dict[str, Any]:
         "display_capacity": display_capacity,
         "low_threshold": low_threshold,
         "status": status,
-        "btc_rate": TOKEN_BTC_RATE,
         "last_topup_at": summary.get("last_topup_at"),
         "updated_at": summary.get("updated_at"),
     }
+
+
+def _team_token_snapshot(team_id: str) -> Dict[str, Any]:
+    summary = team_token_ledger.get_summary(team_id)
+    reserved = manager.reserved_tokens(team_id=team_id, source="team")
+    in_use = manager.in_use_tokens(team_id=team_id, source="team")
+    balance = int(summary.get("balance") or 0)
+    paid_balance = int(summary.get("paid_balance") or balance)
+    free_balance = int(summary.get("free_balance") or 0)
+    available = max(0, balance - reserved)
+    capacity = int(summary.get("last_topup_tokens") or balance or 0)
+    display_capacity = max(1, capacity, balance)
+    low_threshold = int(round(capacity * 0.2)) if capacity else 0
+    status = "low" if capacity and balance <= low_threshold else "ok"
+    return {
+        "balance": balance,
+        "tokens": balance,
+        "paid_balance": paid_balance,
+        "free_balance": free_balance,
+        "available": available,
+        "reserved": reserved,
+        "in_use": in_use,
+        "capacity": capacity,
+        "display_capacity": display_capacity,
+        "low_threshold": low_threshold,
+        "status": status,
+        "last_topup_at": summary.get("last_topup_at"),
+        "updated_at": summary.get("updated_at"),
+    }
+
+
+def _token_snapshot(user: str, team_id: Optional[str] = None) -> Dict[str, Any]:
+    user_snapshot = _user_token_snapshot(user)
+    if not team_id:
+        return {
+            **user_snapshot,
+            "btc_rate": TOKEN_BTC_RATE,
+            "scope": "personal",
+        }
+    team_snapshot = _team_token_snapshot(team_id)
+    team_name = None
+    team = access_store.get_team(team_id)
+    if team:
+        team_name = team.get("name")
+    balance = user_snapshot["balance"] + team_snapshot["balance"]
+    paid_balance = user_snapshot["paid_balance"] + team_snapshot["paid_balance"]
+    free_balance = user_snapshot["free_balance"] + team_snapshot["free_balance"]
+    reserved = user_snapshot["reserved"] + team_snapshot["reserved"]
+    in_use = user_snapshot["in_use"] + team_snapshot["in_use"]
+    available = max(0, balance - reserved)
+    capacity = user_snapshot["capacity"] + team_snapshot["capacity"]
+    display_capacity = max(1, capacity, balance)
+    low_threshold = int(round(capacity * 0.2)) if capacity else 0
+    status = "low" if capacity and balance <= low_threshold else "ok"
+    return {
+        "balance": balance,
+        "tokens": balance,
+        "paid_balance": paid_balance,
+        "free_balance": free_balance,
+        "available": available,
+        "reserved": reserved,
+        "in_use": in_use,
+        "capacity": capacity,
+        "display_capacity": display_capacity,
+        "low_threshold": low_threshold,
+        "status": status,
+        "btc_rate": TOKEN_BTC_RATE,
+        "last_topup_at": _max_timestamp(user_snapshot.get("last_topup_at"), team_snapshot.get("last_topup_at")),
+        "updated_at": _max_timestamp(user_snapshot.get("updated_at"), team_snapshot.get("updated_at")),
+        "user_balance": user_snapshot.get("balance"),
+        "user_paid_balance": user_snapshot.get("paid_balance"),
+        "user_free_balance": user_snapshot.get("free_balance"),
+        "user_available": user_snapshot.get("available"),
+        "user_reserved": user_snapshot.get("reserved"),
+        "user_in_use": user_snapshot.get("in_use"),
+        "user_capacity": user_snapshot.get("capacity"),
+        "team_balance": team_snapshot.get("balance"),
+        "team_paid_balance": team_snapshot.get("paid_balance"),
+        "team_free_balance": team_snapshot.get("free_balance"),
+        "team_available": team_snapshot.get("available"),
+        "team_reserved": team_snapshot.get("reserved"),
+        "team_in_use": team_snapshot.get("in_use"),
+        "team_capacity": team_snapshot.get("capacity"),
+        "team_id": team_id,
+        "team_name": team_name,
+        "scope": "team",
+    }
+
+
+def _can_access_team_tokens(user: Optional[str], team_id: Optional[str]) -> bool:
+    if not user or not team_id:
+        return False
+    if _is_admin_user(user):
+        return True
+    if access_store._team_role(user, team_id):
+        return True
+    for project in access_store.list_projects():
+        if project.get("team_id") != team_id:
+            continue
+        caps = access_store.project_capabilities(user, project.get("id"))
+        if caps.get("read"):
+            return True
+    return False
+
+
+def _is_team_leader(user: Optional[str], team_id: Optional[str]) -> bool:
+    if not user or not team_id:
+        return False
+    if _is_admin_user(user):
+        return True
+    return access_store._team_role(user, team_id) == "leader"
 
 
 def _is_secure_request() -> bool:
@@ -4007,6 +8006,35 @@ def _allowed_origin() -> Optional[str]:
     normalized = origin.rstrip("/")
     if normalized in CORS_ORIGINS:
         return normalized
+    return None
+
+
+def _origin_matches_host(origin: str) -> bool:
+    if not origin:
+        return False
+    host_url = request.host_url.rstrip("/")
+    if origin.rstrip("/") == host_url:
+        return True
+    if SITE_BASE and origin.rstrip("/") == SITE_BASE.rstrip("/"):
+        return True
+    return False
+
+
+def _check_origin() -> Optional[Response]:
+    if not CSRF_ORIGIN_CHECK:
+        return None
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return None
+    origin = request.headers.get("Origin")
+    if origin:
+        if _allowed_origin() or _origin_matches_host(origin):
+            return None
+        return jsonify({"error": "origin_not_allowed"}), 403
+    referer = request.headers.get("Referer")
+    if referer:
+        if _origin_matches_host(referer):
+            return None
+        return jsonify({"error": "referer_not_allowed"}), 403
     return None
 
 
@@ -4057,15 +8085,22 @@ def _require_login() -> Optional[Response]:
     if path in {
         "/login",
         "/sso",
+        "/oidc/login",
+        "/oidc/callback",
         "/setup",
         "/api/login",
         "/api/logout",
+        "/api/oidc/exchange",
         "/api/session",
         "/api/setup",
     } or path.startswith("/api/health"):
         return None
+    if path.startswith("/api/voice/") and not path.startswith("/api/voice/tokens"):
+        return None
     is_api = path.startswith("/api/")
     if not user_store.has_users():
+        if AUTH_MODE in {"oidc", "mixed"}:
+            return None
         if is_api:
             return jsonify({"error": "unauthorized"}), 401
         if path != "/setup":
@@ -4074,6 +8109,8 @@ def _require_login() -> Optional[Response]:
     if not _current_user():
         if is_api:
             return jsonify({"error": "unauthorized"}), 401
+        if AUTH_MODE == "oidc":
+            return redirect(url_for("oidc_login"))
         return redirect(url_for("login"))
     return None
 
@@ -4088,6 +8125,9 @@ def _before_request() -> Optional[Response]:
         return https_block
     if request.method == "OPTIONS":
         return Response(status=204)
+    origin_block = _check_origin()
+    if origin_block:
+        return origin_block
     auth_block = _require_login()
     if auth_block:
         return auth_block
@@ -4105,10 +8145,16 @@ def _after_request(response: Response) -> Response:
             REQUEST_COUNT.labels(request.method, path_label, response.status_code).inc()
         finally:
             INFLIGHT.dec()
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    if CSP_POLICY:
+        response.headers.setdefault("Content-Security-Policy", CSP_POLICY)
+    if request.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
     return _apply_cors(response)
 
 
-@app.route("/")
 def index() -> str:
     user = _current_user()
     return render_template(
@@ -4120,7 +8166,6 @@ def index() -> str:
     )
 
 
-@app.route("/playground")
 def playground() -> str:
     user = _current_user()
     return render_template(
@@ -4132,7 +8177,6 @@ def playground() -> str:
     )
 
 
-@app.route("/admin")
 def admin_dashboard() -> Response:
     user = _current_user()
     role = user_store.get_role(user) if user else None
@@ -4148,17 +8192,14 @@ def admin_dashboard() -> Response:
     )
 
 
-@app.route("/public/<path:filename>")
 def public_asset(filename: str) -> Response:
     return send_from_directory(PUBLIC_DIR, filename)
 
 
-@app.route("/favicon.ico")
 def favicon() -> Response:
     return send_from_directory(PUBLIC_DIR, "favicon.ico")
 
 
-@app.route(METRICS_PATH)
 def metrics() -> Response:
     if not METRICS_ENABLED:
         return jsonify({"error": "metrics_disabled"}), 404
@@ -4166,6 +8207,8 @@ def metrics() -> Response:
     try:
         WORKER_COUNT.set(len(manager.workers))
         JOB_QUEUE_DEPTH.set(manager.queue.qsize())
+        JOB_ACTION_QUEUE_DEPTH.set(job_action_manager.queue_depth())
+        JOB_ACTION_INFLIGHT.set(job_action_manager.inflight())
         UPTIME.set(time.time() - APP_START_TIME)
 
         status_counts: Dict[str, int] = {}
@@ -4183,44 +8226,260 @@ def metrics() -> Response:
     return Response(payload, mimetype=CONTENT_TYPE_LATEST)
 
 
-@app.route("/login", methods=["GET", "POST"])
 def login() -> Response:
-    if not user_store.has_users():
+    if AUTH_MODE == "oidc":
+        return redirect(url_for("oidc_login"))
+    if not user_store.has_users() and not OIDC_ENABLED:
         return redirect(url_for("setup"))
     error = None
     if request.method == "POST":
         username = (request.form.get("username") or "").strip()
         password = (request.form.get("password") or "").strip()
-        if user_store.verify(username, password):
+        if _login_throttled(username):
+            _audit_event("login", actor=username, status="throttled")
+            error = "Too many attempts. Please try again later."
+        elif user_store.verify(username, password):
             session["user"] = username
+            _record_login_attempt(username, ok=True)
+            _audit_event("login", actor=username, status="success")
             return redirect(url_for("index"))
-        error = "Invalid username or password."
-    return render_template("login.html", error=error, api_base=API_BASE, site_base=SITE_BASE)
+        else:
+            _record_login_attempt(username, ok=False)
+            _audit_event("login", actor=username, status="failed")
+            error = "Invalid username or password."
+    return render_template(
+        "login.html",
+        error=error,
+        api_base=API_BASE,
+        site_base=SITE_BASE,
+        oidc_enabled=OIDC_ENABLED,
+        oidc_label=OIDC_BUTTON_LABEL,
+        local_enabled=user_store.has_users(),
+    )
 
 
-@app.route("/sso")
+def _parse_kv_params(raw: str) -> Dict[str, str]:
+    params: Dict[str, str] = {}
+    if not raw:
+        return params
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key:
+            params[key] = value
+    return params
+
+
+def oidc_login() -> Response:
+    if not OIDC_ENABLED:
+        return jsonify({"error": "oidc_not_enabled"}), 404
+    config = _oidc_discovery()
+    if not config:
+        return jsonify({"error": "oidc_config_missing"}), 500
+    auth_endpoint = config.get("authorization_endpoint")
+    if not auth_endpoint:
+        return jsonify({"error": "oidc_authorization_missing"}), 500
+    state = secrets_lib.token_urlsafe(32)
+    nonce = secrets_lib.token_urlsafe(16)
+    code_verifier = secrets_lib.token_urlsafe(64)
+    code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("utf-8")).digest()).decode("utf-8").rstrip("=")
+    session["oidc_state"] = state
+    session["oidc_nonce"] = nonce
+    session["oidc_code_verifier"] = code_verifier
+    session["oidc_started_at"] = _now_iso()
+    params = {
+        "response_type": "code",
+        "client_id": OIDC_CLIENT_ID,
+        "redirect_uri": _oidc_redirect_uri(),
+        "scope": OIDC_SCOPE,
+        "state": state,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    extra_params = _parse_kv_params(os.getenv("REFINER_OIDC_EXTRA_PARAMS", ""))
+    params.update(extra_params)
+    return redirect(auth_endpoint + "?" + urlencode(params), code=302)
+
+
+def oidc_callback() -> Response:
+    if not OIDC_ENABLED:
+        return jsonify({"error": "oidc_not_enabled"}), 404
+    error = (request.args.get("error") or "").strip()
+    if error:
+        _audit_event("oidc_callback", actor=None, status="failed", details={"error": error})
+        return redirect(url_for("login"))
+    code = (request.args.get("code") or "").strip()
+    state = (request.args.get("state") or "").strip()
+    if not code or not state:
+        _audit_event("oidc_callback", actor=None, status="failed", details={"error": "missing_code_or_state"})
+        return redirect(url_for("login"))
+    if state != session.get("oidc_state"):
+        _audit_event("oidc_callback", actor=None, status="failed", details={"error": "state_mismatch"})
+        return redirect(url_for("login"))
+    config = _oidc_discovery()
+    if not config:
+        return jsonify({"error": "oidc_config_missing"}), 500
+    token_endpoint = config.get("token_endpoint")
+    if not token_endpoint:
+        return jsonify({"error": "oidc_token_endpoint_missing"}), 500
+    code_verifier = session.get("oidc_code_verifier")
+    token_payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": _oidc_redirect_uri(),
+        "client_id": OIDC_CLIENT_ID,
+    }
+    if code_verifier:
+        token_payload["code_verifier"] = code_verifier
+    auth = None
+    if OIDC_CLIENT_SECRET:
+        if OIDC_CLIENT_AUTH == "post":
+            token_payload["client_secret"] = OIDC_CLIENT_SECRET
+        else:
+            auth = (OIDC_CLIENT_ID, OIDC_CLIENT_SECRET)
+    token_resp = requests.post(token_endpoint, data=token_payload, auth=auth, timeout=15)
+    if token_resp.status_code >= 400:
+        _audit_event("oidc_callback", actor=None, status="failed", details={"error": "token_exchange_failed"})
+        return redirect(url_for("login"))
+    token_data = token_resp.json()
+    id_token = token_data.get("id_token")
+    access_token = token_data.get("access_token")
+    if not id_token:
+        _audit_event("oidc_callback", actor=None, status="failed", details={"error": "id_token_missing"})
+        return redirect(url_for("login"))
+    try:
+        claims = _verify_jwt(id_token, nonce=session.get("oidc_nonce"))
+    except Exception as exc:
+        _audit_event("oidc_callback", actor=None, status="failed", details={"error": str(exc)})
+        return redirect(url_for("login"))
+    claims = _oidc_maybe_enrich_claims(claims, access_token, config=config)
+    username = _oidc_username_from_claims(claims)
+    if not username:
+        _audit_event("oidc_callback", actor=None, status="failed", details={"error": "username_missing"})
+        return redirect(url_for("login"))
+    email = claims.get(OIDC_EMAIL_CLAIM) if isinstance(claims.get(OIDC_EMAIL_CLAIM), str) else None
+    role = _oidc_role_from_claims(claims)
+    subject = claims.get("sub") if isinstance(claims.get("sub"), str) else None
+    user_store.upsert_external_user(username, role=role, email=email, provider="oidc", subject=subject)
+    session["user"] = username
+    for key in ("oidc_state", "oidc_nonce", "oidc_code_verifier", "oidc_started_at"):
+        session.pop(key, None)
+    _audit_event("oidc_login", actor=username, status="success", details={"role": role})
+    return redirect(url_for("index"))
+
+
+def api_oidc_exchange() -> Response:
+    if not OIDC_ENABLED or not OIDC_EXCHANGE_ENABLED:
+        return jsonify({"error": "oidc_not_enabled"}), 404
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+    code = (payload.get("code") or "").strip()
+    code_verifier = (payload.get("code_verifier") or "").strip()
+    client_id = (payload.get("client_id") or "").strip()
+    redirect_uri = (payload.get("redirect_uri") or "").strip()
+    id_token = (payload.get("id_token") or "").strip()
+    access_token = (payload.get("access_token") or "").strip()
+
+    if redirect_uri and not _oidc_is_redirect_allowed(redirect_uri):
+        _audit_event("oidc_exchange", actor=None, status="failed", details={"error": "redirect_uri_not_allowed"})
+        return jsonify({"error": "redirect_uri_not_allowed"}), 400
+
+    if code:
+        if client_id and client_id != OIDC_CLIENT_ID:
+            _audit_event("oidc_exchange", actor=None, status="failed", details={"error": "client_id_mismatch"})
+            return jsonify({"error": "client_id_mismatch"}), 400
+        config = _oidc_discovery()
+        if not config:
+            return jsonify({"error": "oidc_config_missing"}), 500
+        token_endpoint = config.get("token_endpoint")
+        if not token_endpoint:
+            return jsonify({"error": "oidc_token_endpoint_missing"}), 500
+        token_payload = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri or _oidc_redirect_uri(),
+            "client_id": OIDC_CLIENT_ID,
+        }
+        if code_verifier:
+            token_payload["code_verifier"] = code_verifier
+        auth = None
+        if OIDC_CLIENT_SECRET:
+            if OIDC_CLIENT_AUTH == "post":
+                token_payload["client_secret"] = OIDC_CLIENT_SECRET
+            else:
+                auth = (OIDC_CLIENT_ID, OIDC_CLIENT_SECRET)
+        token_resp = requests.post(token_endpoint, data=token_payload, auth=auth, timeout=15)
+        if token_resp.status_code >= 400:
+            _audit_event("oidc_exchange", actor=None, status="failed", details={"error": "token_exchange_failed"})
+            return jsonify({"error": "token_exchange_failed"}), 401
+        try:
+            token_data = token_resp.json()
+        except Exception:
+            token_data = {}
+        id_token = (token_data.get("id_token") or "").strip()
+        access_token = (token_data.get("access_token") or "").strip()
+
+    if not id_token:
+        _audit_event("oidc_exchange", actor=None, status="failed", details={"error": "id_token_missing"})
+        return jsonify({"error": "id_token_required"}), 400
+    try:
+        claims = _verify_jwt(id_token, nonce=None)
+    except Exception as exc:
+        _audit_event("oidc_exchange", actor=None, status="failed", details={"error": str(exc)})
+        return jsonify({"error": "invalid_id_token"}), 401
+    claims = _oidc_maybe_enrich_claims(claims, access_token, config=_oidc_discovery())
+    username = _oidc_username_from_claims(claims)
+    if not username:
+        _audit_event("oidc_exchange", actor=None, status="failed", details={"error": "username_missing"})
+        return jsonify({"error": "username_missing"}), 400
+    email = claims.get(OIDC_EMAIL_CLAIM) if isinstance(claims.get(OIDC_EMAIL_CLAIM), str) else None
+    role = _oidc_role_from_claims(claims)
+    subject = claims.get("sub") if isinstance(claims.get("sub"), str) else None
+    user_store.upsert_external_user(username, role=role, email=email, provider="oidc", subject=subject)
+    session["user"] = username
+    sso_token = _issue_sso_token(username)
+    _audit_event("oidc_exchange", actor=username, status="success", details={"role": role})
+    return jsonify(
+        {
+            "status": "ok",
+            "user": username,
+            "role": role,
+            "sso_token": sso_token,
+            "sso_expires_in": SSO_TTL_SECONDS,
+        }
+    )
+
 def sso_login() -> Response:
     token = (request.args.get("token") or "").strip()
     next_path = _safe_next_path(request.args.get("next"))
     user = _consume_sso_token(token)
     if not user:
+        _audit_event("sso_login", actor=None, status="failed")
         return redirect(url_for("login"))
     session["user"] = user
+    _audit_event("sso_login", actor=user, status="success")
     return redirect(next_path)
 
 
-@app.route("/logout")
 def logout() -> Response:
     user = _current_user()
     _clear_user_activity(user)
     session.pop("user", None)
+    _audit_event("logout", actor=user, status="success")
     return redirect(url_for("login"))
 
 
-@app.route("/api/login", methods=["POST"])
 def api_login() -> Response:
     if not user_store.has_users():
         return jsonify({"error": "setup_required"}), 400
+    if AUTH_MODE == "oidc":
+        return jsonify({"error": "oidc_required"}), 403
     payload = request.get_json(force=True, silent=True)
     if not isinstance(payload, dict):
         payload = {}
@@ -4228,9 +8487,16 @@ def api_login() -> Response:
     password = (payload.get("password") or "").strip()
     if not username or not password:
         return jsonify({"error": "username_and_password_required"}), 400
+    if _login_throttled(username):
+        _audit_event("api_login", actor=username, status="throttled")
+        return jsonify({"error": "too_many_attempts"}), 429
     if not user_store.verify(username, password):
+        _record_login_attempt(username, ok=False)
+        _audit_event("api_login", actor=username, status="failed")
         return jsonify({"error": "invalid_credentials"}), 401
     session["user"] = username
+    _record_login_attempt(username, ok=True)
+    _audit_event("api_login", actor=username, status="success")
     sso_token = _issue_sso_token(username)
     return jsonify(
         {
@@ -4243,8 +8509,9 @@ def api_login() -> Response:
     )
 
 
-@app.route("/api/setup", methods=["POST"])
 def api_setup() -> Response:
+    if AUTH_MODE == "oidc":
+        return jsonify({"error": "oidc_required"}), 403
     if user_store.has_users():
         return jsonify({"error": "setup_not_allowed"}), 409
     payload = request.get_json(force=True, silent=True)
@@ -4263,14 +8530,17 @@ def api_setup() -> Response:
                 "details": "Username must be 3-32 chars (letters, numbers, underscore, dash).",
             }
         ), 400
-    if len(password) < 8:
-        return jsonify({"error": "password_too_short", "details": "Password must be at least 8 characters."}), 400
+    if len(password) < PASSWORD_MIN_LEN:
+        return jsonify(
+            {"error": "password_too_short", "details": f"Password must be at least {PASSWORD_MIN_LEN} characters."}
+        ), 400
     if confirm and password != confirm:
         return jsonify({"error": "password_mismatch", "details": "Passwords do not match."}), 400
     if email and not EMAIL_RE.match(email):
         return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
     user_store.create_user(username, password, role="admin", email=email or None)
     session["user"] = username
+    _audit_event("setup", actor=username, status="success")
     sso_token = _issue_sso_token(username)
     return (
         jsonify(
@@ -4286,7 +8556,6 @@ def api_setup() -> Response:
     )
 
 
-@app.route("/api/sso/issue", methods=["POST"])
 def api_sso_issue() -> Response:
     user = _current_user()
     if not user:
@@ -4303,15 +8572,14 @@ def api_sso_issue() -> Response:
     )
 
 
-@app.route("/api/logout", methods=["POST"])
 def api_logout() -> Response:
     user = _current_user()
     _clear_user_activity(user)
     session.pop("user", None)
+    _audit_event("api_logout", actor=user, status="success")
     return jsonify({"status": "ok"})
 
 
-@app.route("/api/session")
 def api_session() -> Response:
     user = _current_user()
     if not user:
@@ -4319,7 +8587,6 @@ def api_session() -> Response:
     return jsonify({"authenticated": True, "user": user, "role": user_store.get_role(user)})
 
 
-@app.route("/api/profile", methods=["GET", "POST"])
 def api_profile() -> Response:
     user = _current_user()
     if not user:
@@ -4340,8 +8607,962 @@ def api_profile() -> Response:
     return jsonify({"status": "ok", "email": user_store.get_email(user)})
 
 
-@app.route("/setup", methods=["GET", "POST"])
+def api_todos() -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if request.method == "GET":
+        status_raw = (request.args.get("status") or "").strip()
+        statuses = [item.strip().lower() for item in status_raw.split(",") if item.strip()] if status_raw else None
+        limit_raw = request.args.get("limit")
+        try:
+            limit_val = int(limit_raw) if limit_raw else 50
+        except Exception:
+            limit_val = 50
+        limit_val = max(0, min(limit_val, 200))
+        items = todo_store.list_items(user, statuses=statuses, limit=limit_val)
+        defer_raw = request.args.get("defer")
+        if defer_raw is not None:
+            want_defer = str(defer_raw).strip().lower() in {"1", "true", "yes", "y"}
+            items = [item for item in items if bool(item.get("defer_until_idle")) == want_defer]
+        return jsonify({"items": items})
+
+    payload = request.get_json(force=True, silent=True) or {}
+    text = str(payload.get("text") or payload.get("thought") or payload.get("todo") or "").strip()
+    if not text:
+        return jsonify({"error": "text_required"}), 400
+    source = str(payload.get("source") or "manual").strip().lower() or "manual"
+    device = str(payload.get("device") or "").strip() or None
+    defer_until_idle = payload.get("defer_until_idle")
+    if defer_until_idle is None:
+        defer_until_idle = False
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else None
+    item = todo_store.add_item(
+        user,
+        text,
+        source=source,
+        device=device,
+        meta=meta,
+        defer_until_idle=bool(defer_until_idle),
+    )
+    _audit_event("todo_create", actor=user, status="success", details={"todo_id": item.get("id"), "source": source})
+    return jsonify({"status": "ok", "todo": item}), 201
+
+
+def api_todo_next() -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    idle_only = str(request.args.get("idle") or "").strip().lower() in {"1", "true", "yes", "y"}
+    if idle_only:
+        busy_jobs = _busy_jobs_snapshot(exclude_user=user)
+        if busy_jobs:
+            return jsonify({"status": "busy", "busy_jobs": len(busy_jobs)}), 409
+    items = todo_store.list_items(user, statuses=["todo"], limit=1)
+    return jsonify({"todo": items[0] if items else None})
+
+
+def api_todo_detail(todo_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if request.method == "DELETE":
+        deleted = todo_store.delete_item(user, todo_id)
+        if not deleted:
+            return jsonify({"error": "not_found"}), 404
+        _audit_event("todo_delete", actor=user, status="success", details={"todo_id": todo_id})
+        return jsonify({"status": "deleted", "todo_id": todo_id})
+
+    payload = request.get_json(force=True, silent=True) or {}
+    updates: Dict[str, Any] = {}
+    if "text" in payload or "thought" in payload or "todo" in payload:
+        text = str(payload.get("text") or payload.get("thought") or payload.get("todo") or "").strip()
+        if not text:
+            return jsonify({"error": "text_required"}), 400
+        updates["text"] = text
+    if "status" in payload:
+        status = str(payload.get("status") or "").strip().lower()
+        if status not in {"todo", "done", "archived"}:
+            return jsonify({"error": "invalid_status"}), 400
+        updates["status"] = status
+    if "notes" in payload:
+        updates["notes"] = payload.get("notes")
+    if "priority" in payload:
+        updates["priority"] = payload.get("priority")
+    if "tags" in payload:
+        tags = payload.get("tags")
+        if isinstance(tags, str):
+            tags = [item.strip() for item in tags.split(",") if item.strip()]
+        updates["tags"] = tags
+    if "defer_until_idle" in payload:
+        updates["defer_until_idle"] = bool(payload.get("defer_until_idle"))
+    updated = todo_store.update_item(user, todo_id, updates)
+    if not updated:
+        return jsonify({"error": "not_found"}), 404
+    _audit_event("todo_update", actor=user, status="success", details={"todo_id": todo_id})
+    return jsonify({"status": "ok", "todo": updated})
+
+
+def api_voice_tokens() -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if request.method == "GET":
+        target = (request.args.get("user") or "").strip() or None
+        if target and not _is_admin_user(user):
+            return jsonify({"error": "forbidden"}), 403
+        if not target and not _is_admin_user(user):
+            target = user
+        tokens = voice_token_store.list_tokens(target)
+        return jsonify({"tokens": tokens})
+
+    payload = request.get_json(force=True, silent=True) or {}
+    target = str(payload.get("user") or user).strip()
+    if target != user and not _is_admin_user(user):
+        return jsonify({"error": "forbidden"}), 403
+    if user_store.has_users() and not user_store.get_role(target):
+        return jsonify({"error": "user_not_found"}), 404
+    label = payload.get("label")
+    issued = voice_token_store.issue(target, label=label if isinstance(label, str) else None)
+    _audit_event(
+        "voice_token_issue",
+        actor=user,
+        status="success",
+        details={"token_id": issued.get("id"), "target": target},
+    )
+    return (
+        jsonify(
+            {
+                "status": "ok",
+                "token": issued.get("token"),
+                "id": issued.get("id"),
+                "user": issued.get("user"),
+                "label": issued.get("label"),
+                "created_at": issued.get("created_at"),
+            }
+        ),
+        201,
+    )
+
+
+def api_voice_token_delete(token_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if not _is_admin_user(user):
+        allowed_ids = {entry.get("id") for entry in voice_token_store.list_tokens(user)}
+        if token_id not in allowed_ids:
+            return jsonify({"error": "forbidden"}), 403
+    revoked = voice_token_store.revoke(token_id)
+    if not revoked:
+        return jsonify({"error": "not_found"}), 404
+    _audit_event("voice_token_revoke", actor=user, status="success", details={"token_id": token_id})
+    return jsonify({"status": "revoked", "id": token_id})
+
+
+def api_voice_capture() -> Response:
+    payload = request.get_json(force=False, silent=True) or {}
+    user = _voice_user_from_request(payload)
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    text = _extract_voice_text(payload)
+    if not text:
+        return jsonify({"error": "text_required"}), 400
+    source = str(payload.get("source") or request.args.get("source") or "voice").strip().lower() or "voice"
+    device = _extract_voice_device(payload)
+    meta = {}
+    locale = payload.get("locale")
+    if isinstance(locale, str) and locale.strip():
+        meta["locale"] = locale.strip()
+    item = todo_store.add_item(
+        user,
+        text,
+        source=source,
+        device=device,
+        meta=meta or None,
+        defer_until_idle=True,
+    )
+    _audit_event(
+        "voice_capture",
+        actor=user,
+        status="success",
+        details={"todo_id": item.get("id"), "source": source, "device": device},
+    )
+    return jsonify({"status": "ok", "todo": item})
+
+
+def api_voice_siri() -> Response:
+    payload = request.get_json(force=False, silent=True) or {}
+    user = _voice_user_from_request(payload)
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    text = _extract_voice_text(payload)
+    if not text:
+        return jsonify({"error": "text_required"}), 400
+    device = _extract_voice_device(payload)
+    meta = {}
+    shortcut = payload.get("shortcut") or request.values.get("shortcut")
+    if isinstance(shortcut, str) and shortcut.strip():
+        meta["shortcut"] = shortcut.strip()
+    item = todo_store.add_item(
+        user,
+        text,
+        source="siri",
+        device=device,
+        meta=meta or None,
+        defer_until_idle=True,
+    )
+    _audit_event(
+        "voice_capture",
+        actor=user,
+        status="success",
+        details={"todo_id": item.get("id"), "source": "siri", "device": device},
+    )
+    message = f"Captured: {item.get('text')}"
+    wants_plain = "text/plain" in (request.headers.get("Accept") or "")
+    wants_plain = wants_plain or (request.args.get("format") or "").strip().lower() in {"text", "plain"}
+    if wants_plain:
+        return Response(message, mimetype="text/plain")
+    return jsonify({"status": "ok", "message": message, "todo": item})
+
+
+def api_voice_alexa() -> Response:
+    payload = request.get_json(force=False, silent=True) or {}
+    if VOICE_VERIFY_ALEXA:
+        ok, reason = _alexa_verify_request(payload, request.get_data(cache=True))
+        if not ok:
+            logger.warning("Alexa verification failed: %s", reason)
+            return _alexa_response("Request validation failed.", end_session=True), 401
+        user = _voice_user_from_provider("alexa", payload, allow_tokens=VOICE_ALLOW_TOKENS_WITH_SIGNATURE)
+    else:
+        user = _voice_user_from_request(payload) if VOICE_ALLOW_TOKENS else None
+    if not user:
+        return _alexa_response("Please link your Refiner account to use this skill.", end_session=True), 401
+    text = _extract_alexa_text(payload)
+    if not text:
+        return _alexa_response("Sorry, I didn't catch that. What should I capture?", end_session=False)
+    request_payload = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    intent = request_payload.get("intent") if isinstance(request_payload.get("intent"), dict) else {}
+    meta = {
+        "intent": intent.get("name"),
+        "locale": request_payload.get("locale"),
+    }
+    item = todo_store.add_item(
+        user,
+        text,
+        source="alexa",
+        device="alexa",
+        meta=meta,
+        defer_until_idle=True,
+    )
+    _audit_event(
+        "voice_capture",
+        actor=user,
+        status="success",
+        details={"todo_id": item.get("id"), "source": "alexa"},
+    )
+    return _alexa_response("Captured. I'll save that for later.", end_session=True)
+
+
+def api_voice_google() -> Response:
+    payload = request.get_json(force=False, silent=True) or {}
+    if VOICE_VERIFY_GOOGLE:
+        ok, reason = _google_verify_request()
+        if not ok:
+            logger.warning("Google verification failed: %s", reason)
+            return _google_response("Request validation failed."), 401
+        user = _voice_user_from_provider("google", payload, allow_tokens=VOICE_ALLOW_TOKENS_WITH_SIGNATURE)
+    else:
+        user = _voice_user_from_request(payload) if VOICE_ALLOW_TOKENS else None
+    if not user:
+        return _google_response("Please link your Refiner account to use this action."), 401
+    text = _extract_google_text(payload)
+    if not text:
+        return _google_response("Sorry, I didn't catch that. What should I capture?")
+    query_result = payload.get("queryResult") if isinstance(payload.get("queryResult"), dict) else {}
+    intent = query_result.get("intent") if isinstance(query_result.get("intent"), dict) else {}
+    meta = {
+        "intent": intent.get("displayName") or intent.get("name"),
+        "language": query_result.get("languageCode"),
+    }
+    item = todo_store.add_item(
+        user,
+        text,
+        source="google",
+        device="google_home",
+        meta=meta,
+        defer_until_idle=True,
+    )
+    _audit_event(
+        "voice_capture",
+        actor=user,
+        status="success",
+        details={"todo_id": item.get("id"), "source": "google"},
+    )
+    return _google_response("Captured. I'll save that for later.")
+
+
+def api_voice_stt() -> Response:
+    request_started = time.perf_counter()
+    payload = request.get_json(force=False, silent=True) or {}
+    if not _stt_authorized(payload):
+        return jsonify({"error": "unauthorized"}), 401
+    voice_user = _voice_user_from_request(payload)
+    actor = _current_user() or voice_user or "voice"
+    gesture_mode, avatar_mode, office_flag = _stt_motion_context(payload)
+    collaboration_mode = _stt_collaboration_mode(payload)
+    data, ext, error = _extract_audio_bytes(payload)
+    if error:
+        return jsonify({"error": error}), 400
+    if data is None:
+        return jsonify({"error": "audio_required"}), 400
+    if STT_MAX_BYTES and len(data) > STT_MAX_BYTES:
+        return jsonify({"error": "audio_too_large"}), 413
+    lang = _sanitize_lang(request.form.get("lang") or request.args.get("lang") or payload.get("lang"))
+    prompt_hint = _stt_prompt_hint(payload)
+    capacity_acquired = _acquire_request_capacity(_STT_REQUEST_CAPACITY, STT_CAPACITY_WAIT_SEC)
+    if not capacity_acquired:
+        return jsonify({"error": "stt_capacity_unavailable"}), 503
+    audio_path = None
+    processed_path = None
+    server_motion_payload: Optional[Dict[str, Any]] = None
+    direct_server_mode = (
+        STT_BACKEND == "server"
+        and bool(STT_SERVER_URL)
+        and not (STT_SERVER_PREPROCESS and STT_PREPROCESS_COMMAND)
+    )
+    timings_ms: Dict[str, int] = {"preprocess": 0, "stt": 0, "planner": 0}
+    stt_transport = "server_direct" if direct_server_mode else "command"
+    if STT_BACKEND == "server" and STT_SERVER_URL and not direct_server_mode:
+        stt_transport = "server_file"
+    try:
+        if direct_server_mode:
+            stt_started = time.perf_counter()
+            transcript, stt_error, server_motion_payload = _run_stt_server_bytes(
+                data,
+                ext,
+                lang,
+                prompt_hint=prompt_hint,
+                gesture_mode=gesture_mode,
+                avatar_mode=avatar_mode,
+                office_mode=office_flag,
+                collaboration_mode=collaboration_mode,
+            )
+            timings_ms["stt"] = int((time.perf_counter() - stt_started) * 1000)
+        else:
+            preprocess_started = time.perf_counter()
+            audio_path = _write_audio_temp(data, ext)
+            processed_path, preprocess_error = _run_preprocess(audio_path)
+            timings_ms["preprocess"] = int((time.perf_counter() - preprocess_started) * 1000)
+            if preprocess_error:
+                return jsonify({"error": preprocess_error}), 500
+            stt_started = time.perf_counter()
+            transcript, stt_error, server_motion_payload = _run_stt(
+                processed_path,
+                lang,
+                prompt_hint=prompt_hint,
+                gesture_mode=gesture_mode,
+                avatar_mode=avatar_mode,
+                office_mode=office_flag,
+                collaboration_mode=collaboration_mode,
+            )
+            timings_ms["stt"] = int((time.perf_counter() - stt_started) * 1000)
+        if stt_error or not transcript:
+            # Passive-listening mode: treat no-speech / invalid-audio outcomes as non-fatal.
+            benign_errors = {"stt_output_empty", "invalid_audio", "unsupported_format"}
+            error_code = (stt_error or "").strip().lower()
+            if error_code in benign_errors:
+                return jsonify({"status": "ok", "text": "", "lang": lang, "reason": error_code}), 200
+            return jsonify({"error": stt_error or "stt_failed"}), 500
+    finally:
+        for path in {audio_path, processed_path}:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        _STT_REQUEST_CAPACITY.release()
+    _stt_record_learning(transcript, source="voice_stt")
+    response_payload: Dict[str, Any] = {
+        "status": "ok",
+        "text": transcript,
+        "lang": lang,
+        "gesture_mode": gesture_mode,
+        "avatar_mode": avatar_mode,
+        "collaboration_mode": bool(collaboration_mode),
+    }
+    planner_used = "disabled" if not STT_GESTURE_ENABLED else "none"
+    has_server_clip = (
+        isinstance(server_motion_payload, dict)
+        and isinstance(server_motion_payload.get("avatar_motion"), (dict, list))
+    )
+    if STT_GESTURE_ENABLED and has_server_clip and STT_GESTURE_PREFER_SERVER:
+        response_payload.update(server_motion_payload or {})
+        response_payload["gesture_mode"] = sanitize_gesture_mode(
+            response_payload.get("gesture_mode"),
+            default_mode=gesture_mode,
+            bsl_enabled=STT_BSL_ENABLED,
+        )
+        response_payload["avatar_mode"] = sanitize_avatar_mode(
+            response_payload.get("avatar_mode"),
+            office_mode=office_flag,
+            default_mode=avatar_mode,
+        )
+        planner_used = "rust_server"
+
+    if STT_GESTURE_ENABLED and planner_used != "rust_server":
+        planner_started = time.perf_counter()
+        try:
+            rust_motion_payload = None
+            if STT_GESTURE_RUST_FALLBACK and STT_BACKEND == "server" and STT_SERVER_URL:
+                rust_motion_payload = _run_rust_gesture_plan(
+                    transcript,
+                    gesture_mode=gesture_mode,
+                    avatar_mode=avatar_mode,
+                    office_mode=office_flag,
+                )
+            if isinstance(rust_motion_payload, dict):
+                response_payload.update(rust_motion_payload)
+                response_payload["gesture_mode"] = sanitize_gesture_mode(
+                    response_payload.get("gesture_mode"),
+                    default_mode=gesture_mode,
+                    bsl_enabled=STT_BSL_ENABLED,
+                )
+                response_payload["avatar_mode"] = sanitize_avatar_mode(
+                    response_payload.get("avatar_mode"),
+                    office_mode=office_flag,
+                    default_mode=avatar_mode,
+                )
+                planner_used = "rust_gesture_plan"
+            else:
+                motion_payload = plan_stt_avatar_motion(
+                    transcript,
+                    gesture_mode=gesture_mode,
+                    avatar_mode=avatar_mode,
+                    bsl_enabled=STT_BSL_ENABLED,
+                )
+                if isinstance(motion_payload, dict):
+                    response_payload.update(motion_payload)
+                    planner_used = "python_fallback"
+        except Exception as exc:
+            logger.debug("STT gesture planning skipped: %s", exc)
+            if planner_used == "none":
+                planner_used = "error"
+        finally:
+            timings_ms["planner"] = int((time.perf_counter() - planner_started) * 1000)
+    timings_ms["total"] = int((time.perf_counter() - request_started) * 1000)
+    _audit_event(
+        "voice_stt",
+        actor=actor,
+        status="success",
+        details={
+            "bytes": len(data),
+            "lang": lang,
+            "gesture_mode": response_payload.get("gesture_mode"),
+            "avatar_mode": response_payload.get("avatar_mode"),
+            "collaboration_mode": response_payload.get("collaboration_mode"),
+            "gesture_planner": planner_used,
+            "transport": stt_transport,
+            "timings_ms": timings_ms,
+        },
+    )
+    return jsonify(response_payload)
+
+
+def _parse_user_list_payload(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _diff_list(old: Optional[List[str]], new: Optional[List[str]]) -> Dict[str, List[str]]:
+    old_set = {str(item).strip() for item in (old or []) if str(item).strip()}
+    new_set = {str(item).strip() for item in (new or []) if str(item).strip()}
+    added = sorted(new_set - old_set)
+    removed = sorted(old_set - new_set)
+    return {"added": added, "removed": removed}
+
+
+def _diff_permissions(old: Optional[Dict[str, Any]], new: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, List[str]]]:
+    old_perm = AccessStore._normalise_permissions(old)
+    new_perm = AccessStore._normalise_permissions(new)
+    changes: Dict[str, Dict[str, List[str]]] = {}
+    for key in ("read", "write", "grant"):
+        diff = _diff_list(old_perm.get(key), new_perm.get(key))
+        if diff["added"] or diff["removed"]:
+            changes[key] = diff
+    return changes
+
+
+def api_projects() -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if request.method == "GET":
+        include_viewers = request.args.get("include_viewers", "1").strip().lower() in {"1", "true", "yes"}
+        if _is_admin_user(user):
+            projects = []
+            for project in access_store.list_projects():
+                entry = dict(project)
+                entry["role"] = "admin"
+                entry["capabilities"] = {"read": True, "write": True, "grant": True}
+                team = access_store.get_team(project.get("team_id")) if project.get("team_id") else None
+                if team:
+                    entry["team_name"] = team.get("name")
+                projects.append(entry)
+        else:
+            projects = access_store.projects_for_user(user, include_viewers=include_viewers)
+        return jsonify({"projects": projects})
+    payload = request.get_json(force=True, silent=True) or {}
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "invalid_name"}), 400
+    team_id = payload.get("team_id") or None
+    leaders = _parse_user_list_payload(payload.get("leaders"))
+    contributors = _parse_user_list_payload(payload.get("contributors"))
+    viewers = _parse_user_list_payload(payload.get("viewers"))
+    permissions = payload.get("permissions")
+    if permissions is None:
+        permissions = {
+            "read": payload.get("permissions_read"),
+            "write": payload.get("permissions_write"),
+            "grant": payload.get("permissions_grant"),
+        }
+        if not any(permissions.values()):
+            permissions = None
+    if not _is_admin_user(user):
+        if not team_id:
+            return jsonify({"error": "team_required", "details": "Team ID required for non-admin creation."}), 400
+        if not access_store.can_create_project(user, team_id):
+            return jsonify({"error": "forbidden", "details": "Team grant required to create projects."}), 403
+        if user not in leaders:
+            leaders.append(user)
+    try:
+        project = access_store.create_project(
+            name,
+            team_id=team_id,
+            leaders=leaders,
+            contributors=contributors,
+            viewers=viewers,
+            permissions=permissions,
+        )
+    except ValueError as exc:
+        return jsonify({"error": "invalid_team", "details": str(exc)}), 400
+    _audit_event(
+        "project_create",
+        actor=user,
+        status="success",
+        details={
+            "project_id": project.get("id"),
+            "team_id": project.get("team_id"),
+            "leaders": project.get("leaders"),
+            "contributors": project.get("contributors"),
+            "viewers": project.get("viewers"),
+            "permissions": project.get("permissions"),
+        },
+    )
+    return jsonify(project), 201
+
+
+def api_project_detail(project_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if request.method == "DELETE":
+        if not _is_admin_user(user):
+            return jsonify({"error": "forbidden"}), 403
+        if not access_store.delete_project(project_id):
+            return jsonify({"error": "delete_failed"}), 409
+        _audit_event("project_delete", actor=user, status="success", details={"project_id": project_id})
+        return jsonify({"status": "deleted", "project_id": project_id})
+    if not (_is_admin_user(user) or access_store.can_manage_project(user, project_id)):
+        return jsonify({"error": "forbidden"}), 403
+    before = dict(access_store.get_project(project_id) or {})
+    payload = request.get_json(force=True, silent=True) or {}
+    name = payload.get("name")
+    team_id = payload.get("team_id")
+    leaders = payload.get("leaders")
+    contributors = payload.get("contributors")
+    viewers = payload.get("viewers")
+    permissions = payload.get("permissions")
+    if permissions is None:
+        permissions = {
+            "read": payload.get("permissions_read"),
+            "write": payload.get("permissions_write"),
+            "grant": payload.get("permissions_grant"),
+        }
+        if not any(permissions.values()):
+            permissions = None
+    try:
+        project = access_store.update_project(
+            project_id,
+            name=name,
+            team_id=team_id,
+            leaders=_parse_user_list_payload(leaders) if leaders is not None else None,
+            contributors=_parse_user_list_payload(contributors) if contributors is not None else None,
+            viewers=_parse_user_list_payload(viewers) if viewers is not None else None,
+            permissions=permissions,
+        )
+    except ValueError as exc:
+        return jsonify({"error": "invalid_team", "details": str(exc)}), 400
+    if not project:
+        return jsonify({"error": "not_found"}), 404
+    _audit_event("project_update", actor=user, status="success", details={"project_id": project_id})
+    if before:
+        changes: Dict[str, Any] = {}
+        leader_diff = _diff_list(before.get("leaders"), project.get("leaders"))
+        if leader_diff["added"] or leader_diff["removed"]:
+            changes["leaders"] = leader_diff
+        contributor_diff = _diff_list(before.get("contributors"), project.get("contributors"))
+        if contributor_diff["added"] or contributor_diff["removed"]:
+            changes["contributors"] = contributor_diff
+        viewer_diff = _diff_list(before.get("viewers"), project.get("viewers"))
+        if viewer_diff["added"] or viewer_diff["removed"]:
+            changes["viewers"] = viewer_diff
+        perm_diff = _diff_permissions(before.get("permissions"), project.get("permissions"))
+        if perm_diff:
+            changes["permissions"] = perm_diff
+        if changes:
+            _audit_event(
+                "project_permissions_change",
+                actor=user,
+                status="success",
+                details={"project_id": project_id, "changes": changes},
+            )
+    return jsonify(project)
+
+
+def api_teams() -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if request.method == "GET":
+        if not _is_admin_user(user):
+            return jsonify({"error": "forbidden"}), 403
+        return jsonify({"teams": access_store.list_teams()})
+    if not _is_admin_user(user):
+        return jsonify({"error": "forbidden"}), 403
+    payload = request.get_json(force=True, silent=True) or {}
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "invalid_name"}), 400
+    parent_id = payload.get("parent_id") or None
+    leaders = _parse_user_list_payload(payload.get("leaders"))
+    members = _parse_user_list_payload(payload.get("members"))
+    team = access_store.create_team(name, parent_id=parent_id, leaders=leaders, members=members)
+    _audit_event(
+        "team_create",
+        actor=user,
+        status="success",
+        details={
+            "team_id": team.get("id"),
+            "parent_id": team.get("parent_id"),
+            "leaders": team.get("leaders"),
+            "members": team.get("members"),
+        },
+    )
+    return jsonify(team), 201
+
+
+def api_team_detail(team_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if not _is_admin_user(user):
+        return jsonify({"error": "forbidden"}), 403
+    if request.method == "DELETE":
+        if not access_store.delete_team(team_id):
+            return jsonify({"error": "delete_failed"}), 409
+        _audit_event("team_delete", actor=user, status="success", details={"team_id": team_id})
+        return jsonify({"status": "deleted", "team_id": team_id})
+    before = dict(access_store.get_team(team_id) or {})
+    payload = request.get_json(force=True, silent=True) or {}
+    name = payload.get("name")
+    parent_id = payload.get("parent_id")
+    leaders = payload.get("leaders")
+    members = payload.get("members")
+    team = access_store.update_team(
+        team_id,
+        name=name,
+        parent_id=parent_id,
+        leaders=_parse_user_list_payload(leaders) if leaders is not None else None,
+        members=_parse_user_list_payload(members) if members is not None else None,
+    )
+    if not team:
+        return jsonify({"error": "not_found"}), 404
+    _audit_event("team_update", actor=user, status="success", details={"team_id": team_id})
+    if before:
+        changes: Dict[str, Any] = {}
+        leader_diff = _diff_list(before.get("leaders"), team.get("leaders"))
+        if leader_diff["added"] or leader_diff["removed"]:
+            changes["leaders"] = leader_diff
+        member_diff = _diff_list(before.get("members"), team.get("members"))
+        if member_diff["added"] or member_diff["removed"]:
+            changes["members"] = member_diff
+        if changes:
+            _audit_event(
+                "team_membership_change",
+                actor=user,
+                status="success",
+                details={"team_id": team_id, "changes": changes},
+            )
+    return jsonify(team)
+
+
+def api_team_tokens(team_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    team = access_store.get_team(team_id)
+    if not team:
+        return jsonify({"error": "team_not_found"}), 404
+    if request.method == "GET":
+        if not _can_access_team_tokens(user, team_id):
+            return jsonify({"error": "forbidden"}), 403
+        snapshot = _team_token_snapshot(team_id)
+        return jsonify({"team_id": team_id, "team_name": team.get("name"), **snapshot})
+    if not _is_admin_user(user):
+        return jsonify({"error": "forbidden"}), 403
+    payload = request.get_json(force=True, silent=True) or {}
+    action = (payload.get("action") or "grant").strip().lower()
+    tokens_raw = payload.get("token_amount")
+    tokens = 0
+    if tokens_raw not in (None, ""):
+        try:
+            tokens = int(float(tokens_raw))
+        except Exception:
+            tokens = 0
+    if action in {"add", "grant"}:
+        if tokens <= 0:
+            return jsonify({"error": "invalid_amount", "details": "Token amount must be positive."}), 400
+        meta = {
+            "tokens": tokens,
+            "team_id": team_id,
+            "team_name": team.get("name"),
+            "source": payload.get("source") or "admin",
+            "granted_by": user,
+        }
+        entry_type = "topup" if action == "add" else "grant"
+        team_token_ledger.record(team_id, entry_type, tokens, meta)
+        _audit_event(
+            "team_tokens_topup" if action == "add" else "team_tokens_grant",
+            actor=user,
+            status="success",
+            details={"team_id": team_id, "amount": tokens},
+        )
+        snapshot = _team_token_snapshot(team_id)
+        return jsonify({"message": "Team tokens updated.", "team_id": team_id, **snapshot})
+    if action == "sync":
+        target = payload.get("balance")
+        if target is None:
+            return jsonify({"error": "balance_required"}), 400
+        try:
+            target_balance = int(float(target))
+        except Exception:
+            return jsonify({"error": "invalid_balance"}), 400
+        if target_balance < 0:
+            return jsonify({"error": "invalid_balance"}), 400
+        capacity = payload.get("capacity") or payload.get("last_topup_tokens")
+        try:
+            capacity_val = int(float(capacity)) if capacity not in (None, "") else None
+        except Exception:
+            capacity_val = None
+        target_paid = payload.get("paid_balance")
+        target_free = payload.get("free_balance")
+        try:
+            target_paid_val = int(float(target_paid)) if target_paid not in (None, "") else None
+        except Exception:
+            target_paid_val = None
+        try:
+            target_free_val = int(float(target_free)) if target_free not in (None, "") else None
+        except Exception:
+            target_free_val = None
+        snapshot = _team_token_snapshot(team_id)
+        delta = target_balance - snapshot["balance"]
+        status = "matched" if delta == 0 else "adjusted"
+        team_token_ledger.record(
+            team_id,
+            "sync",
+            delta,
+            {
+                "target_balance": target_balance,
+                "capacity": capacity_val,
+                "source": payload.get("source") or "admin",
+                "sync_user": payload.get("user") or user,
+                "sync_role": payload.get("role"),
+                "target_paid_balance": target_paid_val,
+                "target_free_balance": target_free_val,
+            },
+        )
+        _audit_event("team_tokens_sync", actor=user, status=status, details={"team_id": team_id, "delta": delta})
+        snapshot = _team_token_snapshot(team_id)
+        return jsonify({"message": "Sync complete.", "status": status, "team_id": team_id, **snapshot})
+    return jsonify({"error": "invalid_action"}), 400
+
+
+def api_access_tree() -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if _is_admin_user(user):
+        tree = access_store.tree_all()
+    else:
+        tree = access_store.tree_for_user(user)
+    return jsonify({"tree": tree})
+
+
+def _sse_event(event: str, entry: Dict[str, Any]) -> str:
+    payload = json.dumps(entry)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def api_sessions() -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    payload = request.get_json(force=True, silent=True) or {}
+    job_id = str(payload.get("job_id") or "").strip()
+    room_id = str(payload.get("room_id") or "").strip() or None
+    if not job_id:
+        return jsonify({"error": "job_id_required"}), 400
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "job_not_found"}), 404
+    project_id = _job_project_id(job)
+    role = _job_role_for_user(user, job)
+    session_obj = session_store.get_or_create(job_id, project_id, user, role, room_id=room_id)
+    snapshot = session_obj.snapshot()
+    snapshot["project_role"] = role
+    return jsonify(snapshot)
+
+
+def api_session_detail(session_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    session_obj = session_store.get(session_id)
+    if not session_obj:
+        return jsonify({"error": "not_found"}), 404
+    job = manager.get_job(session_obj.job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "forbidden"}), 403
+    snapshot = session_obj.snapshot()
+    snapshot["project_role"] = _job_role_for_user(user, job)
+    history = session_history.load(session_obj.room_id)
+    if history and isinstance(history.get("events"), list):
+        snapshot["history_count"] = len(history.get("events"))
+    return jsonify(snapshot)
+
+
+def api_session_leave(session_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    session_obj = session_store.get(session_id)
+    if not session_obj:
+        return jsonify({"error": "not_found"}), 404
+    session_store.leave(session_id, user)
+    return jsonify({"status": "ok"})
+
+
+def api_session_stream(session_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    session_obj = session_store.get(session_id)
+    if not session_obj:
+        return jsonify({"error": "not_found"}), 404
+    job = manager.get_job(session_obj.job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "forbidden"}), 403
+    role = _job_role_for_user(user, job)
+    session_obj.join(user, role)
+
+    def generate():
+        q = session_obj.add_listener()
+        last_status = None
+        last_progress = None
+        last_status_event = None
+        try:
+            while True:
+                try:
+                    entry = q.get(timeout=1.0)
+                except queue.Empty:
+                    # periodic job state updates
+                    status = job.status
+                    progress = job.progress
+                    if status != last_status or progress != last_progress:
+                        last_status = status
+                        last_progress = progress
+                        if status != last_status_event:
+                            last_status_event = status
+                            session_obj._record_event(
+                                "job_status",
+                                user=None,
+                                detail={"status": status, "progress": progress},
+                            )
+                        payload = {
+                            "job_id": job.job_id,
+                            "status": status,
+                            "progress": progress,
+                            "updated_at": job.updated_at,
+                        }
+                        yield _sse_event("job", payload)
+                    yield ": keep-alive\n\n"
+                    continue
+                event_type = entry.get("event") or "presence"
+                payload = entry.get("payload") or {}
+                yield _sse_event(event_type, payload)
+        finally:
+            session_obj.remove_listener(q)
+            session_store.leave(session_id, user)
+
+    return Response(generate(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+def api_session_history(session_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    session_obj = session_store.get(session_id)
+    job = manager.get_job(session_obj.job_id) if session_obj else None
+    if session_obj and job:
+        if not _can_view_job(user, job):
+            return jsonify({"error": "forbidden"}), 403
+    else:
+        history = session_history.load(session_id)
+        if history and history.get("job_id"):
+            job = manager.get_job(history.get("job_id"))
+            if job and not _can_view_job(user, job):
+                return jsonify({"error": "forbidden"}), 403
+    history = session_history.load(session_id)
+    if not history:
+        return jsonify({"history": [], "room_id": session_id})
+    events = history.get("events") if isinstance(history.get("events"), list) else []
+    return jsonify({"room_id": session_id, "history": events})
+
+
+def api_sessions_history() -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if not _is_admin_user(user):
+        return jsonify({"error": "forbidden"}), 403
+    try:
+        limit = int(request.args.get("limit") or 50)
+    except Exception:
+        limit = 50
+    rooms = session_history.list_rooms(limit=limit, tail=5)
+    return jsonify({"rooms": rooms})
+
+
 def setup() -> Response:
+    if AUTH_MODE == "oidc":
+        return redirect(url_for("oidc_login"))
     if user_store.has_users():
         return redirect(url_for("login"))
     error = None
@@ -4354,30 +9575,42 @@ def setup() -> Response:
             error = "Username must be 3-32 chars (letters, numbers, underscore, dash)."
         elif email and not EMAIL_RE.match(email):
             error = "Please enter a valid email address."
-        elif len(password) < 8:
-            error = "Password must be at least 8 characters."
+        elif len(password) < PASSWORD_MIN_LEN:
+            error = f"Password must be at least {PASSWORD_MIN_LEN} characters."
         elif password != confirm:
             error = "Passwords do not match."
         else:
             user_store.create_user(username, password, role="admin", email=email or None)
             session["user"] = username
+            _audit_event("setup", actor=username, status="success")
             return redirect(url_for("index"))
     return render_template("setup.html", error=error, api_base=API_BASE, site_base=SITE_BASE)
 
 
-@app.route("/api/health")
 def health() -> Response:
+    learning = None
+    if stt_learning_store:
+        try:
+            learning = stt_learning_store.stats()
+        except Exception:
+            learning = {"error": "unavailable"}
     return jsonify(
         {
             "status": "ok",
             "jobs": len(manager.jobs),
             "workers": len(manager.workers),
+            "job_actions": {
+                "workers": len(job_action_manager.workers),
+                "queue_depth": job_action_manager.queue_depth(),
+                "inflight": job_action_manager.inflight(),
+                "queue_capacity": JOB_ACTION_MAX_QUEUE,
+            },
             "sso": _sso_store_health(),
+            "stt_learning": learning,
         }
     )
 
 
-@app.route("/api/capabilities")
 def capabilities_report() -> Response:
     user = _current_user()
     if not user:
@@ -4388,7 +9621,6 @@ def capabilities_report() -> Response:
     return jsonify(report)
 
 
-@app.route("/api/admin/stats")
 def admin_stats() -> Response:
     user = _current_user()
     if not user:
@@ -4410,6 +9642,10 @@ def admin_stats() -> Response:
             "active_window_sec": ACTIVE_WINDOW_SEC,
             "total_users": total_users,
             "workers": len(manager.workers),
+            "job_action_workers": len(job_action_manager.workers),
+            "job_action_queue_depth": job_action_manager.queue_depth(),
+            "job_action_inflight": job_action_manager.inflight(),
+            "job_action_queue_capacity": JOB_ACTION_MAX_QUEUE,
             "jobs_total": len(jobs_snapshot),
             "jobs_running": jobs_by_status.get("running", 0),
             "jobs_queued": jobs_by_status.get("queued", 0),
@@ -4422,30 +9658,50 @@ def admin_stats() -> Response:
     )
 
 
-@app.route("/api/jobs/estimate", methods=["POST"])
+def api_audit() -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if user_store.get_role(user) != "admin":
+        return jsonify({"error": "forbidden"}), 403
+    limit = request.args.get("limit")
+    try:
+        limit_val = int(limit) if limit else 60
+    except Exception:
+        limit_val = 60
+    limit_val = max(1, min(limit_val, 200))
+    actions_raw = request.args.get("actions") or ""
+    actions = [item.strip() for item in actions_raw.split(",") if item.strip()]
+    entries = _read_audit_entries(limit_val, actions=actions or None)
+    return jsonify({"entries": entries})
+
+
 def job_estimate() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
     payload = request.get_json(force=True, silent=True) or {}
+    project_id = payload.get("project_id") or payload.get("project")
+    team_id = payload.get("team_id") if isinstance(payload, dict) else None
+    if project_id:
+        project = access_store.get_project(project_id)
+        if not project:
+            return jsonify({"error": "project_not_found"}), 404
+        if not (_is_admin_user(user) or access_store.can_submit_project(user, project_id)):
+            return jsonify({"error": "forbidden", "details": "Project access denied."}), 403
+        if not team_id:
+            team_id = project.get("team_id")
+            if team_id:
+                payload["team_id"] = team_id
+    elif team_id and not _can_access_team_tokens(user, team_id):
+        return jsonify({"error": "forbidden", "details": "Team access denied."}), 403
+    if isinstance(payload, dict) and str(payload.get("token_scope") or "").lower() == "personal":
+        team_id = None
     estimate = _estimate_job_tokens(payload)
-    snapshot = _token_snapshot(user)
-    return jsonify(
-        {
-            "estimate": estimate,
-            "available": snapshot["available"],
-            "balance": snapshot["balance"],
-            "reserved": snapshot["reserved"],
-            "in_use": snapshot["in_use"],
-            "capacity": snapshot["capacity"],
-            "display_capacity": snapshot["display_capacity"],
-            "low_threshold": snapshot["low_threshold"],
-            "status": snapshot["status"],
-        }
-    )
+    snapshot = _token_snapshot(user, team_id)
+    return jsonify({"estimate": estimate, **snapshot})
 
 
-@app.route("/api/requirements/import", methods=["POST"])
 def import_requirements() -> Response:
     user = _current_user()
     if not user:
@@ -4474,7 +9730,6 @@ def import_requirements() -> Response:
     return jsonify({"items": items, "count": len(items)})
 
 
-@app.route("/api/requirements/export", methods=["POST"])
 def export_requirements() -> Response:
     user = _current_user()
     if not user:
@@ -4505,7 +9760,6 @@ def export_requirements() -> Response:
     return response
 
 
-@app.route("/api/rag/indexes", methods=["GET"])
 def rag_indexes() -> Response:
     user = _current_user()
     if not user:
@@ -4514,7 +9768,6 @@ def rag_indexes() -> Response:
     return jsonify({"indexes": indexes})
 
 
-@app.route("/api/rag/index", methods=["POST"])
 def rag_index_create() -> Response:
     user = _current_user()
     if not user:
@@ -4553,7 +9806,6 @@ def rag_index_create() -> Response:
     )
 
 
-@app.route("/api/rag/index/<name>", methods=["DELETE"])
 def rag_index_delete(name: str) -> Response:
     user = _current_user()
     if not user:
@@ -4566,7 +9818,6 @@ def rag_index_delete(name: str) -> Response:
     return jsonify({"status": "deleted", "name": name})
 
 
-@app.route("/api/rag/query", methods=["POST"])
 def rag_query() -> Response:
     user = _current_user()
     if not user:
@@ -4602,7 +9853,6 @@ def rag_query() -> Response:
     )
 
 
-@app.route("/api/assistant/rag-mcp", methods=["POST"])
 def assistant_rag_mcp() -> Response:
     user = _current_user()
     if not user:
@@ -4694,6 +9944,9 @@ def assistant_rag_mcp() -> Response:
         user_blocks.append(f"MCP result:\n{json.dumps(mcp_result, ensure_ascii=True)}")
     user_text = "\n\n".join(user_blocks)
 
+    capacity_acquired = _acquire_request_capacity(_ASSISTANT_REQUEST_CAPACITY, ASSISTANT_CAPACITY_WAIT_SEC)
+    if not capacity_acquired:
+        return jsonify({"error": "assistant_capacity_unavailable"}), 503
     try:
         response = provider.predict(
             messages=[{"role": "user", "content": user_text}],
@@ -4704,6 +9957,8 @@ def assistant_rag_mcp() -> Response:
         )
     except Exception as exc:
         return jsonify({"error": "llm_request_failed", "details": str(exc)}), 400
+    finally:
+        _ASSISTANT_REQUEST_CAPACITY.release()
 
     return jsonify(
         {
@@ -4714,7 +9969,6 @@ def assistant_rag_mcp() -> Response:
     )
 
 
-@app.route("/api/mcp/servers", methods=["GET", "POST"])
 def mcp_servers() -> Response:
     user = _current_user()
     if not user:
@@ -4750,7 +10004,6 @@ def mcp_servers() -> Response:
     return jsonify({"server": config.masked()})
 
 
-@app.route("/api/mcp/servers/<name>", methods=["DELETE"])
 def mcp_server_delete(name: str) -> Response:
     user = _current_user()
     if not user:
@@ -4763,7 +10016,6 @@ def mcp_server_delete(name: str) -> Response:
     return jsonify({"status": "deleted", "name": name})
 
 
-@app.route("/api/mcp/servers/<name>/tools", methods=["GET"])
 def mcp_server_tools(name: str) -> Response:
     user = _current_user()
     if not user:
@@ -4782,7 +10034,6 @@ def mcp_server_tools(name: str) -> Response:
         return jsonify({"error": "mcp_request_failed", "details": str(exc)}), 400
 
 
-@app.route("/api/mcp/servers/<name>/call", methods=["POST"])
 def mcp_server_call(name: str) -> Response:
     user = _current_user()
     if not user:
@@ -4808,7 +10059,6 @@ def mcp_server_call(name: str) -> Response:
         return jsonify({"error": "mcp_request_failed", "details": str(exc)}), 400
 
 
-@app.route("/api/mcp/servers/<name>/resources", methods=["GET"])
 def mcp_server_resources(name: str) -> Response:
     user = _current_user()
     if not user:
@@ -4827,7 +10077,6 @@ def mcp_server_resources(name: str) -> Response:
         return jsonify({"error": "mcp_request_failed", "details": str(exc)}), 400
 
 
-@app.route("/api/mcp/servers/<name>/resource", methods=["POST"])
 def mcp_server_resource(name: str) -> Response:
     user = _current_user()
     if not user:
@@ -4850,7 +10099,6 @@ def mcp_server_resource(name: str) -> Response:
         return jsonify({"error": "mcp_request_failed", "details": str(exc)}), 400
 
 
-@app.route("/api/jobs/<job_id>/refunds", methods=["POST"])
 def request_refund(job_id: str) -> Response:
     user = _current_user()
     if not user:
@@ -4905,7 +10153,6 @@ def request_refund(job_id: str) -> Response:
     return jsonify({"refund": refund})
 
 
-@app.route("/api/refunds")
 def list_refunds() -> Response:
     user = _current_user()
     if not user:
@@ -4938,7 +10185,6 @@ def list_refunds() -> Response:
     return jsonify({"requests": requests})
 
 
-@app.route("/api/refunds/<job_id>/<request_id>/screen", methods=["POST"])
 def screen_refund(job_id: str, request_id: str) -> Response:
     user = _current_user()
     if not user:
@@ -5005,7 +10251,6 @@ def screen_refund(job_id: str, request_id: str) -> Response:
     return jsonify({"suggestion": suggestion})
 
 
-@app.route("/api/refunds/<job_id>/<request_id>/decision", methods=["POST"])
 def decide_refund(job_id: str, request_id: str) -> Response:
     user = _current_user()
     if not user:
@@ -5072,7 +10317,6 @@ def decide_refund(job_id: str, request_id: str) -> Response:
     return jsonify({"refund": refund, "max_refund": max_refund})
 
 
-@app.route("/api/refunds/<job_id>/<request_id>/file/<filename>")
 def refund_file(job_id: str, request_id: str, filename: str) -> Response:
     user = _current_user()
     if not user:
@@ -5092,7 +10336,6 @@ def refund_file(job_id: str, request_id: str, filename: str) -> Response:
     return send_from_directory(refund_dir, filename)
 
 
-@app.route("/api/jobs", methods=["GET", "POST"])
 def jobs() -> Response:
     user = _current_user()
     if not user:
@@ -5100,8 +10343,24 @@ def jobs() -> Response:
     if request.method == "POST":
         payload = request.get_json(force=True, silent=True) or {}
         payload["owner"] = user
+        project_id = payload.get("project_id") or payload.get("project")
+        team_id = payload.get("team_id") if isinstance(payload, dict) else None
+        if project_id:
+            project = access_store.get_project(project_id)
+            if not project:
+                return jsonify({"error": "project_not_found"}), 404
+            if not (_is_admin_user(user) or access_store.can_submit_project(user, project_id)):
+                return jsonify({"error": "forbidden", "details": "Project access denied."}), 403
+            if not payload.get("team_id"):
+                payload["team_id"] = project.get("team_id")
+                team_id = payload.get("team_id")
+        elif team_id and not _can_access_team_tokens(user, team_id):
+            return jsonify({"error": "forbidden", "details": "Team access denied."}), 403
+        if isinstance(payload, dict) and str(payload.get("token_scope") or "").lower() == "personal":
+            payload.pop("team_id", None)
+            team_id = None
         estimate = _estimate_job_tokens(payload)
-        snapshot = _token_snapshot(user)
+        snapshot = _token_snapshot(user, team_id)
         if estimate > snapshot["available"]:
             return (
                 jsonify(
@@ -5117,45 +10376,654 @@ def jobs() -> Response:
             )
         job = manager.submit_job(payload, owner=user)
         manager._reserve_tokens(job, estimate)
-        return jsonify(job.to_dict())
+        return jsonify(_augment_job_dict_for_user(job.to_dict(), user, job))
     status = request.args.get("status")
-    jobs_list = [job.to_dict() for job in manager.list_jobs(status=status, owner=user)]
+    scope = (request.args.get("scope") or "team").strip().lower()
+    project_filter = (request.args.get("project_id") or request.args.get("project") or "").strip()
+    jobs_source = manager.list_jobs(status=status)
+    visible_jobs: List[Job] = []
+    if _is_admin_user(user) and scope == "all":
+        visible_jobs = list(jobs_source)
+    elif scope == "personal":
+        visible_jobs = [job for job in jobs_source if job.owner == user]
+    else:
+        visible_jobs = [job for job in jobs_source if _can_view_job(user, job)]
+    if project_filter:
+        visible_jobs = [job for job in visible_jobs if _job_project_id(job) == project_filter]
+    jobs_list = [_augment_job_dict_for_user(job.to_dict(), user, job) for job in visible_jobs]
     return jsonify({"jobs": jobs_list})
 
 
-@app.route("/api/jobs/<job_id>", methods=["GET", "DELETE"])
 def job_detail(job_id: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    job = manager.get_job(job_id, owner=user)
-    if not job:
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
         return jsonify({"error": "job not found"}), 404
     is_admin = _is_admin_user(user)
     if request.method == "DELETE":
         payload = request.get_json(force=True, silent=True) or {}
         stop = bool(payload.get("stop")) or request.args.get("stop") in {"1", "true", "yes"}
+        if not _can_manage_job(user, job):
+            return jsonify({"error": "forbidden"}), 403
         if job.status in {"queued", "running", "paused"} and not stop:
             return jsonify({"error": "job_active", "details": "Stop the job before deleting."}), 409
-        deleted = manager.delete_job(job_id, owner=user, stop_if_active=stop)
+        deleted = manager.delete_job(job_id, owner=None, stop_if_active=stop)
         if not deleted:
             return jsonify({"error": "delete_failed"}), 409
         return jsonify({"status": "deleted", "job_id": job_id})
     data = job.to_dict(include_logs=True, log_tail=DEFAULT_TAIL)
     data["logs"] = _redact_log_entries(data.get("logs", []), is_admin)
-    return jsonify(data)
+    return jsonify(_augment_job_dict_for_user(data, user, job))
 
 
-@app.route("/api/jobs/<job_id>/requirements/progress")
+def _workspace_capabilities() -> Dict[str, Any]:
+    return {
+        "continuum": _continuum_enabled(),
+        "continuum_ready": _continuum_ready(),
+        "ide_template": bool(CONTINUUM_IDE_URL_TEMPLATE),
+        "preview_template": bool(CONTINUUM_PREVIEW_URL_TEMPLATE),
+        "ide_file_template": bool(CONTINUUM_IDE_FILE_URL_TEMPLATE),
+    }
+
+
+def _workspace_response_payload(
+    job: Job,
+    *,
+    status: Optional[str] = None,
+    error: Optional[str] = None,
+    task: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "workspace": job.workspace_env if isinstance(job.workspace_env, dict) else {},
+        "capabilities": _workspace_capabilities(),
+        "status": status,
+        "error": error,
+    }
+    if task is not None:
+        payload["task"] = task
+    return payload
+
+
+def _workspace_task_links(job_id: str, task_id: str) -> Dict[str, str]:
+    return {
+        "status_url": url_for("job_task_detail", job_id=job_id, task_id=task_id),
+        "cancel_url": url_for("job_task_cancel", job_id=job_id, task_id=task_id),
+    }
+
+
+def _workspace_action_refresh(job: Job, *, timeout_sec: Optional[float] = None) -> Dict[str, Any]:
+    now = _now_iso()
+    workspace_env = job.workspace_env if isinstance(job.workspace_env, dict) else {}
+    if workspace_env.get("provider") != "continuum" or not workspace_env.get("vm_id"):
+        workspace_env["updated_at"] = now
+        job.workspace_env = workspace_env
+        job.persist(force=True)
+        return {"status": "refreshed", "workspace": workspace_env}
+    if not _continuum_enabled():
+        raise JobActionExecutionError(
+            "continuum_unavailable",
+            "Continuum API base is not configured.",
+            status_code=400,
+        )
+    vm_id = str(workspace_env.get("vm_id") or "").strip()
+    request_timeout = max(1.0, min(CONTINUUM_TIMEOUT, timeout_sec or CONTINUUM_TIMEOUT))
+    try:
+        resp = _continuum_request("GET", f"/vm/get/{vm_id}", timeout_sec=request_timeout)
+    except Exception as exc:
+        raise JobActionExecutionError("continuum_error", str(exc), status_code=502) from exc
+    status_code = int(getattr(resp, "status_code", 500) or 500)
+    ok = bool(getattr(resp, "ok", 200 <= status_code < 300))
+    if not ok:
+        raise JobActionExecutionError(
+            "continuum_error",
+            f"Continuum returned {status_code}.",
+            status_code=502,
+        )
+    try:
+        data = resp.json() if getattr(resp, "content", None) else {}
+    except Exception as exc:
+        raise JobActionExecutionError("continuum_error", str(exc), status_code=502) from exc
+    if not isinstance(data, dict) or not data.get("success"):
+        details = data.get("message") if isinstance(data, dict) else None
+        raise JobActionExecutionError("continuum_error", details or "Continuum call failed.", status_code=502)
+    vm_data = data.get("data") or {}
+    if isinstance(vm_data, dict):
+        vm_data = dict(vm_data)
+        vm_data.pop("initScript", None)
+    template_vars = _workspace_template_vars(job, vm_data)
+    ide_url = _format_workspace_template(CONTINUUM_IDE_URL_TEMPLATE, template_vars) or workspace_env.get("ide_url")
+    preview_url = _format_workspace_template(CONTINUUM_PREVIEW_URL_TEMPLATE, template_vars) or workspace_env.get("preview_url")
+    workspace_env.update(
+        {
+            "status": vm_data.get("status") or workspace_env.get("status") or "provisioning",
+            "ide_url": ide_url or "",
+            "preview_url": preview_url or "",
+            "updated_at": now,
+            "details": data.get("message") or workspace_env.get("details"),
+            "vm": vm_data,
+        }
+    )
+    job.workspace_env = workspace_env
+    job.persist(force=True)
+    return {"status": "refreshed", "workspace": workspace_env}
+
+
+def _workspace_action_create(
+    job: Job,
+    payload: Dict[str, Any],
+    *,
+    timeout_sec: Optional[float] = None,
+) -> Dict[str, Any]:
+    if not _continuum_ready():
+        missing = []
+        if not CONTINUUM_API_BASE:
+            missing.append("CONTINUUM_API_BASE")
+        if not CONTINUUM_VM_PUBLIC_KEY_ID:
+            missing.append("CONTINUUM_VM_PUBLIC_KEY_ID")
+        detail = "Continuum not configured." if not missing else f"Missing: {', '.join(missing)}"
+        raise JobActionExecutionError("continuum_unavailable", detail, status_code=400)
+    now = _now_iso()
+    workspace_env = job.workspace_env if isinstance(job.workspace_env, dict) else {}
+    force_create = _is_truthy(payload.get("force"))
+    if workspace_env.get("provider") == "continuum" and workspace_env.get("vm_id") and not force_create:
+        return {"status": "exists", "workspace": workspace_env}
+
+    vm_name = str(payload.get("name") or f"refiner-{job.job_id[:8]}").strip()
+    init_script = (payload.get("init_script") or CONTINUUM_VM_INIT_SCRIPT or "").strip()
+    template_vars = _workspace_template_vars(job, {})
+    init_script = _format_workspace_template(init_script, template_vars) if init_script else ""
+    vm_request = {
+        "name": vm_name,
+        "sku": str(payload.get("sku") or CONTINUUM_VM_SKU).strip(),
+        "region": str(payload.get("region") or CONTINUUM_VM_REGION).strip(),
+        "osImage": str(payload.get("os_image") or CONTINUUM_VM_OS).strip(),
+        "publicKeyId": str(payload.get("public_key_id") or CONTINUUM_VM_PUBLIC_KEY_ID).strip(),
+        "initScript": init_script,
+    }
+    job.append_log(f"Requesting Continuum workspace: {vm_request['name']} ({vm_request['region']})")
+    request_timeout = max(1.0, min(CONTINUUM_TIMEOUT, timeout_sec or CONTINUUM_TIMEOUT))
+    try:
+        resp = _continuum_request(
+            "POST",
+            "/vm/create",
+            json_body=vm_request,
+            timeout_sec=request_timeout,
+        )
+    except Exception as exc:
+        raise JobActionExecutionError("continuum_error", str(exc), status_code=502) from exc
+    status_code = int(getattr(resp, "status_code", 500) or 500)
+    ok = bool(getattr(resp, "ok", 200 <= status_code < 300))
+    if not ok:
+        raise JobActionExecutionError(
+            "continuum_error",
+            f"Continuum returned {status_code}.",
+            status_code=502,
+        )
+    try:
+        data = resp.json() if getattr(resp, "content", None) else {}
+    except Exception as exc:
+        raise JobActionExecutionError("continuum_error", str(exc), status_code=502) from exc
+    if not isinstance(data, dict) or not data.get("success"):
+        details = data.get("message") if isinstance(data, dict) else None
+        raise JobActionExecutionError("continuum_error", details or "Continuum call failed.", status_code=502)
+    vm_data = data.get("data") or {}
+    if isinstance(vm_data, dict):
+        vm_data = dict(vm_data)
+        vm_data.pop("initScript", None)
+    template_vars = _workspace_template_vars(job, vm_data)
+    ide_url = _format_workspace_template(CONTINUUM_IDE_URL_TEMPLATE, template_vars)
+    preview_url = _format_workspace_template(CONTINUUM_PREVIEW_URL_TEMPLATE, template_vars)
+    workspace_env = {
+        "provider": "continuum",
+        "status": vm_data.get("status") or "provisioning",
+        "vm_id": vm_data.get("id") or "",
+        "ide_url": ide_url,
+        "preview_url": preview_url,
+        "requested_at": now,
+        "updated_at": now,
+        "details": data.get("message") or "Continuum workspace created",
+        "vm": vm_data,
+    }
+    job.workspace_env = workspace_env
+    job.persist(force=True)
+    job.append_log(f"Continuum workspace created: {workspace_env.get('vm_id') or '--'}.")
+    return {"status": "created", "workspace": workspace_env}
+
+
+def _execute_job_action_task(task: JobActionTask) -> Dict[str, Any]:
+    """Dispatch background action tasks to the relevant job/workspace handlers."""
+    job = manager.get_job(task.job_id)
+    if not job:
+        raise JobActionExecutionError("job_not_found", "Job no longer exists.", status_code=404)
+    if task.action == "workspace_refresh":
+        return _workspace_action_refresh(job, timeout_sec=task.timeout_sec)
+    if task.action == "workspace_create":
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        return _workspace_action_create(job, payload, timeout_sec=task.timeout_sec)
+    raise JobActionExecutionError("invalid_action", f"Unsupported task action: {task.action}", status_code=400)
+
+
+def _enqueue_workspace_task(
+    job: Job,
+    *,
+    owner: str,
+    action: str,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout_sec: float = JOB_ACTION_TIMEOUT_SEC,
+) -> JobActionTask:
+    try:
+        return job_action_manager.submit(
+            job_id=job.job_id,
+            owner=owner,
+            action=action,
+            payload=payload or {},
+            timeout_sec=timeout_sec,
+        )
+    except queue.Full as exc:
+        raise JobActionExecutionError(
+            "job_action_capacity_unavailable",
+            "Background action queue is full. Retry later.",
+            status_code=503,
+        ) from exc
+
+
+def job_workspace(job_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "job not found"}), 404
+
+    if request.method == "GET":
+        return jsonify(_workspace_response_payload(job))
+    if not _can_manage_job(user, job):
+        return jsonify({"error": "forbidden"}), 403
+
+    payload = request.get_json(force=True, silent=True) or {}
+    action = str(payload.get("action") or "create").strip().lower()
+    blocking = _is_truthy(payload.get("blocking")) or _is_truthy(payload.get("wait"))
+    timeout_sec = max(1.0, min(_safe_float(payload.get("timeout_sec"), JOB_ACTION_TIMEOUT_SEC), 120.0))
+    now = _now_iso()
+
+    if action == "clear":
+        job.workspace_env = {}
+        job.persist(force=True)
+        job.append_log("Workspace cleared by user.")
+        return jsonify(_workspace_response_payload(job, status="cleared"))
+
+    if action == "attach":
+        ide_url = str(payload.get("ide_url") or "").strip()
+        preview_url = str(payload.get("preview_url") or "").strip()
+        if not ide_url and not preview_url:
+            return jsonify({"error": "missing_urls", "details": "Provide an IDE URL or preview URL."}), 400
+        workspace_env = job.workspace_env if isinstance(job.workspace_env, dict) else {}
+        workspace_env.update(
+            {
+                "provider": workspace_env.get("provider") or "manual",
+                "status": workspace_env.get("status") or "ready",
+                "ide_url": ide_url or workspace_env.get("ide_url") or "",
+                "preview_url": preview_url or workspace_env.get("preview_url") or "",
+                "updated_at": now,
+                "requested_at": workspace_env.get("requested_at") or now,
+                "details": workspace_env.get("details") or "Attached URLs",
+            }
+        )
+        job.workspace_env = workspace_env
+        job.persist(force=True)
+        job.append_log("Workspace URLs attached by user.")
+        return jsonify(_workspace_response_payload(job, status="attached"))
+
+    if action == "refresh":
+        workspace_env = job.workspace_env if isinstance(job.workspace_env, dict) else {}
+        if workspace_env.get("provider") != "continuum" or not workspace_env.get("vm_id"):
+            result = _workspace_action_refresh(job, timeout_sec=timeout_sec)
+            return jsonify(_workspace_response_payload(job, status=result.get("status")))
+        if not _continuum_enabled():
+            return jsonify({"error": "continuum_unavailable", "details": "Continuum API base is not configured."}), 400
+        if blocking:
+            try:
+                result = _workspace_action_refresh(job, timeout_sec=timeout_sec)
+            except JobActionExecutionError as exc:
+                return jsonify(exc.to_payload()), exc.status_code
+            return jsonify(_workspace_response_payload(job, status=result.get("status")))
+        try:
+            task = _enqueue_workspace_task(
+                job,
+                owner=user,
+                action="workspace_refresh",
+                payload={},
+                timeout_sec=timeout_sec,
+            )
+        except JobActionExecutionError as exc:
+            return jsonify(exc.to_payload()), exc.status_code
+        task_view = task.to_dict(include_result=False)
+        task_view.update(_workspace_task_links(job.job_id, task.task_id))
+        return jsonify(_workspace_response_payload(job, status="queued", task=task_view)), 202
+
+    if action != "create":
+        return jsonify({"error": "invalid_action"}), 400
+    if not _continuum_ready():
+        missing = []
+        if not CONTINUUM_API_BASE:
+            missing.append("CONTINUUM_API_BASE")
+        if not CONTINUUM_VM_PUBLIC_KEY_ID:
+            missing.append("CONTINUUM_VM_PUBLIC_KEY_ID")
+        detail = "Continuum not configured." if not missing else f"Missing: {', '.join(missing)}"
+        return jsonify({"error": "continuum_unavailable", "details": detail}), 400
+    workspace_env = job.workspace_env if isinstance(job.workspace_env, dict) else {}
+    force_create = _is_truthy(payload.get("force"))
+    if workspace_env.get("provider") == "continuum" and workspace_env.get("vm_id") and not force_create:
+        return jsonify(_workspace_response_payload(job, status="exists"))
+    if blocking:
+        try:
+            result = _workspace_action_create(job, payload, timeout_sec=timeout_sec)
+        except JobActionExecutionError as exc:
+            return jsonify(exc.to_payload()), exc.status_code
+        return jsonify(_workspace_response_payload(job, status=result.get("status")))
+    task_payload = {
+        "force": force_create,
+        "name": payload.get("name"),
+        "init_script": payload.get("init_script"),
+        "sku": payload.get("sku"),
+        "region": payload.get("region"),
+        "os_image": payload.get("os_image"),
+        "public_key_id": payload.get("public_key_id"),
+    }
+    try:
+        task = _enqueue_workspace_task(
+            job,
+            owner=user,
+            action="workspace_create",
+            payload=task_payload,
+            timeout_sec=timeout_sec,
+        )
+    except JobActionExecutionError as exc:
+        return jsonify(exc.to_payload()), exc.status_code
+    task_view = task.to_dict(include_result=False)
+    task_view.update(_workspace_task_links(job.job_id, task.task_id))
+    return jsonify(_workspace_response_payload(job, status="queued", task=task_view)), 202
+
+
+def job_tasks(job_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "job not found"}), 404
+    limit = _safe_int(request.args.get("limit"), 20)
+    include_results = _is_truthy(request.args.get("include_results")) or _can_manage_job(user, job)
+    tasks = job_action_manager.list_for_job(job_id, limit=limit, include_results=include_results)
+    for task in tasks:
+        task.update(_workspace_task_links(job_id, task["task_id"]))
+    return jsonify(
+        {
+            "tasks": tasks,
+            "queue_depth": job_action_manager.queue_depth(),
+            "inflight": job_action_manager.inflight(),
+        }
+    )
+
+
+def job_task_detail(job_id: str, task_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "job not found"}), 404
+    task = job_action_manager.get_task(task_id)
+    if not task or task.job_id != job_id:
+        return jsonify({"error": "task_not_found"}), 404
+    include_result = _is_truthy(request.args.get("include_result")) or _can_manage_job(user, job)
+    payload = task.to_dict(include_result=include_result)
+    payload.update(_workspace_task_links(job_id, task_id))
+    return jsonify({"task": payload})
+
+
+def job_task_cancel(job_id: str, task_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "job not found"}), 404
+    if not _can_manage_job(user, job):
+        return jsonify({"error": "forbidden"}), 403
+    task = job_action_manager.get_task(task_id)
+    if not task or task.job_id != job_id:
+        return jsonify({"error": "task_not_found"}), 404
+    if task.is_terminal() and task.status != "cancelled":
+        return jsonify({"error": "task_not_cancellable"}), 409
+    if not job_action_manager.cancel(task_id, job_id=job_id):
+        return jsonify({"error": "task_not_cancellable"}), 409
+    task = job_action_manager.get_task(task_id)
+    payload = task.to_dict(include_result=True) if task else {"task_id": task_id, "status": "cancelled"}
+    payload.update(_workspace_task_links(job_id, task_id))
+    return jsonify({"task": payload})
+
+
+def job_workspace_open(job_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "job not found"}), 404
+    payload = request.get_json(force=True, silent=True) or {}
+    root_id = str(payload.get("root") or "").strip()
+    rel_path = payload.get("path")
+    if not root_id:
+        return jsonify({"error": "root_required"}), 400
+    root_entry = _editor_root_by_id(job, root_id)
+    if not root_entry:
+        return jsonify({"error": "invalid_root"}), 400
+    try:
+        rel = _editor_normalize_rel(rel_path)
+        if not rel:
+            return jsonify({"error": "path_required"}), 400
+    except ValueError:
+        return jsonify({"error": "invalid_path"}), 400
+    url, opened_file = _workspace_file_open_url(job, root_entry, rel)
+    if not url:
+        return jsonify({"error": "workspace_unavailable", "details": "IDE URL not configured."}), 400
+    return jsonify({"url": url, "opened_file": opened_file, "path": rel})
+
+
+def job_editor_roots(job_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "job not found"}), 404
+    if not _editor_allowed(job):
+        return jsonify({"roots": [], "enabled": False, "workflow": job.workflow}), 200
+    roots = []
+    for entry in _editor_root_candidates(job):
+        root_path = entry.get("path")
+        if not root_path:
+            continue
+        default_path = _editor_default_path(job, root_path)
+        roots.append(
+            {
+                "id": entry.get("id"),
+                "label": entry.get("label"),
+                "default_path": default_path,
+            }
+        )
+    return jsonify({"roots": roots, "enabled": True, "workflow": job.workflow})
+
+
+def job_editor_list(job_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "job not found"}), 404
+    if not _editor_allowed(job):
+        return jsonify({"error": "editor_disabled"}), 400
+    root_id = str(request.args.get("root") or "").strip()
+    rel_path = request.args.get("path")
+    root_entry = _editor_root_by_id(job, root_id)
+    if not root_entry:
+        return jsonify({"error": "invalid_root"}), 400
+    try:
+        rel = _editor_normalize_rel(rel_path)
+        entries, truncated = _editor_list_dir(root_entry["path"], rel)
+    except FileNotFoundError:
+        return jsonify({"error": "not_found"}), 404
+    except ValueError:
+        return jsonify({"error": "invalid_path"}), 400
+    return jsonify({"root": root_id, "path": rel, "entries": entries, "truncated": truncated})
+
+
+def job_editor_file(job_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "job not found"}), 404
+    if not _editor_allowed(job):
+        return jsonify({"error": "editor_disabled"}), 400
+    if request.method == "GET":
+        root_id = str(request.args.get("root") or "").strip()
+        rel_path = request.args.get("path")
+    else:
+        payload = request.get_json(force=True, silent=True) or {}
+        root_id = str(payload.get("root") or "").strip()
+        rel_path = payload.get("path")
+    root_entry = _editor_root_by_id(job, root_id)
+    if not root_entry:
+        return jsonify({"error": "invalid_root"}), 400
+    try:
+        rel = _editor_normalize_rel(rel_path)
+        if not rel:
+            return jsonify({"error": "path_required"}), 400
+    except ValueError:
+        return jsonify({"error": "invalid_path"}), 400
+
+    if request.method == "GET":
+        try:
+            data = _editor_read_file(root_entry["path"], rel)
+        except FileNotFoundError:
+            return jsonify({"error": "not_found"}), 404
+        except IsADirectoryError:
+            return jsonify({"error": "is_directory"}), 400
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"root": root_id, "path": rel, **data})
+
+    if not _can_manage_job(user, job):
+        return jsonify({"error": "forbidden"}), 403
+    content = payload.get("content")
+    if not isinstance(content, str):
+        return jsonify({"error": "content_required"}), 400
+    try:
+        data = _editor_write_file(root_entry["path"], rel, content)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    job.append_log(f"Editor saved {rel}.")
+    job.persist(force=True)
+    return jsonify({"root": root_id, "path": rel, **data})
+
+
+def job_editor_ops(job_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "job not found"}), 404
+    if not _editor_allowed(job):
+        return jsonify({"error": "editor_disabled"}), 400
+    if not _can_manage_job(user, job):
+        return jsonify({"error": "forbidden"}), 403
+    payload = request.get_json(force=True, silent=True) or {}
+    action = str(payload.get("action") or "").strip().lower()
+    root_id = str(payload.get("root") or "").strip()
+    root_entry = _editor_root_by_id(job, root_id)
+    if not root_entry:
+        return jsonify({"error": "invalid_root"}), 400
+
+    def normalize(value: Optional[str]) -> str:
+        return _editor_normalize_rel(value)
+
+    if action == "create":
+        rel_path = payload.get("path")
+        content = payload.get("content") if isinstance(payload.get("content"), str) else ""
+        try:
+            rel = normalize(rel_path)
+            if not rel:
+                return jsonify({"error": "path_required"}), 400
+            data = _editor_create_file(root_entry["path"], rel, content)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        job.append_log(f"Editor created {rel}.")
+        job.persist(force=True)
+        return jsonify({"root": root_id, "path": rel, **data})
+
+    if action == "delete":
+        rel_path = payload.get("path")
+        force = bool(payload.get("force"))
+        try:
+            rel = normalize(rel_path)
+            if not rel:
+                return jsonify({"error": "path_required"}), 400
+            data = _editor_delete_path(root_entry["path"], rel, force=force)
+        except FileNotFoundError:
+            return jsonify({"error": "not_found"}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        job.append_log(f"Editor deleted {rel}.")
+        job.persist(force=True)
+        return jsonify({"root": root_id, "path": rel, **data})
+
+    if action == "mkdir":
+        rel_path = payload.get("path")
+        try:
+            rel = normalize(rel_path)
+            if not rel:
+                return jsonify({"error": "path_required"}), 400
+            data = _editor_create_dir(root_entry["path"], rel)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        job.append_log(f"Editor created folder {rel}.")
+        job.persist(force=True)
+        return jsonify({"root": root_id, "path": rel, **data})
+
+    if action == "rename" or action == "move":
+        rel_path = payload.get("path")
+        new_path = payload.get("new_path")
+        try:
+            rel = normalize(rel_path)
+            new_rel = normalize(new_path)
+            if not rel or not new_rel:
+                return jsonify({"error": "path_required"}), 400
+            data = _editor_rename_path(root_entry["path"], rel, new_rel)
+        except FileNotFoundError:
+            return jsonify({"error": "not_found"}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        job.append_log(f"Editor renamed {rel} -> {new_rel}.")
+        job.persist(force=True)
+        return jsonify({"root": root_id, "path": new_rel, **data})
+
+    return jsonify({"error": "invalid_action"}), 400
+
+
 def job_requirements_progress(job_id: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
     job = manager.get_job(job_id)
-    if not job:
+    if not job or not _can_view_job(user, job):
         return jsonify({"error": "job not found"}), 404
-    if user_store.get_role(user) != "admin" and job.owner != user:
-        return jsonify({"error": "forbidden"}), 403
 
     payload = {
         "total": 0,
@@ -5231,16 +11099,13 @@ def job_requirements_progress(job_id: str) -> Response:
     return jsonify(payload)
 
 
-@app.route("/api/jobs/<job_id>/requirements/summary")
 def job_requirements_summary(job_id: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
     job = manager.get_job(job_id)
-    if not job:
+    if not job or not _can_view_job(user, job):
         return jsonify({"error": "job not found"}), 404
-    if user_store.get_role(user) != "admin" and job.owner != user:
-        return jsonify({"error": "forbidden"}), 403
     is_admin = _is_admin_user(user)
 
     payload = {
@@ -5299,13 +11164,12 @@ def job_requirements_summary(job_id: str) -> Response:
     return jsonify(payload)
 
 
-@app.route("/api/jobs/<job_id>/logs")
 def job_logs(job_id: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    job = manager.get_job(job_id, owner=user)
-    if not job:
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
         return jsonify({"error": "job not found"}), 404
     is_admin = _is_admin_user(user)
     tail = request.args.get("tail")
@@ -5317,13 +11181,12 @@ def job_logs(job_id: str) -> Response:
     return jsonify({"logs": _redact_log_entries(logs, is_admin)})
 
 
-@app.route("/api/jobs/<job_id>/logs/stream")
 def job_logs_stream(job_id: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    job = manager.get_job(job_id, owner=user)
-    if not job:
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
         return jsonify({"error": "job not found"}), 404
     is_admin = _is_admin_user(user)
 
@@ -5347,14 +11210,15 @@ def job_logs_stream(job_id: str) -> Response:
     return Response(generate(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
-@app.route("/api/jobs/<job_id>/actions", methods=["POST"])
 def job_actions(job_id: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    job = manager.get_job(job_id, owner=user)
-    if not job:
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
         return jsonify({"error": "job not found"}), 404
+    if not _can_manage_job(user, job):
+        return jsonify({"error": "forbidden"}), 403
     payload = request.get_json(force=True, silent=True) or {}
     action = payload.get("action")
     success = False
@@ -5366,7 +11230,8 @@ def job_actions(job_id: str) -> Response:
         success = manager.stop_job(job_id)
     elif action == "restart":
         estimate = job.token_estimate or _estimate_job_tokens(job.payload)
-        snapshot = _token_snapshot(user)
+        team_id = _job_team_id(job)
+        snapshot = _token_snapshot(job.owner, team_id)
         if estimate > snapshot["available"] and job.token_reserved <= 0:
             return (
                 jsonify(
@@ -5386,17 +11251,200 @@ def job_actions(job_id: str) -> Response:
         return jsonify({"error": "unknown action"}), 400
     if not success:
         return jsonify({"error": "action failed"}), 409
-    return jsonify(job.to_dict())
+    return jsonify(_augment_job_dict_for_user(job.to_dict(), user, job))
 
 
-@app.route("/api/jobs/<job_id>/archive", methods=["POST"])
+def job_transfer(job_id: str) -> Response:
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    job = manager.get_job(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    payload = request.get_json(force=True, silent=True) or {}
+    action = str(payload.get("action") or "").strip().lower()
+    if not action:
+        return jsonify({"error": "action_required"}), 400
+    transfer = job.transfer_request if isinstance(job.transfer_request, dict) else None
+    if action == "request":
+        if job.owner != user and not _is_admin_user(user):
+            return jsonify({"error": "forbidden"}), 403
+        if transfer and transfer.get("status") == "pending":
+            return jsonify({"error": "transfer_pending"}), 409
+        team_id = str(payload.get("team_id") or "").strip()
+        if not team_id:
+            return jsonify({"error": "team_id_required"}), 400
+        team = access_store.get_team(team_id)
+        if not team:
+            return jsonify({"error": "team_not_found"}), 404
+        if not _can_access_team_tokens(user, team_id):
+            return jsonify({"error": "forbidden"}), 403
+        job.transfer_request = {
+            "team_id": team_id,
+            "team_name": team.get("name"),
+            "requested_by": user,
+            "requested_at": _now_iso(),
+            "status": "pending",
+        }
+        job.append_log(f"Transfer requested to team {team.get('name') or team_id}.")
+        job.persist(force=True)
+        _audit_event(
+            "job_team_invite",
+            actor=user,
+            status="success",
+            details={"job_id": job.job_id, "team_id": team_id},
+        )
+        return jsonify(_augment_job_dict_for_user(job.to_dict(), user, job))
+    if action in {"cancel", "withdraw"}:
+        if job.owner != user and not _is_admin_user(user):
+            return jsonify({"error": "forbidden"}), 403
+        if not transfer or transfer.get("status") != "pending":
+            return jsonify({"error": "transfer_not_pending"}), 409
+        transfer.update({"status": "cancelled", "decided_by": user, "decided_at": _now_iso()})
+        job.transfer_request = transfer
+        job.append_log("Transfer request cancelled.")
+        job.persist(force=True)
+        _audit_event(
+            "job_team_invite_cancelled",
+            actor=user,
+            status="success",
+            details={"job_id": job.job_id, "team_id": transfer.get("team_id")},
+        )
+        return jsonify(_augment_job_dict_for_user(job.to_dict(), user, job))
+    if action in {"accept", "decline"}:
+        if not transfer or transfer.get("status") != "pending":
+            return jsonify({"error": "transfer_not_pending"}), 409
+        team_id = transfer.get("team_id")
+        if not (_is_admin_user(user) or _is_team_leader(user, team_id)):
+            return jsonify({"error": "forbidden"}), 403
+        if action == "decline":
+            transfer.update({"status": "declined", "decided_by": user, "decided_at": _now_iso()})
+            job.transfer_request = transfer
+            job.append_log("Transfer request declined.")
+            job.persist(force=True)
+            _audit_event(
+                "job_team_invite_declined",
+                actor=user,
+                status="success",
+                details={"job_id": job.job_id, "team_id": team_id},
+            )
+            return jsonify(_augment_job_dict_for_user(job.to_dict(), user, job))
+        if job.status in {"running"}:
+            return jsonify({"error": "job_active", "details": "Pause or stop the job before transferring."}), 409
+        team = access_store.get_team(team_id) if team_id else None
+        if not team:
+            return jsonify({"error": "team_not_found"}), 404
+        project_id = str(payload.get("project_id") or "").strip()
+        if project_id:
+            project = access_store.get_project(project_id)
+            if not project or project.get("team_id") != team_id:
+                return jsonify({"error": "project_invalid"}), 400
+            if not (_is_admin_user(user) or access_store.can_manage_project(user, project_id)):
+                return jsonify({"error": "forbidden"}), 403
+        estimate = job.token_estimate or _estimate_job_tokens(job.payload)
+        snapshot = _token_snapshot(job.owner, team_id)
+        if estimate > snapshot["available"]:
+            return (
+                jsonify(
+                    {
+                        "error": "insufficient_tokens",
+                        "details": "Insufficient tokens to transfer this job.",
+                        "estimate": estimate,
+                        "available": snapshot["available"],
+                    }
+                ),
+                402,
+            )
+        if job.token_reserved:
+            manager._release_tokens(job, reason="transfer")
+        if not isinstance(job.payload, dict):
+            job.payload = {}
+        job.payload.pop("token_scope", None)
+        job.payload["team_id"] = team_id
+        if project_id:
+            job.payload["project_id"] = project_id
+            job.payload.pop("project", None)
+            job.project_name = project.get("name") if project else job.project_name
+        transfer.update(
+            {
+                "status": "accepted",
+                "decided_by": user,
+                "decided_at": _now_iso(),
+                "team_name": team.get("name") if team else transfer.get("team_name"),
+            }
+        )
+        job.transfer_request = transfer
+        job.append_log(f"Transfer accepted to team {team.get('name') or team_id}.")
+        if estimate > 0:
+            manager._reserve_tokens(job, estimate)
+        job.persist(force=True)
+        _audit_event(
+            "job_team_invite_accepted",
+            actor=user,
+            status="success",
+            details={"job_id": job.job_id, "team_id": team_id, "project_id": project_id or None},
+        )
+        return jsonify(_augment_job_dict_for_user(job.to_dict(), user, job))
+    if action in {"assign_user", "demote"}:
+        team_id = _job_team_id(job)
+        if not team_id:
+            return jsonify({"error": "not_team_job"}), 400
+        if not (_is_admin_user(user) or _is_team_leader(user, team_id)):
+            return jsonify({"error": "forbidden"}), 403
+        target_user = str(payload.get("target_user") or "").strip()
+        if not target_user:
+            return jsonify({"error": "target_user_required"}), 400
+        if not access_store._team_role(target_user, team_id):
+            return jsonify({"error": "target_not_in_team"}), 400
+        if job.status in {"running"}:
+            return jsonify({"error": "job_active", "details": "Pause or stop the job before reassigning."}), 409
+        estimate = job.token_estimate or _estimate_job_tokens(job.payload)
+        snapshot = _token_snapshot(target_user)
+        if estimate > snapshot["available"]:
+            return (
+                jsonify(
+                    {
+                        "error": "insufficient_tokens",
+                        "details": "Target user does not have enough personal tokens.",
+                        "estimate": estimate,
+                        "available": snapshot["available"],
+                    }
+                ),
+                402,
+            )
+        if job.token_reserved:
+            manager._release_tokens(job, reason="assign_user")
+        if not isinstance(job.payload, dict):
+            job.payload = {}
+        job.payload.pop("team_id", None)
+        job.payload.pop("project_id", None)
+        job.payload.pop("project", None)
+        job.payload["owner"] = target_user
+        job.owner = target_user
+        job.transfer_request = None
+        job.append_log(f"Job assigned to {target_user}.")
+        if estimate > 0:
+            manager._reserve_tokens(job, estimate)
+        job.persist(force=True)
+        _audit_event(
+            "job_assign_user",
+            actor=user,
+            status="success",
+            details={"job_id": job.job_id, "target": target_user, "previous_team": team_id},
+        )
+        return jsonify(_augment_job_dict_for_user(job.to_dict(), user, job))
+    return jsonify({"error": "invalid_action"}), 400
+
+
 def job_archive(job_id: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    job = manager.get_job(job_id, owner=user)
-    if not job:
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
         return jsonify({"error": "job not found"}), 404
+    if not _can_manage_job(user, job):
+        return jsonify({"error": "forbidden"}), 403
     payload = request.get_json(force=True, silent=True) or {}
     archived = bool(payload.get("archived", True))
     stop = bool(payload.get("stop"))
@@ -5406,10 +11454,9 @@ def job_archive(job_id: str) -> Response:
         manager.stop_job(job_id)
     if not manager.set_archived(job_id, archived):
         return jsonify({"error": "archive_failed"}), 409
-    return jsonify(job.to_dict())
+    return jsonify(_augment_job_dict_for_user(job.to_dict(), user, job))
 
 
-@app.route("/api/jobs/bulk-delete", methods=["POST"])
 def jobs_bulk_delete() -> Response:
     user = _current_user()
     if not user:
@@ -5420,24 +11467,40 @@ def jobs_bulk_delete() -> Response:
         return jsonify({"error": "invalid_scope"}), 400
     stop = bool(payload.get("stop"))
     target_archived = scope == "archive"
-    jobs_list = [job for job in manager.list_jobs(owner=user) if bool(job.archived) == target_archived]
+    jobs_source = manager.list_jobs()
+    jobs_list = [
+        job
+        for job in jobs_source
+        if bool(job.archived) == target_archived and _can_manage_job(user, job)
+    ]
     active_jobs = [job for job in jobs_list if job.status in {"queued", "running", "paused"}]
     if active_jobs and not stop:
         return jsonify({"error": "job_active", "details": "Stop active jobs before deleting."}), 409
     deleted: List[str] = []
     for job in jobs_list:
-        if manager.delete_job(job.job_id, owner=user, stop_if_active=stop):
+        if manager.delete_job(job.job_id, owner=None, stop_if_active=stop):
             deleted.append(job.job_id)
     return jsonify({"deleted": deleted, "count": len(deleted)})
 
 
-@app.route("/api/tokens", methods=["GET", "POST"])
 def tokens() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
     if request.method == "GET":
-        snapshot = _token_snapshot(user)
+        project_id = (request.args.get("project_id") or request.args.get("project") or "").strip()
+        team_id = (request.args.get("team_id") or "").strip() or None
+        if project_id:
+            project = access_store.get_project(project_id)
+            if not project:
+                return jsonify({"error": "project_not_found"}), 404
+            if not (_is_admin_user(user) or access_store.can_view_project(user, project_id)):
+                return jsonify({"error": "forbidden", "details": "Project access denied."}), 403
+            if not team_id:
+                team_id = project.get("team_id")
+        if team_id and not _can_access_team_tokens(user, team_id):
+            return jsonify({"error": "forbidden", "details": "Team access denied."}), 403
+        snapshot = _token_snapshot(user, team_id or None)
         return jsonify(snapshot)
 
     payload = request.get_json(force=True, silent=True) or {}
@@ -5482,6 +11545,7 @@ def tokens() -> Response:
             "source": payload.get("source") or "portal",
         }
         token_ledger.record(user, "topup", tokens, meta)
+        _audit_event("tokens_topup", actor=user, status="success", details={"amount": tokens})
         snapshot = _token_snapshot(user)
         return jsonify({"message": "Tokens added.", **snapshot})
 
@@ -5501,6 +11565,7 @@ def tokens() -> Response:
             "source": payload.get("source") or "portal",
         }
         token_ledger.record(user, "cashout", -tokens, meta)
+        _audit_event("tokens_cashout", actor=user, status="success", details={"amount": tokens})
         snapshot = _token_snapshot(user)
         return jsonify({"message": "Cashout recorded.", **snapshot})
 
@@ -5524,6 +11589,12 @@ def tokens() -> Response:
             "source": payload.get("source") or "admin",
         }
         token_ledger.record(target_user, "grant", tokens, meta)
+        _audit_event(
+            "tokens_grant",
+            actor=user,
+            status="success",
+            details={"amount": tokens, "target": target_user},
+        )
         snapshot = _token_snapshot(target_user)
         return jsonify({"message": "Free tokens granted.", "target": target_user, **snapshot})
 
@@ -5568,13 +11639,13 @@ def tokens() -> Response:
                 "target_free_balance": target_free_val,
             },
         )
+        _audit_event("tokens_sync", actor=user, status=status, details={"delta": delta})
         snapshot = _token_snapshot(user)
         return jsonify({"message": "Sync complete.", "status": status, **snapshot})
 
     return jsonify({"error": "invalid_action"}), 400
 
 
-@app.route("/api/tokens/ledger")
 def tokens_ledger() -> Response:
     user = _current_user()
     if not user:
@@ -5593,7 +11664,6 @@ def tokens_ledger() -> Response:
     return jsonify({"entries": entries})
 
 
-@app.route("/api/secrets", methods=["GET", "POST"])
 def secrets() -> Response:
     user = _current_user()
     if not user:
@@ -5609,10 +11679,10 @@ def secrets() -> Response:
     if not SECRET_NAME_RE.match(name):
         return jsonify({"error": "invalid secret name"}), 400
     store.set(name, value)
+    _audit_event("secret_set", actor=user, status="success", details={"name": name})
     return jsonify({"name": name, "masked": SecretStore._mask(value), "updated_at": _now_iso()})
 
 
-@app.route("/api/secrets/<name>", methods=["DELETE"])
 def delete_secret(name: str) -> Response:
     if not SECRET_NAME_RE.match(name):
         return jsonify({"error": "invalid secret name"}), 400
@@ -5623,10 +11693,10 @@ def delete_secret(name: str) -> Response:
     deleted = store.delete(name)
     if not deleted:
         return jsonify({"error": "secret not found"}), 404
+    _audit_event("secret_delete", actor=user, status="success", details={"name": name})
     return jsonify({"status": "deleted"})
 
 
-@app.route("/api/github/tree", methods=["POST"])
 def github_tree() -> Response:
     user = _current_user()
     if not user:
@@ -5645,7 +11715,10 @@ def github_tree() -> Response:
         headers["Authorization"] = f"token {token}"
 
     repo_url = f"https://api.github.com/repos/{owner}/{repo}"
-    repo_resp = requests.get(repo_url, headers=headers, timeout=20)
+    try:
+        repo_resp = _http_request_with_retry("GET", repo_url, headers=headers, timeout=20)
+    except requests.RequestException as exc:
+        return jsonify({"error": "repo_lookup_failed", "details": str(exc)}), 502
     if repo_resp.status_code != 200:
         return jsonify({"error": "repo lookup failed", "details": repo_resp.text}), 400
     repo_data = repo_resp.json()
@@ -5653,7 +11726,16 @@ def github_tree() -> Response:
     branch = branch or default_branch
 
     tree_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}"
-    tree_resp = requests.get(tree_url, headers=headers, params={"recursive": "1"}, timeout=30)
+    try:
+        tree_resp = _http_request_with_retry(
+            "GET",
+            tree_url,
+            headers=headers,
+            params={"recursive": "1"},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        return jsonify({"error": "tree_lookup_failed", "details": str(exc)}), 502
     if tree_resp.status_code != 200:
         return jsonify({"error": "tree lookup failed", "details": tree_resp.text}), 400
     tree_data = tree_resp.json()
@@ -5786,16 +11868,118 @@ def _ensure_req_register_in_draft(text: str) -> str:
     return f"{stripped}\n\n{register}"
 
 
-@app.route("/api/assistant/requirements", methods=["POST"])
+def _is_simple_greeting(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", text.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return False
+    greeting_set = {
+        "hi",
+        "hello",
+        "hey",
+        "hi there",
+        "hello there",
+        "hey there",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    }
+    return cleaned in greeting_set
+
+
+def _is_marketing_assistant_request(payload: Dict[str, Any], requirements_text: str) -> bool:
+    assistant_profile = str(payload.get("assistant_profile") or "").strip().lower()
+    if assistant_profile in {"marketing", "neuralmimicry_marketing", "nm_marketing"}:
+        return True
+    lowered_context = (requirements_text or "").strip().lower()
+    if not lowered_context:
+        return False
+    if "neuralmimicry marketing assistant" in lowered_context:
+        return True
+    if "questions about neuralmimicry" in lowered_context and "products" in lowered_context and "services" in lowered_context:
+        return True
+    return False
+
+
+def _assistant_reply_payload(
+    reply_text: str,
+    provider: str,
+    model: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    gesture_mode, avatar_mode, office_flag = _stt_motion_context(payload)
+    response_payload: Dict[str, Any] = {
+        "reply": reply_text,
+        "provider": provider,
+        "model": model,
+        "gesture_mode": gesture_mode,
+        "avatar_mode": avatar_mode,
+    }
+    if not STT_GESTURE_ENABLED:
+        return response_payload
+    if STT_GESTURE_RUST_FALLBACK and STT_BACKEND == "server" and STT_SERVER_URL:
+        try:
+            rust_payload = _run_rust_gesture_plan(
+                reply_text,
+                gesture_mode=gesture_mode,
+                avatar_mode=avatar_mode,
+                office_mode=office_flag,
+            )
+            if isinstance(rust_payload, dict):
+                response_payload.update(rust_payload)
+                response_payload["gesture_mode"] = sanitize_gesture_mode(
+                    response_payload.get("gesture_mode"),
+                    default_mode=gesture_mode,
+                    bsl_enabled=STT_BSL_ENABLED,
+                )
+                response_payload["avatar_mode"] = sanitize_avatar_mode(
+                    response_payload.get("avatar_mode"),
+                    office_mode=office_flag,
+                    default_mode=avatar_mode,
+                )
+                return response_payload
+        except Exception as exc:
+            logger.debug("Assistant Rust gesture planning skipped: %s", exc)
+    try:
+        motion_payload = plan_stt_avatar_motion(
+            reply_text,
+            gesture_mode=gesture_mode,
+            avatar_mode=avatar_mode,
+            bsl_enabled=STT_BSL_ENABLED,
+        )
+        if isinstance(motion_payload, dict):
+            response_payload.update(motion_payload)
+            response_payload["gesture_mode"] = sanitize_gesture_mode(
+                response_payload.get("gesture_mode"),
+                default_mode=gesture_mode,
+                bsl_enabled=STT_BSL_ENABLED,
+            )
+            response_payload["avatar_mode"] = sanitize_avatar_mode(
+                response_payload.get("avatar_mode"),
+                office_mode=office_flag,
+                default_mode=avatar_mode,
+            )
+    except Exception as exc:
+        logger.debug("Assistant gesture planning skipped: %s", exc)
+    return response_payload
+
+
 def assistant_requirements() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
     payload = request.get_json(force=True, silent=True) or {}
+    gesture_mode, avatar_mode, office_flag = _stt_motion_context(payload)
     mode = (payload.get("mode") or "ask").strip().lower()
     prompt = (payload.get("prompt") or "").strip()
+    raw_prompt = prompt
     requirements_text = (payload.get("requirements_text") or "").strip()
     messages = payload.get("messages") or []
+    is_marketing_assistant = _is_marketing_assistant_request(payload, requirements_text)
+    marketing_context = ""
+    marketing_vocab_hint = ""
 
     if mode not in {"ask", "draft"}:
         return jsonify({"error": "invalid mode"}), 400
@@ -5809,6 +11993,34 @@ def assistant_requirements() -> Response:
     provider_hint = payload.get("provider") or payload.get("llm_provider") or "openai"
     model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.1"
     reasoning_effort = payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or "medium"
+
+    if mode == "ask" and is_marketing_assistant and _is_simple_greeting(prompt):
+        return jsonify(
+            _assistant_reply_payload(
+                "Hello! I'm the NeuralMimicry marketing assistant, here to help with questions about our "
+                "neuromorphic AI products and services. What would you like to know?",
+                provider="rule",
+                model="greeting_fastpath",
+                payload=payload,
+            )
+        )
+
+    if is_marketing_assistant and stt_learning_store:
+        try:
+            seed_query = prompt or requirements_text
+            marketing_vocab_hint = stt_learning_store.build_prompt_hint(context=seed_query, max_terms=24)
+            matches = stt_learning_store.query_context(seed_query, limit=4)
+            if matches:
+                chunks = []
+                for match in matches:
+                    source = str(match.get("source") or "knowledge")
+                    text = str(match.get("text") or "").strip()
+                    if not text:
+                        continue
+                    chunks.append(f"[{source}]\\n{text}")
+                marketing_context = "\\n\\n".join(chunks)
+        except Exception as exc:
+            logger.debug("Marketing assistant knowledge lookup skipped: %s", exc)
 
     settings = _resolve_llm_settings(
         user=user,
@@ -5831,15 +12043,30 @@ def assistant_requirements() -> Response:
     if not provider:
         return jsonify({"error": "llm_unavailable"}), 400
 
-    system = (
-        "You are a requirements assistant. Help the user craft clear, testable requirements. "
-        "Ask concise clarifying questions when needed. "
-        "When drafting, output structured Markdown with sections: Overview, Goals, Non-Goals, "
-        "Functional Requirements, Non-Functional Requirements, Acceptance Criteria, Risks. "
-        "Include a 'Requirements Register' section with one requirement per line in the format "
-        "'- REQ-001: Short title' (zero-padded, unique IDs). Add any detail as indented bullets "
-        "beneath each REQ line so the register can be parsed."
-    )
+    if is_marketing_assistant:
+        system = (
+            "You are the NeuralMimicry marketing assistant. Answer questions about NeuralMimicry, its products, "
+            "and its services in a concise, helpful, business-oriented tone. "
+            "For simple greetings, respond in 1-3 short sentences, introduce your role briefly, and invite a relevant next question. "
+            "Do not output requirements-document structures unless explicitly asked to draft requirements."
+        )
+        if gesture_mode == "bsl":
+            system = (
+                f"{system} "
+                "The frontend avatar can sign in BSL, so do not claim that you cannot sign or gesture physically."
+            )
+        if marketing_vocab_hint:
+            system = f"{system}\\n\\nSpeech/STT vocabulary hints:\\n{marketing_vocab_hint}"
+    else:
+        system = (
+            "You are a requirements assistant. Help the user craft clear, testable requirements. "
+            "Ask concise clarifying questions when needed. "
+            "When drafting, output structured Markdown with sections: Overview, Goals, Non-Goals, "
+            "Functional Requirements, Non-Functional Requirements, Acceptance Criteria, Risks. "
+            "Include a 'Requirements Register' section with one requirement per line in the format "
+            "'- REQ-001: Short title' (zero-padded, unique IDs). Add any detail as indented bullets "
+            "beneath each REQ line so the register can be parsed."
+        )
     capabilities_hint = capability_summary(max_items=3)
     if capabilities_hint:
         system = f"{system}\n\nCapabilities summary:\n{capabilities_hint}"
@@ -5857,17 +12084,27 @@ def assistant_requirements() -> Response:
         user_text = "Draft a complete requirements document."
         if requirements_text:
             user_text += f"\n\nCurrent notes:\n{requirements_text}"
+        if marketing_context:
+            user_text += f"\n\nNeuralMimicry context:\n{marketing_context}"
         chat_messages.append({"role": "user", "content": user_text})
     else:
         if not prompt:
             return jsonify({"error": "prompt_required"}), 400
         if requirements_text:
-            prompt = f"Current requirements notes:\\n{requirements_text}\\n\\nUser question: {prompt}"
+            if is_marketing_assistant:
+                prompt = f"Assistant context:\\n{requirements_text}\\n\\nUser message: {prompt}"
+            else:
+                prompt = f"Current requirements notes:\\n{requirements_text}\\n\\nUser question: {prompt}"
+        if marketing_context:
+            prompt = f"{prompt}\\n\\nRetrieved NeuralMimicry knowledge:\\n{marketing_context}"
         chat_messages.append({"role": "user", "content": prompt})
 
     temperature = payload.get("temperature", 0.2)
     max_tokens = payload.get("max_tokens")
     reasoning_effort = payload.get("reasoning_effort")
+    capacity_acquired = _acquire_request_capacity(_ASSISTANT_REQUEST_CAPACITY, ASSISTANT_CAPACITY_WAIT_SEC)
+    if not capacity_acquired:
+        return jsonify({"error": "assistant_capacity_unavailable"}), 503
     try:
         response = provider.predict(
             messages=chat_messages,
@@ -5878,21 +12115,26 @@ def assistant_requirements() -> Response:
         )
     except Exception as exc:
         return jsonify({"error": "llm_request_failed", "details": str(exc)}), 400
+    finally:
+        _ASSISTANT_REQUEST_CAPACITY.release()
 
     reply_text = response.text if isinstance(response.text, str) else str(response.text)
     if mode == "draft":
         reply_text = _ensure_req_register_in_draft(reply_text)
+    if is_marketing_assistant:
+        _stt_record_learning(raw_prompt, source="assistant_marketing_user")
+        _stt_record_learning(reply_text, source="assistant_marketing_reply")
 
     return jsonify(
-        {
-            "reply": reply_text,
-            "provider": response.provider or settings.get("provider"),
-            "model": response.model or settings.get("model"),
-        }
+        _assistant_reply_payload(
+            reply_text,
+            provider=response.provider or settings.get("provider"),
+            model=response.model or settings.get("model"),
+            payload=payload,
+        )
     )
 
 
-@app.route("/api/assistant/form-fill", methods=["POST"])
 def assistant_form_fill() -> Response:
     user = _current_user()
     if not user:
@@ -5973,6 +12215,9 @@ def assistant_form_fill() -> Response:
         "fields": field_descriptions,
     }
 
+    capacity_acquired = _acquire_request_capacity(_ASSISTANT_REQUEST_CAPACITY, ASSISTANT_CAPACITY_WAIT_SEC)
+    if not capacity_acquired:
+        return jsonify({"error": "assistant_capacity_unavailable"}), 503
     try:
         response = provider.predict(
             messages=[{"role": "user", "content": json.dumps(user_text)}],
@@ -5982,6 +12227,8 @@ def assistant_form_fill() -> Response:
         )
     except Exception as exc:
         return jsonify({"error": "llm_request_failed", "details": str(exc)}), 400
+    finally:
+        _ASSISTANT_REQUEST_CAPACITY.release()
 
     parsed = _extract_json_payload(response.text)
     if not isinstance(parsed, list):
@@ -6008,7 +12255,6 @@ def assistant_form_fill() -> Response:
     return jsonify({"suggestions": cleaned})
 
 
-@app.route("/api/playground/plan", methods=["POST"])
 def playground_plan() -> Response:
     user = _current_user()
     if not user:
@@ -6065,6 +12311,9 @@ def playground_plan() -> Response:
         },
     }
 
+    capacity_acquired = _acquire_request_capacity(_ASSISTANT_REQUEST_CAPACITY, ASSISTANT_CAPACITY_WAIT_SEC)
+    if not capacity_acquired:
+        return jsonify({"error": "assistant_capacity_unavailable"}), 503
     try:
         response = provider.predict(
             messages=[{"role": "user", "content": json.dumps(user_text)}],
@@ -6075,6 +12324,8 @@ def playground_plan() -> Response:
         )
     except Exception as exc:
         return jsonify({"error": "llm_request_failed", "details": str(exc)}), 400
+    finally:
+        _ASSISTANT_REQUEST_CAPACITY.release()
 
     parsed = _extract_json_payload(response.text)
     if not isinstance(parsed, dict):
@@ -6102,14 +12353,21 @@ def playground_plan() -> Response:
     req_count = sum(1 for line in requirements_text.splitlines() if REQ_LINE_RE.match(line))
     if req_count <= 0:
         req_count = max(1, len(steps)) if steps else 6
+    requirements_lower = requirements_text.lower()
+    global_titles = _global_requirements_titles()
+    global_detected = "global requirement" in requirements_lower or "global-" in requirements_lower
+    if not global_detected and global_titles:
+        global_detected = any(title in requirements_lower for title in global_titles)
+    if not global_detected:
+        req_count += _global_requirements_count()
 
     job_payload = {
         "workflow": "project_solver",
         "project_name": project_name,
         "requirements_text": requirements_text,
         "project_run": True,
-        "project_max_steps": 100,
-        "project_iterations": req_count,
+        "project_max_steps": 250,
+        "project_iterations": min(50, max(req_count, 10)),
         "llm_provider": settings.get("provider") or provider_hint,
         "llm_model": settings.get("model") or model_hint,
         "llm_reasoning_effort": reasoning_effort,
@@ -6119,7 +12377,14 @@ def playground_plan() -> Response:
         "disable_confluence": True,
         "action_plan": False,
         "dry_run": False,
+        "token_scope": "personal",
+        "source": "playground",
     }
+    codingagent = payload.get("codingagent")
+    if codingagent:
+        job_payload["codingagent"] = codingagent
+    elif _opencode_available_for_playground():
+        job_payload["codingagent"] = "opencode"
 
     return jsonify(
         {
@@ -6137,6 +12402,118 @@ def playground_plan() -> Response:
 def _sse(entry: Dict[str, Any]) -> str:
     payload = json.dumps(entry)
     return f"data: {payload}\n\n"
+
+
+if hasattr(app, "add_url_rule"):
+    register_admin_routes(
+        app,
+        metrics_path=METRICS_PATH,
+        index=index,
+        playground=playground,
+        admin_dashboard=admin_dashboard,
+        public_asset=public_asset,
+        favicon=favicon,
+        metrics=metrics,
+        setup=setup,
+        health=health,
+        capabilities_report=capabilities_report,
+        admin_stats=admin_stats,
+        api_audit=api_audit,
+    )
+    register_auth_routes(
+        app,
+        login=login,
+        oidc_login=oidc_login,
+        oidc_callback=oidc_callback,
+        api_oidc_exchange=api_oidc_exchange,
+        sso_login=sso_login,
+        logout=logout,
+        api_login=api_login,
+        api_setup=api_setup,
+        api_sso_issue=api_sso_issue,
+        api_logout=api_logout,
+        api_session=api_session,
+        api_profile=api_profile,
+    )
+    register_voice_routes(
+        app,
+        api_voice_tokens=api_voice_tokens,
+        api_voice_token_delete=api_voice_token_delete,
+        api_voice_capture=api_voice_capture,
+        api_voice_siri=api_voice_siri,
+        api_voice_alexa=api_voice_alexa,
+        api_voice_google=api_voice_google,
+        api_voice_stt=api_voice_stt,
+    )
+    register_assistant_routes(
+        app,
+        assistant_rag_mcp=assistant_rag_mcp,
+        assistant_requirements=assistant_requirements,
+        assistant_form_fill=assistant_form_fill,
+        playground_plan=playground_plan,
+    )
+    register_jobs_routes(
+        app,
+        {
+            "api_todos": api_todos,
+            "api_todo_next": api_todo_next,
+            "api_todo_detail": api_todo_detail,
+            "api_projects": api_projects,
+            "api_project_detail": api_project_detail,
+            "api_teams": api_teams,
+            "api_team_detail": api_team_detail,
+            "api_team_tokens": api_team_tokens,
+            "api_access_tree": api_access_tree,
+            "api_sessions": api_sessions,
+            "api_session_detail": api_session_detail,
+            "api_session_leave": api_session_leave,
+            "api_session_stream": api_session_stream,
+            "api_session_history": api_session_history,
+            "api_sessions_history": api_sessions_history,
+            "job_estimate": job_estimate,
+            "import_requirements": import_requirements,
+            "export_requirements": export_requirements,
+            "rag_indexes": rag_indexes,
+            "rag_index_create": rag_index_create,
+            "rag_index_delete": rag_index_delete,
+            "rag_query": rag_query,
+            "mcp_servers": mcp_servers,
+            "mcp_server_delete": mcp_server_delete,
+            "mcp_server_tools": mcp_server_tools,
+            "mcp_server_call": mcp_server_call,
+            "mcp_server_resources": mcp_server_resources,
+            "mcp_server_resource": mcp_server_resource,
+            "request_refund": request_refund,
+            "list_refunds": list_refunds,
+            "screen_refund": screen_refund,
+            "decide_refund": decide_refund,
+            "refund_file": refund_file,
+            "jobs": jobs,
+            "job_detail": job_detail,
+            "job_workspace": job_workspace,
+            "job_workspace_open": job_workspace_open,
+            "job_tasks": job_tasks,
+            "job_task_detail": job_task_detail,
+            "job_task_cancel": job_task_cancel,
+            "job_editor_roots": job_editor_roots,
+            "job_editor_list": job_editor_list,
+            "job_editor_file": job_editor_file,
+            "job_editor_ops": job_editor_ops,
+            "job_requirements_progress": job_requirements_progress,
+            "job_requirements_summary": job_requirements_summary,
+            "job_logs": job_logs,
+            "job_logs_stream": job_logs_stream,
+            "job_actions": job_actions,
+            "job_transfer": job_transfer,
+            "job_archive": job_archive,
+            "jobs_bulk_delete": jobs_bulk_delete,
+            "tokens": tokens,
+            "tokens_ledger": tokens_ledger,
+            "secrets": secrets,
+            "delete_secret": delete_secret,
+            "github_tree": github_tree,
+        },
+    )
 
 
 if __name__ == "__main__":

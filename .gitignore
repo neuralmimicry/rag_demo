@@ -220,3 +220,11 @@ __marimo__/
 .*.jsonl
 .vscode/
 *.html
+.agent/skills/
+.agents/skills/
+.claude/skills/
+.codex/skills/
+.cursor/skills/
+.gemini/skills/
+.kiro/skills/
+.skills_sync.json

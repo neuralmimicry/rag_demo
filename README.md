@@ -73,6 +73,7 @@ MCP endpoints are admin-only because they can execute actions in external system
 - `POST /api/setup` creates the first admin account (only allowed when no users exist).
 - `POST /api/sso/issue` issues a short-lived, one-time SSO token (requires an authenticated session).
 - `GET /sso?token=...&next=/` exchanges the SSO token for a first-party session and redirects.
+- `POST /api/oidc/exchange` exchanges an OIDC authorisation code (PKCE) or `id_token` for a Refiner session and SSO token.
 
 The web login and setup pages now call these endpoints directly.
 
@@ -84,6 +85,8 @@ Set these environment variables on the backend:
 - `REFINER_HOST`: set to `0.0.0.0` for public bind.
 
 Cookies default to `SameSite=None` + `Secure` when CORS is enabled. Use `REFINER_COOKIE_SAMESITE` / `REFINER_SECURE_COOKIES` to override.
+
+For OIDC SPA flows, add the frontend callback URL to `REFINER_OIDC_ALLOWED_REDIRECT_URIS` so `/api/oidc/exchange` can reuse the same redirect URI used during authorisation.
 
 ### SSO token storage (optional Redis)
 For multi-instance deployments, store one-time SSO tokens in Redis:
@@ -107,11 +110,53 @@ On the frontend, set the API base:
 3) Point the frontend at the backend origin using `rag-api-base` or `window.__RAG_API_BASE`.
 4) Bootstrap the first user with `POST /api/setup`, then log in with `POST /api/login`.
 
+### Voice STT (native arm64, on-prem)
+Refiner supports an on-prem speech-to-text path for `/api/voice/stt` using the Rust service in [`stt_rust/`](stt_rust/README.md), so browser audio can be transcribed locally without cloud STT vendors.
+
+Recommended backend env:
+- `REFINER_STT_BACKEND=server`
+- `REFINER_STT_SERVER_URL=http://127.0.0.1:7079`
+- `REFINER_STT_SERVER_TIMEOUT=25`
+- `REFINER_STT_SERVER_PREPROCESS=0` (skip ffmpeg-style preprocess in server mode)
+- `REFINER_STT_SERVER_SEND_PROMPT=0` (default `0`, keep prompt hints local unless explicitly required)
+
+Privacy-safe STT learning (optional, enabled by default):
+- `REFINER_STT_LEARNING_ENABLED=1`
+- `REFINER_STT_KB_LOCAL_PATHS=/home/pbisaacs/Developer/neuralmimicry.ai-website`
+- `REFINER_STT_KB_SEED_URLS=https://neuralmimicry.ai`
+- `REFINER_STT_LEARNING_ALLOW_NETWORK=1` (only when outbound network is allowed)
+
+When learning is enabled, `/api/voice/stt` builds redacted vocabulary hints from past conversations and
+seeded site content. By default these hints are used locally (not retransmitted to Rust server requests).
+Set `REFINER_STT_SERVER_SEND_PROMPT=1` only when remote prompt hints are required.
+For command backend parity, include `{prompt}` in `REFINER_STT_ARGS` if your STT CLI supports prompt hints.
+
+For a native `arm64` Ubuntu systemd deployment, use:
+- `stt_rust/refiner-stt.service`
+- `stt_rust/native_arm64_46core.env` (preset tuned for 46 cores)
+
+User-level systemd unit (repo-local paths, no root user required):
+- `stt_rust/refiner-stt-user.service`
+
+Robust local launcher (STT + `refiner_web.py` with health checks and restart loop):
+- `./scripts/start_refiner_stack.sh`
+- If no model is found locally, it auto-downloads `ggml-tiny.en.bin` from the official `ggerganov/whisper.cpp` Hugging Face repo.
+- Optional explicit model: `STT_MODEL=/path/to/ggml-*.bin ./scripts/start_refiner_stack.sh`
+- Optional profile override: `STT_MODEL_PROFILE=base.en ./scripts/start_refiner_stack.sh`
+- Optional URL override: `STT_MODEL_URL=https://.../ggml-model.bin ./scripts/start_refiner_stack.sh`
+- One-shot mode (no restart loop): `./scripts/start_refiner_stack.sh --once`
+
 ### Prometheus/Grafana metrics
 Refiner exposes Prometheus-compatible metrics on `GET /metrics` by default (same port as the web server).
 - Disable or change the path with `REFINER_METRICS_ENABLED` or `REFINER_METRICS_PATH`.
 - The backend exports request counts/latency, in-flight requests, uptime, job counts by status, queue depth, and worker threads.
 - The frontend-only server exports its own request/latency/uptime metrics with a `refiner_frontend_*` prefix.
+
+### Performance tooling
+- Latency/load benchmark helper:
+  - `./scripts/benchmark_refiner_api.py --url http://127.0.0.1:5001/api/health --method GET --requests 50 --concurrency 10`
+- Static bundle budget checks:
+  - `./scripts/check_bundle_budgets.py --root .`
 
 ### Job completion notifications
 Refiner can email users when a job finishes and they are not active in the web UI.
@@ -653,6 +698,82 @@ refiner --agent-role planner=openai:gpt-4o --agent-role reviewer=gemini:gemini-1
 
 Supported roles: `planner`, `researcher`, `reviewer`, `critic`, `editor`. Roles fall back to the main LLM provider if not configured.
 
+### Skills catalog (optional)
+Refiner uses a small built-in skill list to guide prompts in the web assistant, topic research, and project solver. You can extend it with the `antigravity-awesome-skills` index without installing `npx`.
+
+Setup (local file)
+1. Download `skills_index.json` from `https://github.com/sickn33/antigravity-awesome-skills` and place it at `data/antigravity_skills_index.json` (or any path you prefer).
+2. Set `REFINER_SKILLS_INDEX_PATH=/absolute/path/to/skills_index.json` if you did not use the default location.
+
+Auto-detected clone locations (no env var needed)
+- `.agent/skills`, `.agents/skills`, `.claude/skills`, `.codex/skills`, `.cursor/skills`, `.gemini/skills`, `.kiro/skills`
+- `~/.gemini/antigravity/skills`, `~/.kiro/skills`, `~/.claude/skills`, `~/.codex/skills`, `~/.cursor/skills`, `~/.gemini/skills`, `~/.agents/skills`
+
+Auto-sync (optional but enabled by default)
+1. Refiner can clone/pull the antigravity repo when the index is missing or stale.
+2. Controls (config.json `skills_catalog`):
+3. `auto_sync` (bool, default true), `sync_path` (path for clone), `sync_repo_url`, `sync_ref`, `sync_ttl_hours`.
+
+Auto-sync environment overrides
+1. `REFINER_SKILLS_AUTO_SYNC=1`
+2. `REFINER_SKILLS_SYNC_PATH=/absolute/path/to/skills`
+3. `REFINER_SKILLS_SYNC_URL=https://github.com/sickn33/antigravity-awesome-skills.git`
+4. `REFINER_SKILLS_SYNC_REF=main`
+5. `REFINER_SKILLS_SYNC_TTL_HOURS=24`
+
+Skill playbooks (optional)
+1. Add `data/skills_playbooks.json` to map skill keywords/categories to actionable directives.
+2. Override the playbook path with `REFINER_SKILLS_PLAYBOOK_PATH=/absolute/path/to/skills_playbooks.json`.
+
+### Security and compliance
+Refiner includes controls to support ISO 27001 and SOC 2 alignment. See `COMPLIANCE.md` for a detailed checklist and evidence guidance.
+
+Key controls (config/env)
+1. Session security: `REFINER_SECRET_KEY` and `REFINER_REQUIRE_SECRET_KEY=1`.
+2. Secrets at rest: `REFINER_SECRET_STORE_KEY` and `REFINER_SECRET_STORE_REQUIRE_ENCRYPTION=1`.
+3. HTTPS enforcement: `REFINER_ENFORCE_HTTPS=1` and `REFINER_SECURE_COOKIES=1`.
+4. CSRF/origin checks: `REFINER_CSRF_ORIGIN_CHECK=1`.
+5. Audit logging: `REFINER_AUDIT_LOG_PATH=/path/to/audit.log`.
+6. Login throttling: `REFINER_LOGIN_MAX_ATTEMPTS=10` and `REFINER_LOGIN_WINDOW_SEC=300`.
+7. Job retention: `REFINER_JOB_RETENTION_DAYS=30` (or per policy).
+8. SSRF controls: `REFINER_URL_ALLOWLIST=example.com,example.org` and `REFINER_ALLOW_PRIVATE_URLS=0`.
+
+### OIDC authentication (optional)
+Refiner can use an OIDC provider for SSO. Configure via environment variables:
+1. `REFINER_OIDC_ENABLED=1`
+2. `REFINER_OIDC_ISSUER=https://your-issuer`
+3. `REFINER_OIDC_CLIENT_ID=your-client-id`
+4. `REFINER_OIDC_CLIENT_SECRET=your-client-secret` (optional for public clients)
+5. `REFINER_OIDC_REDIRECT_URI=https://your-host/oidc/callback` (recommended)
+6. `REFINER_AUTH_MODE=oidc` to disable local logins or `mixed` to allow both.
+7. Optional role mapping:
+8. `REFINER_OIDC_ADMIN_DOMAINS=example.com`
+9. `REFINER_OIDC_ADMIN_GROUPS=admins,security`
+10. JWT leeway and verification (avoid disabling in production):
+11. `REFINER_OIDC_JWT_LEEWAY=120`
+12. `REFINER_OIDC_SKIP_JWT_VERIFY=0`
+13. Client auth mode: `REFINER_OIDC_CLIENT_AUTH=basic` (or `post` if your provider requires it)
+14. SPA exchange support (commercial frontend):
+15. `REFINER_OIDC_EXCHANGE_ENABLED=1` to allow `POST /api/oidc/exchange`.
+16. `/api/oidc/exchange` accepts either `id_token`/`access_token` or a PKCE `code` + `code_verifier` for server-side token exchange.
+17. `REFINER_OIDC_ALLOWED_REDIRECT_URIS=https://your-frontend/oidc/callback` to allow the SPA redirect URI.
+18. `REFINER_OIDC_ALLOWED_AUDIENCES=spa-client-id` if the SPA uses a different client ID.
+Compatibility aliases:
+- `NM_AUTH_MODE` and `NM_OIDC_*` are also accepted to align SSO configuration across NeuralMimicry services.
+19. Cross-site login: set `REFINER_CORS_ORIGINS=https://your-frontend` and `REFINER_COOKIE_SAMESITE=None` with `REFINER_SECURE_COOKIES=1`.
+
+Optional filters (config.json)
+1. `skills_catalog.allow_categories`: Only load skills from these categories.
+2. `skills_catalog.denylist`: Substrings to exclude (e.g., `red-team`, `malware`, `phish`).
+3. `skills_catalog.summary_max_chars`: Truncate long descriptions in prompt hints.
+4. `skills_catalog.max_external`: Cap the number of external skills loaded.
+
+Optional filters (environment variables)
+1. `REFINER_SKILLS_ALLOW_CATEGORIES=info,code`
+2. `REFINER_SKILLS_DENYLIST=red-team,malware,phish`
+3. `REFINER_SKILLS_SUMMARY_MAX_CHARS=180`
+4. `REFINER_SKILLS_MAX_EXTERNAL=400`
+
 
 ### Logging and progress monitoring
 The tool provides detailed status updates and debug logging to monitor progress in real-time and analyse execution afterwards.
@@ -740,12 +861,17 @@ Inputs
 
 #### OpenCode fallback
 - When code is required and the LLM returns inadequate plans, the solver can query OpenCode via the CLI.
+- If `OPENCODE_SERVER_URL` is set, the solver will call the OpenCode server `/session` API directly and will not invoke the CLI (no `--project-run` required).
+- `OPENCODE_SERVER_FALLBACK_TO_CLI=1` allows the solver to fall back to the CLI when the server health check or request fails (CLI still requires `--project-run`).
+- The server path runs a health check against `/global/health` before creating a session.
 - `OPENCODE_COMMAND_TEMPLATE` is optional; if unset, the fallback uses `opencode run --format json --file <prompt>`. Supported placeholders: `{opencode_bin}`, `{opencode_model_flag}`, `{prompt}`, `{prompt_file}`, `{workspace}`, `{output_path}`.
 - Example (CLI run mode): `OPENCODE_COMMAND_TEMPLATE='{opencode_bin} run --format json {opencode_model_flag} --file {prompt_file} "Use the attached file as instructions. Respond ONLY with JSON."'`.
 - `OPENCODE_BIN` overrides the opencode executable name/path (default: `opencode`).
-- The fallback runs a shell command, so it requires `--project-run` to be enabled.
+- The CLI fallback runs a shell command, so it requires `--project-run` to be enabled.
 - `OPENCODE_FALLBACK_THRESHOLD` controls how many inadequate LLM responses trigger the fallback (default: 1).
 - `OPENCODE_TIMEOUT` sets the command timeout in seconds (default: 900).
+- `OPENCODE_SERVER_TIMEOUT` optionally overrides the server request timeout; defaults to `OPENCODE_TIMEOUT`.
+- `OPENCODE_SERVER_USERNAME`/`OPENCODE_SERVER_PASSWORD` are used for HTTP basic auth when the server is protected.
 - Auto-install is enabled by default when OpenCode is missing; set `OPENCODE_AUTO_INSTALL=0` to disable. You can override the install command with `OPENCODE_INSTALL_COMMAND`.
 - The solver passes through existing `OPENAI_API_KEY`/`GEMINI_API_KEY` values to OpenCode when available.
 - If `OPENCODE_COMMAND_TEMPLATE` is not set, the solver defaults to `opencode run --format json --file <prompt>`, and you can set `OPENCODE_MODEL` to choose a provider/model.

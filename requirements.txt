@@ -16,5 +16,6 @@ xlwt
 beautifulsoup4
 Pillow
 cryptography
+PyJWT
 prometheus-client
 redis

@@ -1,10 +1,13 @@
 #! /bin/bash
 export GOOGLE_API_KEY=AIzaSyCjJ6ncWcXTwkM3hbupgkwkihUzdK_Cx0I
 export GOOGLE_CSE_ID=b1be7dc5503b945c7
-export OLLAMA_BASE_URL=http://localhost:11434
+export OLLAMA_BASE_URL=http://192.168.1.60:11434
 export JIRA_USERNAME="paul@neuralmimicry.ai"
 export JIRA_PASSWORD="97FC81"
 export GEMINI_API_KEY=AIzaSyCjJ6ncWcXTwkM3hbupgkwkihUzdK_Cx0I
 export GOOGLE_GENERATIVE_AI_API_KEY=AIzaSyCjJ6ncWcXTwkM3hbupgkwkihUzdK_Cx0I
 export ZEN_KEY=sk-vjhai9xqyzeJV2Si5Bo8s94y9fnrmXJ4MRcl7Lyu1A0zbjJcZOVlz1u6Hxy7z0D7
 export OPENAI_API_KEY=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
+export OPENCODE_SERVER_URL=http://192.168.1.72:4096
+export OPENAI_RESPONSES_REPLAY_INCOMPLETE=1
+export OPENAI_RESPONSES_REPLAY_PROMPT=1

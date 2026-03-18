@@ -1238,7 +1238,7 @@ def analyze_space_and_write_report(
             messages = [
                 {"role": "user", "content": (
                     f"Space: {space.get('name')} ({space.get('key')})\n\n"
-                    f"Baseline metrics:\n{metrics_text}\n\nHierarchy:\n{hierarchy_text}\n\nFindings:\n{findings_text}\n\nPage assessments (optional):\n{insights_text[:6000]}"
+                    f"Baseline metrics:\n{metrics_text}\n\nHierarchy:\n{hierarchy_text}\n\nFindings:\n{findings_text}\n\nPage assessments (optional):\n{insights_text[:12000]}"
                 )}
             ]
             resp = provider.predict(messages=messages, max_tokens=(llm_max_tokens or 800), temperature=llm_temperature, system="Provide an executive summary as instructed.", timeout=llm_timeout or 90, reasoning_effort=llm_reasoning_effort)

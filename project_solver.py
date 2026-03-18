@@ -20,12 +20,13 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -43,6 +44,7 @@ from web_research import (
     search_web,
     summarize_web_research,
 )
+from skills_engine import build_skill_context, format_skill_directives
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +246,39 @@ SAMPLE_CODE_TEXT_HINTS = (
     "provided code",
     "example implementation",
 )
+
+FILE_PATH_RE = re.compile(
+    r"(?P<path>[A-Za-z0-9_\-./\\]+\\.(?:md|txt|rst|yml|yaml|json|toml|ini|cfg|py|js|ts|tsx|jsx|html|css|sh))"
+)
+CODE_BLOCK_RE = re.compile(r"```(?P<lang>[A-Za-z0-9_+-]*)\n(?P<code>.*?)```", re.S)
+
+LOCAL_INTENT_RULES = [
+    {
+        "id": "verification_only",
+        "keywords": ("run tests", "verification", "verify", "test only", "test-run"),
+        "exclude": ("implement", "feature", "refactor", "rewrite", "build"),
+    },
+    {
+        "id": "docs_update",
+        "keywords": ("readme", "documentation", "docs", ".md", "guide", "notes"),
+        "exclude": ("implement", "feature", "refactor", "rewrite", "build"),
+    },
+    {
+        "id": "config_update",
+        "keywords": ("config", "configuration", "yaml", "yml", "toml", "json", "ini", "cfg"),
+        "exclude": ("deploy", "pipeline", "infra"),
+    },
+    {
+        "id": "dependency_update",
+        "keywords": ("requirements.txt", "dependencies", "dependency", "package.json", "pyproject.toml"),
+        "exclude": ("implement", "feature"),
+    },
+    {
+        "id": "test_update",
+        "keywords": ("test", "pytest", "unit test", "coverage"),
+        "exclude": (),
+    },
+]
 HELPER_MODULE_HINTS = (
     "helper",
     "utils",
@@ -2488,7 +2523,7 @@ def _rephrase_json_payload(
 ) -> Optional[Dict[str, object]]:
     if not response_text:
         return None
-    snippet = _truncate_text(response_text, 6000)
+    snippet = _truncate_text(response_text, 12000)
     schema_block = schema_hint or "{}"
     user_prompt = (
         "Your previous response was not valid JSON. "
@@ -2606,6 +2641,30 @@ def _parse_opencode_output(stdout: str) -> Optional[Dict[str, object]]:
             continue
         _collect_string_fields(obj, candidates)
 
+    for candidate in candidates:
+        try:
+            payload = _parse_json_payload(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _parse_opencode_message_payload(message: object) -> Optional[Dict[str, object]]:
+    if message is None:
+        return None
+    if isinstance(message, str):
+        return _parse_opencode_output(message)
+    candidates: List[str] = []
+    if isinstance(message, dict):
+        parts = message.get("parts")
+        if isinstance(parts, list):
+            for part in parts:
+                _collect_string_fields(part, candidates)
+        _collect_string_fields(message, candidates)
+    elif isinstance(message, list):
+        _collect_string_fields(message, candidates)
     for candidate in candidates:
         try:
             payload = _parse_json_payload(candidate)
@@ -2811,6 +2870,232 @@ def _split_verification_steps(plan_steps: List[Dict[str, object]]) -> Tuple[List
     return non_verification, verification
 
 
+def _package_json_scripts(project_root: str) -> Dict[str, str]:
+    path = os.path.join(project_root, "package.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return {}
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if not isinstance(scripts, dict):
+        return {}
+    return {str(k): str(v) for k, v in scripts.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _parse_localhost_probe(command: str) -> Optional[Tuple[str, int]]:
+    if not command:
+        return None
+    match = re.search(
+        r"https?://(?P<host>localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0)(?::(?P<port>\\d+))?",
+        command,
+    )
+    if not match:
+        return None
+    host = match.group("host") or "localhost"
+    port_raw = match.group("port")
+    try:
+        port = int(port_raw) if port_raw else 80
+    except Exception:
+        port = 80
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    return host, port
+
+
+def _is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_port(host: str, port: int, timeout: float = 25.0, interval: float = 0.5) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        if _is_port_open(host, port):
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _select_node_server_command(scripts: Dict[str, str]) -> Optional[str]:
+    if not scripts:
+        return None
+    for key in ("dev", "start", "preview"):
+        if key in scripts:
+            return f"npm run {key}"
+    return None
+
+
+def _select_node_verify_command(scripts: Dict[str, str]) -> Optional[str]:
+    if not scripts:
+        return None
+    if "test" in scripts:
+        return "npm test"
+    if "build" in scripts:
+        return "npm run build"
+    return None
+
+
+def _execute_shell_command(
+    command: str,
+    *,
+    workdir: str,
+    timeout: int,
+    actions_log: List[str],
+    failure_log: Optional[List[Dict[str, object]]],
+    dataset_summary: Optional[Dict[str, object]],
+    eval_info: Optional[Dict[str, object]],
+) -> bool:
+    try:
+        logger.info(f"Executing command: {command} (workdir={workdir})")
+        result = subprocess.run(
+            command,
+            cwd=workdir,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        actions_log.append(f"Command failed: {command} ({exc})")
+        logger.info(f"Command failed: {command} ({exc})")
+        if failure_log is not None:
+            failure_log.append(
+                {
+                    "command": command,
+                    "workdir": workdir,
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": str(exc),
+                }
+            )
+        return False
+
+    logger.info(f"Command exit code: {result.returncode}")
+    actions_log.append(
+        f"Ran command: {command}\nExit code: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+    verification_issue = None
+    if _is_verification_command(command):
+        verification_issue = _verification_output_issue(
+            result.stdout,
+            result.stderr,
+            dataset_summary=dataset_summary,
+            eval_info=eval_info,
+        )
+        if verification_issue:
+            actions_log.append(
+                f"Verification output issue detected ({verification_issue}); treating as failure."
+            )
+    if result.returncode == 0 and not verification_issue:
+        actions_log.append(f"Command succeeded: {command}")
+        return True
+    actions_log.append(f"Command failed (exit {result.returncode}): {command}")
+    if failure_log is not None:
+        failure_log.append(
+            {
+                "command": command,
+                "workdir": workdir,
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "verification_issue": verification_issue,
+            }
+        )
+    return False
+
+
+def _has_pytest_config(project_root: str) -> bool:
+    for name in ("pytest.ini", "tox.ini", "setup.cfg"):
+        if os.path.isfile(os.path.join(project_root, name)):
+            return True
+    pyproject = os.path.join(project_root, "pyproject.toml")
+    if os.path.isfile(pyproject):
+        try:
+            with open(pyproject, "r", encoding="utf-8", errors="ignore") as handle:
+                text = handle.read(12000)
+            if "[tool.pytest" in text or "pytest" in text:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _select_verification_steps(
+    project_root: str,
+    lang_info: Dict[str, List[str]],
+    *,
+    max_steps: int = 2,
+) -> List[Dict[str, object]]:
+    languages = set(lang_info.get("languages") or [])
+    build_systems = set(lang_info.get("build_systems") or [])
+    steps: List[Dict[str, object]] = []
+
+    if "python" in languages or "python" in build_systems:
+        if _has_pytest_config(project_root) or os.path.isdir(os.path.join(project_root, "tests")):
+            steps.append(
+                {
+                    "type": "run_command",
+                    "step": "Run Python tests",
+                    "command": "python -m pytest",
+                    "workdir": ".",
+                    "timeout": 900,
+                }
+            )
+        else:
+            steps.append(
+                {
+                    "type": "run_command",
+                    "step": "Run Python checks",
+                    "command": "python -m pytest",
+                    "workdir": ".",
+                    "timeout": 900,
+                }
+            )
+
+    if ("node" in languages or "node" in build_systems) and len(steps) < max_steps:
+        scripts = _package_json_scripts(project_root)
+        if "test" in scripts:
+            steps.append(
+                {
+                    "type": "run_command",
+                    "step": "Run Node tests",
+                    "command": "npm test",
+                    "workdir": ".",
+                    "timeout": 900,
+                }
+            )
+
+    if ("go" in languages) and len(steps) < max_steps:
+        steps.append(
+            {
+                "type": "run_command",
+                "step": "Run Go tests",
+                "command": "go test ./...",
+                "workdir": ".",
+                "timeout": 900,
+            }
+        )
+
+    if ("rust" in languages) and len(steps) < max_steps:
+        steps.append(
+            {
+                "type": "run_command",
+                "step": "Run Rust tests",
+                "command": "cargo test",
+                "workdir": ".",
+                "timeout": 900,
+            }
+        )
+
+    return steps[:max_steps]
+
+
 def _looks_like_failure_context(source: RequirementSource) -> bool:
     path = (source.path or "").lower()
     if "failure_context" in path or "solver_context" in path:
@@ -2857,6 +3142,297 @@ def _source_is_pure_code_request(source: RequirementSource) -> bool:
     if not combined:
         return False
     return not NON_CODE_HINT_RE.search(combined)
+
+
+def _is_relative_safe_path(path: str) -> bool:
+    if not path:
+        return False
+    if os.path.isabs(path):
+        return False
+    normalized = os.path.normpath(path)
+    if normalized.startswith(".."):
+        return False
+    return True
+
+
+def _extract_explicit_paths(text: str) -> List[str]:
+    if not text:
+        return []
+    candidates = []
+    for match in FILE_PATH_RE.finditer(text):
+        path = match.group("path")
+        if not path:
+            continue
+        cleaned = path.strip().strip("`'\"")
+        if _is_relative_safe_path(cleaned):
+            candidates.append(cleaned)
+    seen = set()
+    ordered = []
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _format_text_excerpt(
+    text: str,
+    *,
+    max_lines: int = 120,
+    tail_lines: int = 40,
+) -> str:
+    lines = (text or "").splitlines()
+    if not lines:
+        return ""
+    total = len(lines)
+    if total <= max_lines:
+        indices = list(range(total))
+        truncated = False
+    else:
+        head = max(1, max_lines - tail_lines)
+        indices = list(range(head)) + list(range(max(0, total - tail_lines), total))
+        truncated = True
+    rendered: List[str] = []
+    last_idx = -1
+    for idx in indices:
+        if truncated and last_idx >= 0 and idx != last_idx + 1:
+            rendered.append("... (truncated)")
+        rendered.append(f"L{idx + 1}: {lines[idx]}")
+        last_idx = idx
+    return "\n".join(rendered).strip()
+
+
+def _path_has_ignored_segment(path: str, ignored: Optional[List[str]]) -> bool:
+    if not ignored:
+        return False
+    parts = os.path.normpath(path).split(os.sep)
+    return any(part in ignored for part in parts if part)
+
+
+def _collect_explicit_file_excerpts(
+    source: RequirementSource,
+    project_root: str,
+    *,
+    extra_ignored: Optional[List[str]] = None,
+    max_files: int = 3,
+    max_file_bytes: int = 200_000,
+) -> List[Tuple[str, str]]:
+    text = " ".join(
+        part
+        for part in [
+            source.requirements_text or "",
+            " ".join(source.requirement_lines),
+            " ".join(source.todo_lines),
+            source.context_excerpt or "",
+            source.path or "",
+        ]
+        if part
+    )
+    candidates: List[str] = []
+    if source.path and _is_relative_safe_path(source.path):
+        candidates.append(source.path)
+    candidates.extend(_extract_explicit_paths(text))
+    seen: set = set()
+    excerpts: List[Tuple[str, str]] = []
+    ignored = _ignored_dirnames(extra_ignored)
+    for rel_path in candidates:
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
+        if _path_has_ignored_segment(rel_path, ignored):
+            continue
+        abs_path = _safe_path(project_root, rel_path)
+        if not abs_path or not os.path.isfile(abs_path):
+            continue
+        if _is_third_party_path(abs_path):
+            continue
+        text = _read_text_file(abs_path, max_file_bytes)
+        if not text:
+            continue
+        excerpt = _format_text_excerpt(text)
+        if not excerpt:
+            continue
+        excerpts.append((rel_path, excerpt))
+        if len(excerpts) >= max_files:
+            break
+    return excerpts
+
+
+def _extract_code_blocks(text: str) -> List[Dict[str, str]]:
+    if not text:
+        return []
+    blocks: List[Dict[str, str]] = []
+    for match in CODE_BLOCK_RE.finditer(text):
+        lang = (match.group("lang") or "").strip()
+        code = (match.group("code") or "").strip("\n")
+        if not code:
+            continue
+        blocks.append({"lang": lang, "code": code, "pos": str(match.start())})
+    return blocks
+
+
+def _extract_file_code_instructions(text: str, project_root: str) -> List[Dict[str, str]]:
+    if not text:
+        return []
+    lines = text.splitlines()
+    if not lines:
+        return []
+    instructions: List[Dict[str, str]] = []
+    for match in CODE_BLOCK_RE.finditer(text):
+        code = (match.group("code") or "").strip("\n")
+        if not code:
+            continue
+        start_line = text[: match.start()].count("\n")
+        context_lines = lines[max(0, start_line - 4): start_line]
+        path = ""
+        context = ""
+        for line in reversed(context_lines):
+            hit = FILE_PATH_RE.search(line or "")
+            if hit:
+                path = (hit.group("path") or "").strip().strip("`'\"")
+                context = line.strip()
+                break
+        if not path or not _is_relative_safe_path(path):
+            continue
+        abs_path = os.path.join(project_root, path)
+        exists = os.path.exists(abs_path)
+        context_lower = context.lower()
+        if any(word in context_lower for word in ("replace", "overwrite", "full file", "entire file")):
+            mode = "write"
+        elif any(word in context_lower for word in ("append", "add", "insert", "update")):
+            mode = "append"
+        else:
+            mode = "write" if not exists else "append"
+        instructions.append({"path": path, "code": code, "mode": mode})
+    return instructions
+
+
+def _classify_local_intent(source: RequirementSource, project_root: str) -> Dict[str, object]:
+    text = " ".join(
+        part
+        for part in [
+            source.requirements_text or "",
+            " ".join(source.requirement_lines),
+            " ".join(source.todo_lines),
+            source.context_excerpt or "",
+            source.path or "",
+        ]
+        if part
+    )
+    lowered = text.lower()
+    explicit_paths = _extract_explicit_paths(text)
+    code_blocks = _extract_code_blocks(text)
+    best_rule = None
+    best_score = 0.0
+    best_matches: List[str] = []
+    for rule in LOCAL_INTENT_RULES:
+        matches = [kw for kw in rule["keywords"] if kw in lowered]
+        if not matches:
+            continue
+        if any(ex in lowered for ex in rule.get("exclude") or []):
+            continue
+        score = float(len(matches))
+        if score > best_score:
+            best_score = score
+            best_rule = rule
+            best_matches = matches
+    if not best_rule:
+        return {
+            "intent": "unknown",
+            "confidence": 0.0,
+            "signals": [],
+            "paths": explicit_paths,
+            "code_blocks": len(code_blocks),
+        }
+    confidence = min(1.0, best_score / 3.0)
+    if explicit_paths:
+        confidence = min(1.0, confidence + 0.2)
+    if code_blocks:
+        confidence = min(1.0, confidence + 0.2)
+    if best_rule["id"] == "verification_only" and best_score >= 1:
+        confidence = max(confidence, 0.6)
+    return {
+        "intent": best_rule["id"],
+        "confidence": confidence,
+        "signals": best_matches,
+        "paths": explicit_paths,
+        "code_blocks": len(code_blocks),
+    }
+
+
+def _build_local_plan_from_intent(
+    intent_info: Dict[str, object],
+    source: RequirementSource,
+    project_root: str,
+    lang_info: Dict[str, List[str]],
+    *,
+    allow_run: bool,
+    required_ids: Optional[set] = None,
+) -> Optional[Dict[str, object]]:
+    intent = str(intent_info.get("intent") or "")
+    confidence = float(intent_info.get("confidence") or 0.0)
+    min_conf = float(os.getenv("SOLVER_LOCAL_INTENT_MIN_CONF", "0.75"))
+    if intent == "verification_only":
+        min_conf = min(min_conf, 0.5)
+    if confidence < min_conf:
+        return None
+
+    plan_steps: List[Dict[str, object]] = []
+    summary_bits: List[str] = [intent.replace("_", " ")]
+
+    if intent == "verification_only":
+        verification_steps = _select_verification_steps(project_root, lang_info, max_steps=2)
+        if not verification_steps:
+            return None
+        plan_steps.extend(verification_steps)
+        summary_bits.append("local verification")
+
+    instructions = _extract_file_code_instructions(source.requirements_text or "", project_root)
+    if instructions and intent != "verification_only":
+        for instruction in instructions[:3]:
+            path = instruction.get("path")
+            code = instruction.get("code")
+            mode = instruction.get("mode", "append")
+            if not path or not code:
+                continue
+            step_type = "append_file" if mode == "append" else "write_file"
+            plan_steps.append(
+                {
+                    "type": step_type,
+                    "step": f"Apply provided content to {path}",
+                    "path": path,
+                    "content": code.rstrip() + "\n",
+                    "overwrite": mode == "write",
+                }
+            )
+        if instructions:
+            summary_bits.append("apply provided code blocks")
+
+    if not plan_steps:
+        return None
+
+    needs_verification = any(
+        os.path.splitext(step.get("path") or "")[1].lower() in CODE_FILE_EXTS
+        for step in plan_steps
+        if isinstance(step, dict)
+    )
+    if needs_verification and allow_run:
+        verification_steps = _select_verification_steps(project_root, lang_info, max_steps=2)
+        for step in verification_steps:
+            plan_steps.append(step)
+        if verification_steps:
+            summary_bits.append("auto verification")
+
+    requirements = sorted(required_ids) if required_ids else []
+    return {
+        "summary": f"Local plan ({', '.join(summary_bits)})",
+        "requirements": requirements,
+        "done": False,
+        "plan": plan_steps,
+        "provider": "local_heuristic",
+        "local_intent": intent_info,
+    }
 
 
 def _extract_source_requirements(source: RequirementSource, max_fallback: int = 10) -> List[str]:
@@ -3990,6 +4566,7 @@ def _format_progress_memory(progress_tracker: ProgressTracker, source_path: str,
     return summary + "\n\n"
 
 
+
 def _load_solver_config(config_path: str) -> Dict[str, object]:
     try:
         with open(config_path, "r", encoding="utf-8") as handle:
@@ -4656,6 +5233,17 @@ def _plan_has_actionable_steps(plan_steps: List[Dict[str, object]]) -> bool:
         if step_type in {"write_file", "append_file", "replace_in_file", "run_command", "create_dir"}:
             return True
     return False
+
+
+def _plan_is_usable(plan_steps: List[Dict[str, object]], *, requires_code: bool, allow_run: bool) -> Tuple[bool, str]:
+    if not plan_steps:
+        return False, "empty plan"
+    if requires_code:
+        if not _plan_has_actionable_steps(plan_steps):
+            return False, "no actionable steps"
+        if not allow_run and not _plan_has_file_changes(plan_steps):
+            return False, "no file changes when run_command disabled"
+    return True, ""
 
 
 def _extract_plan_text(plan_steps: List[Dict[str, object]]) -> str:
@@ -5380,6 +5968,67 @@ def _opencode_threshold() -> int:
         return 1
 
 
+def _opencode_server_url() -> Optional[str]:
+    raw = os.getenv("OPENCODE_SERVER_URL")
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    if "://" not in cleaned:
+        cleaned = f"http://{cleaned}"
+    parsed = urlparse(cleaned)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return cleaned.rstrip("/")
+
+
+def _opencode_server_auth() -> Optional[Tuple[str, str]]:
+    password = os.getenv("OPENCODE_SERVER_PASSWORD")
+    if not password:
+        return None
+    username = os.getenv("OPENCODE_SERVER_USERNAME", "opencode")
+    return (username, password)
+
+
+def _opencode_server_timeout() -> int:
+    default_timeout = _env_int("OPENCODE_TIMEOUT", 900)
+    return _env_int("OPENCODE_SERVER_TIMEOUT", default_timeout)
+
+
+def _opencode_server_health(server_url: str, actions_log: List[str]) -> bool:
+    auth = _opencode_server_auth()
+    timeout = _opencode_server_timeout()
+    try:
+        resp = requests.get(
+            f"{server_url}/global/health",
+            timeout=timeout,
+            auth=auth,
+        )
+    except requests.RequestException as exc:
+        actions_log.append(f"OpenCode server health check failed: {exc}")
+        return False
+    if resp.status_code >= 400:
+        actions_log.append(
+            f"OpenCode server health check error: HTTP {resp.status_code} - {resp.text}"
+        )
+        return False
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        if payload.get("healthy") is False:
+            actions_log.append("OpenCode server reported unhealthy status.")
+            return False
+        version = payload.get("version")
+        if version:
+            actions_log.append(f"OpenCode server healthy (version {version}).")
+    else:
+        actions_log.append("OpenCode server health check returned non-JSON response.")
+    return True
+
+
 def _codex_cli_mode() -> str:
     raw = os.getenv("CODEX_USE_CLI") or os.getenv("CODEX_CLI_MODE") or "auto"
     norm = raw.strip().lower()
@@ -5627,6 +6276,88 @@ def _build_opencode_command(
     )
 
 
+def _query_opencode_server_plan(
+    *,
+    server_url: str,
+    prompt: str,
+    actions_log: List[str],
+) -> Optional[Dict[str, object]]:
+    auth = _opencode_server_auth()
+    timeout = _opencode_server_timeout()
+    session_id: Optional[str] = None
+    try:
+        resp = requests.post(
+            f"{server_url}/session",
+            json={},
+            timeout=timeout,
+            auth=auth,
+        )
+    except requests.RequestException as exc:
+        actions_log.append(f"OpenCode server request failed (create session): {exc}")
+        return None
+    if resp.status_code >= 400:
+        actions_log.append(
+            f"OpenCode server session create failed: HTTP {resp.status_code} - {resp.text}"
+        )
+        return None
+    try:
+        session_payload = resp.json()
+    except ValueError as exc:
+        actions_log.append(f"OpenCode server session response invalid JSON: {exc}")
+        return None
+    if isinstance(session_payload, dict):
+        session_id = session_payload.get("id") or session_payload.get("sessionID") or session_payload.get("sessionId")
+    if not session_id:
+        actions_log.append("OpenCode server session response missing session id.")
+        return None
+
+    request_payload: Dict[str, object] = {
+        "parts": [{"type": "text", "text": prompt}],
+    }
+    opencode_model = os.getenv("OPENCODE_MODEL")
+    if opencode_model:
+        request_payload["model"] = opencode_model
+
+    try:
+        resp = requests.post(
+            f"{server_url}/session/{session_id}/message",
+            json=request_payload,
+            timeout=timeout,
+            auth=auth,
+        )
+    except requests.RequestException as exc:
+        actions_log.append(f"OpenCode server request failed (send message): {exc}")
+        return None
+    finally:
+        try:
+            requests.delete(
+                f"{server_url}/session/{session_id}",
+                timeout=timeout,
+                auth=auth,
+            )
+        except requests.RequestException:
+            pass
+
+    if resp.status_code >= 400:
+        actions_log.append(
+            f"OpenCode server message failed: HTTP {resp.status_code} - {resp.text}"
+        )
+        return None
+
+    try:
+        response_payload = resp.json()
+    except ValueError:
+        response_payload = resp.text
+    payload = _parse_opencode_message_payload(response_payload)
+    if not payload:
+        actions_log.append(
+            "OpenCode server response did not contain valid JSON payload. "
+            "Ensure the server is configured and the selected model is authorized."
+        )
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _query_opencode_plan(
     *,
     prompt: str,
@@ -5637,6 +6368,40 @@ def _query_opencode_plan(
     llm_provider: Optional[str],
     llm_api_key: Optional[str],
 ) -> Optional[Dict[str, object]]:
+    server_url_raw = os.getenv("OPENCODE_SERVER_URL")
+    server_url = _opencode_server_url()
+    server_fallback_to_cli = _env_bool("OPENCODE_SERVER_FALLBACK_TO_CLI", False)
+    if server_url_raw and not server_url:
+        actions_log.append("OPENCODE_SERVER_URL is set but invalid; expected host[:port] or URL.")
+    if server_url:
+        if not _opencode_server_health(server_url, actions_log):
+            if server_fallback_to_cli:
+                actions_log.append(
+                    "OpenCode server unhealthy; falling back to CLI because OPENCODE_SERVER_FALLBACK_TO_CLI=1."
+                )
+            else:
+                actions_log.append(
+                    "OpenCode server unhealthy; skipping CLI invocation because OPENCODE_SERVER_FALLBACK_TO_CLI is not enabled."
+                )
+                return None
+        else:
+            actions_log.append(f"Querying OpenCode server via {server_url}/session.")
+            payload = _query_opencode_server_plan(
+                server_url=server_url,
+                prompt=prompt,
+                actions_log=actions_log,
+            )
+            if payload:
+                return payload
+            if server_fallback_to_cli:
+                actions_log.append(
+                    "OpenCode server request failed; falling back to CLI because OPENCODE_SERVER_FALLBACK_TO_CLI=1."
+                )
+            else:
+                actions_log.append(
+                    "OpenCode server request failed; skipping CLI invocation because OPENCODE_SERVER_FALLBACK_TO_CLI is not enabled."
+                )
+                return None
     if not allow_run:
         actions_log.append("OpenCode fallback skipped (run commands disabled).")
         return None
@@ -6066,6 +6831,262 @@ def _plan_recovery_steps(
     return [step for step in plan_steps if isinstance(step, dict)]
 
 
+def _candidate_requirements_files_local(workspace: str) -> Optional[str]:
+    if not workspace or not os.path.isdir(workspace):
+        return None
+    priority = [
+        "requirements.txt",
+        "requirements-dev.txt",
+        "requirements-dev.in",
+        "requirements.in",
+        "requirements-test.txt",
+        "req.txt",
+    ]
+    for name in priority:
+        candidate = os.path.join(workspace, name)
+        if os.path.isfile(candidate):
+            return name
+    try:
+        for name in sorted(os.listdir(workspace)):
+            if name.startswith("requirements") and name.endswith(".txt"):
+                return name
+            if name.startswith("req") and name.endswith(".txt"):
+                return name
+    except Exception:
+        return None
+    return None
+
+
+def _project_packaging_signals_local(workspace: str) -> Dict[str, bool]:
+    def _exists(name: str) -> bool:
+        return os.path.isfile(os.path.join(workspace, name))
+
+    has_pyproject = _exists("pyproject.toml")
+    has_poetry = False
+    if has_pyproject:
+        try:
+            with open(os.path.join(workspace, "pyproject.toml"), "r", encoding="utf-8", errors="ignore") as handle:
+                text = handle.read(4096)
+            has_poetry = "[tool.poetry]" in text
+        except Exception:
+            has_poetry = False
+
+    return {
+        "pyproject": has_pyproject,
+        "poetry": has_poetry or _exists("poetry.lock"),
+        "pipfile": _exists("Pipfile"),
+        "setup_py": _exists("setup.py"),
+        "setup_cfg": _exists("setup.cfg"),
+        "package_json": _exists("package.json"),
+    }
+
+
+def _plan_local_recovery(
+    *,
+    command: str,
+    result: Dict[str, Any],
+    workspace: str,
+    venv_path: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    text = ((result.get("stdout") or "") + "\n" + (result.get("stderr") or "")).lower()
+    recovery: Dict[str, Any] = {"reason": "", "commands": []}
+
+    venv_path = venv_path or _find_workspace_venv(workspace)
+    python_exec = os.path.join(venv_path, "bin", "python") if venv_path else "python"
+    pip_cmd = f"{python_exec} -m pip"
+    packaging = _project_packaging_signals_local(workspace)
+    lang_info = detect_languages(workspace)
+    languages = set(lang_info.get("languages") or [])
+    python_signals = bool(
+        packaging.get("pyproject")
+        or packaging.get("setup_py")
+        or packaging.get("setup_cfg")
+        or packaging.get("pipfile")
+        or "python" in languages
+    )
+
+    if python_signals and (".venv/bin/python" in command or ".venv\\scripts\\python" in command.lower()):
+        venv_candidate = os.path.join(workspace, ".venv", "bin", "python")
+        if not os.path.exists(venv_candidate):
+            recovery["reason"] = "missing venv"
+            recovery["commands"] = [
+                "python -m venv .venv",
+                "python -m ensurepip --upgrade",
+                f"{pip_cmd} install -U pip setuptools wheel",
+            ]
+            return recovery
+
+    if python_signals and ("no module named pip" in text or "pip: command not found" in text):
+        recovery["reason"] = "pip missing"
+        recovery["commands"] = [
+            "python -m ensurepip --upgrade",
+            f"{pip_cmd} install -U pip setuptools wheel",
+        ]
+        return recovery
+
+    if python_signals and (
+        "could not open requirements file" in text
+        or ("no such file or directory" in text and "requirements" in text)
+    ):
+        req_file = _candidate_requirements_files_local(workspace)
+        if req_file:
+            recovery["reason"] = "requirements file missing; fallback to available requirements"
+            recovery["commands"] = [f"{pip_cmd} install -r {req_file}"]
+            return recovery
+        if packaging["poetry"]:
+            recovery["reason"] = "requirements missing; poetry project detected"
+            commands = []
+            if shutil.which("poetry") is None:
+                commands.append(f"{pip_cmd} install -U poetry")
+            commands.append("poetry install")
+            recovery["commands"] = commands
+            return recovery
+        if packaging["pipfile"]:
+            recovery["reason"] = "requirements missing; pipenv project detected"
+            commands = []
+            if shutil.which("pipenv") is None:
+                commands.append(f"{pip_cmd} install -U pipenv")
+            commands.append("pipenv install --dev")
+            recovery["commands"] = commands
+            return recovery
+        if packaging["pyproject"] or packaging["setup_py"] or packaging["setup_cfg"]:
+            recovery["reason"] = "requirements missing; install project package"
+            recovery["commands"] = [f"{pip_cmd} install -e ."]
+            return recovery
+
+    if python_signals and ("no module named pytest" in text or "pytest: command not found" in text):
+        recovery["reason"] = "pytest missing"
+        req_file = _candidate_requirements_files_local(workspace)
+        if req_file:
+            recovery["commands"] = [f"{pip_cmd} install -r {req_file}"]
+        else:
+            recovery["commands"] = [f"{pip_cmd} install -U pytest"]
+        return recovery
+
+    if python_signals and (
+        "no module named" in text
+        and ("pip install" in command or "-m pytest" in command or "pytest" in command)
+    ):
+        if packaging["pyproject"] or packaging["setup_py"] or packaging["setup_cfg"]:
+            recovery["reason"] = "dependency missing; install project package"
+            recovery["commands"] = [f"{pip_cmd} install -e ."]
+            return recovery
+        req_file = _candidate_requirements_files_local(workspace)
+        if req_file:
+            recovery["reason"] = "dependency missing; reinstall requirements"
+            recovery["commands"] = [f"{pip_cmd} install -r {req_file}"]
+            return recovery
+
+    if python_signals and ("error: invalid command 'bdist_wheel'" in text or "bdist_wheel" in text):
+        recovery["reason"] = "wheel missing"
+        recovery["commands"] = [f"{pip_cmd} install -U wheel"]
+        return recovery
+
+    if python_signals and "poetry: command not found" in text and packaging["poetry"]:
+        recovery["reason"] = "poetry missing"
+        recovery["commands"] = [f"{pip_cmd} install -U poetry", "poetry install"]
+        return recovery
+
+    if python_signals and "pipenv: command not found" in text and packaging["pipfile"]:
+        recovery["reason"] = "pipenv missing"
+        recovery["commands"] = [f"{pip_cmd} install -U pipenv", "pipenv install --dev"]
+        return recovery
+
+    if "pytest" in command and ("failed" in text or "error" in text) and "--lf" not in command:
+        recovery["reason"] = "pytest failure; retry last failed tests"
+        recovery["commands"] = [command + " --lf"]
+        return recovery
+
+    if ("go: command not found" in text or "go: not found" in text) and "go" in languages:
+        recovery["reason"] = "go toolchain missing"
+        recovery["commands"] = []
+        return recovery
+
+    if ("cargo: command not found" in text or "rustc: command not found" in text) and "rust" in languages:
+        recovery["reason"] = "rust toolchain missing"
+        recovery["commands"] = []
+        return recovery
+
+    if ("gcc: command not found" in text or "g++: command not found" in text) and ("c" in languages or "cpp" in languages):
+        recovery["reason"] = "c/c++ toolchain missing"
+        recovery["commands"] = []
+        return recovery
+
+    if ("gfortran: command not found" in text or "fortran: command not found" in text) and "fortran" in languages:
+        recovery["reason"] = "fortran toolchain missing"
+        recovery["commands"] = []
+        return recovery
+
+    if ("fpc: command not found" in text or "pascal: command not found" in text) and "pascal" in languages:
+        recovery["reason"] = "pascal toolchain missing"
+        recovery["commands"] = []
+        return recovery
+
+    if packaging["package_json"] and ("npm: command not found" in text or "node: command not found" in text):
+        recovery["reason"] = "node tooling missing"
+        recovery["commands"] = []
+        return recovery
+
+    return None
+
+
+def _plan_local_recovery_steps(
+    failures: List[Dict[str, object]],
+    *,
+    project_root: str,
+    venv_path: Optional[str],
+    workspace: Optional[str],
+    actions_log: List[str],
+) -> List[Dict[str, object]]:
+    if not failures:
+        return []
+    workspace_root = workspace or project_root
+    seen_commands: set = set()
+    steps: List[Dict[str, object]] = []
+    for failure in failures:
+        command = failure.get("command")
+        if not isinstance(command, str) or not command:
+            continue
+        recovery = _plan_local_recovery(
+            command=command,
+            result=failure,
+            workspace=workspace_root,
+            venv_path=venv_path,
+        )
+        if not recovery:
+            continue
+        reason = recovery.get("reason") or "local recovery"
+        commands = recovery.get("commands") or []
+        if commands:
+            actions_log.append(f"Local recovery ({reason}) generated {len(commands)} command(s).")
+        for rec_cmd in commands:
+            if not rec_cmd or rec_cmd in seen_commands:
+                continue
+            seen_commands.add(rec_cmd)
+            steps.append(
+                {
+                    "type": "run_command",
+                    "step": f"Recovery: {reason}",
+                    "command": rec_cmd,
+                    "workdir": ".",
+                    "timeout": 900,
+                }
+            )
+        retry_cmd = command
+        if retry_cmd and retry_cmd not in seen_commands:
+            seen_commands.add(retry_cmd)
+            steps.append(
+                {
+                    "type": "run_command",
+                    "step": f"Retry command after recovery: {command}",
+                    "command": command,
+                    "workdir": failure.get("workdir") or ".",
+                    "timeout": 900,
+                }
+            )
+    return steps
+
+
 def _requirements_specify_output_dir(requirements_text: str) -> bool:
     lowered = requirements_text.lower()
     tokens = (
@@ -6288,6 +7309,7 @@ def _apply_step(
     actions_log: List[str],
     allowed_roots: Optional[List[str]] = None,
     failure_log: Optional[List[Dict[str, object]]] = None,
+    replace_failures: Optional[List[Dict[str, object]]] = None,
     venv_path: Optional[str] = None,
     workspace_root: Optional[str] = None,
     hallucination_log: Optional[List[str]] = None,
@@ -6502,6 +7524,18 @@ def _apply_step(
             if not isinstance(find_text, str) or not find_text:
                 actions_log.append(f"Skipped replace_in_file without find: {rel_path}")
                 logger.info(f"Skipped replace_in_file (missing find): {rel_path}")
+                if replace_failures is not None:
+                    existing = _read_text_file(abs_path, max_bytes=200_000) or ""
+                    excerpt = _format_text_excerpt(existing) if existing else ""
+                    replace_failures.append(
+                        {
+                            "path": rel_path,
+                            "abs_path": abs_path,
+                            "find": "",
+                            "issue": "missing_find",
+                            "excerpt": excerpt,
+                        }
+                    )
                 return
             existing = _read_text_file(abs_path, max_bytes=5_000_000)
             if existing is None:
@@ -6512,6 +7546,17 @@ def _apply_step(
             if find_text not in existing:
                 actions_log.append(f"Skipped replace_in_file; pattern not found in {rel_path}")
                 logger.info(f"Skipped replace_in_file (pattern not found): {rel_path}")
+                if replace_failures is not None:
+                    excerpt = _format_text_excerpt(existing)
+                    replace_failures.append(
+                        {
+                            "path": rel_path,
+                            "abs_path": abs_path,
+                            "find": find_text,
+                            "issue": "pattern_not_found",
+                            "excerpt": excerpt,
+                        }
+                    )
                 return
             updated = existing.replace(find_text, replace_text, count if count > 0 else existing.count(find_text))
             if abs_path.endswith(".py"):
@@ -6604,61 +7649,110 @@ def _apply_step(
             workspace_root=workspace_root,
             actions_log=actions_log,
         )
-        try:
-            timeout = step.get("timeout", 600)
-            logger.info(f"Executing command: {rewritten_command} (workdir={workdir})")
-            result = subprocess.run(
-                rewritten_command,
-                cwd=abs_workdir,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout if isinstance(timeout, (int, float)) else 600,
-            )
-            logger.info(f"Command exit code: {result.returncode}")
-            actions_log.append(
-                f"Ran command: {rewritten_command}\nExit code: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-            )
-            verification_issue = None
-            if _is_verification_command(rewritten_command):
-                verification_issue = _verification_output_issue(
-                    result.stdout,
-                    result.stderr,
+        timeout = step.get("timeout", 600)
+        timeout_value = timeout if isinstance(timeout, (int, float)) else 600
+        probe = _parse_localhost_probe(rewritten_command)
+        if probe:
+            host, port = probe
+            scripts = _package_json_scripts(abs_workdir) or _package_json_scripts(project_root)
+            server_command = _select_node_server_command(scripts)
+            if server_command:
+                already_open = _is_port_open(host, port)
+                server_proc = None
+                if not already_open:
+                    actions_log.append(
+                        f"Starting dev server for localhost probe: {server_command} (port {port})"
+                    )
+                    try:
+                        server_proc = subprocess.Popen(
+                            server_command,
+                            cwd=abs_workdir,
+                            shell=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
+                        )
+                    except Exception as exc:
+                        actions_log.append(f"Failed to start dev server: {exc}")
+                        if failure_log is not None:
+                            failure_log.append(
+                                {
+                                    "command": server_command,
+                                    "workdir": abs_workdir,
+                                    "exit_code": None,
+                                    "stdout": "",
+                                    "stderr": str(exc),
+                                    "verification_issue": "dev server start failed",
+                                }
+                            )
+                        return
+                    wait_timeout = _env_int("SOLVER_LOCALHOST_PROBE_WAIT_SEC", 25)
+                    if not _wait_for_port(host, port, timeout=float(wait_timeout)):
+                        actions_log.append(
+                            f"Dev server did not open port {port} within {wait_timeout}s; skipping probe."
+                        )
+                        if failure_log is not None:
+                            failure_log.append(
+                                {
+                                    "command": server_command,
+                                    "workdir": abs_workdir,
+                                    "exit_code": None,
+                                    "stdout": "",
+                                    "stderr": f"port {port} not ready",
+                                    "verification_issue": "dev server not ready",
+                                }
+                            )
+                        if server_proc:
+                            server_proc.terminate()
+                            try:
+                                server_proc.wait(timeout=5)
+                            except Exception:
+                                server_proc.kill()
+                        return
+                _execute_shell_command(
+                    rewritten_command,
+                    workdir=abs_workdir,
+                    timeout=int(timeout_value),
+                    actions_log=actions_log,
+                    failure_log=failure_log,
                     dataset_summary=dataset_summary,
                     eval_info=eval_info,
                 )
-                if verification_issue:
-                    actions_log.append(
-                        f"Verification output issue detected ({verification_issue}); treating as failure."
-                    )
-            if result.returncode == 0 and not verification_issue:
-                actions_log.append(f"Command succeeded: {rewritten_command}")
-            else:
-                actions_log.append(f"Command failed (exit {result.returncode}): {rewritten_command}")
-                if failure_log is not None:
-                    failure_log.append(
-                        {
-                            "command": rewritten_command,
-                            "workdir": abs_workdir,
-                            "exit_code": result.returncode,
-                            "stdout": result.stdout,
-                            "stderr": result.stderr,
-                            "verification_issue": verification_issue,
-                        }
-                    )
-        except Exception as exc:
-            actions_log.append(f"Command failed: {rewritten_command} ({exc})")
-            logger.info(f"Command failed: {rewritten_command} ({exc})")
-            if failure_log is not None:
-                failure_log.append(
-                    {
-                        "command": rewritten_command,
-                        "workdir": abs_workdir,
-                        "exit_code": None,
-                        "stdout": "",
-                        "stderr": str(exc),
-                    }
+                if server_proc:
+                    server_proc.terminate()
+                    try:
+                        server_proc.wait(timeout=5)
+                    except Exception:
+                        server_proc.kill()
+                return
+            verify_command = _select_node_verify_command(scripts)
+            if verify_command:
+                actions_log.append(
+                    f"Using Node verification command before localhost probe: {verify_command}"
                 )
+                _execute_shell_command(
+                    verify_command,
+                    workdir=abs_workdir,
+                    timeout=int(timeout_value),
+                    actions_log=actions_log,
+                    failure_log=failure_log,
+                    dataset_summary=dataset_summary,
+                    eval_info=eval_info,
+                )
+                actions_log.append(
+                    "Skipped localhost probe because no dev/start/preview script was found."
+                )
+                return
+        _execute_shell_command(
+            rewritten_command,
+            workdir=abs_workdir,
+            timeout=int(timeout_value),
+            actions_log=actions_log,
+            failure_log=failure_log,
+            dataset_summary=dataset_summary,
+            eval_info=eval_info,
+        )
         return
 
     actions_log.append(f"Skipped unknown step type: {step_type}")
@@ -6801,6 +7895,21 @@ def run_project_solver(
     planner_params = _role_params("planner")
     reviewer_params = _role_params("reviewer")
     researcher_params = _role_params("researcher")
+    local_planner_provider = None
+    if _env_bool("SOLVER_TRY_OLLAMA_FIRST", True) and llm_provider != "ollama":
+        try:
+            local_model = os.getenv("SOLVER_OLLAMA_MODEL") or os.getenv("OLLAMA_MODEL")
+            local_planner_provider = get_provider(
+                "ollama",
+                model=local_model,
+                base_url=ollama_base_url,
+                inter_request_gap=llm_inter_request_gap,
+            )
+            actions_log.append(
+                "Local Ollama planner enabled; will try before remote planner."
+            )
+        except Exception as exc:
+            actions_log.append(f"Ollama local planner unavailable: {exc}")
 
     requirement_sources: List[RequirementSource] = []
     context_summary = ""
@@ -7009,6 +8118,14 @@ def run_project_solver(
             f"Helper modules detected: {', '.join(sorted(helper_modules.keys()))}"
         )
 
+    language_info = detect_languages(project_root)
+    if language_info.get("languages") or language_info.get("build_systems"):
+        actions_log.append(
+            "Language signals: "
+            f"languages={language_info.get('languages') or []}; "
+            f"build_systems={language_info.get('build_systems') or []}"
+        )
+
     requirements_register, requirements_register_source = _build_requirements_register(
         requirement_sources,
         context_summary,
@@ -7172,6 +8289,7 @@ def run_project_solver(
     last_web_research_iteration_by_source: Dict[str, int] = {}
     last_web_research_steps_by_source: Dict[str, int] = {}
     verification_failures_by_source: Dict[str, List[Dict[str, object]]] = {}
+    replace_failures_by_source: Dict[str, List[Dict[str, object]]] = {}
     agentic_workflow = AgenticWorkflow(
         phases=["plan", "act", "verify", "reflect"],
         max_cycles=max_iterations,
@@ -7450,6 +8568,34 @@ def run_project_solver(
                 for test_path, test_excerpt in test_matches:
                     test_lines.append(f"- {test_path} (excerpt):\n{test_excerpt}")
                 test_section = "\n".join(test_lines).strip() + "\n\n"
+            explicit_excerpts = _collect_explicit_file_excerpts(
+                source,
+                project_root,
+                extra_ignored=extra_ignored,
+            )
+            explicit_section = ""
+            if explicit_excerpts:
+                explicit_lines = [
+                    "Target file excerpts (use exact text for replace_in_file when editing existing files):"
+                ]
+                for file_path, excerpt in explicit_excerpts:
+                    explicit_lines.append(f"- {file_path}:\n{excerpt}")
+                explicit_section = "\n".join(explicit_lines).strip() + "\n\n"
+            replace_section = ""
+            pending_replace_failures = replace_failures_by_source.get(source.path)
+            if pending_replace_failures:
+                replace_lines = [
+                    "Replace-in-file failures from the last attempt (pattern not found). "
+                    "Use the excerpts below to craft exact find/replace steps:"
+                ]
+                for entry in pending_replace_failures[:3]:
+                    find_text = _safe_str(entry.get("find"))
+                    if len(find_text) > 240:
+                        find_text = find_text[:240] + "...(truncated)"
+                    excerpt = _safe_str(entry.get("excerpt"))
+                    file_path = _safe_str(entry.get("path"))
+                    replace_lines.append(f"- {file_path} (failed find): {find_text}\n{excerpt}")
+                replace_section = "\n".join(replace_lines).strip() + "\n\n"
             repo_section = ""
             if repo_index:
                 query_text = " ".join(
@@ -7496,6 +8642,19 @@ def run_project_solver(
             if web_research_note:
                 research_section = f"External research findings:\n{web_research_note}\n\n"
             progress_memory = _format_progress_memory(progress_tracker, source.path)
+            skill_context = build_skill_context(
+                source.requirements_text,
+                source.context_excerpt,
+                requirements_register_section,
+                focus="project_solver",
+                limit=8,
+            )
+            skills_directives = format_skill_directives(
+                skill_context,
+                sections=("plan_hints", "coding_hints", "verification_hints", "safety_hints"),
+                include_skills=True,
+            )
+            skills_section = f"Skill directives:\n{skills_directives}\n\n" if skills_directives else ""
             user_prompt = (
                 "Project tree (partial):\n"
                 f"{tree_summary}\n\n"
@@ -7505,8 +8664,11 @@ def run_project_solver(
                 f"{repo_section}"
                 f"{sample_section}"
                 f"{test_section}"
+                f"{explicit_section}"
+                f"{replace_section}"
                 f"{requirements_page_note}"
                 f"{requirements_label}:\n{paged_requirements}\n\n"
+                f"{skills_section}"
                 "Source context excerpt:\n"
                 f"{source_context}\n\n"
                 f"{research_section}"
@@ -7584,13 +8746,43 @@ def run_project_solver(
         "- Do not invent package names; if a dependency is unclear, call it out and prefer standard-library alternatives.\n"
         "- Do not create or overwrite venv activation scripts directly; use python -m venv to create them.\n"
         "- If eval_data.json or load_eval_data() is present, use it for evaluation and do not hardcode single-file runs.\n"
+        "- When using replace_in_file, copy the exact text from provided excerpts or the file content; avoid guessing snippets.\n"
         "- If all requirements for this source are satisfied, set done=true and plan=[]\n"
     )
 
             payload = None
             codingagent_used = None
+            local_intent = _classify_local_intent(source, project_root)
+            local_payload = _build_local_plan_from_intent(
+                local_intent,
+                source,
+                project_root,
+                language_info,
+                allow_run=allow_run,
+                required_ids=source_required_ids,
+            )
+            if local_payload:
+                local_steps = local_payload.get("plan", [])
+                usable, reason = _plan_is_usable(
+                    local_steps if isinstance(local_steps, list) else [],
+                    requires_code=source_requires_code,
+                    allow_run=allow_run,
+                )
+                if usable:
+                    payload = local_payload
+                    _record_action(
+                        f"Using local intent plan ({local_intent.get('intent')}).",
+                        source_actions_log,
+                    )
+                else:
+                    _record_action(
+                        f"Local intent plan discarded ({reason}).",
+                        source_actions_log,
+                    )
             pure_code_request = _source_is_pure_code_request(source)
             if (
+                payload is None
+                and
                 codingagent_primary_mode == "primary"
                 and pure_code_request
                 and codingagent_primary
@@ -7655,6 +8847,35 @@ def run_project_solver(
                     if codingagent_used == "opencode":
                         opencode_used_sources.add(source.path)
                     _record_action(f"Using coding agent plan ({codingagent_used}).", source_actions_log)
+
+            if payload is None and local_planner_provider:
+                try:
+                    resp = local_planner_provider.predict(
+                        [{"role": "user", "content": user_prompt}],
+                        system=system_prompt,
+                        max_tokens=planner_params.get("max_tokens"),
+                        temperature=planner_params.get("temperature", llm_temperature),
+                        timeout=planner_params.get("timeout"),
+                        reasoning_effort=planner_params.get("reasoning_effort"),
+                    )
+                    candidate = _coerce_plan_payload(_parse_json_payload(resp.text or "{}"))
+                    if candidate and isinstance(candidate.get("plan"), list):
+                        usable, reason = _plan_is_usable(
+                            candidate.get("plan"),
+                            requires_code=source_requires_code,
+                            allow_run=allow_run,
+                        )
+                        if usable:
+                            candidate["provider"] = "ollama"
+                            payload = candidate
+                            _record_action("Using local Ollama plan.", source_actions_log)
+                        else:
+                            _record_action(
+                                f"Ollama plan rejected ({reason}); falling back to remote.",
+                                source_actions_log,
+                            )
+                except Exception as exc:
+                    _record_action(f"Ollama plan request failed: {exc}", source_actions_log)
 
             if payload is None:
                 resp = planner_provider.predict(
@@ -7723,15 +8944,18 @@ def run_project_solver(
                     plan_steps = agent_payload.get("plan")
                     if pure_code and isinstance(plan_steps, list):
                         if _plan_has_code_changes(plan_steps) and not _plan_has_verification(plan_steps):
-                            plan_steps.append(
-                                {
-                                    "type": "run_command",
-                                    "step": "Run tests (auto-added after code-only coding agent output)",
-                                    "command": "python -m pytest",
-                                    "workdir": ".",
-                                    "timeout": 900,
-                                }
-                            )
+                            verification_steps = _select_verification_steps(project_root, language_info, max_steps=2)
+                            if not verification_steps:
+                                verification_steps = [
+                                    {
+                                        "type": "run_command",
+                                        "step": "Run tests (auto-added after code-only coding agent output)",
+                                        "command": "python -m pytest",
+                                        "workdir": ".",
+                                        "timeout": 900,
+                                    }
+                                ]
+                            plan_steps.extend(verification_steps)
                             agent_payload["plan"] = plan_steps
                             _record_action(
                                 "Added verification command after code-only coding agent output.",
@@ -8026,15 +9250,24 @@ def run_project_solver(
                         continue
             if plan_has_code_changes and not _plan_has_verification(plan_steps):
                 if not strict_verification and allow_run:
-                    plan_steps.append(
-                        {
-                            "type": "run_command",
-                            "step": "Run tests to verify changes",
-                            "command": "python -m pytest",
-                            "workdir": ".",
-                            "timeout": 900,
-                        }
-                    )
+                    verification_steps = _select_verification_steps(project_root, language_info, max_steps=2)
+                    if not verification_steps:
+                        verification_steps = [
+                            {
+                                "type": "run_command",
+                                "step": "Run tests to verify changes",
+                                "command": "python -m pytest",
+                                "workdir": ".",
+                                "timeout": 900,
+                            }
+                        ]
+                    plan_steps.extend(verification_steps)
+                    if verification_steps:
+                        commands = [step.get("command") for step in verification_steps if isinstance(step, dict)]
+                        _record_action(
+                            "Auto-selected verification command(s): " + ", ".join([c for c in commands if c]),
+                            source_actions_log,
+                        )
                     _ensure_plan_requirement_refs(
                         plan_steps,
                         payload_requirements=payload.get("requirements"),
@@ -8131,6 +9364,7 @@ def run_project_solver(
             iteration_steps_applied = 0
             iteration_unresolved_start = len(unresolved_failures)
             replan_due_to_verification = False
+            replan_due_to_replace = False
             verification_steps_executed = 0
             current_venv = _find_workspace_venv(solver_workspace)
             replan_due_to_hallucination = False
@@ -8152,6 +9386,7 @@ def run_project_solver(
                 before_len = len(actions_log)
                 before_hallucinations = len(source_hallucinations)
                 command_failures: List[Dict[str, object]] = []
+                replace_failures: List[Dict[str, object]] = []
                 is_verification_step = False
                 if _normalize_step_type(step.get("type")) == "run_command":
                     command = step.get("command")
@@ -8164,6 +9399,7 @@ def run_project_solver(
                     actions_log=actions_log,
                     allowed_roots=allowed_roots,
                     failure_log=command_failures,
+                    replace_failures=replace_failures,
                     venv_path=current_venv,
                     workspace_root=solver_workspace,
                     hallucination_log=source_hallucinations,
@@ -8192,6 +9428,14 @@ def run_project_solver(
                     )
                     replan_due_to_hallucination = True
                     break
+                if replace_failures:
+                    replace_failures_by_source.setdefault(source.path, []).extend(replace_failures)
+                    _record_action(
+                        "Replace-in-file failed; replanning current source with actual file contents.",
+                        source_actions_log,
+                    )
+                    replan_due_to_replace = True
+                    break
 
                 if command_failures and allow_run:
                     venv_path = current_venv or _find_workspace_venv(solver_workspace)
@@ -8208,6 +9452,14 @@ def run_project_solver(
                             project_root=project_root,
                             actions_log=source_actions_log,
                         )
+                        if not recovery_steps:
+                            recovery_steps = _plan_local_recovery_steps(
+                                failures_to_fix,
+                                project_root=project_root,
+                                venv_path=venv_path,
+                                workspace=solver_workspace,
+                                actions_log=source_actions_log,
+                            )
                         if not recovery_steps:
                             recovery_steps = _plan_recovery_steps(
                                 reviewer_provider,
@@ -8242,6 +9494,7 @@ def run_project_solver(
                                 actions_log=actions_log,
                                 allowed_roots=allowed_roots,
                                 failure_log=failures_to_fix,
+                                replace_failures=replace_failures,
                                 venv_path=venv_path,
                                 workspace_root=solver_workspace,
                                 hallucination_log=source_hallucinations,
@@ -8270,7 +9523,18 @@ def run_project_solver(
                                 )
                                 replan_due_to_hallucination = True
                                 break
+                            if replace_failures:
+                                replace_failures_by_source.setdefault(source.path, []).extend(replace_failures)
+                                _record_action(
+                                    "Replace-in-file failed during recovery; replanning with actual file contents.",
+                                    source_actions_log,
+                                )
+                                replan_due_to_replace = True
+                                break
                         if replan_due_to_hallucination:
+                            failures_to_fix = []
+                            break
+                        if replan_due_to_replace:
                             failures_to_fix = []
                             break
                         if failures_to_fix:
@@ -8316,7 +9580,7 @@ def run_project_solver(
                                     "Deferring current requirement source to proceed with other sources; will retry later.",
                                     source_actions_log,
                                 )
-                    if replan_due_to_verification:
+                    if replan_due_to_verification or replan_due_to_replace:
                         break
                     if defer_source:
                         break
@@ -8329,6 +9593,7 @@ def run_project_solver(
                         "steps_applied": iteration_steps_applied,
                         "replan_due_to_hallucination": replan_due_to_hallucination,
                         "replan_due_to_verification": replan_due_to_verification,
+                        "replan_due_to_replace": replan_due_to_replace,
                         "defer_source": defer_source,
                     }
                 ),
@@ -8368,6 +9633,18 @@ def run_project_solver(
                             f"Retrace to checkpoint {retrace_to} after verification dead-end.",
                             source_actions_log,
                         )
+                elif replan_due_to_replace:
+                    retrace_to = progress_checkpoint_by_source.get(source.path)
+                    progress_tracker.mark_dead_end(
+                        plan_entry_id,
+                        "replan due to replace-in-file failure",
+                        retrace_to=retrace_to,
+                    )
+                    if retrace_to:
+                        _record_action(
+                            f"Retrace to checkpoint {retrace_to} after replace-in-file dead-end.",
+                            source_actions_log,
+                        )
                 elif defer_source:
                     progress_tracker.update(
                         plan_entry_id,
@@ -8382,6 +9659,8 @@ def run_project_solver(
                     progress_checkpoint_by_source[source.path] = plan_entry_id
             if verification_steps_executed and not replan_due_to_verification:
                 verification_failures_by_source.pop(source.path, None)
+            if not replan_due_to_replace:
+                replace_failures_by_source.pop(source.path, None)
             if replan_due_to_hallucination:
                 cycle.record(
                     "reflect",
@@ -8392,6 +9671,12 @@ def run_project_solver(
                 cycle.record(
                     "reflect",
                     PhaseResult.retry("replan due to verification failure", data={"scope": "source"}),
+                )
+                continue
+            if replan_due_to_replace:
+                cycle.record(
+                    "reflect",
+                    PhaseResult.retry("replan due to replace-in-file failure", data={"scope": "source"}),
                 )
                 continue
             if defer_source:
