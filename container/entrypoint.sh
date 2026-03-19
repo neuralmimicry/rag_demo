@@ -6,6 +6,12 @@ if [ "$#" -gt 0 ]; then
   shift
 fi
 
+export REFINER_JOB_DIR="${REFINER_JOB_DIR:-/app/job_data}"
+if ! mkdir -p "$REFINER_JOB_DIR" 2>/dev/null; then
+  export REFINER_JOB_DIR="$(pwd)/job_data"
+  mkdir -p "$REFINER_JOB_DIR"
+fi
+
 if [ -z "${REFINER_PORT:-}" ] && [ -n "${PORT:-}" ]; then
   export REFINER_PORT="$PORT"
 fi
@@ -45,11 +51,23 @@ case "$mode" in
   frontend)
     exec python frontend_server.py "$@"
     ;;
+  tests|test|suite)
+    if [ "$#" -gt 0 ]; then
+      exec pytest "$@"
+    fi
+    exec pytest tests
+    ;;
+  smoke)
+    exec python -m py_compile refiner_web.py run_refiner.py "$@"
+    ;;
+  cli)
+    exec python run_refiner.py "$@"
+    ;;
   full|combined)
     exec python refiner_web.py "$@"
     ;;
   *)
-    echo "Usage: $0 [backend|frontend|full] [args...]" >&2
+    echo "Usage: $0 [backend|frontend|full|tests|smoke|cli] [args...]" >&2
     exit 1
     ;;
 esac
