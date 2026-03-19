@@ -192,33 +192,205 @@ Notes:
 - Admins can grant free (non-cashable) tokens via `POST /api/tokens` with action `grant`.
 - Cashout operations only draw down paid token balance; free grants are not cashable.
 
-### Container image (multi-arch)
-Build the Podman/Docker image from `Containerfile` for multiple architectures:
-- Podman (multi-arch with buildx-style output):
-  - `podman build --platform linux/amd64,linux/arm64 -t refiner:latest -f Containerfile .`
-- Docker buildx:
-  - `docker buildx build --platform linux/amd64,linux/arm64 -t refiner:latest -f Containerfile .`
-Note: The default `BASE_IMAGE` now pulls from GHCR (`ghcr.io/snakepacker/python/3.11`). If you see a `403 Forbidden` while pulling from GHCR, ensure your PAT includes `read:packages` and you are logged in to `ghcr.io`. If you override `BASE_IMAGE` to a Docker Hub image, Docker Hub requires a Personal Access Token (PAT) for multi-arch pulls. Log in with a PAT before building:
-- `podman login docker.io -u <dockerhub_user> --password-stdin`
-- `docker login docker.io -u <dockerhub_user> --password-stdin`
+### Container build and deployment (Podman + Kubernetes)
+The `Containerfile` is now aligned for both local container runtime use and Kubernetes:
+- non-root runtime user (`uid/gid 10001`)
+- writable job-data volume at `/app/job_data`
+- built-in healthcheck against `/api/health`
+- explicit entrypoint modes: `full`, `backend`, `frontend`, `tests`, `smoke`, `cli`
 
-Run the image (choose one mode):
-- Backend only: `podman run -p 5001:5001 refiner:latest backend`
-- Frontend only: `podman run -p 8080:8080 -e REFINER_API_BASE=https://api.example.com refiner:latest frontend`
-- Combined: `podman run -p 5001:5001 refiner:latest full`
+#### 1) Build image locally
+Podman:
+- `podman build --format docker -t refiner:latest -f Containerfile .`
 
-Publish to GitHub Container Registry (GHCR) (default org: `neuralmimicry`, user: `masterkiga`):
-- Log in (use a GitHub PAT with `write:packages`):
-  - `GHCR_USER=masterkiga; echo "$GHCR_TOKEN" | podman login ghcr.io -u "$GHCR_USER" --password-stdin`
-  - `GHCR_USER=masterkiga; echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin`
-- Tag the image:
-  - `podman tag refiner:latest ghcr.io/neuralmimicry/refiner:latest`
-  - `docker tag refiner:latest ghcr.io/neuralmimicry/refiner:latest`
-- Push:
-  - `podman push ghcr.io/neuralmimicry/refiner:latest`
-  - `docker push ghcr.io/neuralmimicry/refiner:latest`
-- Or build + push multi-arch in one step (Docker buildx):
-  - `docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/neuralmimicry/refiner:latest -f Containerfile . --push`
+Docker:
+- `docker build -t refiner:latest -f Containerfile .`
+
+Multi-arch:
+- `podman build --format docker --platform linux/amd64,linux/arm64 -t refiner:latest -f Containerfile .`
+- `docker buildx build --platform linux/amd64,linux/arm64 -t refiner:latest -f Containerfile .`
+
+Note: Podman default OCI output does not retain Dockerfile `HEALTHCHECK` metadata. Keep `--format docker` if you need health checks visible via `podman ps`/`podman healthcheck`.
+
+#### 2) Run Refiner suite in Podman
+Backend/API mode:
+- `podman run --rm -p 5001:5001 -v "$(pwd)/job_data:/app/job_data:Z" refiner:latest backend`
+
+Frontend helper mode:
+- `podman run --rm -p 8080:8080 -e REFINER_API_BASE=http://127.0.0.1:5001 refiner:latest frontend`
+
+Default/full mode:
+- `podman run --rm -p 5001:5001 -v "$(pwd)/job_data:/app/job_data:Z" refiner:latest`
+
+Run full automated test suite inside the image:
+- `podman run --rm refiner:latest tests`
+
+Run fast smoke checks:
+- `podman run --rm refiner:latest smoke`
+
+Run CLI workflow directly:
+- `podman run --rm -v "$(pwd):/workspace:Z" -w /workspace refiner:latest cli --help`
+
+#### 3) Push image to registry
+GHCR login:
+- `echo "$GHCR_TOKEN" | podman login ghcr.io -u "$GHCR_USER" --password-stdin`
+- `echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin`
+
+Tag + push:
+- `podman tag refiner:latest ghcr.io/<org>/refiner:latest`
+- `podman push ghcr.io/<org>/refiner:latest`
+
+Docker buildx push (multi-arch):
+- `docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/<org>/refiner:latest -f Containerfile . --push`
+
+#### 4) Kubernetes deployment
+Create namespace + secret:
+- `kubectl create namespace refiner`
+- `kubectl -n refiner create secret generic refiner-secrets --from-literal=REFINER_SECRET_KEY='<strong-random-secret>' --from-literal=REFINER_ADMIN_PASSWORD='<admin-password>'`
+
+Apply deployment/service (`refiner-k8s.yaml`):
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: refiner
+  namespace: refiner
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: refiner
+  template:
+    metadata:
+      labels:
+        app: refiner
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+      - name: refiner
+        image: ghcr.io/<org>/refiner:latest
+        imagePullPolicy: IfNotPresent
+        args: ["backend"]
+        ports:
+        - containerPort: 5001
+          name: http
+        env:
+        - name: REFINER_HOST
+          value: "0.0.0.0"
+        - name: REFINER_PORT
+          value: "5001"
+        - name: REFINER_JOB_DIR
+          value: "/app/job_data"
+        - name: REFINER_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: refiner-secrets
+              key: REFINER_SECRET_KEY
+        - name: REFINER_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: refiner-secrets
+              key: REFINER_ADMIN_PASSWORD
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 20
+        volumeMounts:
+        - name: job-data
+          mountPath: /app/job_data
+      volumes:
+      - name: job-data
+        persistentVolumeClaim:
+          claimName: refiner-job-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: refiner
+  namespace: refiner
+spec:
+  selector:
+    app: refiner
+  ports:
+  - name: http
+    port: 5001
+    targetPort: http
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: refiner-job-data
+  namespace: refiner
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+If your cluster requires an explicit storage class, add `storageClassName` under the PVC `spec`.
+
+Deploy:
+- `kubectl apply -f refiner-k8s.yaml`
+
+Check rollout + health:
+- `kubectl -n refiner rollout status deployment/refiner`
+- `kubectl -n refiner get pods,svc`
+- `kubectl -n refiner logs deploy/refiner --tail=200`
+
+#### 5) Continuum control-plane integration (NMC)
+NeuralMimicry Continuum (`nmc`) now includes a `refiner` command group to manage this deployment lifecycle directly with `kubectl`.
+
+Build `nmc` client:
+- `cmake -S /home/pbisaacs/Developer/neuralmimicry/nmc/nmc_client -B /tmp/nmc_client_build`
+- `cmake --build /tmp/nmc_client_build`
+
+Control Refiner via Continuum:
+- `/tmp/nmc_client_build/nmc refiner deploy --manifest ./refiner-k8s.yaml --namespace refiner --timeout 300`
+- `/tmp/nmc_client_build/nmc refiner status --namespace refiner`
+- `/tmp/nmc_client_build/nmc refiner scale --namespace refiner --replicas 3`
+- `/tmp/nmc_client_build/nmc refiner logs --namespace refiner --tail 300`
+- `/tmp/nmc_client_build/nmc refiner remove --namespace refiner --delete-storage`
+
+#### 6) Security tracking integration (Tracey)
+Tracey now supports Refiner-specific tracking with:
+- periodic health probe checks (`/api/health`)
+- JSONL security finding feed ingestion (for container vulnerability findings)
+
+Example Tracey config block:
+```json
+"refiner": {
+  "enabled": true,
+  "source": "refiner",
+  "service_name": "refiner",
+  "health_url": "http://127.0.0.1:5001/api/health",
+  "security_feed_path": "refiner_security_feed.jsonl",
+  "poll_interval_ms": 5000,
+  "timeout_ms": 2500
+}
+```
+
+Example security feed line (append JSONL):
+```json
+{"service":"refiner","image":"ghcr.io/<org>/refiner:latest","severity":"high","cvss":8.6,"cve":"CVE-2026-12345","title":"openssl vulnerable dependency","scanner":"trivy","status":"open","finding_id":"trivy-001"}
+```
+
+Generate feed entries from a real image scan:
+- `./scripts/export_refiner_security_feed.sh ghcr.io/neuralmimicry/refiner:latest refiner_security_feed.jsonl`
 
 The default Jira statistics workflow can (optionally) run discovery, refine your JQL, fetch issues, generate monthly CSVs and a leaderboard, and write a consolidated timelines.csv. If the refined JQL returns no results, the tool automatically retries with your base JQL to avoid empty runs due to over-filtering.
 
