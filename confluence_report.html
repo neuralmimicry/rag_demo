@@ -1,0 +1,181 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Confluence Space Quality Report — CTO Digital Network Products</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2rem; }
+    table { border-collapse: collapse; }
+    td, th { border: 1px solid #ddd; padding: 8px; }
+    th { background: #f3f3f3; }
+    .small { font-size: 0.9em; color: #444; }
+    .muted { color: #666; }
+    details { margin-bottom: 1rem; }
+  </style>
+  <script>
+    // Simple interactive selection manifest creator
+    function toggleAll(cls, checked) {
+      document.querySelectorAll('.' + cls).forEach(cb => cb.checked = checked);
+      updateEstimates();
+    }
+    function updateEstimates() {
+      let totalTokens = 0;
+      document.querySelectorAll('.page-row').forEach(row => {
+        const cb = row.querySelector('input[type=checkbox]');
+        const tokens = parseInt(row.getAttribute('data-tokens') || '0');
+        if (cb && cb.checked) totalTokens += tokens;
+      });
+      const perReq = parseInt((document.getElementById('chunkSize') || {}).value || '2000');
+      document.getElementById('selTokens').innerText = totalTokens.toString();
+      document.getElementById('selReqs').innerText = perReq > 0 ? Math.ceil(totalTokens / perReq) : '-';
+    }
+    function downloadSelection() {
+      const items = [];
+      document.querySelectorAll('.page-row').forEach(row => {
+        const cb = row.querySelector('input[type=checkbox]');
+        if (cb && cb.checked) {
+          items.push({ id: row.getAttribute('data-id'), title: row.getAttribute('data-title') });
+        }
+      });
+      const manifest = { version: 1, selectedPages: items, chunkSize: parseInt((document.getElementById('chunkSize')||{}).value||'2000') };
+      const blob = new Blob([JSON.stringify(manifest, null, 2)], {type : 'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'selection.json'; a.click();
+      URL.revokeObjectURL(url);
+    }
+  </script>
+  </head>
+  <body>
+    <h1>Confluence Space Quality Report — CTO Digital Network Products</h1>
+    <p><strong>Space:</strong> CTO Digital Network Products (CDNP)</p>
+    
+    <section>
+      <h2>Executive Summary</h2>
+      <pre>Executive Summary:
+
+The CDNP has conducted an assessment of the digital network products, focusing on page quality, information architecture, and security hygiene. The findings highlight areas for improvement, including standardizing page templates, adopting a taxonomy, and enhancing metadata quality.
+
+Key Recommendations:
+
+1. Standardize page templates for RFCs/ADRs, runbooks, and post-incident reviews to improve discoverability and governance.
+2. Adopt a standard taxonomy (e.g., product, team, lifecycle) and label pages for improved search and governance.
+3. Flatten the page hierarchy or introduce index pages to improve findability.
+4. Label 81 leaf pages to support search and governance.
+5. Ensure spaces use appropriate permissions; avoid storing secrets; link to secure repositories for credentials; add Data Classification labels to sensitive docs.
+
+Action Items:
+
+1. Update documentation to reflect the latest MySQL version.
+2. Improve clarity and concision in the Confluence branch on moving MySQL data files.
+3. Add ownership and context information to the document.
+4. Enhance security best practices, considering encryption and secure file transfer methods.
+
+Recommendations for Agile Best Practices:
+
+* Break down this task into smaller, incremental updates to ensure continuous improvement and alignment with agile principles.
+
+Recommendations for Telco Best Practices:
+
+* Ensure the updated documentation aligns with telco security standards and best practices.
+
+Recommendations for Security Best Practices:
+
+* Review and update the security best practices section to ensure alignment with modern telco and security standards.</pre>
+    </section>
+        
+    <section>
+      <h2>Baseline Metrics</h2>
+      <table>
+        <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>total_pages</td><td>100</td></tr><tr><td>pages_with_labels</td><td>2</td></tr><tr><td>stale_pages_180d</td><td>0</td></tr><tr><td>unknown_update_dates</td><td>0</td></tr>
+        </tbody>
+      </table>
+      <h3>Top Authors</h3>
+      <ul><li>Conor Mckiernan: 7</li><li>Devinder Kumar: 9</li><li>Kaushik Bansal: 10</li><li>Marnie Yule: 11</li><li>Sayfur Rahman: 8</li></ul>
+    </section>
+    <section>
+      <h2>Findings & Recommendations</h2>
+      <ul><li><strong>Agile/SDLC Practices:</strong> Consider standard page templates for RFCs/ADRs, runbooks, and post-incident reviews. Link Jira epics/stories to design docs and keep diagrams current. <em>(info)</em></li><li><strong>Information Architecture:</strong> Only 2.0% of pages have labels. Adopt a standard taxonomy (e.g., product, team, lifecycle) and label pages for discoverability and governance. <em>(medium)</em></li><li><strong>Information Architecture:</strong> Page hierarchy is very deep (>= 6 levels). Consider flattening or introducing index pages to improve findability. <em>(medium)</em></li><li><strong>LLM Integration:</strong> LLM provider ollama/llama3.2 reachable (latency ~6 ms). <em>(info)</em></li><li><strong>Metadata Quality:</strong> 81 leaf pages have no labels. Label leaves to support search and governance. <em>(low)</em></li><li><strong>Security Hygiene:</strong> Ensure spaces use appropriate permissions; avoid storing secrets; link to secure repositories for credentials; add Data Classification labels to sensitive docs. <em>(info)</em></li></ul>
+    </section>
+    
+    <section>
+      <h2>Hierarchy Summary — Full Space</h2>
+      <table>
+        <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Root pages</td><td>0</td></tr><tr><td>Leaf pages</td><td>83</td></tr><tr><td>Max depth</td><td>11</td></tr><tr><td>Average depth</td><td>5.9</td></tr><tr><td>Deep nodes (>=5 levels)</td><td>65</td></tr><tr><td>Leaf pages without labels</td><td>81</td></tr><tr><td>Leaf pages stale >180d</td><td>0</td></tr>
+        </tbody>
+      </table>
+      <h3>Top Hubs (most direct children)</h3>
+      <table>
+        <thead><tr><th>Page</th><th>Direct Children</th></tr></thead>
+        <tbody>
+          
+        </tbody>
+      </table>
+    </section>
+        
+    <section>
+      <h2>Interactive Analysis (LLM scope selection)</h2>
+      <p class="muted">Use the controls below to choose which pages to include in LLM analysis and download a selection manifest. Then re-run the CLI with <code>--selection selection.json</code> and an LLM provider.</p>
+      <div class="small">Token estimates are heuristic (≈1 token ≈ 4 chars).</div>
+      
+      <div style="margin: 0.5rem 0;">
+        <button onclick="toggleAll('page-checkbox', true)">Select all</button>
+        <button onclick="toggleAll('page-checkbox', false)">Deselect all</button>
+        &nbsp; | Chunk size (tokens): <input id="chunkSize" type="number" value="2000" min="200" max="8000" step="100" oninput="updateEstimates()" />
+        &nbsp; | Estimated selected tokens: <strong id="selTokens">0</strong>
+        &nbsp; (~requests: <strong id="selReqs">0</strong>)
+        &nbsp; <button onclick="downloadSelection()">Download Selection JSON</button>
+      </div>
+      <table>
+        <thead><tr><th>Include</th><th>Title</th><th>Depth</th><th>Labels</th><th>Last Updated</th><th>Est. tokens</th></tr></thead>
+        <tbody id="pageList"><tr class='page-row' data-id='7061078024' data-title='How to Move MySQL Data Files to D: Drive' data-tokens='278'><td><input type='checkbox' class='page-checkbox' onclick='updateEstimates()' /></td><td><a href='https://neuralmimicry.atlassian.net/wiki/spaces/CDNP/pages/7061078024/How-to-Move-MySQL-Data-Files-to-D:-Drive' target='_blank'>How to Move MySQL Data Files to D: Drive</a></td><td>2</td><td>how-to, howto, mysql, disk-space, kb-how-to-article</td><td>2025-12-09T09:57:35.033000+00:00</td><td>278</td></tr></tbody>
+      </table>
+      <script>
+        // Populate rows provided by server-side placeholder
+        updateEstimates();
+      </script>
+    </section>
+    
+  <section><h2>LLM Insights</h2><details><summary><a href='https://neuralmimicry.atlassian.net/wiki/spaces/CDNP/pages/7061078024/How-to-Move-MySQL-Data-Files-to-D:-Drive' target='_blank'>How to Move MySQL Data Files to D: Drive</a></summary><div class='small muted'>LLM requests: 2, total latency: 11183 ms</div><pre>**Quality Assessment:**
+
+The Confluence branch provides step-by-step instructions on moving MySQL data files from C: drive to D: drive, but lacks clarity, structure, ownership, and modern security best practices.
+
+**Prioritized Recommendations:**
+
+1. **Update the documentation to reflect the latest MySQL version**: Ensure that the instructions are compatible with the current MySQL version (e.g., MySQL 8.0 or later).
+2. **Improve clarity and concision**: Break down complex steps into smaller, easier-to-follow sections, and use clear headings and bullet points.
+3. **Add ownership and context**: Include information about who should perform this task, why it's necessary, and any potential risks or consequences.
+4. **Enhance security best practices**: Consider using a more secure method to move files, such as using the `mysqldump` command with encryption.
+
+**Short Action List:**
+
+1. Update the MySQL version in the documentation.
+2. Revise content for clarity and concision.
+3. Add ownership and context information.
+4. Review and update security best practices.
+
+**Additional Recommendations:**
+
+* Consider adding screenshots or images to illustrate key steps.
+* Use a more formal tone and avoid colloquial expressions.
+* Ensure the document is up-to-date with any changes to MySQL configuration or file locations.
+
+**Recommendation for Agile Best Practices:**
+
+Consider breaking down this task into smaller, incremental updates to ensure continuous improvement and alignment with agile principles.
+
+**Recommendation for Telco Best Practices:**
+
+Ensure that the updated documentation aligns with telco security standards and best practices, such as secure file transfer methods and proper folder permissions.
+
+**Recommendation for Security Best Practices:**
+
+Review and update the security best practices section to ensure alignment with modern telco and security standards, including encryption and secure file transfer methods.</pre></details></section>
+  </body>
+</html>

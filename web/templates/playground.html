@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="rag-api-base" content="{{ api_base or '' }}">
+  <title>Playground · School Monitor</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/playground.css">
+</head>
+<body class="playground-page">
+  <header class="playground-hero">
+    <div>
+      <span class="eyebrow">Playground</span>
+      <h1>School Monitor</h1>
+      <p class="subtitle">Describe a small classroom tool or activity. School Monitor turns it into a quick build.</p>
+    </div>
+    <div class="playground-links">
+      <a class="ghost" href="/">Control Room</a>
+    </div>
+  </header>
+
+  <main class="playground-shell">
+    <section class="card playground-card">
+      <h2>What should we build?</h2>
+      <p class="subtitle">Keep it simple and quick.</p>
+      <div class="quick-tasks" id="quickTasks">
+        <button type="button" class="chip" data-task="Build a maths practice game with levels, rewards, and a progress tracker.">Maths adventure game</button>
+        <button type="button" class="chip" data-task="Create a reading comprehension quiz with short passages and instant feedback.">Reading quiz</button>
+        <button type="button" class="chip" data-task="Make science flashcards with a fun, colourful interface for quick study.">Science flashcards</button>
+        <button type="button" class="chip" data-task="Build a classroom timer and reward board for focus sessions.">Focus timer</button>
+        <button type="button" class="chip" data-task="Create a homework habit tracker with streaks and badges.">Habit tracker</button>
+      </div>
+      <div class="field">
+        <label for="playgroundPrompt">Your idea</label>
+        <textarea id="playgroundPrompt" rows="5" placeholder="Example: Build a spelling challenge with levels, streaks, and small rewards."></textarea>
+      </div>
+      <div class="playground-actions">
+        <button type="button" class="primary" id="playgroundPlan">Make a plan</button>
+        <button type="button" class="ghost" id="playgroundBuild" disabled>Build it</button>
+      </div>
+      <div id="playgroundStatus" class="status-banner" hidden></div>
+    </section>
+
+    <section class="card playground-card">
+      <div class="playground-output">
+        <h2>Plan</h2>
+        <p class="subtitle" id="planSummary">Your plan will appear here.</p>
+        <div id="planSteps" class="plan-steps"></div>
+        <div class="plan-meta" id="planMeta">--</div>
+        <div class="playground-link" id="controlLink" hidden>
+          <a class="link-inline" href="/">Open Control Room</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/playground.js"></script>
+</body>
+</html>

@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="rag-api-base" content="{{ api_base or '' }}">
+  <title>Refiner Control Room</title>
+  <link rel="icon" href="/public/favicon.ico">
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
+</head>
+<body>
+  <div class="bg">
+    <span class="orb orb-1"></span>
+    <span class="orb orb-2"></span>
+    <span class="orb orb-3"></span>
+  </div>
+  <header class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-nav-brand" href="{{ site_base }}/" aria-label="Neuralmimicry main site">
+        <img class="site-nav-logo" src="/public/neuralmimicryicon512.png" alt="">
+        <span>NeuralMimicry</span>
+      </a>
+      <div class="site-nav-links">
+        <a href="{{ site_base }}/">Home</a>
+        <a href="{{ site_base }}/about">About</a>
+        <a href="{{ site_base }}/solutions">Solutions</a>
+        <a href="{{ site_base }}/news">News</a>
+        <a href="{{ site_base }}/github">GitHub</a>
+        <a href="{{ site_base }}/team">Team</a>
+        <a href="{{ site_base }}/careers">Careers</a>
+      </div>
+      <div class="site-nav-actions">
+        <div class="site-nav-user">
+          <span>Signed in</span>
+          <strong>{{ current_user or 'unknown' }}</strong>
+        </div>
+        {% if user_role == 'admin' %}
+        <a class="site-nav-link" href="/admin">Admin</a>
+        {% endif %}
+        <a class="site-nav-link site-nav-logout" href="/logout">Log out</a>
+        <a class="site-nav-link" href="{{ site_base }}/contact">Contact</a>
+        <a class="site-nav-link site-nav-cta" href="{{ site_base }}/subscribe">Subscribe</a>
+      </div>
+    </div>
+    <div class="site-utility">
+      <a href="{{ site_base }}/accessibility">Accessibility</a>
+      <span>|</span>
+      <a href="{{ site_base }}/privacy">Privacy</a>
+      <span>|</span>
+      <a href="{{ site_base }}/terms">Terms</a>
+      <span>|</span>
+      <a href="{{ site_base }}/contact">Contact</a>
+    </div>
+  </header>
+  <header class="hero hero-compact">
+    <div>
+      <h1><img class="headline-logo" src="/public/nmrefiner.png" alt="Refiner"> Control Room</h1>
+      <p class="subtitle">Queue workflows, manage projects, and track every stage of Refiner in real time.</p>
+    </div>
+  </header>
+
+  <section class="status-strip">
+    <div class="status-card" id="systemStats">
+      <div>
+        <span class="label">Workers</span>
+        <span class="value" id="workerCount">--</span>
+      </div>
+      <div>
+        <span class="label">Jobs</span>
+        <span class="value" id="jobCount">--</span>
+      </div>
+    </div>
+    <div class="status-card token-panel" id="tokenPanel">
+      <div class="token-head">
+        <span class="label" id="tokenScopeLabel">Token Balance</span>
+        <span class="value" id="tokenBalance">--</span>
+      </div>
+      <div class="token-bar" id="tokenBar">
+        <span class="token-segment available" id="tokenAvailable"></span>
+        <span class="token-segment estimate" id="tokenEstimateFill"></span>
+        <span class="token-segment inuse" id="tokenInUse"></span>
+        <span class="token-threshold" id="tokenThreshold"></span>
+      </div>
+      <div class="token-meta">
+        <span id="tokenAvailableLabel">Available: --</span>
+        <span id="tokenEstimateLabel">In estimate: --</span>
+        <span id="tokenInUseLabel">In use: --</span>
+      </div>
+      <div class="token-breakdown" id="tokenBreakdown" hidden>
+        <span id="tokenUserBalance">Personal: --</span>
+        <span id="tokenTeamBalance">Team: --</span>
+      </div>
+    </div>
+    <div class="status-card queue-summary" id="queueSummary">
+      <div class="label">Queue Health</div>
+      <div class="queue-metrics">
+        <div><span>Queued</span><strong id="queueQueuedCount">--</strong></div>
+        <div><span>Running</span><strong id="queueRunningCount">--</strong></div>
+        <div><span>Failed</span><strong id="queueFailedCount">--</strong></div>
+        <div><span>Completed</span><strong id="queueCompletedCount">--</strong></div>
+      </div>
+    </div>
+  </section>
+
+  <main class="control-grid">
+    <div class="column queue-column">
+      <section class="card queue" id="jobQueue">
+        <div class="card-header queue-header">
+          <div>
+            <h2>Job Queue</h2>
+            <div class="filters" id="statusFilters"></div>
+            <div class="scope-toggle" id="scopeFilters">
+              <button type="button" class="ghost active" data-scope="team">Team</button>
+              <button type="button" class="ghost" data-scope="personal">My Jobs</button>
+            </div>
+          </div>
+          <div class="queue-actions">
+            <button type="button" class="ghost" id="deleteQueue">Delete Queue</button>
+            <button type="button" class="ghost" id="deleteArchive">Delete Archive</button>
+          </div>
+        </div>
+        <div id="jobsList" class="job-list"></div>
+      </section>
+    </div>
+
+    <div class="column detail-column">
+      <section class="card detail">
+        <div class="card-header">
+          <h2>Job Detail</h2>
+          <p id="jobHint">Select a job to inspect stages, metrics, and controls.</p>
+        </div>
+        <div id="jobDetail" class="job-detail"></div>
+      </section>
+
+      <section class="card logs">
+        <div class="card-header">
+          <h2>Live Logs</h2>
+          <div class="log-controls">
+            <button type="button" id="clearLogs" class="ghost">Clear</button>
+            <label class="check">
+              <input id="autoScroll" type="checkbox" checked>
+              Auto-scroll
+            </label>
+          </div>
+        </div>
+        <pre id="logOutput" class="log-output"></pre>
+      </section>
+    </div>
+
+    <div class="column builder-column">
+      <section class="card builder" id="jobBuilder">
+      <div class="card-header">
+        <h2>New Job</h2>
+        <p>Define a workflow, provide inputs, and queue the run.</p>
+      </div>
+      <div class="tab-row" id="builderTabs">
+        <button type="button" class="tab-btn active" data-tab="job">Job Builder</button>
+        <button type="button" class="tab-btn" data-tab="global">Global Settings</button>
+        <a class="tab-btn playground-link" href="/playground">Playground</a>
+      </div>
+      <div class="tab-panel active" data-tab="job">
+        <details class="form-fold">
+          <summary>0 · Generate from goal (optional)</summary>
+          <div class="form-fold-body assistant-panel form-assistant">
+            <div class="card-header">
+              <h3 class="has-tip" data-tooltip="Generate field-by-field suggestions for the full form. Apply changes selectively.">Form Assistant</h3>
+              <p>Describe your goal and let the assistant propose values across the UI.</p>
+            </div>
+            <div class="field">
+              <label for="formAssistantPrompt">Goal or Context</label>
+              <textarea id="formAssistantPrompt" rows="3" placeholder="Example: Generate a Jira analysis for CAT, include action plan, use Gemini..."></textarea>
+            </div>
+            <div class="field grid-2">
+              <div>
+                <label for="formAssistantScope">Scope</label>
+                <select id="formAssistantScope">
+                  <option value="workflow">Current Workflow</option>
+                  <option value="job">Job Builder Tab</option>
+                  <option value="global">Global Settings Tab</option>
+                  <option value="all">All Fields</option>
+                </select>
+              </div>
+              <div class="field inline">
+                <label class="check">
+                  <input id="formAssistantEmptyOnly" type="checkbox" checked>
+                  Suggest only empty fields
+                </label>
+              </div>
+            </div>
+            <div class="assistant-actions">
+              <button type="button" id="formAssistantSuggest" class="primary">Suggest Fields</button>
+              <button type="button" id="formAssistantApplyAll" class="ghost">Apply All</button>
+              <button type="button" id="formAssistantClear" class="ghost">Clear Suggestions</button>
+            </div>
+            <div id="formAssistantStatus" class="status-banner" hidden></div>
+            <div id="formAssistantList" class="assistant-suggestions"></div>
+          </div>
+        </details>
+        <form id="jobForm">
+        <div class="form-step">
+          <div class="step-title">1 · Choose workflow</div>
+          <div class="field">
+            <label for="workflow" class="has-tip" data-tooltip="Choose which backend workflow to run. The form below will show the inputs needed for the selected workflow.">Workflow</label>
+            <select id="workflow" name="workflow">
+              <option value="project_solver">Project Solver</option>
+              <option value="topic_research">Topic Research</option>
+              <option value="jira_analysis">Jira Analysis</option>
+              <option value="confluence_analysis">Confluence Analysis</option>
+              <option value="delivery_pipeline">Delivery Pipeline</option>
+              <option value="jira_stats">Jira Stats</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-step">
+          <div class="step-title">2 · Provide inputs</div>
+          <div class="field">
+            <label for="projectId" class="has-tip" data-tooltip="Assign the job to a project so your team can view shared progress and logs.">Project</label>
+            <select id="projectId" name="projectId">
+              <option value="">Personal / Unassigned</option>
+            </select>
+            <p class="subtitle" id="projectRoleHint">Project access: --</p>
+          </div>
+        <div class="workflow-section" data-workflow="project_solver">
+          <div class="field">
+            <label class="has-tip" data-tooltip="Choose between a local path on this server or a GitHub repo that will be forked into the neuralmimicry org.">Project Source</label>
+            <div class="segmented" data-source-group="project">
+              <label class="segmented-option">
+                <input type="radio" name="projectSource" value="local" checked>
+                Local Path
+              </label>
+              <label class="segmented-option">
+                <input type="radio" name="projectSource" value="github">
+                GitHub Repo
+              </label>
+            </div>
+          </div>
+          <div class="field">
+            <label for="projectName" class="has-tip" data-tooltip="Friendly label shown in the queue and detail panels. If no project root is provided, this name is used to create a folder under job_data/projects.">Project Name</label>
+            <input id="projectName" type="text" placeholder="Neon Atlas" autocomplete="off">
+          </div>
+          <div class="source-panel" data-source-group="project" data-source="local">
+            <div class="field">
+              <label for="projectRoot" class="has-tip" data-tooltip="Absolute path to an existing project. Required if you want the solver to work on an existing codebase.">Project Root (optional)</label>
+              <input id="projectRoot" type="text" placeholder="/path/to/project">
+            </div>
+            <div class="field inline">
+              <label class="check">
+                <input id="createProject" type="checkbox" checked>
+                Create project folder if missing
+              </label>
+            </div>
+          </div>
+          <div class="source-panel" data-source-group="project" data-source="github" hidden>
+            <div class="field">
+              <label for="repoUrl" class="has-tip" data-tooltip="GitHub repo URL or owner/repo. The repo will be forked into the neuralmimicry org.">GitHub Repo</label>
+              <input id="repoUrl" type="text" placeholder="owner/repo or https://github.com/owner/repo">
+            </div>
+            <div class="field grid-2">
+              <div>
+                <label for="repoBranch" class="has-tip" data-tooltip="Optional source branch to clone (defaults to repo default branch).">Source Branch</label>
+                <input id="repoBranch" type="text" placeholder="main">
+              </div>
+              <div>
+                <label for="workBranch" class="has-tip" data-tooltip="Branch name to create in the fork for changes.">Work Branch</label>
+                <input id="workBranch" type="text" placeholder="refiner/feature-123">
+              </div>
+            </div>
+            <div class="field grid-2">
+              <div>
+                <label for="repoSubdir" class="has-tip" data-tooltip="Project root relative path inside the repo (optional).">Project Subdir</label>
+                <div class="inline-input">
+                  <div class="input-action-wrap">
+                    <input id="repoSubdir" type="text" placeholder="services/api">
+                    <button type="button" class="input-action browse-action" data-browse-target="repoSubdir" data-browse-mode="dir" aria-label="Browse repo folders">Browse</button>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <label for="requirementsRelPath" class="has-tip" data-tooltip="Requirements file path relative to repo root.">Requirements Path</label>
+                <div class="inline-input">
+                  <div class="input-action-wrap">
+                    <input id="requirementsRelPath" type="text" placeholder="docs/requirements.md">
+                    <button type="button" class="input-action browse-action" data-browse-target="requirementsRelPath" data-browse-mode="file" aria-label="Browse requirements file">Browse</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="field grid-2">
+              <div>
+                <label for="forkOrg" class="has-tip" data-tooltip="Fork organisation (defaults to neuralmimicry).">Fork Org</label>
+                <input id="forkOrg" type="text" placeholder="neuralmimicry">
+              </div>
+              <div>
+                <label for="commitMessage" class="has-tip" data-tooltip="Commit message for pushed changes.">Commit Message</label>
+                <input id="commitMessage" type="text" placeholder="Refiner updates">
+              </div>
+            </div>
+            <div class="field grid-2">
+              <div>
+                <label for="gitAuthorName" class="has-tip" data-tooltip="Commit author name (optional).">Author Name</label>
+                <input id="gitAuthorName" type="text" placeholder="refiner-bot">
+              </div>
+              <div>
+                <label for="gitAuthorEmail" class="has-tip" data-tooltip="Commit author email (optional).">Author Email</label>
+                <input id="gitAuthorEmail" type="text" placeholder="automation@neuralmimicry.ai">
+              </div>
+            </div>
+          </div>
+          <section class="requirements-stack">
+            <div class="card-header">
+              <h3>Requirements</h3>
+              <p>Draft with the assistant, edit the requirements text, then refine the structured register.</p>
+            </div>
+            <div class="requirements-flow">
+              <div class="assistant-panel requirements-assistant">
+                <div class="card-header">
+                  <h4 class="has-tip" data-tooltip="Chat with an LLM to draft or refine requirements. Responses can be inserted into the requirements text box.">Requirements Assistant</h4>
+                  <p>Ask questions, refine scope, or generate a structured requirements draft.</p>
+                </div>
+                <div id="assistantMessages" class="assistant-messages"></div>
+                <div class="field">
+                  <label for="assistantInput">Assistant Prompt</label>
+                  <textarea id="assistantInput" rows="3" placeholder="Ask for clarifications or request a draft..."></textarea>
+                </div>
+                <div class="assistant-actions">
+                  <button type="button" id="assistantAsk" class="primary">Ask</button>
+                  <button type="button" id="assistantDraft" class="ghost">Draft Requirements</button>
+                  <button type="button" id="assistantInsert" class="ghost">Insert Last Response</button>
+                  <button type="button" id="assistantClear" class="ghost">Clear Chat</button>
+                </div>
+                <div id="assistantStatus" class="status-banner" hidden></div>
+              </div>
+              <div class="field">
+                <label for="requirementsText" class="has-tip" data-tooltip="Paste requirements, user stories, or a brief. Saved to job_data/{job}/requirements.md when submitted.">Requirements Text</label>
+                <textarea id="requirementsText" rows="6" placeholder="Paste your requirements, user stories, or brief"></textarea>
+              </div>
+              <div class="requirements-grid">
+                <div class="card-header">
+                  <h4 class="has-tip" data-tooltip="Detected REQ-### items appear here for quick edits before queuing the job.">Requirements Register</h4>
+                  <p>When REQ IDs are detected, edit them here and apply the changes back to the requirements text.</p>
+                </div>
+                <div class="req-actions">
+                  <button type="button" id="reqExtract" class="ghost">Extract from Text</button>
+                  <button type="button" id="reqExtractJob" class="ghost">Extract from Job</button>
+                  <button type="button" id="reqAdd" class="ghost">Add Requirement</button>
+                  <button type="button" id="reqApply" class="primary">Apply to Text</button>
+                  <button type="button" id="reqImport" class="ghost">Import</button>
+                  <select id="reqExportFormat" class="req-select" aria-label="Export format">
+                    <option value="csv">CSV</option>
+                    <option value="xlsx">XLSX</option>
+                    <option value="xls">XLS</option>
+                    <option value="ods">ODS</option>
+                  </select>
+                  <button type="button" id="reqExport" class="ghost">Export</button>
+                  <input id="reqImportFile" type="file" accept=".csv,.xls,.xlsx,.ods" hidden>
+                </div>
+                <div id="reqGridStatus" class="status-banner" hidden></div>
+                <div class="req-grid">
+                  <div class="req-grid-head">
+                    <div>ID</div>
+                    <div>Title</div>
+                    <div>Description</div>
+                    <div>Actions</div>
+                  </div>
+                  <div id="reqGridBody" class="req-grid-body"></div>
+                </div>
+              </div>
+              <div class="field requirements-path">
+                <label for="requirementsPath" class="has-tip" data-tooltip="Path to an existing requirements file. If provided, it takes precedence over the text box.">Requirements Path (optional)</label>
+                <input id="requirementsPath" type="text" placeholder="/path/to/requirements.md">
+                <p class="subtitle">Use a file path when requirements already live in the repo. Otherwise, the text box above is used.</p>
+              </div>
+            </div>
+          </section>
+          <div class="field inline">
+            <label class="check">
+              <input id="projectRun" type="checkbox">
+              Allow project solver to run commands
+            </label>
+          </div>
+        </div>
+
+        <div class="workflow-section" data-workflow="topic_research" hidden>
+          <div class="field">
+            <label for="topicSource" class="has-tip" data-tooltip="Paste a topic brief or URL. Non-URL text is saved to job_data/{job}/topic.txt for processing.">Topic Source</label>
+            <textarea id="topicSource" rows="4" placeholder="Paste topic and requirements, or a URL"></textarea>
+          </div>
+          <div class="field">
+            <label for="topicOutput" class="has-tip" data-tooltip="Optional path to write the researched document. Defaults to job_data/{job}/researched_document.md.">Output Path (optional)</label>
+            <input id="topicOutput" type="text" placeholder="job_data/your_job/researched_document.md">
+          </div>
+        </div>
+
+        <div class="workflow-section" data-workflow="jira_analysis" hidden>
+          <div class="field">
+            <label for="jiraProjects" class="has-tip" data-tooltip="Comma-separated Jira project keys. Example: CAT,ENG,OPS">Projects CSV</label>
+            <input id="jiraProjects" type="text" placeholder="CAT,ENG,OPS">
+          </div>
+          <div class="field">
+            <label for="jiraJql" class="has-tip" data-tooltip="Custom JQL overrides the project list. Keep it valid for your Jira instance.">Custom JQL (optional)</label>
+            <input id="jiraJql" type="text" placeholder="project = CAT ORDER BY updated DESC">
+          </div>
+          <div class="field inline">
+            <label class="check">
+              <input id="jiraActionPlan" type="checkbox">
+              Include action plan
+            </label>
+            <label class="check">
+              <input id="jiraDryRun" type="checkbox">
+              Dry run (no LLM calls)
+            </label>
+          </div>
+        </div>
+
+        <div class="workflow-section" data-workflow="confluence_analysis" hidden>
+          <div class="field">
+            <label for="confluenceSpace" class="has-tip" data-tooltip="Confluence space key (short code). Example: CAT">Space Key</label>
+            <input id="confluenceSpace" type="text" placeholder="CAT">
+          </div>
+          <div class="field inline">
+            <label class="check">
+              <input id="useRovo" type="checkbox">
+              Use Rovo when available
+            </label>
+            <label class="check">
+              <input id="confluenceActionPlan" type="checkbox">
+              Include action plan
+            </label>
+          </div>
+          <div class="field inline">
+            <label class="check">
+              <input id="confluenceDryRun" type="checkbox">
+              Dry run (no LLM calls)
+            </label>
+          </div>
+        </div>
+
+        <div class="workflow-section" data-workflow="delivery_pipeline" hidden>
+          <div class="field">
+            <label class="has-tip" data-tooltip="Choose between a local path or GitHub repo for the pipeline workspace.">Project Source</label>
+            <div class="segmented" data-source-group="delivery">
+              <label class="segmented-option">
+                <input type="radio" name="deliverySource" value="local" checked>
+                Local Path
+              </label>
+              <label class="segmented-option">
+                <input type="radio" name="deliverySource" value="github">
+                GitHub Repo
+              </label>
+            </div>
+          </div>
+          <div class="source-panel" data-source-group="delivery" data-source="local">
+          <div class="field">
+            <label for="deliveryProjectRoot" class="has-tip" data-tooltip="Project root for pipeline stages. Must exist on disk.">Project Root</label>
+            <input id="deliveryProjectRoot" type="text" placeholder="/path/to/project">
+          </div>
+          <div class="field">
+            <label for="deliveryConfig" class="has-tip" data-tooltip="Optional path to delivery_pipeline.json. Defaults to project root or bundled config.">Delivery Config (optional)</label>
+            <input id="deliveryConfig" type="text" placeholder="/path/to/delivery_pipeline.json">
+          </div>
+          </div>
+          <div class="source-panel" data-source-group="delivery" data-source="github" hidden>
+            <div class="field">
+              <label for="deliveryRepoUrl" class="has-tip" data-tooltip="GitHub repo URL or owner/repo. Forked into neuralmimicry.">GitHub Repo</label>
+              <input id="deliveryRepoUrl" type="text" placeholder="owner/repo or https://github.com/owner/repo">
+            </div>
+            <div class="field grid-2">
+              <div>
+                <label for="deliveryRepoBranch" class="has-tip" data-tooltip="Optional source branch to clone.">Source Branch</label>
+                <input id="deliveryRepoBranch" type="text" placeholder="main">
+              </div>
+              <div>
+                <label for="deliveryWorkBranch" class="has-tip" data-tooltip="Work branch name in the fork.">Work Branch</label>
+                <input id="deliveryWorkBranch" type="text" placeholder="rag-demo/pipeline-123">
+              </div>
+            </div>
+            <div class="field grid-2">
+              <div>
+                <label for="deliveryRepoSubdir" class="has-tip" data-tooltip="Project root relative path inside the repo (optional).">Project Subdir</label>
+                <div class="inline-input">
+                  <div class="input-action-wrap">
+                    <input id="deliveryRepoSubdir" type="text" placeholder="services/api">
+                    <button type="button" class="input-action browse-action" data-browse-target="deliveryRepoSubdir" data-browse-mode="dir" data-browse-context="delivery" aria-label="Browse delivery repo folders">Browse</button>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <label for="deliveryForkOrg" class="has-tip" data-tooltip="Fork organisation (defaults to neuralmimicry).">Fork Org</label>
+                <input id="deliveryForkOrg" type="text" placeholder="neuralmimicry">
+              </div>
+            </div>
+            <div class="field grid-2">
+              <div>
+                <label for="deliveryCommitMessage" class="has-tip" data-tooltip="Commit message for pushed changes.">Commit Message</label>
+                <input id="deliveryCommitMessage" type="text" placeholder="Refiner pipeline updates">
+              </div>
+              <div>
+                <label for="deliveryAuthorEmail" class="has-tip" data-tooltip="Commit author email (optional).">Author Email</label>
+                <input id="deliveryAuthorEmail" type="text" placeholder="automation@neuralmimicry.ai">
+              </div>
+            </div>
+          </div>
+          <div class="field inline">
+            <label class="check">
+              <input id="deliveryRun" type="checkbox">
+              Execute pipeline commands
+            </label>
+            <label class="check">
+              <input id="deliveryAllowUnfinished" type="checkbox">
+              Allow unfinished deploy
+            </label>
+          </div>
+        </div>
+        </div>
+
+        <div class="section-divider"></div>
+
+        <details class="form-fold">
+          <summary>Advanced settings (LLM, secrets, CLI)</summary>
+          <div class="form-fold-body">
+            <div class="field">
+              <label for="llmProvider" class="has-tip" data-tooltip="Override the LLM provider from config.json. Leave blank to use config defaults.">LLM Provider</label>
+              <select id="llmProvider">
+                <option value="">Use config default</option>
+                <option value="openai">OpenAI</option>
+                <option value="gemini">Gemini</option>
+                <option value="ollama">Ollama</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="llmModel" class="has-tip" data-tooltip="Optional model override (e.g., gpt-5.2-codex).">LLM Model (optional)</label>
+              <input id="llmModel" type="text" placeholder="gpt-5.2-codex">
+            </div>
+            <div class="field grid-2">
+              <div>
+                <label for="llmTemperature" class="has-tip" data-tooltip="Sampling temperature. Lower is more deterministic.">Temperature</label>
+                <input id="llmTemperature" type="number" min="0" max="2" step="0.1" placeholder="0.2">
+              </div>
+              <div>
+                <label for="llmMaxTokens" class="has-tip" data-tooltip="Maximum output tokens per LLM call. Budget and cost control.">Max Tokens</label>
+                <input id="llmMaxTokens" type="number" min="1" step="1" placeholder="24000" value="24000">
+              </div>
+            </div>
+
+            <div class="job-secrets">
+              <div class="card-header">
+                <h3 class="has-tip" data-tooltip="Add per-job secret overrides. Defaults (from Credentials Vault) are used unless you turn them off.">Job Secrets</h3>
+                <p>Provide job-specific secrets or overrides without changing defaults.</p>
+              </div>
+              <div class="field inline">
+                <label class="check">
+                  <input id="useDefaultSecrets" type="checkbox" checked>
+                  Use saved defaults
+                </label>
+              </div>
+              <div id="jobSecretList" class="secret-list"></div>
+              <div class="secret-form">
+                <div class="field">
+                  <label for="jobSecretName" class="has-tip" data-tooltip="Environment variable name for this job only.">Secret Name</label>
+                  <input id="jobSecretName" type="text" placeholder="OPENAI_API_KEY">
+                </div>
+                <div class="field">
+                  <label for="jobSecretValue" class="has-tip" data-tooltip="Secret value for this job only. Not stored after the job is queued.">Secret Value</label>
+                  <input id="jobSecretValue" type="password" placeholder="sk-..." autocomplete="new-password">
+                </div>
+                <div class="actions">
+                  <button type="button" id="addJobSecret" class="primary">Add Job Secret</button>
+                  <button type="button" id="clearJobSecret" class="ghost">Clear</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="extraArgs" class="has-tip" data-tooltip="Raw CLI arguments passed to run_refiner.py. Use this for anything not covered above.">Extra CLI Args (optional)</label>
+              <input id="extraArgs" type="text" placeholder="--llm-timeout 120 --post-comments">
+            </div>
+
+            <div class="field inline">
+              <label class="check">
+                <input id="verbose" type="checkbox" checked>
+                Verbose logging
+              </label>
+              <label class="check">
+                <input id="debug" type="checkbox">
+                Debug logging
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <div id="jobStatus" class="status-banner" hidden></div>
+        <div id="tokenEstimate" class="status-banner token-estimate" hidden></div>
+
+        <div class="form-step">
+          <div class="step-title">3 · Review & queue</div>
+          <div class="actions">
+            <button type="submit" class="primary">Queue Job</button>
+            <button type="button" id="resetForm" class="ghost">Reset</button>
+          </div>
+        </div>
+        </form>
+      </div>
+
+      <div class="tab-panel" data-tab="global">
+          <div class="credential-panel">
+            <div class="card-header">
+              <h3 class="has-tip" data-tooltip="Secrets are stored server-side only and injected into job env vars. Values are never shown again.">Credentials Vault</h3>
+              <p>Manage API keys and tokens used by backend jobs.</p>
+            </div>
+            <div id="secretList" class="secret-list"></div>
+            <form id="secretForm" class="secret-form" autocomplete="off">
+              <div class="field">
+                <label for="secretName" class="has-tip" data-tooltip="Environment variable name (e.g., OPENAI_API_KEY, GEMINI_API_KEY).">Secret Name</label>
+                <input id="secretName" type="text" placeholder="OPENAI_API_KEY">
+              </div>
+              <div class="field">
+                <label for="secretValue" class="has-tip" data-tooltip="Paste the secret value. It will be stored locally on the server.">Secret Value</label>
+                <input id="secretValue" type="password" placeholder="sk-..." autocomplete="new-password">
+              </div>
+              <div class="actions">
+                <button type="button" id="saveSecret" class="primary">Save Secret</button>
+                <button type="button" id="clearSecretForm" class="ghost">Clear</button>
+              </div>
+            </form>
+          </div>
+
+          <div class="credential-panel notification-panel">
+            <div class="card-header">
+              <h3 class="has-tip" data-tooltip="Used to email you when jobs finish and you're not active in the UI.">Notifications</h3>
+              <p>Set an email address to receive job completion updates when you're offline.</p>
+            </div>
+            <form id="notificationForm" class="secret-form" autocomplete="off">
+              <div class="field">
+                <label for="notifyEmail">Notification Email</label>
+                <input id="notifyEmail" type="email" placeholder="you@example.com" autocomplete="email">
+              </div>
+              <div id="notifyStatus" class="status-banner" hidden></div>
+              <div class="actions">
+                <button type="button" id="saveNotifyEmail" class="primary">Save Email</button>
+                <button type="button" id="clearNotifyEmail" class="ghost">Clear</button>
+              </div>
+            </form>
+          </div>
+
+          <div class="cli-builder">
+            <div class="card-header">
+              <h3 class="has-tip" data-tooltip="Click a bubble to open a pop-up with choices. Your selections build a CLI args string you can apply below.">CLI Args Builder</h3>
+              <p>Click bubbles to add flags and options. This helps build accurate run_refiner.py arguments.</p>
+            </div>
+            <div class="bubble-row" id="cliBubbles"></div>
+            <div id="bubblePopover" class="bubble-popover" hidden>
+              <div class="bubble-title" id="bubbleTitle"></div>
+              <div class="bubble-help" id="bubbleHelp"></div>
+              <div class="bubble-options" id="bubbleOptions"></div>
+            </div>
+            <div class="field">
+              <label for="cliArgsPreview" class="has-tip" data-tooltip="Generated arguments from your bubble selections. Click Apply to copy into Extra CLI Args.">Generated CLI Args</label>
+              <textarea id="cliArgsPreview" rows="2" readonly></textarea>
+            </div>
+            <div class="actions">
+              <button type="button" id="applyCliArgs" class="primary">Apply to Extra Args</button>
+              <button type="button" id="clearCliArgs" class="ghost">Clear Builder</button>
+            </div>
+          </div>
+        </div>
+    </section>
+
+    <section class="card todo-panel" id="todoPanel">
+      <div class="card-header">
+        <h2>Thought Inbox</h2>
+        <p>Capture voice notes and quick ideas, then refine when Refiner is idle.</p>
+      </div>
+      <div class="todo-controls">
+        <div class="field">
+          <label for="todoInput">Capture a thought</label>
+          <textarea id="todoInput" rows="2" placeholder="Capture a thought or ToDo..."></textarea>
+        </div>
+        <div class="field inline">
+          <label class="check">
+            <input id="todoDeferInput" type="checkbox" checked>
+            Defer until idle
+          </label>
+        </div>
+        <div class="actions">
+          <button type="button" id="todoAdd" class="primary">Add</button>
+          <button type="button" id="todoRefresh" class="ghost">Refresh</button>
+          <button type="button" id="todoNextIdle" class="ghost">Next when idle</button>
+        </div>
+      </div>
+      <div class="todo-filters">
+        <div class="filters" id="todoStatusFilters">
+          <button type="button" class="filter-btn active" data-status="todo">To Do</button>
+          <button type="button" class="filter-btn" data-status="done">Done</button>
+          <button type="button" class="filter-btn" data-status="archived">Archived</button>
+        </div>
+        <label class="check">
+          <input id="todoDeferOnly" type="checkbox">
+          Show idle-only
+        </label>
+      </div>
+      <div id="todoStatus" class="status-banner" hidden></div>
+      <div id="todoList" class="todo-list"></div>
+    </section>
+
+    <section class="card capability-card" id="capabilityCard">
+      <div class="card-header">
+        <h2>Capabilities &amp; Workflows</h2>
+        <p>Derived from the current codebase so you can align jobs with what Refiner can do.</p>
+      </div>
+      <div class="capability-meta">
+        <span>Generated: <strong id="capabilityGeneratedAt">--</strong></span>
+        <span>Files scanned: <strong id="capabilityFileCount">--</strong></span>
+      </div>
+      <div id="capabilityStatus" class="status-banner" hidden></div>
+      <div class="capability-grid">
+        <div>
+          <div class="capability-section-title">Workflows</div>
+          <div id="capabilityWorkflows" class="capability-list"></div>
+        </div>
+        <div>
+          <div class="capability-section-title">Capabilities</div>
+          <div id="capabilityFeatures" class="capability-list"></div>
+        </div>
+      </div>
+    </section>
+    </div>
+  </main>
+
+  <div id="repoBrowser" class="modal" data-open="false" aria-hidden="true" hidden>
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Repo Browser</h3>
+        <button type="button" id="closeRepoBrowser" class="ghost">Close</button>
+      </div>
+      <div class="field">
+        <label for="repoSearch">Filter</label>
+        <input id="repoSearch" type="text" placeholder="Search paths">
+      </div>
+      <div id="repoBrowserStatus" class="status-banner" hidden></div>
+      <div id="repoBrowserList" class="repo-list"></div>
+    </div>
+  </div>
+
+  <div id="transferModal" class="modal" data-open="false" aria-hidden="true" hidden>
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="transferModalTitle">Queue Assignment</h3>
+        <button type="button" id="transferModalClose" class="ghost">Close</button>
+      </div>
+      <p class="subtitle" id="transferModalDesc">Select where this job should live.</p>
+      <div class="field" id="transferTeamRow">
+        <label for="transferTeamSelect">Team</label>
+        <select id="transferTeamSelect"></select>
+      </div>
+      <div class="field" id="transferProjectRow" hidden>
+        <label for="transferProjectSelect">Project (optional)</label>
+        <select id="transferProjectSelect"></select>
+      </div>
+      <div class="field" id="transferUserRow" hidden>
+        <label for="transferUserSelect">Assign To</label>
+        <select id="transferUserSelect"></select>
+      </div>
+      <div id="transferModalStatus" class="status-banner" hidden></div>
+      <div class="assistant-actions">
+        <button type="button" class="ghost" id="transferModalCancel">Cancel</button>
+        <button type="button" class="primary" id="transferModalConfirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toastContainer" class="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/xml/xml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/css/css.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/htmlmixed/htmlmixed.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/yaml/yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/shell/shell.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

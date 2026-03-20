@@ -219,7 +219,6 @@ __marimo__/
 .idea/
 .*.jsonl
 .vscode/
-*.html
 .agent/skills/
 .agents/skills/
 .claude/skills/

@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="rag-api-base" content="{{ api_base or '' }}">
+  <title>Refiner Admin Console</title>
+  <link rel="icon" href="/public/favicon.ico">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="bg">
+    <span class="orb orb-1"></span>
+    <span class="orb orb-2"></span>
+    <span class="orb orb-3"></span>
+  </div>
+  <header class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-nav-brand" href="{{ site_base }}/" aria-label="Neuralmimicry main site">
+        <img class="site-nav-logo" src="/public/neuralmimicryicon512.png" alt="">
+        <span>Neuralmimicry</span>
+      </a>
+      <div class="site-nav-links">
+        <a href="{{ site_base }}/">Home</a>
+        <a href="{{ site_base }}/about">About</a>
+        <a href="{{ site_base }}/solutions">Solutions</a>
+        <a href="{{ site_base }}/news">News</a>
+        <a href="{{ site_base }}/github">GitHub</a>
+        <a href="{{ site_base }}/team">Team</a>
+        <a href="{{ site_base }}/careers">Careers</a>
+      </div>
+      <div class="site-nav-actions">
+        <div class="site-nav-user">
+          <span>Signed in</span>
+          <strong>{{ current_user or 'unknown' }}</strong>
+        </div>
+        {% if user_role == 'admin' %}
+        <a class="site-nav-link" href="/">Control Room</a>
+        {% endif %}
+        <a class="site-nav-link site-nav-logout" href="/logout">Log out</a>
+        <a class="site-nav-link" href="{{ site_base }}/contact">Contact</a>
+        <a class="site-nav-link site-nav-cta" href="{{ site_base }}/subscribe">Subscribe</a>
+      </div>
+    </div>
+    <div class="site-utility">
+      <a href="{{ site_base }}/accessibility">Accessibility</a>
+      <span>|</span>
+      <a href="{{ site_base }}/privacy">Privacy</a>
+      <span>|</span>
+      <a href="{{ site_base }}/terms">Terms</a>
+      <span>|</span>
+      <a href="{{ site_base }}/contact">Contact</a>
+    </div>
+  </header>
+  <header class="hero hero-compact">
+    <div>
+      <h1>Admin Console</h1>
+      <p class="subtitle">System-wide usage, active users, and job health across all tenants.</p>
+    </div>
+  </header>
+
+  <main class="admin-grid">
+    <section class="card admin-overview">
+      <div class="card-header">
+        <h2>System Overview</h2>
+        <p>Realtime counts across all users and workflows.</p>
+      </div>
+      <div class="admin-metrics">
+        <div class="admin-metric">
+          <span class="label">Active Users</span>
+          <span class="value" id="activeUsersCount">--</span>
+          <span class="meta" id="activeWindowLabel">Last {{ active_window_sec }}s</span>
+        </div>
+        <div class="admin-metric">
+          <span class="label">Total Users</span>
+          <span class="value" id="totalUsersCount">--</span>
+          <span class="meta">Registered accounts</span>
+        </div>
+        <div class="admin-metric">
+          <span class="label">Workers</span>
+          <span class="value" id="workersCount">--</span>
+          <span class="meta">Active threads</span>
+        </div>
+        <div class="admin-metric">
+          <span class="label">Jobs Running</span>
+          <span class="value" id="jobsRunningCount">--</span>
+          <span class="meta">All users</span>
+        </div>
+        <div class="admin-metric">
+          <span class="label">Jobs Queued</span>
+          <span class="value" id="jobsQueuedCount">--</span>
+          <span class="meta">Awaiting workers</span>
+        </div>
+        <div class="admin-metric">
+          <span class="label">Jobs Failed</span>
+          <span class="value" id="jobsFailedCount">--</span>
+          <span class="meta">Needs attention</span>
+        </div>
+        <div class="admin-metric">
+          <span class="label">Jobs Completed</span>
+          <span class="value" id="jobsCompletedCount">--</span>
+          <span class="meta">All time</span>
+        </div>
+        <div class="admin-metric">
+          <span class="label">Jobs Paused</span>
+          <span class="value" id="jobsPausedCount">--</span>
+          <span class="meta">Awaiting resume</span>
+        </div>
+        <div class="admin-metric">
+          <span class="label">Total Jobs</span>
+          <span class="value" id="jobsTotalCount">--</span>
+          <span class="meta">All statuses</span>
+        </div>
+        <div class="admin-metric">
+          <span class="label">Uptime</span>
+          <span class="value" id="uptimeValue">--</span>
+          <span class="meta">Since last restart</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card admin-users">
+      <div class="card-header">
+        <h2>Active Users</h2>
+        <p>Users with activity in the last {{ active_window_sec }} seconds.</p>
+      </div>
+      <div id="activeUsersList" class="admin-list"></div>
+    </section>
+
+    <section class="card admin-jobs">
+      <div class="card-header">
+        <h2>Jobs By Status</h2>
+        <p>Live snapshot of job distribution.</p>
+      </div>
+      <div id="jobsStatusGrid" class="admin-status-grid"></div>
+    </section>
+
+    <section class="card admin-refunds">
+      <div class="card-header">
+        <h2>Refund Requests</h2>
+        <p>Review refund requests, run LLM screening, and apply decisions.</p>
+      </div>
+      <div id="refundList" class="refund-list"></div>
+    </section>
+
+    <section class="card admin-audit">
+      <div class="card-header">
+        <h2>Transfer Audit</h2>
+        <p>Recent team transfer activity for jobs and queue assignments.</p>
+      </div>
+      <div id="auditTransferList" class="admin-list"></div>
+    </section>
+
+    <section class="card admin-teams">
+      <div class="card-header">
+        <h2>Teams</h2>
+        <p>Create hierarchical teams and assign leaders/members.</p>
+      </div>
+      <form id="teamForm" class="admin-form">
+        <div class="field grid-2">
+          <div>
+            <label for="teamName">Team Name</label>
+            <input id="teamName" type="text" placeholder="Platform Engineering">
+          </div>
+          <div>
+            <label for="teamParent">Parent Team</label>
+            <select id="teamParent">
+              <option value="">None</option>
+            </select>
+          </div>
+        </div>
+        <div class="field grid-2">
+          <div>
+            <label for="teamLeaders">Leaders (comma separated)</label>
+            <input id="teamLeaders" type="text" placeholder="alice, bob">
+          </div>
+          <div>
+            <label for="teamMembers">Members (comma separated)</label>
+            <input id="teamMembers" type="text" placeholder="carla, devon">
+          </div>
+        </div>
+        <div class="assistant-actions">
+          <button type="button" class="primary" id="teamCreate">Create Team</button>
+          <span class="status-banner" id="teamStatus" hidden></span>
+        </div>
+      </form>
+      <div id="teamList" class="admin-list"></div>
+    </section>
+
+    <section class="card admin-projects">
+      <div class="card-header">
+        <h2>Projects</h2>
+        <p>Assign leaders, contributors, viewers, and explicit read/write/grant permissions.</p>
+      </div>
+      <form id="projectForm" class="admin-form">
+        <div class="field grid-2">
+          <div>
+            <label for="projectName">Project Name</label>
+            <input id="projectName" type="text" placeholder="Refiner">
+          </div>
+          <div>
+            <label for="projectTeam">Team</label>
+            <select id="projectTeam">
+              <option value="">Unassigned</option>
+            </select>
+          </div>
+        </div>
+        <div class="field grid-3">
+          <div>
+            <label for="projectLeaders">Leaders</label>
+            <input id="projectLeaders" type="text" placeholder="alice">
+          </div>
+          <div>
+            <label for="projectContributors">Contributors</label>
+            <input id="projectContributors" type="text" placeholder="bob, carla">
+          </div>
+          <div>
+            <label for="projectViewers">Viewers</label>
+            <input id="projectViewers" type="text" placeholder="finance">
+          </div>
+        </div>
+        <div class="field grid-3">
+          <div>
+            <label for="projectPermRead">Explicit Read</label>
+            <input id="projectPermRead" type="text" placeholder="external_auditor">
+          </div>
+          <div>
+            <label for="projectPermWrite">Explicit Write</label>
+            <input id="projectPermWrite" type="text" placeholder="ops_bot">
+          </div>
+          <div>
+            <label for="projectPermGrant">Explicit Grant</label>
+            <input id="projectPermGrant" type="text" placeholder="team_lead">
+          </div>
+        </div>
+        <div class="assistant-actions">
+          <button type="button" class="primary" id="projectCreate">Create Project</button>
+          <span class="status-banner" id="projectStatus" hidden></span>
+        </div>
+      </form>
+      <div id="projectList" class="admin-list"></div>
+    </section>
+
+    <section class="card admin-sessions">
+      <div class="card-header">
+        <h2>Room History</h2>
+        <p>Recent collaboration rooms and their latest events.</p>
+      </div>
+      <div id="roomHistoryList" class="admin-list"></div>
+    </section>
+  </main>
+
+  <script src="/static/admin.js"></script>
+</body>
+</html>
