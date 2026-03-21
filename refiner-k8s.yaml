@@ -3,6 +3,11 @@ kind: Deployment
 metadata:
   name: refiner
   namespace: refiner
+  labels:
+    app: refiner
+    app.kubernetes.io/name: refiner
+    app.kubernetes.io/part-of: refiner-cluster
+    nmc.neuralmimicry.ai/workload: refiner
 spec:
   replicas: 2
   selector:
@@ -12,6 +17,9 @@ spec:
     metadata:
       labels:
         app: refiner
+        app.kubernetes.io/name: refiner
+        app.kubernetes.io/part-of: refiner-cluster
+        nmc.neuralmimicry.ai/workload: refiner
     spec:
       securityContext:
         runAsNonRoot: true
@@ -68,6 +76,10 @@ kind: Service
 metadata:
   name: refiner
   namespace: refiner
+  labels:
+    app.kubernetes.io/name: refiner
+    app.kubernetes.io/part-of: refiner-cluster
+    nmc.neuralmimicry.ai/workload: refiner
 spec:
   selector:
     app: refiner
@@ -81,6 +93,10 @@ kind: PersistentVolumeClaim
 metadata:
   name: refiner-job-data
   namespace: refiner
+  labels:
+    app.kubernetes.io/name: refiner
+    app.kubernetes.io/part-of: refiner-cluster
+    nmc.neuralmimicry.ai/workload: refiner
 spec:
   accessModes:
   - ReadWriteOnce
