@@ -1,0 +1,29 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: refiner
+  namespace: refiner
+  labels:
+    app.kubernetes.io/name: refiner
+    app.kubernetes.io/part-of: refiner-cluster
+    nmc.neuralmimicry.ai/workload: refiner
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    cert-manager.io/cluster-issuer: "selfsigned-ca-issuer"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - refiner.neuralmimicry.ai
+    secretName: refiner-tls
+  rules:
+  - host: refiner.neuralmimicry.ai
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: refiner
+            port:
+              number: 5001

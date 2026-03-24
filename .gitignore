@@ -214,7 +214,6 @@ __marimo__/
 *.csv
 .discovery_cache.json
 .research_cache/
-*.png
 
 .idea/
 .*.jsonl
