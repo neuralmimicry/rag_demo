@@ -1,0 +1,664 @@
+openapi: 3.0.3
+info:
+  title: Refiner API
+  description: |
+    **Refiner** is NeuralMimicry's intelligent project management and AI assistant platform.
+
+    ## Features
+    - 🤖 **AI-Powered Assistant**: Context-aware responses with RAG and LLM integration
+    - 🎙️ **Voice Integration**: Alexa and Google Assistant support with STT/TTS
+    - 📊 **Project Management**: Jira/Confluence integration and analysis
+    - 🔐 **Secure**: Token-based authentication, encryption, audit logging
+    - 🚀 **Scalable**: Job queues, MCP server integration, caching
+
+    ## Authentication
+    Most endpoints require authentication via session cookies or bearer tokens.
+    Voice endpoints support platform-specific verification (Alexa, Google Assistant).
+
+  version: 1.0.0
+  contact:
+    name: NeuralMimicry Support
+    url: https://neuralmimicry.ai
+    email: support@neuralmimicry.ai
+  license:
+    name: Proprietary
+    url: https://neuralmimicry.ai/license
+
+servers:
+  - url: http://localhost:5555
+    description: Local development server
+  - url: https://refiner.neuralmimicry.ai
+    description: Production server
+
+tags:
+  - name: Health
+    description: Service health and status endpoints
+  - name: Authentication
+    description: User authentication and session management
+  - name: Assistant
+    description: AI assistant chat and context management
+  - name: Voice
+    description: Voice assistant integration (Alexa, Google Assistant)
+  - name: STT
+    description: Speech-to-text transcription and gesture planning
+  - name: Jobs
+    description: Asynchronous job management and project operations
+  - name: Admin
+    description: Administrative operations and system management
+  - name: RAG
+    description: Retrieval-Augmented Generation document management
+
+components:
+  securitySchemes:
+    sessionAuth:
+      type: apiKey
+      in: cookie
+      name: session
+      description: Session cookie authentication
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Bearer token authentication
+    voiceToken:
+      type: apiKey
+      in: header
+      name: X-Voice-Token
+      description: Voice platform authentication token
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, version, timestamp]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+          example: healthy
+        version:
+          type: string
+          example: "1.0.0"
+        timestamp:
+          type: string
+          format: date-time
+        services:
+          type: object
+          properties:
+            stt:
+              type: string
+              enum: [available, unavailable]
+            redis:
+              type: string
+              enum: [connected, disconnected]
+            continuum:
+              type: string
+              enum: [enabled, disabled]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: "Invalid request"
+        details:
+          type: string
+          example: "Additional error context"
+        code:
+          type: string
+          example: "INVALID_INPUT"
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 128
+        password:
+          type: string
+          format: password
+          minLength: 1
+
+    LoginResponse:
+      type: object
+      required: [status, user]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        user:
+          type: object
+          properties:
+            username:
+              type: string
+            role:
+              type: string
+              enum: [admin, user]
+
+    AssistantMessage:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          minLength: 1
+          maxLength: 32000
+          description: User message or prompt
+        session_id:
+          type: string
+          format: uuid
+          description: Optional session ID for conversation continuity
+        rag_enabled:
+          type: boolean
+          default: true
+          description: Enable RAG context retrieval
+        skills_enabled:
+          type: boolean
+          default: true
+          description: Enable skills/capabilities lookup
+        llm_provider:
+          type: string
+          enum: [openai, gemini, ollama]
+          description: Override default LLM provider
+        llm_model:
+          type: string
+          description: Override default model name
+        temperature:
+          type: number
+          minimum: 0.0
+          maximum: 2.0
+          default: 0.7
+        max_tokens:
+          type: integer
+          minimum: 1
+          maximum: 128000
+
+    AssistantResponse:
+      type: object
+      required: [status, response]
+      properties:
+        status:
+          type: string
+          enum: [ok, error]
+        response:
+          type: string
+          description: AI assistant response text
+        session_id:
+          type: string
+          format: uuid
+        sources:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+                enum: [rag, skill, context]
+              title:
+                type: string
+              snippet:
+                type: string
+        usage:
+          type: object
+          properties:
+            prompt_tokens:
+              type: integer
+            completion_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+
+    STTTranscribeResponse:
+      type: object
+      required: [status, text, lang]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        text:
+          type: string
+          description: Transcribed text
+        lang:
+          type: string
+          example: "en-GB"
+        gesture_mode:
+          type: string
+          enum: [gesticulation, bsl]
+        avatar_mode:
+          type: string
+          enum: [chat, office]
+        avatar_motion:
+          $ref: '#/components/schemas/AvatarMotion'
+        gesture_summary:
+          type: object
+          properties:
+            style:
+              type: string
+            token_count:
+              type: integer
+        audio_analysis:
+          type: object
+          properties:
+            speech_ratio:
+              type: number
+            speech_confidence:
+              type: number
+            noise_level:
+              type: string
+              enum: [low, moderate, high]
+            snr_db:
+              type: number
+            collaboration_likely:
+              type: boolean
+
+    AvatarMotion:
+      type: object
+      required: [duration_ms, keyframes]
+      properties:
+        duration_ms:
+          type: integer
+          minimum: 0
+          description: Total motion duration in milliseconds
+        keyframes:
+          type: array
+          items:
+            type: object
+            required: [t, pose]
+            properties:
+              t:
+                type: integer
+                minimum: 0
+                description: Keyframe timestamp in milliseconds
+              pose:
+                type: object
+                description: Full-body avatar pose parameters
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      description: |
+        Returns service health status and version information.
+
+        **Note:** This endpoint is publicly accessible and does not require authentication.
+      tags: [Health]
+      security: []  # No authentication required
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /api/version:
+    get:
+      summary: API version
+      description: |
+        Returns API version and build information.
+
+        **Note:** This endpoint is publicly accessible and does not require authentication.
+      tags: [Health]
+      security: []  # No authentication required
+      responses:
+        '200':
+          description: Version information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                  build:
+                    type: string
+                  commit:
+                    type: string
+
+  /api/docs:
+    get:
+      summary: API documentation UI
+      description: |
+        Interactive Swagger UI for exploring and testing the API.
+
+        **Note:** This endpoint is publicly accessible and does not require authentication.
+        The documentation itself is public, but calling the actual API endpoints requires
+        appropriate authentication as documented.
+      tags: [Health]
+      security: []  # No authentication required
+      responses:
+        '200':
+          description: Swagger UI HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/docs/openapi.json:
+    get:
+      summary: OpenAPI specification (JSON)
+      description: |
+        OpenAPI 3.0 specification in JSON format.
+
+        **Note:** This endpoint is publicly accessible and does not require authentication.
+      tags: [Health]
+      security: []  # No authentication required
+      responses:
+        '200':
+          description: OpenAPI specification
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/docs/openapi.yaml:
+    get:
+      summary: OpenAPI specification (YAML)
+      description: |
+        OpenAPI 3.0 specification in YAML format.
+
+        **Note:** This endpoint is publicly accessible and does not require authentication.
+      tags: [Health]
+      security: []  # No authentication required
+      responses:
+        '200':
+          description: OpenAPI specification
+          content:
+            text/yaml:
+              schema:
+                type: string
+
+  /auth/login:
+    post:
+      summary: User login
+      description: Authenticate user and create session
+      tags: [Authentication]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/logout:
+    post:
+      summary: User logout
+      description: Terminate current session
+      tags: [Authentication]
+      security:
+        - sessionAuth: []
+      responses:
+        '200':
+          description: Logout successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+
+  /api/assistant/chat:
+    post:
+      summary: Send message to AI assistant
+      description: |
+        Send a message to the AI assistant. The assistant provides context-aware responses
+        using RAG (Retrieval-Augmented Generation), skills database, and LLM inference.
+      tags: [Assistant]
+      security:
+        - sessionAuth: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssistantMessage'
+      responses:
+        '200':
+          description: Assistant response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssistantResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/stt/transcribe:
+    post:
+      summary: Transcribe audio to text
+      description: |
+        Upload audio file for speech-to-text transcription. Supports multiple formats
+        (wav, mp3, ogg, webm, flac). Returns transcribed text with optional gesture
+        planning and audio analysis.
+      tags: [STT]
+      security:
+        - sessionAuth: []
+        - voiceToken: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [audio]
+              properties:
+                audio:
+                  type: string
+                  format: binary
+                  description: Audio file (max 6MB)
+                lang:
+                  type: string
+                  default: "en-GB"
+                  example: "en-GB"
+                  description: Language code
+                prompt:
+                  type: string
+                  maxLength: 640
+                  description: Context prompt for improved accuracy
+                gesture_mode:
+                  type: string
+                  enum: [gesticulation, bsl]
+                  description: Gesture/motion style
+                avatar_mode:
+                  type: string
+                  enum: [chat, office]
+                  description: Avatar presentation mode
+                collaboration_mode:
+                  type: boolean
+                  description: Enable multi-speaker detection
+      responses:
+        '200':
+          description: Transcription successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/STTTranscribeResponse'
+        '400':
+          description: Invalid audio or parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Audio file too large
+        '503':
+          description: STT service unavailable
+
+  /api/stt/gesture-plan:
+    post:
+      summary: Generate gesture plan from text
+      description: |
+        Generate avatar motion keyframes and gesture timeline from input text.
+        Supports both semantic gesticulation and BSL (British Sign Language) modes.
+      tags: [STT]
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  minLength: 1
+                  maxLength: 10000
+                gesture_mode:
+                  type: string
+                  enum: [gesticulation, bsl]
+                  default: gesticulation
+                avatar_mode:
+                  type: string
+                  enum: [chat, office]
+                  default: chat
+      responses:
+        '200':
+          description: Gesture plan generated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, text, gesture_mode, avatar_mode]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  text:
+                    type: string
+                  gesture_mode:
+                    type: string
+                  avatar_mode:
+                    type: string
+                  avatar_motion:
+                    $ref: '#/components/schemas/AvatarMotion'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/jobs:
+    get:
+      summary: List jobs
+      description: Get paginated list of user jobs
+      tags: [Jobs]
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, running, completed, failed]
+      responses:
+        '200':
+          description: Job list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      type: object
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  limit:
+                    type: integer
+        '401':
+          description: Unauthorized
+
+  /api/rag/documents:
+    post:
+      summary: Upload RAG document
+      description: |
+        Upload document for indexing in RAG system. Supports PDF, DOCX, TXT,
+        Markdown, and other text formats. Documents are chunked and embedded
+        for semantic search.
+      tags: [RAG]
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Document file (max 600KB)
+                title:
+                  type: string
+                  maxLength: 256
+                tags:
+                  type: string
+                  description: Comma-separated tags
+      responses:
+        '200':
+          description: Document uploaded and indexed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  document_id:
+                    type: string
+                  chunks:
+                    type: integer
+        '400':
+          description: Invalid file or parameters
+        '413':
+          description: File too large

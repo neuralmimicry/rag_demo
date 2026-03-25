@@ -77,6 +77,8 @@ struct SttResponse {
     gesture_mode: String,
     avatar_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    bsl_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     avatar_motion: Option<AvatarMotion>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gesture_summary: Option<GestureSummary>,
@@ -112,6 +114,8 @@ struct GesturePlanResponse {
     text: String,
     gesture_mode: String,
     avatar_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bsl_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     avatar_motion: Option<AvatarMotion>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -223,6 +227,7 @@ struct GesturePlan {
     motion: AvatarMotion,
     summary: GestureSummary,
     timeline: Vec<GestureTimelineEntry>,
+    bsl_text: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -568,8 +573,9 @@ async fn transcribe(State(state): State<Arc<AppState>>, mut multipart: Multipart
                     status: "ok",
                     text,
                     lang,
-                    gesture_mode: selected_gesture_mode,
-                    avatar_mode: selected_avatar_mode,
+                    gesture_mode: selected_gesture_mode.clone(),
+                    avatar_mode: selected_avatar_mode.clone(),
+                    bsl_text: plan.as_ref().and_then(|p| p.bsl_text.clone()),
                     avatar_motion: plan.as_ref().map(|p| p.motion.clone()),
                     gesture_summary: plan.as_ref().map(|p| p.summary.clone()),
                     gesture_timeline: plan.as_ref().map(|p| p.timeline.clone()),
@@ -651,6 +657,7 @@ async fn gesture_plan(
             text,
             gesture_mode: selected_gesture_mode,
             avatar_mode: selected_avatar_mode,
+            bsl_text: plan.as_ref().and_then(|p| p.bsl_text.clone()),
             avatar_motion: plan.as_ref().map(|p| p.motion.clone()),
             gesture_summary: plan.as_ref().map(|p| p.summary.clone()),
             gesture_timeline: plan.as_ref().map(|p| p.timeline.clone()),
@@ -904,8 +911,8 @@ fn rest_pose(gesture_mode: &str, amplitude: f32) -> Pose {
         pose.shoulder_rise += 0.12 * amplitude;
         pose.left_shoulder_pitch += 0.22 * amplitude;
         pose.right_shoulder_pitch += 0.22 * amplitude;
-        pose.left_shoulder_roll -= 0.44 * amplitude;
-        pose.right_shoulder_roll += 0.44 * amplitude;
+        pose.left_shoulder_roll += 0.44 * amplitude;
+        pose.right_shoulder_roll -= 0.44 * amplitude;
         pose.left_elbow += 0.10 * amplitude;
         pose.right_elbow += 0.10 * amplitude;
         pose.left_wrist_yaw -= 0.12 * amplitude;
@@ -921,8 +928,8 @@ fn rest_pose(gesture_mode: &str, amplitude: f32) -> Pose {
         pose.shoulder_rise += 0.08 * amplitude;
         pose.left_shoulder_pitch += 0.16 * amplitude;
         pose.right_shoulder_pitch += 0.16 * amplitude;
-        pose.left_shoulder_roll -= 0.26 * amplitude;
-        pose.right_shoulder_roll += 0.26 * amplitude;
+        pose.left_shoulder_roll += 0.26 * amplitude;
+        pose.right_shoulder_roll -= 0.26 * amplitude;
         pose.left_wrist_yaw -= 0.08 * amplitude;
         pose.right_wrist_yaw += 0.08 * amplitude;
         pose.left_elbow -= 0.05 * amplitude;
@@ -1289,8 +1296,8 @@ fn apply_template(
     };
     pose.left_shoulder_pitch += blend.shoulder_pitch * intensity * left_bias;
     pose.right_shoulder_pitch += blend.shoulder_pitch * intensity * right_bias;
-    pose.left_shoulder_roll -= blend.shoulder_roll * intensity * left_bias;
-    pose.right_shoulder_roll += blend.shoulder_roll * intensity * right_bias;
+    pose.left_shoulder_roll += blend.shoulder_roll * intensity * left_bias;
+    pose.right_shoulder_roll -= blend.shoulder_roll * intensity * right_bias;
     pose.left_elbow += blend.elbow * intensity * left_bias;
     pose.right_elbow += blend.elbow * intensity * right_bias;
     pose.left_wrist_yaw -= blend.wrist * intensity * left_bias;
@@ -1345,12 +1352,104 @@ fn push_frame(frames: &mut Vec<MotionKeyframe>, t: u32, pose: Pose) {
     });
 }
 
+/// Transform English text to BSL word order following BSL grammar rules.
+///
+/// BSL Grammar Differences from English:
+/// 1. Topic-Comment structure (Topic first, then comment)
+/// 2. Time indicators at sentence start
+/// 3. Question words at end for questions
+/// 4. No "to be" verbs (are, is, was, etc.)
+/// 5. No articles (a, an, the)
+/// 6. Different pronoun placement
+/// 7. Adjectives after nouns
+/// 8. No passive voice - convert to active
+fn transform_to_bsl_order(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return String::new();
+    }
+
+    let mut result: Vec<String> = Vec::new();
+    let mut i = 0;
+
+    // Remove common articles and "to be" verbs
+    let skip_words = ["a", "an", "the", "is", "are", "was", "were", "be", "been", "being"];
+
+    // Check if question (ends with ?)
+    let is_question = text.trim().ends_with('?');
+    let mut question_word: Option<String> = None;
+
+    // Time indicators - move to front
+    let time_words = ["yesterday", "today", "tomorrow", "now", "later", "before", "after", "morning", "afternoon", "evening", "night"];
+    let mut time_indicator: Option<String> = None;
+
+    while i < words.len() {
+        let word_lower = words[i].trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+
+        // Capture time indicators
+        if time_words.contains(&word_lower.as_str()) && time_indicator.is_none() {
+            time_indicator = Some(words[i].to_string());
+            i += 1;
+            continue;
+        }
+
+        // Capture question words for end placement
+        if is_question && ["what", "where", "when", "why", "who", "how", "which"].contains(&word_lower.as_str()) {
+            question_word = Some(words[i].to_string());
+            i += 1;
+            continue;
+        }
+
+        // Skip articles and "to be" verbs
+        if skip_words.contains(&word_lower.as_str()) {
+            i += 1;
+            continue;
+        }
+
+        // Skip "do/does/did" in questions
+        if is_question && ["do", "does", "did"].contains(&word_lower.as_str()) {
+            i += 1;
+            continue;
+        }
+
+        result.push(words[i].to_string());
+        i += 1;
+    }
+
+    // Build BSL sentence structure
+    let mut bsl_words: Vec<String> = Vec::new();
+
+    // 1. Time indicator first (if present)
+    if let Some(time) = time_indicator {
+        bsl_words.push(time);
+    }
+
+    // 2. Main content
+    bsl_words.extend(result);
+
+    // 3. Question word at end (if question)
+    if let Some(qword) = question_word {
+        bsl_words.push(qword);
+    }
+
+    bsl_words.join(" ")
+}
+
 fn plan_gesture_motion(text: &str, gesture_mode: &str, avatar_mode: &str) -> Option<GesturePlan> {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
         return None;
     }
-    let tokens = tokenize_transcript(&normalized, 28);
+
+    // Transform text for BSL if in BSL mode
+    let (display_text, bsl_text) = if gesture_mode == "bsl" {
+        let bsl_transformed = transform_to_bsl_order(&normalized);
+        (bsl_transformed.clone(), Some(bsl_transformed))
+    } else {
+        (normalized.clone(), None)
+    };
+
+    let tokens = tokenize_transcript(&display_text, 28);
     if tokens.is_empty() {
         return None;
     }
@@ -1402,7 +1501,19 @@ fn plan_gesture_motion(text: &str, gesture_mode: &str, avatar_mode: &str) -> Opt
     }
 
     let duration_ms = clamp_u32(cursor.saturating_add(180), 700, 18_000);
-    push_frame(&mut frames, duration_ms, rest);
+    push_frame(&mut frames, duration_ms, rest.clone());
+
+    // Debug logging for first frame pose values
+    if let Some(first_frame) = frames.first() {
+        eprintln!("[DEBUG] First keyframe pose values for gesture_mode={}", gesture_mode);
+        eprintln!("  left_shoulder_pitch: {:.3}", first_frame.pose.left_shoulder_pitch);
+        eprintln!("  right_shoulder_pitch: {:.3}", first_frame.pose.right_shoulder_pitch);
+        eprintln!("  left_shoulder_roll: {:.3}", first_frame.pose.left_shoulder_roll);
+        eprintln!("  right_shoulder_roll: {:.3}", first_frame.pose.right_shoulder_roll);
+        eprintln!("  left_elbow: {:.3}", first_frame.pose.left_elbow);
+        eprintln!("  right_elbow: {:.3}", first_frame.pose.right_elbow);
+    }
+
     Some(GesturePlan {
         motion: AvatarMotion {
             duration_ms,
@@ -1417,6 +1528,7 @@ fn plan_gesture_motion(text: &str, gesture_mode: &str, avatar_mode: &str) -> Opt
             token_count: timeline.len(),
         },
         timeline,
+        bsl_text,
     })
 }
 
@@ -2172,5 +2284,62 @@ mod tests {
     fn normalizes_avatar_mode_aliases() {
         assert_eq!(normalize_avatar_mode("Office Mode"), Some("office"));
         assert_eq!(normalize_avatar_mode("Chat Mode"), Some("chat"));
+    }
+
+    #[test]
+    fn transforms_english_to_bsl_removes_articles_and_be_verbs() {
+        let text = "The cat is on the mat.";
+        let bsl = transform_to_bsl_order(text);
+        // Should remove "the", "is"
+        assert!(!bsl.contains("the"));
+        assert!(!bsl.contains("The"));
+        assert!(!bsl.contains("is"));
+        assert!(bsl.contains("cat"));
+        assert!(bsl.contains("on"));
+        assert!(bsl.contains("mat"));
+    }
+
+    #[test]
+    fn transforms_question_word_to_end_in_bsl() {
+        let text = "What is your name?";
+        let bsl = transform_to_bsl_order(text);
+        // "What" should be at end, "is" removed
+        assert!(bsl.ends_with("What") || bsl.ends_with("What?"));
+        assert!(!bsl.starts_with("What"));
+        assert!(!bsl.contains(" is "));
+    }
+
+    #[test]
+    fn moves_time_indicators_to_front_in_bsl() {
+        let text = "I went to the shop yesterday.";
+        let bsl = transform_to_bsl_order(text);
+        // "yesterday" should be at start
+        assert!(bsl.starts_with("yesterday") || bsl.starts_with("Yesterday"));
+        // Articles removed
+        assert!(!bsl.contains("the"));
+    }
+
+    #[test]
+    fn removes_do_does_did_in_questions() {
+        let text = "Do you like coffee?";
+        let bsl = transform_to_bsl_order(text);
+        assert!(!bsl.contains("Do"));
+        assert!(!bsl.contains("do"));
+        assert!(bsl.contains("you"));
+        assert!(bsl.contains("like"));
+        assert!(bsl.contains("coffee"));
+    }
+
+    #[test]
+    fn bsl_transformation_preserves_essential_words() {
+        let text = "Hello, my name is Paul.";
+        let bsl = transform_to_bsl_order(text);
+        // Should keep Hello, my, name, Paul
+        assert!(bsl.contains("Hello"));
+        assert!(bsl.contains("my"));
+        assert!(bsl.contains("name"));
+        assert!(bsl.contains("Paul"));
+        // Should remove "is"
+        assert!(!bsl.contains("is"));
     }
 }
