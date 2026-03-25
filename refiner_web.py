@@ -8082,6 +8082,9 @@ def _require_login() -> Optional[Response]:
         return None
     if path == METRICS_PATH:
         return None
+    # Allow public access to API documentation and health endpoints
+    if path.startswith("/api/docs") or path in {"/health", "/api/version"}:
+        return None
     if path in {
         "/login",
         "/sso",
@@ -12517,6 +12520,14 @@ if hasattr(app, "add_url_rule"):
 
 
 if __name__ == "__main__":
+    # Register API documentation and health endpoints
+    try:
+        from api_docs import add_api_documentation_support
+        add_api_documentation_support(app)
+        logger.info("API documentation enabled at /api/docs")
+    except Exception as exc:
+        logger.warning(f"Failed to register API documentation: {exc}")
+
     host = os.getenv("REFINER_HOST", "127.0.0.1")
     port = int(os.getenv("REFINER_PORT", "5001"))
     debug = os.getenv("REFINER_DEBUG", "0") in {"1", "true", "yes"}

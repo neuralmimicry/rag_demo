@@ -1,4 +1,6 @@
 Flask
+flask-swagger-ui
+flasgger
 requests
 packaging
 jira
