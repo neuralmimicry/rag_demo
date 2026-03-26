@@ -106,8 +106,10 @@ On the frontend, set the API base:
    - `REFINER_HOST=0.0.0.0`
    - `REFINER_ENFORCE_HTTPS=1`
    - `REFINER_TRUST_PROXY=1` (if TLS terminates upstream)
-   - `REFINER_CORS_ORIGINS=https://your-frontend.example`
-3) Point the frontend at the backend origin using `rag-api-base` or `window.__RAG_API_BASE`.
+   - `REFINER_CORS_ORIGINS=https://your-frontend.example,https://your-amplify-branch.amplifyapp.com`
+   - `REFINER_COOKIE_SAMESITE=None` and `REFINER_SECURE_COOKIES=1`
+   - Serve the API host with a publicly trusted TLS certificate (for example via cert-manager + `letsencrypt-prod`). Browsers reject self-signed certs with `ERR_CERT_AUTHORITY_INVALID`.
+3) Point the frontend at the backend origin using `rag-api-base` or `window.__RAG_API_BASE` (for this website: `https://api.neuralmimicry.ai`, not `/auth`).
 4) Bootstrap the first user with `POST /api/setup`, then log in with `POST /api/login`.
 
 ### Voice STT (native arm64, on-prem)
