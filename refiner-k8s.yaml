@@ -1,3 +1,4 @@
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,49 +28,59 @@ spec:
         runAsGroup: 10001
         fsGroup: 10001
       containers:
-      - name: refiner
-        image: ghcr.io/neuralmimicry/refiner:latest
-        imagePullPolicy: IfNotPresent
-        args: ["backend"]
-        ports:
-        - containerPort: 5001
-          name: http
-        env:
-        - name: REFINER_HOST
-          value: "0.0.0.0"
-        - name: REFINER_PORT
-          value: "5001"
-        - name: REFINER_JOB_DIR
-          value: "/app/job_data"
-        - name: REFINER_SECRET_KEY
-          valueFrom:
-            secretKeyRef:
-              name: refiner-secrets
-              key: REFINER_SECRET_KEY
-        - name: REFINER_ADMIN_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: refiner-secrets
-              key: REFINER_ADMIN_PASSWORD
-        readinessProbe:
-          httpGet:
-            path: /api/health
-            port: http
-          initialDelaySeconds: 10
-          periodSeconds: 10
-        livenessProbe:
-          httpGet:
-            path: /api/health
-            port: http
-          initialDelaySeconds: 30
-          periodSeconds: 20
-        volumeMounts:
-        - name: job-data
-          mountPath: /app/job_data
+        - name: refiner
+          image: ghcr.io/neuralmimicry/refiner:latest
+          imagePullPolicy: IfNotPresent
+          args: ["backend"]
+          ports:
+            - containerPort: 5001
+              name: http
+          env:
+            - name: REFINER_HOST
+              value: "0.0.0.0"
+            - name: REFINER_PORT
+              value: "5001"
+            - name: REFINER_JOB_DIR
+              value: "/app/job_data"
+            - name: REFINER_TRUST_PROXY
+              value: "1"
+            - name: REFINER_ENFORCE_HTTPS
+              value: "1"
+            - name: REFINER_CORS_ORIGINS
+              value: "https://neuralmimicry.ai,https://www.neuralmimicry.ai"
+            - name: REFINER_COOKIE_SAMESITE
+              value: "None"
+            - name: REFINER_SECURE_COOKIES
+              value: "1"
+            - name: REFINER_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_SECRET_KEY
+            - name: REFINER_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_ADMIN_PASSWORD
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          volumeMounts:
+            - name: job-data
+              mountPath: /app/job_data
       volumes:
-      - name: job-data
-        persistentVolumeClaim:
-          claimName: refiner-job-data
+        - name: job-data
+          persistentVolumeClaim:
+            claimName: refiner-job-data
 ---
 apiVersion: v1
 kind: Service
@@ -84,9 +95,9 @@ spec:
   selector:
     app: refiner
   ports:
-  - name: http
-    port: 5001
-    targetPort: http
+    - name: http
+      port: 5001
+      targetPort: http
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -99,7 +110,7 @@ metadata:
     nmc.neuralmimicry.ai/workload: refiner
 spec:
   accessModes:
-  - ReadWriteOnce
+    - ReadWriteOnce
   resources:
     requests:
       storage: 10Gi

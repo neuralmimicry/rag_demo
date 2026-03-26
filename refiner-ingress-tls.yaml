@@ -1,3 +1,4 @@
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -8,22 +9,21 @@ metadata:
     app.kubernetes.io/part-of: refiner-cluster
     nmc.neuralmimicry.ai/workload: refiner
   annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /
-    cert-manager.io/cluster-issuer: "selfsigned-ca-issuer"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
 spec:
   ingressClassName: nginx
   tls:
-  - hosts:
-    - refiner.neuralmimicry.ai
-    secretName: refiner-tls
+    - hosts:
+        - api.neuralmimicry.ai
+      secretName: api-neuralmimicry-ai-tls
   rules:
-  - host: refiner.neuralmimicry.ai
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: refiner
-            port:
-              number: 5001
+    - host: api.neuralmimicry.ai
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: refiner
+                port:
+                  number: 5001
