@@ -30,7 +30,7 @@ spec:
       containers:
         - name: refiner
           image: ghcr.io/neuralmimicry/refiner:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           args: ["backend"]
           ports:
             - containerPort: 5001
@@ -43,8 +43,6 @@ spec:
             - name: REFINER_JOB_DIR
               value: "/app/job_data"
             - name: REFINER_TRUST_PROXY
-              value: "1"
-            - name: REFINER_ENFORCE_HTTPS
               value: "1"
             - name: REFINER_CORS_ORIGINS
               value: "https://neuralmimicry.ai,https://www.neuralmimicry.ai"
