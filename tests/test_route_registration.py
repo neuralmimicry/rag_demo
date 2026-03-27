@@ -17,3 +17,4 @@ def test_voice_and_assistant_routes_are_registered():
     assert "/api/jobs/<job_id>/tasks" in rules
     assert "/api/jobs/<job_id>/tasks/<task_id>" in rules
     assert "/api/jobs/<job_id>/tasks/<task_id>/cancel" in rules
+    assert "/api/workers/telemetry" in rules

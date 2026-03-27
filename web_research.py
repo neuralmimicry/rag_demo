@@ -1,3 +1,12 @@
+"""Web search and fetch utilities for topic research workflows.
+
+Features include:
+- provider-agnostic search engine interfaces,
+- Google Custom Search integration with local caching,
+- robust URL fetching with retry/header rotation/advice hooks, and
+- content extraction helpers for text and binary documents.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -23,6 +32,7 @@ DEFAULT_CACHE_ROOT = ".research_cache"
 
 
 def normalize_query(query: str, *, max_chars: int = 512, drop_todo_fixme: bool = False) -> str:
+    """Normalize a free-form search query with optional truncation/filters."""
     if not query:
         return ""
     cleaned = " ".join(str(query).split())
@@ -38,11 +48,15 @@ def normalize_query(query: str, *, max_chars: int = 512, drop_todo_fixme: bool =
 
 
 class WebResearchCache:
+    """Simple JSON cache for search/fetch results keyed by hashed input."""
+
     def __init__(self, root: str, namespace: Optional[str] = None):
+        """Create a cache namespace rooted under ``root``."""
         self.root = os.path.abspath(root)
         self.namespace = (namespace or "").strip()
 
     def _dir(self, kind: str) -> str:
+        """Ensure and return the on-disk directory for one cache kind."""
         base = self.root
         if self.namespace:
             base = os.path.join(base, self.namespace)
@@ -52,10 +66,12 @@ class WebResearchCache:
         return target
 
     def _path(self, kind: str, key: str) -> str:
+        """Compute a stable cache path for ``kind`` and logical key."""
         key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return os.path.join(self._dir(kind), f"{key_hash}.json")
 
     def read(self, kind: str, key: str, ttl_hours: int) -> Optional[Any]:
+        """Read cached data if present and not expired."""
         try:
             path = self._path(kind, key)
             if not os.path.exists(path):
@@ -70,6 +86,7 @@ class WebResearchCache:
             return None
 
     def write(self, kind: str, key: str, data: Any) -> None:
+        """Write cache data with a timestamp envelope."""
         try:
             path = self._path(kind, key)
             with open(path, "w", encoding="utf-8") as handle:
@@ -79,14 +96,20 @@ class WebResearchCache:
 
 
 class SearchEngine:
+    """Abstract search-engine interface used by ``search_web``."""
+
     def search(self, query: str) -> List[Dict[str, str]]:
+        """Return normalized search results for a query."""
         raise NotImplementedError
 
     def verify(self) -> Tuple[bool, str]:
+        """Check provider readiness."""
         return True, "Success"
 
 
 class MockSearchEngine(SearchEngine):
+    """LLM-backed fallback that simulates web search snippets."""
+
     def __init__(
         self,
         llm: Optional[LLMProvider] = None,
@@ -99,6 +122,7 @@ class MockSearchEngine(SearchEngine):
         self._quota_reached = False
 
     def search(self, query: str) -> List[Dict[str, str]]:
+        """Generate synthetic search results via the configured LLM."""
         if not self.llm:
             return [{"title": "No search engine", "snippet": "No LLM provided to simulate search.", "url": "#"}]
 
@@ -142,6 +166,8 @@ class MockSearchEngine(SearchEngine):
 
 
 class GoogleSearchEngine(SearchEngine):
+    """Google Custom Search API integration with response caching."""
+
     def __init__(
         self,
         api_key: str,
@@ -157,6 +183,7 @@ class GoogleSearchEngine(SearchEngine):
         self.cache_root = cache_root or DEFAULT_CACHE_ROOT
 
     def _cache_path(self, query: str) -> str:
+        """Return the file path for cached query results."""
         os.makedirs(self.cache_root, exist_ok=True)
         cache_dir = os.path.join(self.cache_root, "search_cache")
         os.makedirs(cache_dir, exist_ok=True)
@@ -164,6 +191,7 @@ class GoogleSearchEngine(SearchEngine):
         return os.path.join(cache_dir, f"google_{q_hash}.json")
 
     def _read_cache(self, query: str) -> Optional[List[Dict[str, str]]]:
+        """Load cached results when still within TTL."""
         try:
             cache_path = self._cache_path(query)
             if not os.path.exists(cache_path):
@@ -181,6 +209,7 @@ class GoogleSearchEngine(SearchEngine):
         return None
 
     def _write_cache(self, query: str, results: List[Dict[str, str]]) -> None:
+        """Persist query results to disk cache."""
         try:
             cache_path = self._cache_path(query)
             with open(cache_path, "w", encoding="utf-8") as handle:
@@ -190,6 +219,7 @@ class GoogleSearchEngine(SearchEngine):
 
     @staticmethod
     def _format_error(resp: requests.Response) -> str:
+        """Extract a human-readable error message from an HTTP response."""
         message = ""
         try:
             data = resp.json()
@@ -212,6 +242,7 @@ class GoogleSearchEngine(SearchEngine):
         return message
 
     def search(self, query: str) -> List[Dict[str, str]]:
+        """Execute a Google Custom Search request and normalize results."""
         if not self.api_key or not self.cse_id:
             logger.warning("Google Search credentials missing. Falling back.")
             return []
@@ -238,7 +269,11 @@ class GoogleSearchEngine(SearchEngine):
         }
         try:
             resp = requests.get(url, params=params, timeout=self.timeout)
-            if resp.status_code in (413, 414) and max_chars > 0:
+            try:
+                status_code = int(getattr(resp, "status_code", 0) or 0)
+            except Exception:
+                status_code = 0
+            if status_code in (413, 414) and max_chars > 0:
                 fallback_limit = max(128, min(256, max_chars))
                 reduced = normalize_query(normalized_query, max_chars=fallback_limit)
                 if reduced and reduced != normalized_query:
@@ -248,9 +283,13 @@ class GoogleSearchEngine(SearchEngine):
                     params["q"] = reduced
                     normalized_query = reduced
                     resp = requests.get(url, params=params, timeout=self.timeout)
-            if resp.status_code >= 400:
+                    try:
+                        status_code = int(getattr(resp, "status_code", 0) or 0)
+                    except Exception:
+                        status_code = 0
+            if status_code >= 400:
                 message = self._format_error(resp)
-                logger.error(f"Google Search failed: HTTP {resp.status_code} {message}")
+                logger.error(f"Google Search failed: HTTP {status_code} {message}")
                 return []
             data = resp.json()
             results = []
@@ -271,6 +310,7 @@ class GoogleSearchEngine(SearchEngine):
             return []
 
     def verify(self) -> Tuple[bool, str]:
+        """Probe Google Search credentials/connectivity with a lightweight query."""
         if not self.api_key or not self.cse_id:
             return False, "Google Search credentials (API key or CSE ID) are missing."
 
@@ -304,6 +344,7 @@ def search_web(
     max_chars: int = 512,
     drop_todo_fixme: bool = False,
 ) -> List[Dict[str, str]]:
+    """Run multiple search engines, normalize, deduplicate, and cache results."""
     normalized = normalize_query(query, max_chars=max_chars, drop_todo_fixme=drop_todo_fixme)
     if not normalized:
         return []
@@ -350,6 +391,7 @@ def search_web(
 
 
 def _strip_html_text(content: str) -> str:
+    """Extract visible text from HTML with BeautifulSoup fallback."""
     if not content:
         return ""
     try:
@@ -372,6 +414,7 @@ def fetch_url(
     headers_list: Optional[List[Dict[str, str]]] = None,
     get_fetch_advice: Optional[Callable[[str, str], Dict[str, Any]]] = None,
 ) -> requests.Response:
+    """Fetch URL content using rotating browser headers and optional advice."""
     if not url_allowed(url):
         raise requests.exceptions.RequestException("URL blocked by policy")
     headers_list = headers_list or [
@@ -388,22 +431,18 @@ def fetch_url(
             "Accept-Language": "en-GB,en;q=0.5",
             "Referer": "https://www.bing.com/",
         },
-        {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-GB,en;q=0.9",
-        },
     ]
 
     last_error = None
     session = session or requests.Session()
     for headers in headers_list:
+        attempt_headers = dict(headers or {})
         try:
-            headers.update({
+            attempt_headers.update({
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
             })
-            resp = session.get(url, headers=headers, timeout=timeout)
+            resp = session.get(url, headers=attempt_headers, timeout=timeout)
             if resp.status_code < 400:
                 return resp
             last_error = f"HTTP {resp.status_code}: {resp.reason}"
@@ -418,7 +457,7 @@ def fetch_url(
         advice = get_fetch_advice(url, last_error)
         if advice:
             try:
-                headers = advice.get("headers", headers_list[0])
+                headers = dict(advice.get("headers") or headers_list[0])
                 cookies = advice.get("cookies", {})
                 params = advice.get("params", {})
                 reasoning = advice.get("reasoning", "No reasoning provided.")
@@ -447,6 +486,7 @@ def fetch_url_content(
     get_fetch_advice: Optional[Callable[[str, str], Dict[str, Any]]] = None,
     raise_on_error: bool = False,
 ) -> str:
+    """Fetch URL and return cleaned textual content (including binary conversion)."""
     if not url:
         return ""
     if cache:
@@ -520,6 +560,7 @@ def summarize_web_research(
     llm_timeout: Optional[int],
     llm_reasoning_effort: Optional[str],
 ) -> str:
+    """Ask an LLM to summarize collected web findings with citations."""
     if not documents:
         return ""
     lines = [f"Query: {query}", "Sources:"]
@@ -550,6 +591,7 @@ def summarize_web_research(
 
 
 def heuristic_relevance_check(content: str, topic: str, requirements: str) -> bool:
+    """Cheap keyword overlap check to filter irrelevant fetched content."""
     if not content or not topic:
         return False
 
@@ -577,6 +619,7 @@ def heuristic_relevance_check(content: str, topic: str, requirements: str) -> bo
 
 
 def _env_int(name: str, default: int) -> int:
+    """Read an integer env var with safe default fallback."""
     try:
         return int(os.getenv(name, str(default)))
     except Exception:

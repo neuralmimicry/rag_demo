@@ -1,3 +1,11 @@
+"""Reusable plan/act/verify/reflect workflow primitives.
+
+The module models a deterministic agentic loop with:
+- phase-level status semantics (ok/retry/halt/error),
+- event history for traceability, and
+- optional progress-path tracking for dead-end avoidance.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -11,33 +19,42 @@ _STATUS_ORDER = {"ok": 0, "retry": 1, "halt": 2, "error": 3}
 
 @dataclass
 class PhaseResult:
+    """Normalized outcome produced by one workflow phase handler."""
+
     status: str = "ok"
     notes: str = ""
     data: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def ok(cls, notes: str = "", data: Optional[Dict[str, Any]] = None) -> "PhaseResult":
+        """Convenience constructor for successful phase completion."""
         return cls(status="ok", notes=notes, data=data or {})
 
     @classmethod
     def retry(cls, notes: str = "", data: Optional[Dict[str, Any]] = None) -> "PhaseResult":
+        """Signal that the workflow should retry another cycle."""
         return cls(status="retry", notes=notes, data=data or {})
 
     @classmethod
     def halt(cls, notes: str = "", data: Optional[Dict[str, Any]] = None) -> "PhaseResult":
+        """Signal a graceful stop without treating the run as an error."""
         return cls(status="halt", notes=notes, data=data or {})
 
     @classmethod
     def error(cls, notes: str = "", data: Optional[Dict[str, Any]] = None) -> "PhaseResult":
+        """Signal terminal failure for the workflow."""
         return cls(status="error", notes=notes, data=data or {})
 
     def normalized_status(self) -> str:
+        """Return a supported status token, defaulting unknown values to ``ok``."""
         status = (self.status or "ok").strip().lower()
         return status if status in _STATUS_ORDER else "ok"
 
 
 @dataclass
 class PhaseEvent:
+    """Recorded execution event for one phase within one cycle."""
+
     cycle: int
     phase: str
     status: str
@@ -49,14 +66,18 @@ class PhaseEvent:
 
 @dataclass
 class WorkflowState:
+    """Aggregated workflow state and phase history."""
+
     label: str
     context: Dict[str, Any] = field(default_factory=dict)
     events: List[PhaseEvent] = field(default_factory=list)
 
     def record(self, event: PhaseEvent) -> None:
+        """Append an event to workflow history."""
         self.events.append(event)
 
     def last_event(self, phase: Optional[str] = None) -> Optional[PhaseEvent]:
+        """Return the latest event overall or for a specific phase."""
         if not self.events:
             return None
         if not phase:
@@ -69,6 +90,8 @@ class WorkflowState:
 
 @dataclass
 class PathEntry:
+    """One node in the progress tracker path history."""
+
     id: int
     label: str
     source: str
@@ -82,6 +105,8 @@ class PathEntry:
 
 
 class ProgressTracker:
+    """Tracks explored solution paths and dead ends across iterations."""
+
     def __init__(
         self,
         *,
@@ -97,6 +122,7 @@ class ProgressTracker:
             self._load(entries)
 
     def _load(self, entries: List[Dict[str, Any]]) -> None:
+        """Rehydrate tracker entries from serialized history."""
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -132,6 +158,7 @@ class ProgressTracker:
         data: Optional[Dict[str, Any]] = None,
         parent_id: Optional[int] = None,
     ) -> int:
+        """Create a new path entry and return its generated ID."""
         entry = PathEntry(
             id=self._next_id,
             label=self.label,
@@ -157,6 +184,7 @@ class ProgressTracker:
         data: Optional[Dict[str, Any]] = None,
         retrace_to: Optional[int] = None,
     ) -> None:
+        """Update status/metadata for an existing entry."""
         entry = self._get(entry_id)
         if not entry:
             return
@@ -170,15 +198,18 @@ class ProgressTracker:
             entry.retrace_to = retrace_to
 
     def mark_dead_end(self, entry_id: int, reason: str, *, retrace_to: Optional[int] = None) -> None:
+        """Mark an entry as a dead end with optional retrace target."""
         self.update(entry_id, status="dead_end", notes=reason, retrace_to=retrace_to)
 
     def _get(self, entry_id: int) -> Optional[PathEntry]:
+        """Return one path entry by ID."""
         for entry in self.entries:
             if entry.id == entry_id:
                 return entry
         return None
 
     def summarize(self, source: Optional[str] = None, max_items: int = 6) -> str:
+        """Render a compact path summary for prompts/logs."""
         entries = self.entries
         if source:
             entries = [e for e in entries if e.source == source]
@@ -197,6 +228,7 @@ class ProgressTracker:
         return "\n".join(lines).strip()
 
     def export(self) -> Dict[str, Any]:
+        """Serialize tracker state for persistence."""
         return {
             "label": self.label,
             "entries": [
@@ -218,6 +250,8 @@ class ProgressTracker:
 
 
 class AgenticCycle:
+    """Mutable per-cycle context passed to phase handlers."""
+
     def __init__(
         self,
         workflow: "AgenticWorkflow",
@@ -232,12 +266,15 @@ class AgenticCycle:
         self.decision = "continue"
 
     def set(self, key: str, value: Any) -> None:
+        """Store phase-local data on the cycle."""
         self.data[key] = value
 
     def get(self, key: str, default: Any = None) -> Any:
+        """Read phase-local data from the cycle."""
         return self.data.get(key, default)
 
     def record(self, phase: str, result: Optional[PhaseResult]) -> PhaseEvent:
+        """Record a phase result and update control-flow decision state."""
         if result is None:
             result = PhaseResult.ok()
         status = result.normalized_status()
@@ -256,6 +293,7 @@ class AgenticCycle:
         return event
 
     def _update_decision(self, status: str) -> None:
+        """Promote cycle decision severity based on observed status."""
         if status not in _STATUS_ORDER:
             return
         current = _STATUS_ORDER.get(self.decision, 0)
@@ -268,6 +306,8 @@ class AgenticCycle:
 
 
 class AgenticWorkflow:
+    """Coordinator for deterministic multi-phase, multi-cycle execution."""
+
     def __init__(
         self,
         *,
@@ -283,6 +323,7 @@ class AgenticWorkflow:
         self.state = WorkflowState(label=label)
 
     def start_cycle(self, cycle_index: int, context: Optional[Dict[str, Any]] = None) -> AgenticCycle:
+        """Create a new cycle wrapper bound to workflow state."""
         return AgenticCycle(self, cycle_index, context=context)
 
     def run(
@@ -293,6 +334,7 @@ class AgenticWorkflow:
         context: Optional[Dict[str, Any]] = None,
         on_cycle_end: Optional[Callable[[AgenticCycle], None]] = None,
     ) -> WorkflowState:
+        """Execute configured phases until completion, retry, or terminal stop."""
         cycles = max_cycles or self.max_cycles
         if not cycles or cycles <= 0:
             return self.state
@@ -315,6 +357,7 @@ class AgenticWorkflow:
         return self.state
 
     def export(self) -> Dict[str, Any]:
+        """Serialize workflow events for downstream diagnostics."""
         return {
             "label": self.state.label,
             "events": [
@@ -332,6 +375,7 @@ class AgenticWorkflow:
         }
 
     def _log_event(self, event: PhaseEvent) -> None:
+        """Emit a debug log for each recorded phase event."""
         if not self.logger:
             return
         self.logger.debug(

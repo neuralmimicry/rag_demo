@@ -1,3 +1,12 @@
+"""Core Jira statistics workflow and shared configuration helpers.
+
+This module is the historical backbone of Refiner and still powers:
+- the default Jira reporting pipeline,
+- data extraction/fallback logic for issue retrieval,
+- timeline/KPI report generation, and
+- shared configuration/credential resolution consumed by other workflows.
+"""
+
 import calendar
 from datetime import datetime, timedelta, timezone
 import holidays
@@ -11,7 +20,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from jira import JIRA as jira_api
 import os  # For environment variables
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 from flask import Flask, request, jsonify
 
 # Discovery for narrowing JQL using Confluence/Jira keywords
@@ -22,6 +31,7 @@ app = Flask(__name__)
 
 @app.route('/', methods=['POST'])
 def webhook():
+    """Minimal webhook receiver used by AppSheet-style integrations."""
     data = request.json
     # Process the data from AppSheet
     response_data = {
@@ -833,7 +843,10 @@ def fetch_issues(jira_connector, jql_query):
                 return client_issues
             # If client path returned nothing and we still want to try HTTP, only then fetch creds
             try:
-                username, password = get_credentials(getattr(jira_connector, 'instance_name', None))
+                try:
+                    username, password = get_credentials(getattr(jira_connector, 'instance_name', None))
+                except TypeError:
+                    username, password = get_credentials()
             except Exception:
                 # If credentials cannot be obtained (e.g., non-interactive), return what we have
                 return []
@@ -1717,15 +1730,19 @@ def _save_programme_projects_epics_gantt_html(proj_agg: dict, epic_agg: dict, ou
     # Sort project rows by start
     proj_rows.sort(key=lambda t: (t[1][1] or datetime.min))
 
+    def _clean_scope_key(value: Any) -> str:
+        s = str(value or "")
+        return s.split("|")[-1] if "|" in s else s
+
     def _project_href(pkey: str, p_entry: dict) -> str:
         url = p_entry.get('jira_url', JIRA_URL).rstrip('/')
-        actual_key = pkey.split('|')[-1] if '|' in str(pkey) else pkey
+        actual_key = _clean_scope_key(pkey)
         jql = f"project = {actual_key}"
         return f"{url}/issues/?jql={quote(jql)}"
 
     def _epic_href(ekey: str, e_entry: dict) -> str:
         url = e_entry.get('jira_url', JIRA_URL).rstrip('/')
-        actual_key = ekey.split('|')[-1] if '|' in str(ekey) else ekey
+        actual_key = _clean_scope_key(ekey)
         return f"{url}/browse/{actual_key}"
 
     if proj_rows:
@@ -1921,18 +1938,18 @@ def _save_programme_projects_epics_gantt_html(proj_agg: dict, epic_agg: dict, ou
         # For epics, add data-parent attribute for project-level toggling, and add epic toggle
         if kind == 'epic':
             # Prefer explicit parent computed during row assembly; fallback to key prefix
-            pfx = r.get('parent') or (r.get('key') or '').split('-')[0]
+            pfx = _clean_scope_key(r.get('parent') or (r.get('key') or '').split('-')[0])
             attrs.append(f'data-parent="{pfx}"')
             row_classes.append('epic-row')
         # For stories, add data-parent-epic and data-parent-project to support both toggles
         if kind == 'story':
-            attrs.append(f'data-parent-epic="{r.get("parent", "")}"')
-            attrs.append(f'data-parent-project="{r.get("parent_project", "")}"')
+            attrs.append(f'data-parent-epic="{_clean_scope_key(r.get("parent", ""))}"')
+            attrs.append(f'data-parent-project="{_clean_scope_key(r.get("parent_project", ""))}"')
             row_classes.append('story-row')
         # Common metadata attributes for filtering
         # Key/kind
         if r.get('key'):
-            attrs.append(f'data-key="{r.get("key")}"')
+            attrs.append(f'data-key="{_clean_scope_key(r.get("key"))}"')
         attrs.append(f'data-kind="{kind}"')
         # Dates for filtering
         try:
@@ -1995,13 +2012,13 @@ def _save_programme_projects_epics_gantt_html(proj_agg: dict, epic_agg: dict, ou
         # For projects, add data-project and a toggle control
         toggle_html = ""
         if kind == 'project':
-            pkey = r.get('key') or ''
+            pkey = _clean_scope_key(r.get('key') or '')
             attrs.append(f'data-project="{pkey}"')
             expanded = bool(r.get('expanded', True))
             glyph = '▾' if expanded else '▸'
             toggle_html = f"<button class=\"toggle\" data-project=\"{pkey}\" aria-expanded=\"{'true' if expanded else 'false'}\">{glyph}</button>"
         elif kind == 'epic':
-            ekey = r.get('key') or ''
+            ekey = _clean_scope_key(r.get('key') or '')
             expanded = bool(r.get('expanded', True))
             glyph = '▾' if expanded else '▸'
             toggle_html = f"<button class=\"toggle toggle-epic\" data-epic=\"{ekey}\" aria-expanded=\"{'true' if expanded else 'false'}\">{glyph}</button>"
@@ -2960,22 +2977,54 @@ def generate_timelines_report(issues, fields_maps: dict):
                         e['end_source'] = 'calculated'
 
     # Write CSV
+    def _scope_key_variants(scope_key: str, clean_counts: dict) -> List[str]:
+        raw = str(scope_key or "")
+        out = [raw]
+        if "|" in raw:
+            clean = raw.split("|")[-1]
+            if clean and clean != raw and int(clean_counts.get(clean, 0)) == 1:
+                out.append(clean)
+        return out
+
+    project_clean_counts: Dict[str, int] = {}
+    for key in (proj_agg or {}).keys():
+        raw = str(key or "")
+        clean = raw.split("|")[-1] if "|" in raw else raw
+        project_clean_counts[clean] = int(project_clean_counts.get(clean, 0)) + 1
+
+    epic_clean_counts: Dict[str, int] = {}
+    for key in (epic_agg or {}).keys():
+        raw = str(key or "")
+        clean = raw.split("|")[-1] if "|" in raw else raw
+        epic_clean_counts[clean] = int(epic_clean_counts.get(clean, 0)) + 1
+
     with open(TIMELINES_FILE, mode='w', newline='') as f:
         w = csv.writer(f)
         w.writerow([
             'ScopeType', 'ScopeKey', 'ScopeName', 'StartDate', 'EndDate', 'LastUpdated',
             'PercentDone', 'IssuesCount', 'UniqueAssigneesCount', 'UniqueAssignees',
             'UpdatersCount', 'Updaters'])
+        emitted = set()
         for scope_key, e in proj_agg.items():
-            w.writerow([
-                'Project', scope_key, e['name'], e['start'], e['end'], e['last_updated'], e['percent_done'],
-                e['issues'], len(e['assignees']), "; ".join(e['assignees']), len(e['updaters']), "; ".join(e['updaters'])
-            ])
+            for out_key in _scope_key_variants(scope_key, project_clean_counts):
+                marker = ('Project', out_key)
+                if marker in emitted:
+                    continue
+                emitted.add(marker)
+                w.writerow([
+                    'Project', out_key, e['name'], e['start'], e['end'], e['last_updated'], e['percent_done'],
+                    e['issues'], len(e['assignees']), "; ".join(e['assignees']), len(e['updaters']), "; ".join(e['updaters'])
+                ])
         for scope_key, e in epic_agg.items():
-            w.writerow([
-                'Epic', scope_key, e['name'], e['start'], e['end'], e['last_updated'], e['percent_done'],
-                e['issues'], len(e['assignees']), "; ".join(e['assignees']), len(e['updaters']), "; ".join(e['updaters'])
-            ])
+            for out_key in _scope_key_variants(scope_key, epic_clean_counts):
+                marker = ('Epic', out_key)
+                if marker in emitted:
+                    continue
+                emitted.add(marker)
+                w.writerow([
+                    'Epic', out_key, e['name'], e['start'], e['end'], e['last_updated'], e['percent_done'],
+                    e['issues'], len(e['assignees']), "; ".join(e['assignees']), len(e['updaters']), "; ".join(e['updaters'])
+                ])
     print(f"Timelines report has been written to {TIMELINES_FILE}")
     # Also render a simple Gantt chart of project timelines for an overview programme plan
     # If the configured GANTT_FILE is a relative path, place it alongside the timelines CSV
@@ -3039,10 +3088,10 @@ def generate_timelines_report(issues, fields_maps: dict):
             minimal.append('  </div>')
             minimal.append('  <div class="rows">')
             # Include one project-like row and one epic-like row to provide expected links and attributes
-            minimal.append(f'    <div class="row" data-project="{pk}"><div class="label">{pk_clean} Name</div>'
+            minimal.append(f'    <div class="row" data-project="{pk_clean}"><div class="label">{pk_clean} Name</div>'
                            f'      <a class="bar" href="{p_url}/issues/?jql=project%20%3D%20{pk_clean}" target="_blank" title="Start: - | End: - | Percent done: 0.00%"></a>'
                            '    </div>')
-            minimal.append(f'    <div class="row epic-row" data-parent="{pk}"><div class="label">{ek_clean} (Epic)</div>'
+            minimal.append(f'    <div class="row epic-row" data-parent="{pk_clean}"><div class="label">{ek_clean} (Epic)</div>'
                            f'      <a class="bar" href="{e_url}/browse/{ek_clean}" target="_blank" title="Start: - | End: - | Percent done: 0.00%"></a>'
                            '    </div>')
             minimal.append('  </div>')
@@ -3181,6 +3230,7 @@ def _raw_to_issue(raw: dict):
 
 
 def leaderboard_sort_key(item):
+    """Sort leaderboard rows by throughput descending, then QA returns ascending."""
     assignee_data = item[1]
     # Sorting by descending throughput and ascending QA returns
     return -assignee_data['throughput'], assignee_data['qa_returns']
@@ -3214,6 +3264,12 @@ def main():
 
     all_fetched_issues = []
     instance_fields_maps = {}
+    used_zero_results_fallback = False
+    # Defaults keep post-loop logic safe even when early-continue branches run for every instance.
+    refined_jql = JQL_QUERY
+    discovery_result = None
+    jira_connector = None
+    username = password = None
 
     for instance in INSTANCES:
         instance_name = instance.get("name", "Unnamed Instance")
@@ -3227,13 +3283,21 @@ def main():
         print(f"\n>>> Processing instance: {instance_name} ({instance_jira_url})")
 
         try:
-            username, password = get_credentials(instance_name)
+            try:
+                # Backward compatibility: some tests/integrations monkeypatch get_credentials
+                # with a zero-argument callable.
+                username, password = get_credentials(instance_name)
+            except TypeError:
+                username, password = get_credentials()
         except Exception as e:
             print(f"Failed to get credentials for {instance_name}: {e}")
             continue
 
-        # Connect to JIRA
-        jira_connector = create_jira_connection(username, password, instance_jira_url, instance_name)
+        # Connect to JIRA (support tests/integrations patching a 2-arg connector).
+        try:
+            jira_connector = create_jira_connection(username, password, instance_jira_url, instance_name)
+        except TypeError:
+            jira_connector = create_jira_connection(username, password)
 
         # Optional: force ultra-broad mode to bypass discovery and fetch anything updated recently
         if FORCE_ULTRA_BROAD:
@@ -3333,6 +3397,7 @@ def main():
             except Exception:
                 proj_list = []
             if proj_list:
+                print(f"[{instance_name}] Auto per-project retry: refined query returned 0; trying {len(proj_list)} projects individually.")
                 auto_counts = []
                 tmp_issues = []
                 for p in proj_list:
@@ -3340,8 +3405,141 @@ def main():
                     issues = _fetch_sanitized(jira_connector, pjql)
                     _merge_unique(tmp_issues, issues)
                     auto_counts.append((p, len(issues or [])))
+                if auto_counts:
+                    head = ", ".join(f"{k}:{c}" for k, c in auto_counts[:10])
+                    print(f"[{instance_name}] Auto per-project retry sample counts → {head}; unique={len(tmp_issues)}")
                 if tmp_issues:
                     fetched_instance_issues = tmp_issues
+
+        # If discovery over-constrained this instance, run bounded per-instance fallbacks.
+        if not fetched_instance_issues and refined_jql != JQL_QUERY:
+            used_zero_results_fallback = True
+            # First, clear discovery cache and retry discovery once.
+            try:
+                cache_path = os.path.join(os.getcwd(), DEFAULT_CACHE_FILE)
+                if os.path.exists(cache_path):
+                    os.remove(cache_path)
+                    print(f"Refined JQL returned 0 issues; cleared discovery cache '{DEFAULT_CACHE_FILE}' and retrying discovery...")
+                else:
+                    print("Refined JQL returned 0 issues; no discovery cache found to clear. Retrying discovery...")
+            except Exception as e:
+                print(f"Failed to clear discovery cache: {e}. Retrying discovery anyway...")
+
+            discovery_result_retry = discovery_result
+            try:
+                discovery_result_retry = discover_hierarchy(
+                    jira_connector,
+                    instance_jira_url,
+                    (username, password),
+                    _CONFIG,
+                    disable_jira=DISABLE_JIRA,
+                    disable_confluence=DISABLE_CONFLUENCE,
+                    confluence_url=instance_confluence_url,
+                )
+                refined_jql_retry = build_refined_jql(JQL_QUERY, discovery_result_retry)
+                if refined_jql_retry != JQL_QUERY:
+                    print(f"Refined JQL (after cache clear) applied: {refined_jql_retry}")
+                else:
+                    print("No discovery refinement after cache clear; using base JQL.")
+            except Exception as e:
+                print(f"Discovery retry failed ({e}); proceeding with base JQL.")
+                refined_jql_retry = JQL_QUERY
+
+            if discovery_result_retry:
+                instance_fields_maps[instance_jira_url] = getattr(discovery_result_retry, 'fields', {}) or {}
+
+            # On retry as well, honor per-project iteration when enabled.
+            if ITERATE_PER_PROJECT:
+                fetched_instance_issues = []
+                try:
+                    proj_list = list(getattr(discovery_result_retry, 'projects', []) or [])
+                except Exception:
+                    proj_list = []
+                if proj_list:
+                    for p in proj_list:
+                        pjql = _build_per_project_jql(refined_jql_retry, p)
+                        _merge_unique(fetched_instance_issues, _fetch_sanitized(jira_connector, pjql))
+                else:
+                    fetched_instance_issues = _fetch_sanitized(jira_connector, refined_jql_retry)
+            else:
+                fetched_instance_issues = _fetch_sanitized(jira_connector, refined_jql_retry)
+
+            # If still nothing, broaden projects-only refinement by including Epics.
+            if not fetched_instance_issues and refined_jql_retry != JQL_QUERY:
+                only_projects = False
+                try:
+                    only_projects = bool(getattr(discovery_result_retry, 'projects', None)) and not bool(getattr(discovery_result_retry, 'epics', None))
+                except Exception:
+                    only_projects = False
+
+                if only_projects:
+                    rb = refined_jql_retry.strip()
+                    order_by = ""
+                    m = re.search(r"\border\s+by\b(.+)$", rb, flags=re.IGNORECASE)
+                    if m:
+                        order_by = " ORDER BY " + m.group(1).strip()
+                        rb = rb[: m.start()].strip()
+                    broadened = f"({rb}) OR (issuetype = Epic)".strip()
+                    broadened_jql = f"{broadened}{order_by}" if order_by else broadened
+                    broadened_safe = _sanitize_jql_order_by(broadened_jql)
+                    print(f"Refined JQL returned 0 issues again; attempting a broadened query: {broadened_safe}")
+                    fetched_instance_issues = _fetch_sanitized(jira_connector, broadened_jql)
+
+            # Final bounded fallbacks focusing on recent activity to surface something useful.
+            if not fetched_instance_issues and refined_jql_retry != JQL_QUERY:
+                order_by_tail = ""
+                try:
+                    bj = (JQL_QUERY or "").strip()
+                    m2 = re.search(r"\border\s+by\b(.+)$", bj, flags=re.IGNORECASE)
+                    if m2:
+                        order_by_tail = " ORDER BY " + m2.group(1).strip()
+                except Exception:
+                    pass
+
+                epic_recent = f"issuetype = Epic AND updated >= -{RECENT_DAYS}d"
+                epic_recent_jql = epic_recent + order_by_tail
+                epic_recent_safe = _sanitize_jql_order_by(epic_recent_jql)
+                print(f"No results yet; trying recent Epics window: {epic_recent_safe}")
+                fetched_instance_issues = _fetch_sanitized(jira_connector, epic_recent_jql)
+
+                if not fetched_instance_issues:
+                    types = "Story, Task, Bug, Improvement, Spike"
+                    deliv_recent = f"issuetype in ({types}) AND updated >= -{RECENT_DAYS}d"
+                    deliv_recent_jql = deliv_recent + order_by_tail
+                    deliv_recent_safe = _sanitize_jql_order_by(deliv_recent_jql)
+                    print(f"Still empty; trying recent delivery types window: {deliv_recent_safe}")
+                    fetched_instance_issues = _fetch_sanitized(jira_connector, deliv_recent_jql)
+
+                if not fetched_instance_issues and TRY_CREATED_WINDOW:
+                    created_only = f"created >= -{RECENT_DAYS}d" + order_by_tail
+                    created_safe = _sanitize_jql_order_by(created_only)
+                    print(f"Still empty; trying created window: {created_safe}")
+                    fetched_instance_issues = _fetch_sanitized(jira_connector, created_only)
+
+                if not fetched_instance_issues:
+                    ultra = f"updated >= -{RECENT_DAYS}d" + order_by_tail
+                    ultra_safe = _sanitize_jql_order_by(ultra)
+                    print(f"Still empty; trying ultra-broad updated window: {ultra_safe}")
+                    fetched_instance_issues = _fetch_sanitized(jira_connector, ultra)
+
+                if not fetched_instance_issues and ENABLE_USER_SCOPED_FALLBACK:
+                    user_scoped = (
+                        f"(assignee = currentUser() OR reporter = currentUser()) AND updated >= -{RECENT_DAYS}d"
+                        + order_by_tail
+                    )
+                    user_scoped_safe = _sanitize_jql_order_by(user_scoped)
+                    print(f"Still empty; trying user-scoped recent activity: {user_scoped_safe}")
+                    fetched_instance_issues = _fetch_sanitized(jira_connector, user_scoped)
+
+                if not fetched_instance_issues and ALLOW_EXTREME_BROAD:
+                    extreme = "ORDER BY created DESC"
+                    extreme_safe = _sanitize_jql_order_by(extreme)
+                    print(f"Still empty; trying extreme-broad no-filter query: {extreme_safe}")
+                    fetched_instance_issues = _fetch_sanitized(jira_connector, extreme)
+
+            if not fetched_instance_issues and refined_jql_retry != JQL_QUERY:
+                print("Refined JQL returned 0 issues again; retrying with base JQL...")
+                fetched_instance_issues = _fetch_sanitized(jira_connector, JQL_QUERY)
 
         all_fetched_issues.extend(fetched_instance_issues)
 
@@ -3366,10 +3564,10 @@ def main():
     # We use the LAST instance's refined JQL for the broadening logic if needed,
     # though broadening across multiple instances is complex. For now, we skip
     # the broadening if we already have some results.
-    if refined_jql != JQL_QUERY and current_count > 0 and current_count < MIN_RESULTS:
+    if refined_jql != JQL_QUERY and current_count > 0 and current_count < MIN_RESULTS and not used_zero_results_fallback:
         # (Remaining broadening logic could go here but it's instance-specific)
         pass
-    if refined_jql != JQL_QUERY and current_count > 0 and current_count < MIN_RESULTS:
+    if refined_jql != JQL_QUERY and current_count > 0 and current_count < MIN_RESULTS and not used_zero_results_fallback:
         # Try to gently broaden to surface enough data for charts
         print(f"Only {current_count} issues found from refined query; relaxing constraints to broaden selection (target >= {MIN_RESULTS}).")
         # Determine ORDER BY tail from refined JQL

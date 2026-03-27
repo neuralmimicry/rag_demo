@@ -1,3 +1,10 @@
+"""Lightweight frontend-only Flask server for Refiner static UI pages.
+
+This service serves templates/static assets and exposes optional Prometheus
+metrics. It is intentionally separate from the backend API process so UI
+hosting can be deployed independently when needed.
+"""
+
 import os
 import time
 
@@ -40,41 +47,49 @@ app = Flask(__name__, static_folder="web/static", template_folder="web/templates
 
 @app.route("/")
 def index() -> str:
+    """Render the main landing page."""
     return render_template("index.html", current_user=None, api_base=API_BASE)
 
 
 @app.route("/playground")
 def playground() -> str:
+    """Render the playground UI."""
     return render_template("playground.html", current_user=None, api_base=API_BASE)
 
 
 @app.route("/public/<path:filename>")
 def public_asset(filename: str):
+    """Serve assets from ``web/public``."""
     return send_from_directory(PUBLIC_DIR, filename)
 
 
 @app.route("/favicon.ico")
 def favicon():
+    """Serve the site favicon."""
     return send_from_directory(PUBLIC_DIR, "favicon.ico")
 
 
 @app.route("/login")
 def login() -> str:
+    """Render login page shell."""
     return render_template("login.html", error=None, api_base=API_BASE)
 
 
 @app.route("/setup")
 def setup() -> str:
+    """Render first-user setup page shell."""
     return render_template("setup.html", error=None, api_base=API_BASE)
 
 
 @app.route("/health")
 def health() -> dict:
+    """Health endpoint used by container/runtime checks."""
     return {"status": "ok"}
 
 
 @app.route(METRICS_PATH)
 def metrics():
+    """Expose Prometheus metrics when enabled."""
     if not METRICS_ENABLED:
         return {"error": "metrics_disabled"}, 404
     UPTIME.set(time.time() - APP_START_TIME)
@@ -84,6 +99,7 @@ def metrics():
 
 @app.before_request
 def before_request():
+    """Capture per-request start state for metrics."""
     if METRICS_ENABLED:
         request._metrics_start = time.time()
         INFLIGHT.inc()
@@ -91,6 +107,7 @@ def before_request():
 
 @app.after_request
 def after_request(response):
+    """Record latency/count metrics and return response unchanged."""
     if METRICS_ENABLED:
         try:
             path_label = request.url_rule.rule if request.url_rule else request.path

@@ -17,6 +17,7 @@ def register_admin_routes(
     health: Callable,
     capabilities_report: Callable,
     admin_stats: Callable,
+    workers_telemetry: Callable,
     api_audit: Callable,
 ) -> None:
     """Register admin/system/public routes."""
@@ -30,5 +31,5 @@ def register_admin_routes(
     app.add_url_rule("/api/health", view_func=health)
     app.add_url_rule("/api/capabilities", view_func=capabilities_report)
     app.add_url_rule("/api/admin/stats", view_func=admin_stats)
+    app.add_url_rule("/api/workers/telemetry", view_func=workers_telemetry)
     app.add_url_rule("/api/audit", view_func=api_audit)
-

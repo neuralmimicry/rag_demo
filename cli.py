@@ -13,6 +13,7 @@ from typing import Optional, List
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """CLI wrapper that delegates execution to :func:`run_refiner.run`."""
     # Add the current directory to sys.path to allow top-level imports from
     # within the package to work when called via the console script entry point.
     import sys

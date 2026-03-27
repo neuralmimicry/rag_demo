@@ -6,7 +6,24 @@ const workflowSelect = document.getElementById('workflow');
 const resetButton = document.getElementById('resetForm');
 const clearLogsButton = document.getElementById('clearLogs');
 const autoScrollCheckbox = document.getElementById('autoScroll');
+const systemStatsEl = document.getElementById('systemStats');
 const workerCountEl = document.getElementById('workerCount');
+const workerCapacityEl = document.getElementById('workerCapacity');
+const workerOnlineEl = document.getElementById('workerOnline');
+const workerAvailableEl = document.getElementById('workerAvailable');
+const workerInUseEl = document.getElementById('workerInUse');
+const workerComingOnlineEl = document.getElementById('workerComingOnline');
+const workerFailedEl = document.getElementById('workerFailed');
+const workersInlineStatusEl = document.getElementById('workersInlineStatus');
+const workersDetailOpenBtn = document.getElementById('workersDetailOpen');
+const workersModalEl = document.getElementById('workersModal');
+const workersModalCloseBtn = document.getElementById('workersModalClose');
+const workersModalRefreshBtn = document.getElementById('workersModalRefresh');
+const workersModalSubtitleEl = document.getElementById('workersModalSubtitle');
+const workersModalStatsEl = document.getElementById('workersModalStats');
+const workersTimelineChartEl = document.getElementById('workersTimelineChart');
+const workersTimelineLegendEl = document.getElementById('workersTimelineLegend');
+const workersModalStatusEl = document.getElementById('workersModalStatus');
 const jobCountEl = document.getElementById('jobCount');
 const queueQueuedCountEl = document.getElementById('queueQueuedCount');
 const queueRunningCountEl = document.getElementById('queueRunningCount');
@@ -151,6 +168,7 @@ let sessionStream = null;
 let sessionSnapshot = null;
 let workspaceSnapshot = null;
 let workspaceCapabilities = null;
+let workersTelemetrySnapshot = null;
 let jobsPollTimer = null;
 let todoFilterStatus = 'todo';
 let todoDeferOnly = false;
@@ -2932,10 +2950,227 @@ async function requestEstimate() {
   }
 }
 
+function toSafeNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function formatWorkersCount(value) {
+  const parsed = toSafeNumber(value, 0);
+  return String(Math.max(0, Math.round(parsed)));
+}
+
+function setWorkersModalOpen(isOpen) {
+  if (!workersModalEl) return;
+  workersModalEl.hidden = !isOpen;
+  workersModalEl.dataset.open = isOpen ? 'true' : 'false';
+  workersModalEl.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
+}
+
+function clearWorkersModalStatus() {
+  if (!workersModalStatusEl) return;
+  workersModalStatusEl.textContent = '';
+  workersModalStatusEl.hidden = true;
+  workersModalStatusEl.classList.remove('error');
+}
+
+function showWorkersModalStatus(message, isError = false) {
+  if (!workersModalStatusEl) return;
+  workersModalStatusEl.textContent = message;
+  workersModalStatusEl.hidden = !message;
+  workersModalStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function setWorkersInlineStatus(message, isDegraded = false) {
+  if (!workersInlineStatusEl) return;
+  const text = (message || '').trim();
+  workersInlineStatusEl.textContent = text;
+  workersInlineStatusEl.hidden = !text;
+  workersInlineStatusEl.classList.toggle('error', Boolean(isDegraded));
+}
+
+function setWorkersCardDegraded(isDegraded) {
+  if (!systemStatsEl) return;
+  systemStatsEl.classList.toggle('degraded', Boolean(isDegraded));
+}
+
+function updateWorkersIndicator(summary, fallbackWorkers = null) {
+  const metrics = summary || {};
+  const targetWorkers = toSafeNumber(metrics.target_workers, fallbackWorkers ?? metrics.online_workers ?? 0);
+  if (workerCountEl) workerCountEl.textContent = formatWorkersCount(targetWorkers);
+  if (workerCapacityEl) workerCapacityEl.textContent = formatWorkersCount(metrics.max_workers_capacity);
+  if (workerOnlineEl) workerOnlineEl.textContent = formatWorkersCount(metrics.online_workers);
+  if (workerAvailableEl) workerAvailableEl.textContent = formatWorkersCount(metrics.available_workers);
+  if (workerInUseEl) workerInUseEl.textContent = formatWorkersCount(metrics.in_use_workers);
+  if (workerComingOnlineEl) workerComingOnlineEl.textContent = formatWorkersCount(metrics.coming_online_workers);
+  if (workerFailedEl) workerFailedEl.textContent = formatWorkersCount(metrics.failed_workers);
+}
+
+function renderWorkersLegend() {
+  if (!workersTimelineLegendEl) return;
+  workersTimelineLegendEl.innerHTML = [
+    '<span style="border-color:#2563eb;color:#2563eb">Capacity</span>',
+    '<span style="border-color:#16a34a;color:#16a34a">Online</span>',
+    '<span style="border-color:#ea580c;color:#ea580c">In-use</span>',
+    '<span style="border-color:#ca8a04;color:#ca8a04">Coming online</span>',
+    '<span style="border-color:#dc2626;color:#dc2626">Failed</span>',
+  ].join('');
+}
+
+function renderWorkersTimeline(history) {
+  if (!workersTimelineChartEl) return;
+  if (!Array.isArray(history) || !history.length) {
+    workersTimelineChartEl.innerHTML = '';
+    return;
+  }
+  const width = 760;
+  const height = 260;
+  const padLeft = 44;
+  const padRight = 12;
+  const padTop = 14;
+  const padBottom = 24;
+  const usableWidth = width - padLeft - padRight;
+  const usableHeight = height - padTop - padBottom;
+  const metricsRows = history.map((entry) => entry?.workers || {});
+  const lines = [
+    { key: 'max_workers_capacity', color: '#2563eb' },
+    { key: 'online_workers', color: '#16a34a' },
+    { key: 'in_use_workers', color: '#ea580c' },
+    { key: 'coming_online_workers', color: '#ca8a04' },
+    { key: 'failed_workers', color: '#dc2626' },
+  ];
+  const maxY = Math.max(
+    1,
+    ...metricsRows.flatMap((row) => lines.map((line) => toSafeNumber(row?.[line.key], 0))),
+  );
+  const xFor = (index) => padLeft + ((metricsRows.length <= 1 ? 0 : index / (metricsRows.length - 1)) * usableWidth);
+  const yFor = (value) => padTop + ((maxY - toSafeNumber(value, 0)) / maxY) * usableHeight;
+
+  const gridLines = [];
+  for (let i = 0; i <= 4; i += 1) {
+    const y = padTop + (i / 4) * usableHeight;
+    const value = Math.round(maxY - (i / 4) * maxY);
+    gridLines.push(`<line x1="${padLeft}" y1="${y}" x2="${width - padRight}" y2="${y}" stroke="rgba(148,163,184,0.25)" stroke-width="1"></line>`);
+    gridLines.push(`<text x="4" y="${y + 4}" fill="rgba(148,163,184,0.9)" font-size="10">${value}</text>`);
+  }
+
+  const lineSvg = lines
+    .map((line) => {
+      const points = metricsRows
+        .map((row, idx) => `${xFor(idx)},${yFor(row?.[line.key])}`)
+        .join(' ');
+      return `<polyline fill="none" stroke="${line.color}" stroke-width="2.2" points="${points}"></polyline>`;
+    })
+    .join('');
+
+  const startTs = history[0]?.captured_at || '--';
+  const endTs = history[history.length - 1]?.captured_at || '--';
+  workersTimelineChartEl.innerHTML = `
+    <rect x="0" y="0" width="${width}" height="${height}" fill="rgba(15,23,42,0.45)" rx="10"></rect>
+    ${gridLines.join('')}
+    ${lineSvg}
+    <text x="${padLeft}" y="${height - 6}" fill="rgba(148,163,184,0.9)" font-size="10">${escapeHtml(startTs)}</text>
+    <text x="${width - padRight - 6}" y="${height - 6}" text-anchor="end" fill="rgba(148,163,184,0.9)" font-size="10">${escapeHtml(endTs)}</text>
+  `;
+}
+
+function renderWorkersModal(payload) {
+  const summary = payload?.summary || payload?.autoscaler?.workers || {};
+  const autoscaler = payload?.autoscaler || {};
+  const cluster = payload?.continuum_cluster || {};
+  const statusText = summary.status || autoscaler.remote?.status || '--';
+  const decisionText = autoscaler.last_decision || '--';
+  const utilPct = toSafeNumber(summary.utilization_pct, 0).toFixed(1);
+  const pressurePct = toSafeNumber(summary.queue_pressure_pct, 0).toFixed(1);
+  if (workersModalSubtitleEl) {
+    workersModalSubtitleEl.textContent = `Status: ${statusText} • Decision: ${decisionText} • Utilisation: ${utilPct}% • Queue pressure: ${pressurePct}%`;
+  }
+  if (workersModalStatsEl) {
+    const clusterInfo = cluster && !cluster.error
+      ? `${escapeHtml(cluster.name || '--')} (${formatWorkersCount(cluster.ready_nodes)}/${formatWorkersCount(cluster.total_nodes)} nodes ready)`
+      : 'Unavailable';
+    workersModalStatsEl.innerHTML = `
+      <div class="input-static"><span>Max capacity</span><strong>${formatWorkersCount(summary.max_workers_capacity)}</strong></div>
+      <div class="input-static"><span>Target workers</span><strong>${formatWorkersCount(summary.target_workers)}</strong></div>
+      <div class="input-static"><span>Online workers</span><strong>${formatWorkersCount(summary.online_workers)}</strong></div>
+      <div class="input-static"><span>Available workers</span><strong>${formatWorkersCount(summary.available_workers)}</strong></div>
+      <div class="input-static"><span>In-use workers</span><strong>${formatWorkersCount(summary.in_use_workers)}</strong></div>
+      <div class="input-static"><span>Coming online</span><strong>${formatWorkersCount(summary.coming_online_workers)}</strong></div>
+      <div class="input-static"><span>Failed workers</span><strong>${formatWorkersCount(summary.failed_workers)}</strong></div>
+      <div class="input-static"><span>Queue depth</span><strong>${formatWorkersCount(summary.queue_depth)}</strong></div>
+      <div class="input-static"><span>Continuum cluster</span><strong>${clusterInfo}</strong></div>
+    `;
+  }
+  renderWorkersLegend();
+  renderWorkersTimeline(payload?.history || []);
+  const warnings = Array.isArray(payload?.warnings) ? payload.warnings.filter(Boolean) : [];
+  const message = String(payload?.message || warnings[0] || '').trim();
+  if (message) {
+    showWorkersModalStatus(message, Boolean(payload?.degraded));
+  } else {
+    clearWorkersModalStatus();
+  }
+}
+
+async function loadWorkersTelemetry({ refresh = false, includeCluster = false, limit = 180, silent = true } = {}) {
+  const params = new URLSearchParams();
+  params.set('limit', String(limit));
+  if (refresh) params.set('refresh', '1');
+  if (includeCluster) params.set('include_cluster', '1');
+  try {
+    const res = await apiFetch(`/api/workers/telemetry?${params.toString()}`);
+    if (!res.ok) {
+      if (!silent) showWorkersModalStatus('Unable to load workers telemetry.', true);
+      return null;
+    }
+    const payload = await res.json();
+    workersTelemetrySnapshot = payload;
+    updateWorkersIndicator(payload?.summary || payload?.autoscaler?.workers || {}, payload?.summary?.target_workers);
+    const warnings = Array.isArray(payload?.warnings) ? payload.warnings.filter(Boolean) : [];
+    const inlineMessage = String(payload?.message || warnings[0] || '').trim();
+    setWorkersInlineStatus(inlineMessage, Boolean(payload?.degraded));
+    setWorkersCardDegraded(Boolean(payload?.degraded));
+    if (!workersModalEl?.hidden) {
+      renderWorkersModal(payload);
+    }
+    return payload;
+  } catch (err) {
+    if (!silent) showWorkersModalStatus('Workers telemetry request failed.', true);
+    setWorkersInlineStatus('Workers telemetry is temporarily unavailable.', true);
+    setWorkersCardDegraded(true);
+    return null;
+  }
+}
+
+function openWorkersModal() {
+  if (!workersModalEl) return;
+  setWorkersModalOpen(true);
+  clearWorkersModalStatus();
+  if (workersTelemetrySnapshot) {
+    renderWorkersModal(workersTelemetrySnapshot);
+  }
+  void loadWorkersTelemetry({ refresh: true, includeCluster: true, limit: 240, silent: false });
+}
+
+function closeWorkersModal() {
+  setWorkersModalOpen(false);
+  clearWorkersModalStatus();
+}
+
 async function fetchHealth() {
-  const res = await apiFetch('/api/health');
-  const data = await res.json();
-  workerCountEl.textContent = data.workers;
+  try {
+    const res = await apiFetch('/api/health');
+    const data = await res.json();
+    const summary = data?.workers_summary || data?.continuum_autoscaler?.workers || {};
+    updateWorkersIndicator(summary, data.workers);
+    const continuum = data?.continuum_autoscaler?.continuum || {};
+    const inlineMessage = String(continuum?.message || '').trim();
+    setWorkersInlineStatus(inlineMessage, Boolean(continuum?.degraded));
+    setWorkersCardDegraded(Boolean(continuum?.degraded));
+  } catch (err) {
+    setWorkersInlineStatus('Health check failed. Showing last known worker values.', true);
+    setWorkersCardDegraded(true);
+  }
 }
 
 function renderCapabilityItems(container, items, emptyText) {
@@ -4843,6 +5078,25 @@ if (transferModalConfirmBtn) {
     }
   });
 }
+if (workersDetailOpenBtn) {
+  workersDetailOpenBtn.addEventListener('click', openWorkersModal);
+}
+if (workersModalCloseBtn) {
+  workersModalCloseBtn.addEventListener('click', closeWorkersModal);
+}
+if (workersModalRefreshBtn) {
+  workersModalRefreshBtn.addEventListener('click', () => {
+    showWorkersModalStatus('Refreshing telemetry from Continuum...');
+    void loadWorkersTelemetry({ refresh: true, includeCluster: true, limit: 240, silent: false });
+  });
+}
+if (workersModalEl) {
+  workersModalEl.addEventListener('click', (event) => {
+    if (event.target === workersModalEl) {
+      closeWorkersModal();
+    }
+  });
+}
 
 initFilters();
 initScopeFilters();
@@ -4865,6 +5119,11 @@ fetchCapabilities();
 fetchTokens();
 setInterval(fetchHealth, 15000);
 setInterval(fetchTokens, 12000);
+setInterval(() => {
+  if (workersModalEl && !workersModalEl.hidden) {
+    void loadWorkersTelemetry({ refresh: false, includeCluster: false, limit: 240, silent: true });
+  }
+}, 15000);
 
 tabButtons.forEach((btn) => {
   btn.addEventListener('click', () => setActiveTab(btn.dataset.tab));

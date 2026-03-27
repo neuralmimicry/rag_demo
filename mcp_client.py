@@ -1,3 +1,13 @@
+"""Minimal JSON-RPC MCP client and per-user server registry.
+
+This module provides:
+- ``MCPClient`` for runtime tool/resource RPC calls, and
+- ``MCPServerStore`` for storing server connection metadata per owner.
+
+It is intentionally small so the web API can layer access control/auditing on
+top without coupling to a large SDK.
+"""
+
 from __future__ import annotations
 
 import json
@@ -12,6 +22,8 @@ import requests
 
 @dataclass
 class MCPServerConfig:
+    """Connection settings for a single MCP server."""
+
     name: str
     base_url: str
     auth_type: str = "bearer"
@@ -20,6 +32,7 @@ class MCPServerConfig:
     timeout: int = 20
 
     def masked(self) -> Dict[str, Any]:
+        """Return a safe representation with secrets hidden."""
         return {
             "name": self.name,
             "base_url": self.base_url,
@@ -31,11 +44,15 @@ class MCPServerConfig:
 
 
 class MCPClient:
+    """Thin JSON-RPC 2.0 client for MCP servers."""
+
     def __init__(self, config: MCPServerConfig):
+        """Initialize a persistent HTTP session for repeated RPC calls."""
         self.config = config
         self._session = requests.Session()
 
     def _headers(self) -> Dict[str, str]:
+        """Build request headers including optional auth metadata."""
         headers = {"Content-Type": "application/json"}
         if self.config.headers:
             headers.update(self.config.headers)
@@ -47,6 +64,7 @@ class MCPClient:
         return headers
 
     def _rpc(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Execute one JSON-RPC request and normalize error handling."""
         payload = {
             "jsonrpc": "2.0",
             "id": uuid.uuid4().hex,
@@ -67,31 +85,41 @@ class MCPClient:
         return data
 
     def initialize(self, client_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Call ``initialize`` on the MCP server."""
         return self._rpc("initialize", {"client": client_info or {}})
 
     def list_tools(self) -> Dict[str, Any]:
+        """List tools exposed by the server."""
         return self._rpc("tools/list")
 
     def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Invoke one server tool by name."""
         return self._rpc("tools/call", {"name": name, "arguments": arguments or {}})
 
     def list_resources(self) -> Dict[str, Any]:
+        """List readable resources exposed by the server."""
         return self._rpc("resources/list")
 
     def read_resource(self, uri: str) -> Dict[str, Any]:
+        """Read one resource URI from the server."""
         return self._rpc("resources/read", {"uri": uri})
 
 
 class MCPServerStore:
+    """JSON-file store for per-owner MCP server configs."""
+
     def __init__(self, root: str):
+        """Create/ensure the registry root directory."""
         self.root = root
         os.makedirs(self.root, exist_ok=True)
 
     def _path_for(self, owner: str) -> str:
+        """Return the safe JSON path for an owner's server registry."""
         safe_owner = re.sub(r"[^A-Za-z0-9_.-]+", "_", owner or "default")
         return os.path.join(self.root, f"{safe_owner}.json")
 
     def list_servers(self, owner: str) -> List[MCPServerConfig]:
+        """Load all server configs for an owner."""
         path = self._path_for(owner)
         if not os.path.exists(path):
             return []
@@ -120,6 +148,7 @@ class MCPServerStore:
         return results
 
     def save_server(self, owner: str, config: MCPServerConfig) -> None:
+        """Upsert one server config for an owner."""
         servers = self.list_servers(owner)
         servers = [s for s in servers if s.name != config.name]
         servers.append(config)
@@ -129,6 +158,7 @@ class MCPServerStore:
             json.dump(payload, handle)
 
     def delete_server(self, owner: str, name: str) -> bool:
+        """Delete a named server; return ``False`` when not found."""
         servers = self.list_servers(owner)
         next_servers = [s for s in servers if s.name != name]
         if len(next_servers) == len(servers):
@@ -140,6 +170,7 @@ class MCPServerStore:
         return True
 
     def get_server(self, owner: str, name: str) -> Optional[MCPServerConfig]:
+        """Fetch one named server config."""
         for server in self.list_servers(owner):
             if server.name == name:
                 return server

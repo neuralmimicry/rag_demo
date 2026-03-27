@@ -13,6 +13,7 @@ Key aspects:
 - Refinement principle: every run should improve the solution in a measurable, qualitative, and quantifiable way, with attention to efficiency and performance where applicable. This principle is core to the Refiner name.
 - Reuse & traceability: generated/updated modules are intended to be modular, tracked against requirement IDs, and paired with tests/examples to aid cross-project reuse.
 - Privacy for reuse: reusable modules must be scrubbed of user/company-identifying information to prevent cross-project leakage.
+- Codebase intent/workflow reference: see [CODEBASE_INTENT_AND_WORKFLOW.md](CODEBASE_INTENT_AND_WORKFLOW.md).
 
 
 ## Quickstart

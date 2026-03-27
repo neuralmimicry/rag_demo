@@ -1,3 +1,14 @@
+"""Small, dependency-free RAG primitives for local document retrieval.
+
+The implementation uses:
+- character-window chunking with overlap,
+- lightweight tokenization, and
+- BM25-style ranking over in-memory chunks.
+
+Indexes are persisted as JSON so they can be managed per user/workspace by the
+web API without requiring an external vector database.
+"""
+
 from __future__ import annotations
 
 import json
@@ -13,6 +24,7 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-/]{2,}")
 
 
 def _tokenize(text: str) -> List[str]:
+    """Tokenize text into normalized search terms and split sub-terms."""
     if not text:
         return []
     tokens = []
@@ -28,6 +40,7 @@ def _tokenize(text: str) -> List[str]:
 
 
 def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
+    """Split text into overlapping chunks suitable for retrieval indexing."""
     if not text:
         return []
     cleaned = text.strip()
@@ -52,6 +65,8 @@ def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[st
 
 @dataclass
 class RagDocument:
+    """Input document to be indexed for retrieval."""
+
     doc_id: str
     source: str
     text: str
@@ -60,6 +75,8 @@ class RagDocument:
 
 @dataclass
 class RagChunk:
+    """Indexed chunk with token stats used for ranking."""
+
     chunk_id: str
     doc_id: str
     source: str
@@ -71,6 +88,8 @@ class RagChunk:
 
 @dataclass
 class RagMatch:
+    """Search result emitted by :meth:`RagIndex.search`."""
+
     chunk_id: str
     source: str
     score: float
@@ -79,6 +98,8 @@ class RagMatch:
 
 
 class RagIndex:
+    """In-memory BM25-like index built from :class:`RagDocument` entries."""
+
     def __init__(self, name: str, chunks: List[RagChunk], idf: Dict[str, float], avg_len: float):
         self.name = name
         self.chunks = chunks
@@ -95,6 +116,7 @@ class RagIndex:
         chunk_overlap: int = 200,
         max_chunks: Optional[int] = None,
     ) -> "RagIndex":
+        """Create an index from documents with optional chunk limits."""
         chunks: List[RagChunk] = []
         for doc in documents:
             for idx, chunk_text_item in enumerate(chunk_text(doc.text, chunk_size, chunk_overlap), start=1):
@@ -132,6 +154,7 @@ class RagIndex:
         return cls(name=name, chunks=chunks, idf=idf, avg_len=avg_len)
 
     def search(self, query: str, limit: int = 5, min_score: float = 0.0) -> List[RagMatch]:
+        """Return the top-N BM25-ranked matches for the query."""
         tokens = _tokenize(query)
         if not tokens or not self.chunks:
             return []
@@ -162,6 +185,7 @@ class RagIndex:
         return results[:limit]
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialize index contents for JSON persistence."""
         return {
             "name": self.name,
             "avg_len": self.avg_len,
@@ -182,6 +206,7 @@ class RagIndex:
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "RagIndex":
+        """Restore an index from :meth:`to_dict` output."""
         name = payload.get("name") or "rag"
         idf = payload.get("idf") or {}
         avg_len = float(payload.get("avg_len") or 1.0)
@@ -204,16 +229,21 @@ class RagIndex:
 
 
 class RagStore:
+    """Filesystem-backed storage for per-owner RAG indexes."""
+
     def __init__(self, root: str):
+        """Initialize the index store root directory."""
         self.root = root
         os.makedirs(self.root, exist_ok=True)
 
     def _index_path(self, owner: str, name: str) -> str:
+        """Build a safe path for an owner's named index file."""
         safe_owner = re.sub(r"[^A-Za-z0-9_.-]+", "_", owner or "default")
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name or "index")
         return os.path.join(self.root, safe_owner, f"{safe_name}.json")
 
     def list_indexes(self, owner: str) -> List[Dict[str, Any]]:
+        """List persisted index names and chunk counts for one owner."""
         safe_owner = re.sub(r"[^A-Za-z0-9_.-]+", "_", owner or "default")
         owner_dir = os.path.join(self.root, safe_owner)
         if not os.path.isdir(owner_dir):
@@ -237,6 +267,7 @@ class RagStore:
         return sorted(results, key=lambda item: item.get("name") or "")
 
     def save_index(self, owner: str, index: RagIndex) -> str:
+        """Persist an index and return the file path used."""
         path = self._index_path(owner, index.name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
@@ -244,6 +275,7 @@ class RagStore:
         return path
 
     def load_index(self, owner: str, name: str) -> Optional[RagIndex]:
+        """Load an index or return ``None`` when missing/corrupt."""
         path = self._index_path(owner, name)
         if not os.path.exists(path):
             return None
@@ -255,6 +287,7 @@ class RagStore:
             return None
 
     def delete_index(self, owner: str, name: str) -> bool:
+        """Delete a persisted index, returning success state."""
         path = self._index_path(owner, name)
         if not os.path.exists(path):
             return False

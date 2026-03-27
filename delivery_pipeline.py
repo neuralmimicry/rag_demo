@@ -1578,6 +1578,8 @@ def run_delivery_pipeline(
         stage_start = time.time()
         stage_retry_attempts: Optional[int] = None
         stage_auto_recover: Optional[bool] = None
+        remediation_results: List[Dict[str, Any]] = []
+        security_issue_path: Optional[str] = None
         approval_present, approval_path = _approval_status(
             stage,
             approvals_cfg,
@@ -1659,8 +1661,6 @@ def run_delivery_pipeline(
             solver_attempts_used = 0
             security_stage = _is_security_stage(stage)
             security_failed = False
-            remediation_results: List[Dict[str, Any]] = []
-            security_issue_path: Optional[str] = None
 
             if allow_run:
                 env = os.environ.copy()
