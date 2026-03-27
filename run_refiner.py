@@ -51,7 +51,10 @@ logger = logging.getLogger(__name__)
 
 
 class EventEmitter:
+    """Emit structured workflow events to stdout and/or JSONL file."""
+
     def __init__(self, enabled: bool = False, stream=None, file_path: Optional[str] = None):
+        """Initialize optional stream/file event sinks."""
         self.enabled = bool(enabled)
         self.stream = stream or sys.stdout
         self.file_handle = None
@@ -62,6 +65,7 @@ class EventEmitter:
                 logger.warning("Failed to open events file %s: %s", file_path, exc)
 
     def emit(self, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        """Write one event record to enabled sinks."""
         if not (self.enabled or self.file_handle):
             return
         record = {"type": event_type, "ts": time.time()}
@@ -81,6 +85,7 @@ class EventEmitter:
                 pass
 
     def close(self) -> None:
+        """Close file sink when configured."""
         if self.file_handle:
             try:
                 self.file_handle.close()
@@ -97,6 +102,7 @@ def _emit_stage(
     progress: Optional[int] = None,
     message: Optional[str] = None,
 ) -> None:
+    """Emit a normalized stage-progress event."""
     if not emitter:
         return
     payload: Dict[str, Any] = {"workflow": workflow, "stage": stage, "status": status}
@@ -108,6 +114,7 @@ def _emit_stage(
 
 
 def _parse_agent_role_overrides(raw_items: Optional[List[str]]) -> Dict[str, Dict[str, str]]:
+    """Parse ``--agent-role`` overrides into ``role -> provider/model`` mapping."""
     roles: Dict[str, Dict[str, str]] = {}
     for item in raw_items or []:
         if not item or "=" not in item:
@@ -130,6 +137,7 @@ def _parse_agent_role_overrides(raw_items: Optional[List[str]]) -> Dict[str, Dic
 
 
 def _normalize_agentic_roles(raw_roles: object) -> Dict[str, Dict[str, object]]:
+    """Normalize role config values from dict/list formats to one mapping."""
     roles: Dict[str, Dict[str, object]] = {}
     if isinstance(raw_roles, dict):
         items = raw_roles.items()
@@ -158,6 +166,7 @@ def _resolve_agentic_roles(
     overrides: Optional[Dict[str, Dict[str, object]]],
     get_llm_credentials,
 ) -> Dict[str, Dict[str, object]]:
+    """Resolve role configs to concrete provider/model/api-key settings."""
     llm_configs = cfg.get("llm_providers", []) or []
     roles = _normalize_agentic_roles(cfg.get("agentic_roles"))
     for role, override in (overrides or {}).items():
@@ -200,6 +209,7 @@ def _resolve_agentic_roles(
 
 
 def _run_jira_workflow() -> int:
+    """Run the default Jira statistics workflow."""
     # Defer import to keep import side-effects minimal for unit tests
     from main import main as jira_main
     jira_main()
@@ -234,6 +244,7 @@ def _run_confluence_analysis(
     dry_run_post: bool = False,
     llm_inter_request_gap: float = 3.0,
 ) -> int:
+    """Execute Confluence analysis mode from parsed CLI options."""
     from main import load_config, get_credentials, get_llm_credentials
     from confluence_analysis import analyze_space_and_write_report
 
@@ -327,6 +338,7 @@ def _run_jira_analysis(
     dry_run_post: bool = False,
     llm_inter_request_gap: float = 3.0,
 ) -> int:
+    """Execute Jira quality analysis mode from parsed CLI options."""
     from main import load_config, get_credentials, get_llm_credentials
     from jira_analysis import analyze_jira_and_write_report
 
@@ -414,6 +426,7 @@ def _run_topic_research(
     disable_confluence: bool = False,
     agentic_role_overrides: Optional[Dict[str, Dict[str, object]]] = None,
 ) -> int:
+    """Execute topic research mode and optionally emit reference bibliography."""
     from main import load_config, get_credentials, get_llm_credentials
     from topic_researcher import TopicResearcher
 
@@ -509,6 +522,7 @@ def _run_project_solver(
     codingagent_reasoning_effort: Optional[str] = None,
     agentic_role_overrides: Optional[Dict[str, Dict[str, object]]] = None,
 ) -> int:
+    """Execute project solver mode and print completion diagnostics."""
     from credentials import get_llm_credentials
     from project_solver import run_project_solver
 
@@ -679,6 +693,7 @@ def _run_delivery_pipeline(
     project_output_dir: Optional[str],
     solver_fallback_override: Optional[bool],
 ) -> int:
+    """Execute delivery pipeline mode with optional solver fallback controls."""
     from delivery_pipeline import run_delivery_pipeline
     from credentials import get_llm_credentials
 
@@ -729,6 +744,7 @@ def _run_delivery_pipeline(
 
 
 def run(argv: Optional[List[str]] = None) -> int:
+    """Parse CLI args, select a workflow, and execute with event telemetry."""
     parser = argparse.ArgumentParser(description="Refiner reporter, Jira quality analyser, and Confluence space analyser")
     parser.add_argument("--analyze-confluence", action="store_true", help="Run Confluence space quality analysis instead of Jira statistics")
     parser.add_argument("--analyze-jira", action="store_true", help="Run Jira project/issue quality analysis (interactive HTML + optional LLM)")

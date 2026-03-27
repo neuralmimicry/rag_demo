@@ -1,3 +1,13 @@
+"""Capability inventory and skill-selection helpers for Refiner.
+
+The module combines:
+- static workflow metadata,
+- optional repository capability analysis, and
+- local/external skills catalog loading with lightweight filtering.
+
+It powers `/api/capabilities` responses and skill recommendation UX.
+"""
+
 from __future__ import annotations
 
 import json
@@ -150,10 +160,12 @@ _SKILLS_SYNC_LOCK = threading.Lock()
 
 
 def _split_csv(value: str) -> List[str]:
+    """Split comma-separated config/env values into normalized tokens."""
     return [item.strip() for item in value.split(",") if item and item.strip()]
 
 
 def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean environment variable with robust truthy parsing."""
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -161,6 +173,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _env_int(name: str, default: int) -> int:
+    """Read an integer environment variable with fallback default."""
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -171,6 +184,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _load_skills_config() -> Dict[str, Any]:
+    """Load ``skills_catalog`` settings from Refiner config when present."""
     cfg_path = os.getenv("REFINER_CONFIG_PATH") or os.getenv("SOLVER_CONFIG_PATH") or "config.json"
     if not os.path.isabs(cfg_path):
         cfg_path = os.path.join(_REPO_ROOT, cfg_path)
@@ -187,6 +201,7 @@ def _load_skills_config() -> Dict[str, Any]:
 
 
 def _resolve_candidate_roots() -> List[str]:
+    """Return likely local skill directories to probe for index files."""
     home = os.path.expanduser("~")
     return [
         os.path.join(_REPO_ROOT, ".agent", "skills"),
@@ -207,6 +222,7 @@ def _resolve_candidate_roots() -> List[str]:
 
 
 def _normalize_index_path(candidate: str) -> Optional[str]:
+    """Normalize an index path candidate and return existing path if valid."""
     if not candidate:
         return None
     candidate = candidate.strip()
@@ -220,6 +236,7 @@ def _normalize_index_path(candidate: str) -> Optional[str]:
 
 
 def _resolve_skill_index_path(cfg: Dict[str, Any]) -> Optional[str]:
+    """Resolve skills index path from env/config/default candidate paths."""
     for env_name in _SKILL_INDEX_ENV_VARS:
         env_value = os.getenv(env_name)
         if env_value:
@@ -243,6 +260,7 @@ def _resolve_skill_index_path(cfg: Dict[str, Any]) -> Optional[str]:
 
 
 def _resolve_sync_path(cfg: Dict[str, Any]) -> str:
+    """Resolve where external skill repositories should be synced locally."""
     env_path = os.getenv("REFINER_SKILLS_SYNC_PATH")
     if env_path:
         return env_path
@@ -264,10 +282,12 @@ def _resolve_sync_path(cfg: Dict[str, Any]) -> str:
 
 
 def _sync_state_path(repo_path: str) -> str:
+    """Return path to the local sync state file."""
     return os.path.join(repo_path, ".skills_sync.json")
 
 
 def _load_sync_state(repo_path: str) -> Dict[str, Any]:
+    """Load last sync metadata for the external skills repo."""
     path = _sync_state_path(repo_path)
     if not os.path.isfile(path):
         return {}
@@ -280,6 +300,7 @@ def _load_sync_state(repo_path: str) -> Dict[str, Any]:
 
 
 def _write_sync_state(repo_path: str, payload: Dict[str, Any]) -> None:
+    """Persist sync metadata for external skills repo operations."""
     path = _sync_state_path(repo_path)
     try:
         with open(path, "w", encoding="utf-8") as handle:
@@ -289,10 +310,12 @@ def _write_sync_state(repo_path: str, payload: Dict[str, Any]) -> None:
 
 
 def _git_available() -> bool:
+    """Return whether ``git`` is available on PATH."""
     return shutil.which("git") is not None
 
 
 def _git_cmd(args: List[str], cwd: Optional[str] = None, timeout: int = 30) -> Tuple[bool, str]:
+    """Run a git command and return ``(ok, combined_output)``."""
     try:
         proc = subprocess.run(
             args,
@@ -309,6 +332,7 @@ def _git_cmd(args: List[str], cwd: Optional[str] = None, timeout: int = 30) -> T
 
 
 def _sync_repo(cfg: Dict[str, Any]) -> None:
+    """Best-effort clone/fetch of external skills catalog repository."""
     auto_sync = _env_bool("REFINER_SKILLS_AUTO_SYNC", bool(cfg.get("auto_sync", True)))
     if not auto_sync:
         return
@@ -376,6 +400,7 @@ def _sync_repo(cfg: Dict[str, Any]) -> None:
 
 
 def _normalize_external_skill(entry: Dict[str, Any], summary_max_chars: int) -> Optional[Dict[str, Any]]:
+    """Normalize one external skill record into Refiner's runtime schema."""
     if not isinstance(entry, dict):
         return None
     skill_id = str(entry.get("id") or "").strip()
@@ -403,6 +428,7 @@ def _normalize_external_skill(entry: Dict[str, Any], summary_max_chars: int) -> 
 
 
 def _load_external_skills(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """Load and sanitize external skills from index JSON (if configured)."""
     cfg = _load_skills_config()
     _sync_repo(cfg)
     index_path = _resolve_skill_index_path(cfg)
@@ -489,6 +515,7 @@ def _load_external_skills(force_refresh: bool = False) -> List[Dict[str, Any]]:
 
 
 def _get_skills(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """Return merged built-in and external skills without duplicates."""
     skills = list(_SKILLS)
     external = _load_external_skills(force_refresh=force_refresh)
     seen = {skill.get("id") for skill in skills if skill.get("id")}
@@ -504,6 +531,7 @@ def _get_skills(force_refresh: bool = False) -> List[Dict[str, Any]]:
 
 
 def _load_analysis(force_refresh: bool = False) -> Dict[str, Any]:
+    """Run or reuse repository capability analysis output."""
     global _CAPABILITY_CACHE
     if not force_refresh and _CAPABILITY_CACHE.get("report"):
         return _CAPABILITY_CACHE["report"]
@@ -516,6 +544,7 @@ def _load_analysis(force_refresh: bool = False) -> Dict[str, Any]:
 
 
 def _tokenize(text: str) -> List[str]:
+    """Tokenize free-form text for lightweight skill matching."""
     tokens = []
     for match in _TOKEN_RE.findall(text or ""):
         token = match.lower().strip()
@@ -529,6 +558,7 @@ def _tokenize(text: str) -> List[str]:
 
 
 def get_capabilities(force_refresh: bool = False) -> Dict[str, Any]:
+    """Build the complete capability payload exposed by the API."""
     analysis = _load_analysis(force_refresh=force_refresh)
     skills = _get_skills(force_refresh=force_refresh)
     external_count = len([s for s in skills if s.get("external")])
@@ -559,10 +589,12 @@ def get_capabilities(force_refresh: bool = False) -> Dict[str, Any]:
 
 
 def get_skills(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """Public accessor for merged skills catalog."""
     return _get_skills(force_refresh=force_refresh)
 
 
 def capability_summary(max_items: int = 6) -> str:
+    """Render a concise human-readable capability summary."""
     capabilities = get_capabilities()
     workflows = capabilities.get("workflows") or []
     workflow_names = ", ".join([item.get("name", "") for item in workflows if item.get("name")])
@@ -588,6 +620,7 @@ def capability_summary(max_items: int = 6) -> str:
 
 
 def select_skills(query: str, limit: int = 4) -> List[Dict[str, Any]]:
+    """Return top skills relevant to a query using token overlap scoring."""
     query_tokens = set(_tokenize(query))
     if not query_tokens:
         return []
@@ -606,6 +639,7 @@ def select_skills(query: str, limit: int = 4) -> List[Dict[str, Any]]:
 
 
 def format_skill_brief(skills: List[Dict[str, Any]]) -> str:
+    """Format selected skills into a compact bullet list string."""
     if not skills:
         return ""
     lines = []

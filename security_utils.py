@@ -1,3 +1,14 @@
+"""Security and audit helpers used across Refiner services.
+
+This module centralizes:
+- log redaction of common secret formats,
+- URL safety policy checks (allowlist/blocklist/private-host guards), and
+- lightweight append-only audit logging.
+
+The helpers are intentionally dependency-light so they can be reused by both
+CLI and web entry points.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -36,10 +47,12 @@ _DEFAULT_SECRET_PATTERNS = [
 
 
 def _split_csv(value: str) -> List[str]:
+    """Split a comma-separated env value into normalized non-empty entries."""
     return [item.strip() for item in value.split(",") if item and item.strip()]
 
 
 def _redaction_patterns() -> List[re.Pattern]:
+    """Compile redaction patterns from env overrides or secure defaults."""
     patterns: List[str] = []
     env_keys = _split_csv(os.getenv("REFINER_REDACT_KEYS", ""))
     env_patterns = _split_csv(os.getenv("REFINER_REDACT_PATTERNS", ""))
@@ -63,6 +76,7 @@ _REDACT_PATTERNS = _redaction_patterns()
 
 
 def redact_text(text: str) -> str:
+    """Redact likely secret values from a free-form text string."""
     if not text:
         return text
     redacted = text
@@ -72,7 +86,10 @@ def redact_text(text: str) -> str:
 
 
 class RedactionFilter(logging.Filter):
+    """Logging filter that redacts secrets in message templates and arguments."""
+
     def filter(self, record: logging.LogRecord) -> bool:
+        """Apply in-place redaction and keep the record."""
         try:
             if isinstance(record.msg, str):
                 record.msg = redact_text(record.msg)
@@ -90,12 +107,14 @@ class RedactionFilter(logging.Filter):
 
 
 def attach_redaction_filter(logger_obj: Optional[logging.Logger] = None) -> None:
+    """Attach :class:`RedactionFilter` to each handler on the target logger."""
     target = logger_obj or logging.getLogger()
     for handler in target.handlers:
         handler.addFilter(RedactionFilter())
 
 
 def ensure_file_permissions(path: str, mode: int = 0o600) -> None:
+    """Best-effort chmod for sensitive files."""
     try:
         os.chmod(path, mode)
     except Exception:
@@ -103,6 +122,7 @@ def ensure_file_permissions(path: str, mode: int = 0o600) -> None:
 
 
 def ensure_dir_permissions(path: str, mode: int = 0o700) -> None:
+    """Create a directory and enforce restrictive permissions."""
     try:
         os.makedirs(path, exist_ok=True)
         os.chmod(path, mode)
@@ -111,6 +131,7 @@ def ensure_dir_permissions(path: str, mode: int = 0o700) -> None:
 
 
 def is_private_host(hostname: str) -> bool:
+    """Return ``True`` when hostname resolves to local/private network ranges."""
     if not hostname:
         return True
     lowered = hostname.lower()
@@ -134,6 +155,7 @@ def is_private_host(hostname: str) -> bool:
 
 
 def url_allowed(url: str) -> bool:
+    """Validate a URL against scheme, allowlist, blocklist, and private-host policy."""
     if not url:
         return False
     parsed = urlparse(url)
@@ -160,6 +182,8 @@ def url_allowed(url: str) -> bool:
 
 @dataclass
 class AuditEvent:
+    """Structured audit record written by :class:`AuditLogger`."""
+
     action: str
     actor: Optional[str]
     status: str
@@ -167,6 +191,7 @@ class AuditEvent:
     details: Dict[str, object]
 
     def to_record(self) -> Dict[str, object]:
+        """Serialize the event into a JSON-ready dictionary."""
         return {
             "action": self.action,
             "actor": self.actor,
@@ -177,7 +202,10 @@ class AuditEvent:
 
 
 class AuditLogger:
+    """Append-only JSONL audit logger with secure file-permission defaults."""
+
     def __init__(self, path: str):
+        """Create the target file and ensure restrictive permissions."""
         self.path = path
         ensure_dir_permissions(os.path.dirname(path), mode=0o700)
         try:
@@ -189,6 +217,7 @@ class AuditLogger:
             pass
 
     def log(self, action: str, *, actor: Optional[str], status: str, details: Optional[Dict[str, object]] = None) -> None:
+        """Write one audit event; failures are non-fatal and debug logged."""
         payload = AuditEvent(
             action=action,
             actor=actor,
@@ -204,6 +233,7 @@ class AuditLogger:
 
 
 def hash_identifier(value: str) -> str:
+    """Return a stable SHA-256 hash for pseudonymous identifiers."""
     if not value:
         return ""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()

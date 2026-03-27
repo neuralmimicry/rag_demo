@@ -1,9 +1,24 @@
+"""Primary Flask web/API server for Refiner.
+
+This module hosts:
+- authentication and session management,
+- job orchestration/work queues,
+- LLM assistant endpoints,
+- voice/STT ingestion and gesture planning,
+- RAG and MCP integrations, and
+- operational features (metrics, auditing, token ledger, notifications).
+
+It is intentionally monolithic for deployment simplicity, while route groups
+are split into `refiner_routes/*` where practical.
+"""
+
 import json
 import base64
 import hashlib
 import csv
 import io
 import logging
+import math
 import os
 import posixpath
 import queue
@@ -74,6 +89,7 @@ except Exception:
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
+    """Read a boolean env var using a standard truthy value set."""
     value = os.getenv(name)
     if value is None:
         return default
@@ -81,6 +97,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def _env_first(*names: str, default: str = "") -> str:
+    """Return the first non-empty environment variable from a list."""
     for name in names:
         value = os.getenv(name)
         if value is None:
@@ -92,6 +109,7 @@ def _env_first(*names: str, default: str = "") -> str:
 
 
 def _normalize_opencode_server_url() -> Optional[str]:
+    """Normalize and validate the optional OpenCode server URL."""
     raw = os.getenv("OPENCODE_SERVER_URL")
     if not raw:
         return None
@@ -107,6 +125,7 @@ def _normalize_opencode_server_url() -> Optional[str]:
 
 
 def _opencode_available_for_playground() -> bool:
+    """Detect whether OpenCode tooling is reachable for playground features."""
     if _normalize_opencode_server_url():
         return True
     opencode_bin = os.getenv("OPENCODE_BIN", "opencode")
@@ -379,6 +398,22 @@ CONTINUUM_IDE_FILE_URL_TEMPLATE = _env_first(
     "CONTINUUM_IDE_FILE_URL_TEMPLATE",
     default="",
 )
+CONTINUUM_AUTOSCALE_ENABLED = _env_flag("CONTINUUM_AUTOSCALE_ENABLED", True)
+CONTINUUM_AUTOSCALE_POLL_SEC = max(1.0, float(os.getenv("CONTINUUM_AUTOSCALE_POLL_SEC", "8")))
+CONTINUUM_AUTOSCALE_MIN_REPLICAS = max(0, int(os.getenv("CONTINUUM_AUTOSCALE_MIN_REPLICAS", "1")))
+CONTINUUM_AUTOSCALE_MAX_REPLICAS = max(
+    CONTINUUM_AUTOSCALE_MIN_REPLICAS,
+    int(os.getenv("CONTINUUM_AUTOSCALE_MAX_REPLICAS", "8")),
+)
+CONTINUUM_AUTOSCALE_BACKLOG_PER_REPLICA = max(1, int(os.getenv("CONTINUUM_AUTOSCALE_BACKLOG_PER_REPLICA", "1")))
+CONTINUUM_AUTOSCALE_SCALE_UP_STEP = max(1, int(os.getenv("CONTINUUM_AUTOSCALE_SCALE_UP_STEP", "1")))
+CONTINUUM_AUTOSCALE_SCALE_DOWN_STEP = max(1, int(os.getenv("CONTINUUM_AUTOSCALE_SCALE_DOWN_STEP", "1")))
+CONTINUUM_AUTOSCALE_IDLE_SEC = max(0.0, float(os.getenv("CONTINUUM_AUTOSCALE_IDLE_SEC", "180")))
+CONTINUUM_AUTOSCALE_COOLDOWN_SEC = max(0.0, float(os.getenv("CONTINUUM_AUTOSCALE_COOLDOWN_SEC", "45")))
+CONTINUUM_AUTOSCALE_TIMEOUT_SEC = max(1.0, float(os.getenv("CONTINUUM_AUTOSCALE_TIMEOUT_SEC", "10")))
+CONTINUUM_AUTOSCALE_NAMESPACE = (os.getenv("CONTINUUM_AUTOSCALE_NAMESPACE") or "refiner").strip() or "refiner"
+CONTINUUM_AUTOSCALE_DEPLOYMENT = (os.getenv("CONTINUUM_AUTOSCALE_DEPLOYMENT") or "refiner").strip() or "refiner"
+CONTINUUM_AUTOSCALE_HISTORY_MAX = max(120, int(os.getenv("CONTINUUM_AUTOSCALE_HISTORY_MAX", "720")))
 if CONTINUUM_API_BASE and "://" not in CONTINUUM_API_BASE:
     CONTINUUM_API_BASE = f"http://{CONTINUUM_API_BASE}"
 EDITOR_MAX_BYTES = int(os.getenv("REFINER_EDITOR_MAX_BYTES", "400000"))
@@ -412,6 +447,8 @@ audit_logger = AuditLogger(AUDIT_LOG_PATH)
 
 
 class _SafeFormatDict(dict):
+    """Format-map dict that substitutes missing keys with empty strings."""
+
     def __missing__(self, key: str) -> str:
         return ""
 
@@ -538,6 +575,38 @@ def _continuum_request(
         timeout=timeout,
         retries=retries,
     )
+
+
+def _continuum_json_payload(response: requests.Response, *, operation: str) -> Dict[str, Any]:
+    status_code = int(getattr(response, "status_code", 500) or 500)
+    ok = bool(getattr(response, "ok", 200 <= status_code < 300))
+    if not ok:
+        raise RuntimeError(f"{operation} returned status {status_code}.")
+    try:
+        payload = response.json() if getattr(response, "content", None) else {}
+    except Exception as exc:
+        raise RuntimeError(f"{operation} returned invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict) or not payload.get("success"):
+        detail = payload.get("message") if isinstance(payload, dict) else "request failed"
+        raise RuntimeError(f"{operation} failed: {detail}")
+    data = payload.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _friendly_continuum_error(message: Optional[str]) -> str:
+    text = (message or "").strip()
+    if not text:
+        return "Continuum is temporarily unavailable. Showing last known worker state."
+    lowered = text.lower()
+    if "timed out" in lowered or "timeout" in lowered:
+        return "Continuum timed out. Showing last known worker state while retrying."
+    if "connection refused" in lowered or "failed to establish" in lowered or "name or service not known" in lowered:
+        return "Cannot reach Continuum right now. Showing last known worker state."
+    if "401" in lowered or "403" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
+        return "Continuum authentication failed. Showing cached worker state."
+    if "invalid json" in lowered:
+        return "Continuum returned an invalid response. Showing last known worker state."
+    return "Continuum communication is degraded. Showing last known worker state."
 
 
 def _editor_allowed(job: "Job") -> bool:
@@ -1107,6 +1176,8 @@ SSO_REDIS_URL = (os.getenv("REFINER_SSO_REDIS_URL") or os.getenv("REDIS_URL") or
 SSO_REDIS_PREFIX = (os.getenv("REFINER_SSO_REDIS_PREFIX") or "refiner:sso:").strip() or "refiner:sso:"
 
 class SsoStore:
+    """Abstract interface for issuing and consuming one-time SSO tokens."""
+
     type_name = "base"
 
     def issue(self, user: str) -> str:
@@ -1120,6 +1191,8 @@ class SsoStore:
 
 
 class MemorySsoStore(SsoStore):
+    """In-memory SSO token store for single-process deployments."""
+
     type_name = "memory"
 
     def __init__(self, ttl_seconds: int):
@@ -1162,6 +1235,8 @@ class MemorySsoStore(SsoStore):
 
 
 class RedisSsoStore(SsoStore):
+    """Redis-backed SSO token store for multi-instance deployments."""
+
     type_name = "redis"
 
     def __init__(self, client: Any, prefix: str, ttl_seconds: int):
@@ -1662,6 +1737,8 @@ GUARDRAIL_PATTERNS = {
 
 
 class SecretStore:
+    """Encrypted-at-rest credential store scoped per user."""
+
     def __init__(self, path: str):
         self.path = path
         self.lock = threading.RLock()
@@ -1782,6 +1859,8 @@ class SecretStore:
 
 
 class UserStore:
+    """Persistent local user/role registry with password hashing."""
+
     def __init__(self, path: str):
         self.path = path
         self.lock = threading.RLock()
@@ -1904,6 +1983,8 @@ class UserStore:
 
 
 class AccessStore:
+    """Store for team/project membership and role-based access metadata."""
+
     def __init__(self, path: str):
         self.path = path
         self.lock = threading.RLock()
@@ -2312,6 +2393,8 @@ class AccessStore:
 
 
 class VoiceTokenStore:
+    """Persistent registry for API voice tokens and associated users."""
+
     def __init__(self, path: str):
         self.path = path
         self.lock = threading.RLock()
@@ -2418,6 +2501,8 @@ class VoiceTokenStore:
 
 
 class TodoStore:
+    """Per-user TODO persistence used by assistant planning endpoints."""
+
     def __init__(self, root: str):
         self.root = root
         self.lock = threading.RLock()
@@ -2547,6 +2632,8 @@ class TodoStore:
 
 
 class SessionHistoryStore:
+    """Persistent append-only history of conversational room events."""
+
     def __init__(self, root: str, max_events: int = SESSION_HISTORY_MAX):
         self.root = root
         self.max_events = max_events
@@ -2642,6 +2729,8 @@ class SessionHistoryStore:
 
 
 class WorkspaceSession:
+    """In-memory workspace collaboration session model."""
+
     def __init__(self, room_id: str, job_id: str, project_id: Optional[str], created_by: str):
         self.room_id = room_id
         self.session_id = room_id
@@ -2736,6 +2825,8 @@ class WorkspaceSession:
 
 
 class SessionStore:
+    """TTL-based in-memory manager for active workspace sessions."""
+
     def __init__(self, ttl_sec: int = SESSION_TTL_SEC):
         self.sessions: Dict[str, WorkspaceSession] = {}
         self.lock = threading.RLock()
@@ -2834,6 +2925,8 @@ class SessionStore:
         session.leave(user)
 
 class TokenLedger:
+    """Ledger for token balances, reservations, usage, and cashout events."""
+
     def __init__(self, root: str):
         self.root = root
         self.lock = threading.RLock()
@@ -3099,6 +3192,8 @@ TOKEN_RE = re.compile(
 
 @dataclass
 class Stage:
+    """One lifecycle stage entry for a background job."""
+
     name: str
     status: str
     started_at: Optional[str] = None
@@ -3108,6 +3203,8 @@ class Stage:
 
 @dataclass
 class Job:
+    """Runtime/persistent state for an asynchronous Refiner job."""
+
     job_id: str
     payload: Dict[str, Any]
     project_name: str = ""
@@ -3553,6 +3650,8 @@ class JobActionExecutionError(RuntimeError):
 
 @dataclass
 class JobActionTask:
+    """Queued side-action task associated with a job."""
+
     task_id: str
     job_id: str
     owner: str
@@ -3769,6 +3868,8 @@ class JobActionManager:
 
 
 class JobManager:
+    """Background job queue manager for workflow execution processes."""
+
     def __init__(self, workers: int = DEFAULT_WORKERS):
         self.jobs: Dict[str, Job] = {}
         self.queue: queue.Queue = queue.Queue()
@@ -3827,6 +3928,7 @@ class JobManager:
         with self.lock:
             self.jobs[job_id] = job
         self.queue.put(job_id)
+        _notify_continuum_autoscaler()
         return job
 
     def get_job(self, job_id: str, owner: Optional[str] = None) -> Optional[Job]:
@@ -4095,6 +4197,7 @@ class JobManager:
                 job.persist(force=True)
             job.set_status("queued")
             self.queue.put(job_id)
+            _notify_continuum_autoscaler()
             return True
         if os.name != "nt":
             try:
@@ -4242,6 +4345,7 @@ class JobManager:
         job.append_log(f"--- restart #{job.restart_count} ---")
         job.set_status("queued")
         self.queue.put(job_id)
+        _notify_continuum_autoscaler()
         return True
 
     def _worker_loop(self, worker_id: int) -> None:
@@ -5210,9 +5314,519 @@ class JobManager:
             return None
 
 
+class ContinuumQueueAutoscaler:
+    """Scale Refiner workers via Continuum when queue pressure exceeds local capacity."""
+
+    def __init__(
+        self,
+        manager: JobManager,
+        *,
+        enabled: bool = CONTINUUM_AUTOSCALE_ENABLED,
+        poll_sec: float = CONTINUUM_AUTOSCALE_POLL_SEC,
+        min_replicas: int = CONTINUUM_AUTOSCALE_MIN_REPLICAS,
+        max_replicas: int = CONTINUUM_AUTOSCALE_MAX_REPLICAS,
+        backlog_per_replica: int = CONTINUUM_AUTOSCALE_BACKLOG_PER_REPLICA,
+        scale_up_step: int = CONTINUUM_AUTOSCALE_SCALE_UP_STEP,
+        scale_down_step: int = CONTINUUM_AUTOSCALE_SCALE_DOWN_STEP,
+        idle_sec: float = CONTINUUM_AUTOSCALE_IDLE_SEC,
+        cooldown_sec: float = CONTINUUM_AUTOSCALE_COOLDOWN_SEC,
+        timeout_sec: float = CONTINUUM_AUTOSCALE_TIMEOUT_SEC,
+        namespace: str = CONTINUUM_AUTOSCALE_NAMESPACE,
+        deployment: str = CONTINUUM_AUTOSCALE_DEPLOYMENT,
+    ):
+        self.manager = manager
+        self.enabled = bool(enabled)
+        self.poll_sec = max(1.0, float(poll_sec))
+        self.min_replicas = max(0, int(min_replicas))
+        self.max_replicas = max(self.min_replicas, int(max_replicas))
+        self.backlog_per_replica = max(1, int(backlog_per_replica))
+        self.scale_up_step = max(1, int(scale_up_step))
+        self.scale_down_step = max(1, int(scale_down_step))
+        self.idle_sec = max(0.0, float(idle_sec))
+        self.cooldown_sec = max(0.0, float(cooldown_sec))
+        self.timeout_sec = max(1.0, float(timeout_sec))
+        self.namespace = (namespace or "refiner").strip() or "refiner"
+        self.deployment = (deployment or "refiner").strip() or "refiner"
+        self._wake_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._idle_since: Optional[float] = None
+        self._last_scale_at: Optional[str] = None
+        self._last_scale_ts: float = 0.0
+        self._last_decision: str = "init"
+        self._last_error: Optional[str] = None
+        self._last_snapshot: Dict[str, int] = {"queue_depth": 0, "queued": 0, "running": 0, "paused": 0, "workers": 0}
+        self._last_remote: Dict[str, Any] = {}
+        self._history: Deque[Dict[str, Any]] = deque(maxlen=CONTINUUM_AUTOSCALE_HISTORY_MAX)
+        self._continuum_failures: int = 0
+        self._continuum_last_success_at: Optional[str] = None
+        self._continuum_last_failure_at: Optional[str] = None
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def _record_continuum_success(self) -> None:
+        with self._lock:
+            self._continuum_failures = 0
+            self._continuum_last_success_at = _now_iso()
+
+    def _record_continuum_failure(self) -> None:
+        with self._lock:
+            self._continuum_failures += 1
+            self._continuum_last_failure_at = _now_iso()
+
+    def start(self) -> None:
+        if not self.enabled or not _continuum_enabled():
+            return
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, name="continuum-queue-autoscaler", daemon=True)
+        self._thread.start()
+        self.notify_queue_change()
+
+    def stop(self, timeout: float = 1.0) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=max(0.1, float(timeout)))
+
+    def notify_queue_change(self) -> None:
+        self._wake_event.set()
+
+    def _worker_metrics(self, snapshot: Dict[str, int], remote: Dict[str, Any], decision: str) -> Dict[str, Any]:
+        workers_per_replica = max(1, self._safe_int(snapshot.get("workers"), 1))
+        running_jobs = max(0, self._safe_int(snapshot.get("running"), 0))
+        queued_jobs = max(0, self._safe_int(snapshot.get("queued"), 0))
+        queue_depth = max(0, self._safe_int(snapshot.get("queue_depth"), queued_jobs))
+        desired_replicas = max(self.min_replicas, self._safe_int(remote.get("desired_replicas"), self.min_replicas))
+        ready_replicas = max(0, self._safe_int(remote.get("ready_replicas"), 0))
+        available_replicas = max(0, self._safe_int(remote.get("available_replicas"), 0))
+        max_workers_capacity = max(self.min_replicas, self.max_replicas) * workers_per_replica
+        target_workers = desired_replicas * workers_per_replica
+        online_workers = ready_replicas * workers_per_replica
+        available_workers = max(0, online_workers - running_jobs)
+        in_use_workers = min(running_jobs, online_workers)
+        scaling_gap = max(0, target_workers - online_workers)
+        status_raw = str(remote.get("status") or "Unknown")
+        status_normalized = status_raw.strip().lower()
+        degraded = status_normalized in {"degraded", "unavailable", "failed", "error"}
+        scale_up_active = decision.startswith("scale_up")
+        failed_workers = scaling_gap if degraded and not scale_up_active else 0
+        coming_online_workers = max(0, scaling_gap - failed_workers)
+        queue_pressure = 0.0
+        if online_workers > 0:
+            queue_pressure = min(500.0, round((queue_depth / float(online_workers)) * 100.0, 2))
+        utilization_pct = 0.0
+        if max_workers_capacity > 0:
+            utilization_pct = min(100.0, round((in_use_workers / float(max_workers_capacity)) * 100.0, 2))
+        return {
+            "workers_per_replica": workers_per_replica,
+            "max_workers_capacity": max_workers_capacity,
+            "target_workers": target_workers,
+            "online_workers": online_workers,
+            "available_workers": available_workers,
+            "in_use_workers": in_use_workers,
+            "coming_online_workers": coming_online_workers,
+            "failed_workers": failed_workers,
+            "queue_depth": queue_depth,
+            "queued_jobs": queued_jobs,
+            "running_jobs": running_jobs,
+            "desired_replicas": desired_replicas,
+            "ready_replicas": ready_replicas,
+            "available_replicas": available_replicas,
+            "status": status_raw or "Unknown",
+            "utilization_pct": utilization_pct,
+            "queue_pressure_pct": queue_pressure,
+        }
+
+    def history(self, limit: int = 120) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = list(self._history)
+        if limit <= 0:
+            return []
+        return items[-limit:]
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            snapshot = dict(self._last_snapshot)
+            remote = dict(self._last_remote)
+            decision = self._last_decision
+            error = self._last_error
+            last_scale_at = self._last_scale_at
+            continuum_failures = int(self._continuum_failures or 0)
+            continuum_last_success_at = self._continuum_last_success_at
+            continuum_last_failure_at = self._continuum_last_failure_at
+        worker_metrics = self._worker_metrics(snapshot, remote, decision)
+        degraded = continuum_failures > 0 or (decision.endswith("_error") if isinstance(decision, str) else False)
+        message = _friendly_continuum_error(error) if degraded else ""
+        return {
+            "enabled": self.enabled,
+            "continuum_configured": _continuum_enabled(),
+            "running": bool(self._thread and self._thread.is_alive()),
+            "poll_sec": self.poll_sec,
+            "cooldown_sec": self.cooldown_sec,
+            "idle_sec": self.idle_sec,
+            "min_replicas": self.min_replicas,
+            "max_replicas": self.max_replicas,
+            "backlog_per_replica": self.backlog_per_replica,
+            "namespace": self.namespace,
+            "deployment": self.deployment,
+            "last_decision": decision,
+            "last_scale_at": last_scale_at,
+            "last_error": error,
+            "snapshot": snapshot,
+            "remote": remote,
+            "workers": worker_metrics,
+            "continuum": {
+                "degraded": degraded,
+                "consecutive_failures": continuum_failures,
+                "last_success_at": continuum_last_success_at,
+                "last_failure_at": continuum_last_failure_at,
+                "message": message,
+            },
+        }
+
+    def evaluate_once(self) -> None:
+        if not self.enabled:
+            self._update_state(decision="disabled", error=None)
+            return
+        if not _continuum_enabled():
+            self._update_state(decision="continuum_unconfigured", error=None)
+            return
+        snapshot = self._queue_snapshot()
+        now_ts = time.time()
+        active = snapshot["queue_depth"] > 0 or snapshot["running"] > 0 or snapshot["paused"] > 0
+        if active:
+            self._idle_since = None
+        elif self._idle_since is None:
+            self._idle_since = now_ts
+
+        try:
+            remote = self._fetch_remote_status()
+        except Exception as exc:
+            self._record_continuum_failure()
+            message = str(exc)
+            logger.warning("Continuum autoscaler status fetch failed: %s", message)
+            self._update_state(snapshot=snapshot, decision="status_error", error=message)
+            return
+        self._record_continuum_success()
+
+        current_replicas = max(0, self._safe_int(remote.get("desired_replicas"), self.min_replicas))
+
+        if current_replicas < self.min_replicas:
+            target = self.min_replicas
+            if target > current_replicas and not self._cooldown_active(now_ts):
+                if self._apply_scale(target, reason="enforce_min_replicas", snapshot=snapshot):
+                    return
+
+        should_scale_up = snapshot["queue_depth"] > 0 and snapshot["running"] >= snapshot["workers"]
+        if should_scale_up and current_replicas < self.max_replicas:
+            if self._cooldown_active(now_ts):
+                self._update_state(snapshot=snapshot, remote=remote, decision="cooldown", error=None)
+                return
+            queued_units = int(math.ceil(snapshot["queue_depth"] / float(self.backlog_per_replica)))
+            increment = max(self.scale_up_step, queued_units)
+            target = min(self.max_replicas, current_replicas + increment)
+            if target > current_replicas and self._apply_scale(target, reason="scale_up_queue_backlog", snapshot=snapshot):
+                return
+
+        idle_for = (now_ts - self._idle_since) if self._idle_since is not None else 0.0
+        should_scale_down = (
+            self._idle_since is not None
+            and idle_for >= self.idle_sec
+            and current_replicas > self.min_replicas
+        )
+        if should_scale_down:
+            if self._cooldown_active(now_ts):
+                self._update_state(snapshot=snapshot, remote=remote, decision="cooldown", error=None)
+                return
+            target = max(self.min_replicas, current_replicas - self.scale_down_step)
+            if target < current_replicas and self._apply_scale(target, reason="scale_down_idle", snapshot=snapshot):
+                return
+
+        decision = "steady"
+        if should_scale_up and current_replicas >= self.max_replicas:
+            decision = "at_max_replicas"
+        elif should_scale_down and current_replicas <= self.min_replicas:
+            decision = "at_min_replicas"
+        self._update_state(snapshot=snapshot, remote=remote, decision=decision, error=None)
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.evaluate_once()
+            except Exception as exc:
+                logger.warning("Continuum autoscaler loop error: %s", exc)
+                self._update_state(decision="loop_error", error=str(exc))
+            self._wake_event.wait(timeout=self.poll_sec)
+            self._wake_event.clear()
+
+    def _queue_snapshot(self) -> Dict[str, int]:
+        queue_depth = max(0, int(self.manager.queue.qsize()))
+        with self.manager.lock:
+            jobs_snapshot = list(self.manager.jobs.values())
+            workers = max(1, len(self.manager.workers))
+        queued = 0
+        running = 0
+        paused = 0
+        for job in jobs_snapshot:
+            status = (getattr(job, "status", "") or "").strip().lower()
+            if status == "queued":
+                queued += 1
+            elif status == "running":
+                running += 1
+            elif status == "paused":
+                paused += 1
+        return {
+            "queue_depth": queue_depth,
+            "queued": queued,
+            "running": running,
+            "paused": paused,
+            "workers": workers,
+        }
+
+    def _fetch_remote_status(self) -> Dict[str, Any]:
+        params = urlencode({"namespace": self.namespace, "deployment": self.deployment})
+        path = "/k8s/refiner/status"
+        if params:
+            path = f"{path}?{params}"
+        response = _continuum_request("GET", path, timeout_sec=self.timeout_sec)
+        data = _continuum_json_payload(response, operation="Continuum refiner status")
+        return {
+            "namespace": data.get("namespace") or self.namespace,
+            "deployment": data.get("deployment") or self.deployment,
+            "observed": bool(data.get("observed")),
+            "healthy": bool(data.get("healthy")),
+            "desired_replicas": max(0, self._safe_int(data.get("desired_replicas"), self.min_replicas)),
+            "ready_replicas": max(0, self._safe_int(data.get("ready_replicas"), 0)),
+            "available_replicas": max(0, self._safe_int(data.get("available_replicas"), 0)),
+            "status": (data.get("status") or "").strip() or "Unknown",
+        }
+
+    def _request_scale(self, replicas: int) -> Dict[str, Any]:
+        target = max(self.min_replicas, min(self.max_replicas, int(replicas)))
+        response = _continuum_request(
+            "POST",
+            "/k8s/refiner/scale",
+            json_body={"namespace": self.namespace, "deployment": self.deployment, "replicas": target},
+            timeout_sec=self.timeout_sec,
+        )
+        data = _continuum_json_payload(response, operation="Continuum refiner scale")
+        return {
+            "namespace": data.get("namespace") or self.namespace,
+            "deployment": data.get("deployment") or self.deployment,
+            "observed": bool(data.get("observed", True)),
+            "healthy": bool(data.get("healthy", False)),
+            "desired_replicas": max(0, self._safe_int(data.get("desired_replicas"), target)),
+            "ready_replicas": max(0, self._safe_int(data.get("ready_replicas"), 0)),
+            "available_replicas": max(0, self._safe_int(data.get("available_replicas"), 0)),
+            "status": (data.get("status") or "").strip() or "Unknown",
+        }
+
+    def _cooldown_active(self, now_ts: float) -> bool:
+        if self.cooldown_sec <= 0:
+            return False
+        return self._last_scale_ts > 0 and (now_ts - self._last_scale_ts) < self.cooldown_sec
+
+    def _apply_scale(self, target: int, *, reason: str, snapshot: Dict[str, int]) -> bool:
+        try:
+            remote = self._request_scale(target)
+        except Exception as exc:
+            self._record_continuum_failure()
+            message = str(exc)
+            logger.warning("Continuum autoscaler scale request failed: %s", message)
+            self._update_state(snapshot=snapshot, decision=f"{reason}_error", error=message)
+            return False
+        self._record_continuum_success()
+        now_ts = time.time()
+        self._last_scale_ts = now_ts
+        self._last_scale_at = _now_iso()
+        self._update_state(snapshot=snapshot, remote=remote, decision=reason, error=None)
+        return True
+
+    def _update_state(
+        self,
+        *,
+        snapshot: Optional[Dict[str, int]] = None,
+        remote: Optional[Dict[str, Any]] = None,
+        decision: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            if snapshot is not None:
+                self._last_snapshot = dict(snapshot)
+            if remote is not None:
+                self._last_remote = dict(remote)
+            if decision:
+                self._last_decision = decision
+            self._last_error = error
+            metrics = self._worker_metrics(self._last_snapshot, self._last_remote, self._last_decision)
+            self._history.append(
+                {
+                    "timestamp_ms": int(time.time() * 1000),
+                    "captured_at": _now_iso(),
+                    "decision": self._last_decision,
+                    "error": self._last_error,
+                    "workers": metrics,
+                }
+            )
+
+
+continuum_autoscaler: Optional[ContinuumQueueAutoscaler] = None
+
+
+def _notify_continuum_autoscaler() -> None:
+    autoscaler = continuum_autoscaler
+    if autoscaler:
+        autoscaler.notify_queue_change()
+
+
+def _continuum_autoscaler_status() -> Dict[str, Any]:
+    autoscaler = continuum_autoscaler
+    if not autoscaler:
+        return {"enabled": False, "continuum_configured": _continuum_enabled(), "running": False}
+    return autoscaler.status()
+
+
+def _continuum_cluster_snapshot(timeout_sec: float) -> Optional[Dict[str, Any]]:
+    if not _continuum_enabled():
+        return None
+    try:
+        response = _continuum_request("GET", "/k8s/list", timeout_sec=timeout_sec, retries=1)
+        data = _continuum_json_payload(response, operation="Continuum k8s list")
+    except Exception as exc:
+        return {"error": str(exc)}
+    clusters = data.get("clusters") if isinstance(data, dict) else None
+    if not isinstance(clusters, list):
+        return {"error": "missing cluster data"}
+    selected: Optional[Dict[str, Any]] = None
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            continue
+        cluster_id = str(cluster.get("id") or "").strip().lower()
+        cluster_name = str(cluster.get("name") or "").strip().lower()
+        if cluster_id == "k8s-local-refiner" or cluster_name == "refiner-local":
+            selected = cluster
+            break
+    if not selected:
+        for cluster in clusters:
+            if isinstance(cluster, dict):
+                selected = cluster
+                break
+    if not selected:
+        return {"error": "no clusters reported"}
+    payload: Dict[str, Any] = {
+        "id": selected.get("id"),
+        "name": selected.get("name"),
+        "region": selected.get("region"),
+        "status": selected.get("status"),
+        "total_nodes": _safe_int(selected.get("total_nodes")),
+        "ready_nodes": _safe_int(selected.get("ready_nodes")),
+    }
+    refiner = selected.get("refiner")
+    if isinstance(refiner, dict):
+        payload["refiner"] = {
+            "observed": bool(refiner.get("observed")),
+            "healthy": bool(refiner.get("healthy")),
+            "namespace": refiner.get("namespace"),
+            "deployment": refiner.get("deployment"),
+            "desired_replicas": _safe_int(refiner.get("desired_replicas")),
+            "ready_replicas": _safe_int(refiner.get("ready_replicas")),
+            "available_replicas": _safe_int(refiner.get("available_replicas")),
+        }
+    return payload
+
+
+def _workers_telemetry_payload(
+    *,
+    limit: int = 180,
+    refresh: bool = False,
+    include_cluster: bool = False,
+) -> Dict[str, Any]:
+    autoscaler = continuum_autoscaler
+    if not autoscaler:
+        return {
+            "ok": True,
+            "degraded": False,
+            "message": "",
+            "warnings": [],
+            "autoscaler": {"enabled": False, "running": False, "continuum_configured": _continuum_enabled()},
+            "summary": {},
+            "history": [],
+        }
+    warnings: List[str] = []
+    if refresh:
+        try:
+            autoscaler.evaluate_once()
+        except Exception as exc:
+            logger.warning("Workers telemetry refresh failed: %s", exc)
+            warnings.append(_friendly_continuum_error(str(exc)))
+    try:
+        status = autoscaler.status()
+    except Exception as exc:
+        logger.warning("Workers telemetry status snapshot failed: %s", exc)
+        status = {
+            "enabled": bool(getattr(autoscaler, "enabled", False)),
+            "continuum_configured": _continuum_enabled(),
+            "running": bool(getattr(autoscaler, "_thread", None)),
+            "continuum": {
+                "degraded": True,
+                "consecutive_failures": 0,
+                "last_success_at": None,
+                "last_failure_at": _now_iso(),
+                "message": _friendly_continuum_error(str(exc)),
+            },
+        }
+        warnings.append(_friendly_continuum_error(str(exc)))
+    try:
+        timeline = autoscaler.history(limit=max(1, min(limit, CONTINUUM_AUTOSCALE_HISTORY_MAX)))
+    except Exception as exc:
+        logger.warning("Workers telemetry history snapshot failed: %s", exc)
+        timeline = []
+        warnings.append("Workers timeline is temporarily unavailable.")
+    continuum_state = status.get("continuum") if isinstance(status, dict) else {}
+    degraded = bool(continuum_state.get("degraded")) if isinstance(continuum_state, dict) else False
+    continuum_message = ""
+    if isinstance(continuum_state, dict):
+        continuum_message = str(continuum_state.get("message") or "").strip()
+    if continuum_message and continuum_message not in warnings:
+        warnings.append(continuum_message)
+    payload: Dict[str, Any] = {
+        "ok": not degraded,
+        "degraded": degraded,
+        "message": continuum_message,
+        "warnings": warnings,
+        "autoscaler": status,
+        "summary": status.get("workers") or {},
+        "history": timeline,
+    }
+    if include_cluster:
+        cluster = _continuum_cluster_snapshot(timeout_sec=autoscaler.timeout_sec)
+        payload["continuum_cluster"] = cluster
+        if isinstance(cluster, dict) and cluster.get("error"):
+            degraded = True
+            cluster_warning = _friendly_continuum_error(str(cluster.get("error")))
+            if cluster_warning not in warnings:
+                warnings.append(cluster_warning)
+    payload["degraded"] = degraded
+    payload["ok"] = not degraded
+    payload["warnings"] = warnings
+    if degraded and not payload.get("message"):
+        payload["message"] = warnings[0] if warnings else _friendly_continuum_error(None)
+    return payload
+
+
 access_store = AccessStore(ACCESS_STORE_PATH)
 manager = JobManager()
 job_action_manager = JobActionManager()
+continuum_autoscaler = ContinuumQueueAutoscaler(manager)
+continuum_autoscaler.start()
 user_store = UserStore(USERS_PATH)
 user_store.ensure_admin_from_env()
 _secret_stores: Dict[str, SecretStore] = {}
@@ -8159,6 +8773,7 @@ def _after_request(response: Response) -> Response:
 
 
 def index() -> str:
+    """Render or serve the index route."""
     user = _current_user()
     return render_template(
         "index.html",
@@ -8170,6 +8785,7 @@ def index() -> str:
 
 
 def playground() -> str:
+    """Render or serve the playground route."""
     user = _current_user()
     return render_template(
         "playground.html",
@@ -8181,6 +8797,7 @@ def playground() -> str:
 
 
 def admin_dashboard() -> Response:
+    """Render the admin dashboard page."""
     user = _current_user()
     role = user_store.get_role(user) if user else None
     if role != "admin":
@@ -8196,14 +8813,17 @@ def admin_dashboard() -> Response:
 
 
 def public_asset(filename: str) -> Response:
+    """Serve files from the public web assets directory."""
     return send_from_directory(PUBLIC_DIR, filename)
 
 
 def favicon() -> Response:
+    """Render or serve the favicon route."""
     return send_from_directory(PUBLIC_DIR, "favicon.ico")
 
 
 def metrics() -> Response:
+    """Render or serve the metrics route."""
     if not METRICS_ENABLED:
         return jsonify({"error": "metrics_disabled"}), 404
 
@@ -8230,6 +8850,7 @@ def metrics() -> Response:
 
 
 def login() -> Response:
+    """Render or serve the login route."""
     if AUTH_MODE == "oidc":
         return redirect(url_for("oidc_login"))
     if not user_store.has_users() and not OIDC_ENABLED:
@@ -8278,6 +8899,7 @@ def _parse_kv_params(raw: str) -> Dict[str, str]:
 
 
 def oidc_login() -> Response:
+    """Handle the oidc login route."""
     if not OIDC_ENABLED:
         return jsonify({"error": "oidc_not_enabled"}), 404
     config = _oidc_discovery()
@@ -8310,6 +8932,7 @@ def oidc_login() -> Response:
 
 
 def oidc_callback() -> Response:
+    """Handle the oidc callback route."""
     if not OIDC_ENABLED:
         return jsonify({"error": "oidc_not_enabled"}), 404
     error = (request.args.get("error") or "").strip()
@@ -8377,6 +9000,7 @@ def oidc_callback() -> Response:
 
 
 def api_oidc_exchange() -> Response:
+    """API endpoint for oidc exchange."""
     if not OIDC_ENABLED or not OIDC_EXCHANGE_ENABLED:
         return jsonify({"error": "oidc_not_enabled"}), 404
     payload = request.get_json(force=True, silent=True)
@@ -8459,6 +9083,7 @@ def api_oidc_exchange() -> Response:
     )
 
 def sso_login() -> Response:
+    """Handle the sso login route."""
     token = (request.args.get("token") or "").strip()
     next_path = _safe_next_path(request.args.get("next"))
     user = _consume_sso_token(token)
@@ -8471,6 +9096,7 @@ def sso_login() -> Response:
 
 
 def logout() -> Response:
+    """Render or serve the logout route."""
     user = _current_user()
     _clear_user_activity(user)
     session.pop("user", None)
@@ -8479,6 +9105,7 @@ def logout() -> Response:
 
 
 def api_login() -> Response:
+    """API endpoint for login."""
     if not user_store.has_users():
         return jsonify({"error": "setup_required"}), 400
     if AUTH_MODE == "oidc":
@@ -8513,6 +9140,7 @@ def api_login() -> Response:
 
 
 def api_setup() -> Response:
+    """API endpoint for setup."""
     if AUTH_MODE == "oidc":
         return jsonify({"error": "oidc_required"}), 403
     if user_store.has_users():
@@ -8560,6 +9188,7 @@ def api_setup() -> Response:
 
 
 def api_sso_issue() -> Response:
+    """API endpoint for sso issue."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -8576,6 +9205,7 @@ def api_sso_issue() -> Response:
 
 
 def api_logout() -> Response:
+    """API endpoint for logout."""
     user = _current_user()
     _clear_user_activity(user)
     session.pop("user", None)
@@ -8584,6 +9214,7 @@ def api_logout() -> Response:
 
 
 def api_session() -> Response:
+    """API endpoint for session."""
     user = _current_user()
     if not user:
         return jsonify({"authenticated": False, "user": None}), 200
@@ -8591,6 +9222,7 @@ def api_session() -> Response:
 
 
 def api_profile() -> Response:
+    """API endpoint for profile."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -8611,6 +9243,7 @@ def api_profile() -> Response:
 
 
 def api_todos() -> Response:
+    """API endpoint for todos."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -8653,6 +9286,7 @@ def api_todos() -> Response:
 
 
 def api_todo_next() -> Response:
+    """API endpoint for todo next."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -8666,6 +9300,7 @@ def api_todo_next() -> Response:
 
 
 def api_todo_detail(todo_id: str) -> Response:
+    """API endpoint for todo detail."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -8707,6 +9342,7 @@ def api_todo_detail(todo_id: str) -> Response:
 
 
 def api_voice_tokens() -> Response:
+    """API endpoint for voice tokens."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -8749,6 +9385,7 @@ def api_voice_tokens() -> Response:
 
 
 def api_voice_token_delete(token_id: str) -> Response:
+    """API endpoint for voice token delete."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -8764,6 +9401,7 @@ def api_voice_token_delete(token_id: str) -> Response:
 
 
 def api_voice_capture() -> Response:
+    """API endpoint for voice capture."""
     payload = request.get_json(force=False, silent=True) or {}
     user = _voice_user_from_request(payload)
     if not user:
@@ -8795,6 +9433,7 @@ def api_voice_capture() -> Response:
 
 
 def api_voice_siri() -> Response:
+    """API endpoint for voice siri."""
     payload = request.get_json(force=False, silent=True) or {}
     user = _voice_user_from_request(payload)
     if not user:
@@ -8830,6 +9469,7 @@ def api_voice_siri() -> Response:
 
 
 def api_voice_alexa() -> Response:
+    """API endpoint for voice alexa."""
     payload = request.get_json(force=False, silent=True) or {}
     if VOICE_VERIFY_ALEXA:
         ok, reason = _alexa_verify_request(payload, request.get_data(cache=True))
@@ -8868,6 +9508,7 @@ def api_voice_alexa() -> Response:
 
 
 def api_voice_google() -> Response:
+    """API endpoint for voice google."""
     payload = request.get_json(force=False, silent=True) or {}
     if VOICE_VERIFY_GOOGLE:
         ok, reason = _google_verify_request()
@@ -8906,6 +9547,7 @@ def api_voice_google() -> Response:
 
 
 def api_voice_stt() -> Response:
+    """API endpoint for voice stt."""
     request_started = time.perf_counter()
     payload = request.get_json(force=False, silent=True) or {}
     if not _stt_authorized(payload):
@@ -9102,6 +9744,7 @@ def _diff_permissions(old: Optional[Dict[str, Any]], new: Optional[Dict[str, Any
 
 
 def api_projects() -> Response:
+    """API endpoint for projects."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9172,6 +9815,7 @@ def api_projects() -> Response:
 
 
 def api_project_detail(project_id: str) -> Response:
+    """API endpoint for project detail."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9240,6 +9884,7 @@ def api_project_detail(project_id: str) -> Response:
 
 
 def api_teams() -> Response:
+    """API endpoint for teams."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9272,6 +9917,7 @@ def api_teams() -> Response:
 
 
 def api_team_detail(team_id: str) -> Response:
+    """API endpoint for team detail."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9317,6 +9963,7 @@ def api_team_detail(team_id: str) -> Response:
 
 
 def api_team_tokens(team_id: str) -> Response:
+    """API endpoint for team tokens."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9408,6 +10055,7 @@ def api_team_tokens(team_id: str) -> Response:
 
 
 def api_access_tree() -> Response:
+    """API endpoint for access tree."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9424,6 +10072,7 @@ def _sse_event(event: str, entry: Dict[str, Any]) -> str:
 
 
 def api_sessions() -> Response:
+    """API endpoint for sessions."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9444,6 +10093,7 @@ def api_sessions() -> Response:
 
 
 def api_session_detail(session_id: str) -> Response:
+    """API endpoint for session detail."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9462,6 +10112,7 @@ def api_session_detail(session_id: str) -> Response:
 
 
 def api_session_leave(session_id: str) -> Response:
+    """API endpoint for session leave."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9473,6 +10124,7 @@ def api_session_leave(session_id: str) -> Response:
 
 
 def api_session_stream(session_id: str) -> Response:
+    """API endpoint for session stream."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9528,6 +10180,7 @@ def api_session_stream(session_id: str) -> Response:
 
 
 def api_session_history(session_id: str) -> Response:
+    """API endpoint for session history."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9550,6 +10203,7 @@ def api_session_history(session_id: str) -> Response:
 
 
 def api_sessions_history() -> Response:
+    """API endpoint for sessions history."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9564,6 +10218,7 @@ def api_sessions_history() -> Response:
 
 
 def setup() -> Response:
+    """Render or serve the setup route."""
     if AUTH_MODE == "oidc":
         return redirect(url_for("oidc_login"))
     if user_store.has_users():
@@ -9591,7 +10246,9 @@ def setup() -> Response:
 
 
 def health() -> Response:
+    """Render or serve the health route."""
     learning = None
+    autoscaler_status = _continuum_autoscaler_status()
     if stt_learning_store:
         try:
             learning = stt_learning_store.stats()
@@ -9608,6 +10265,8 @@ def health() -> Response:
                 "inflight": job_action_manager.inflight(),
                 "queue_capacity": JOB_ACTION_MAX_QUEUE,
             },
+            "continuum_autoscaler": autoscaler_status,
+            "workers_summary": autoscaler_status.get("workers") if isinstance(autoscaler_status, dict) else {},
             "sso": _sso_store_health(),
             "stt_learning": learning,
         }
@@ -9615,6 +10274,7 @@ def health() -> Response:
 
 
 def capabilities_report() -> Response:
+    """Return a capabilities snapshot for UI/API consumers."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9625,6 +10285,7 @@ def capabilities_report() -> Response:
 
 
 def admin_stats() -> Response:
+    """Return aggregated admin statistics."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9656,12 +10317,42 @@ def admin_stats() -> Response:
             "jobs_completed": jobs_by_status.get("completed", 0),
             "jobs_paused": jobs_by_status.get("paused", 0),
             "jobs_by_status": jobs_by_status,
+            "continuum_autoscaler": _continuum_autoscaler_status(),
             "uptime_sec": int(time.time() - APP_START_TIME),
         }
     )
 
 
+def workers_telemetry() -> Response:
+    """Return worker capacity and autoscaler telemetry for the Control Room."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes", "y"}
+    include_cluster = str(request.args.get("include_cluster") or "").strip().lower() in {"1", "true", "yes", "y"}
+    try:
+        limit = int(request.args.get("limit") or 180)
+    except Exception:
+        limit = 180
+    limit = max(10, min(limit, CONTINUUM_AUTOSCALE_HISTORY_MAX))
+    try:
+        payload = _workers_telemetry_payload(limit=limit, refresh=refresh, include_cluster=include_cluster)
+    except Exception as exc:
+        logger.warning("Workers telemetry endpoint degraded: %s", exc)
+        payload = {
+            "ok": False,
+            "degraded": True,
+            "message": _friendly_continuum_error(str(exc)),
+            "warnings": [_friendly_continuum_error(str(exc))],
+            "autoscaler": _continuum_autoscaler_status(),
+            "summary": {},
+            "history": [],
+        }
+    return jsonify(payload)
+
+
 def api_audit() -> Response:
+    """API endpoint for audit."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9680,6 +10371,7 @@ def api_audit() -> Response:
 
 
 def job_estimate() -> Response:
+    """Job endpoint for estimate."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9706,6 +10398,7 @@ def job_estimate() -> Response:
 
 
 def import_requirements() -> Response:
+    """Handle the import requirements route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9734,6 +10427,7 @@ def import_requirements() -> Response:
 
 
 def export_requirements() -> Response:
+    """Handle the export requirements route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9764,6 +10458,7 @@ def export_requirements() -> Response:
 
 
 def rag_indexes() -> Response:
+    """RAG endpoint for indexes."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9772,6 +10467,7 @@ def rag_indexes() -> Response:
 
 
 def rag_index_create() -> Response:
+    """RAG endpoint for index create."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9810,6 +10506,7 @@ def rag_index_create() -> Response:
 
 
 def rag_index_delete(name: str) -> Response:
+    """RAG endpoint for index delete."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9822,6 +10519,7 @@ def rag_index_delete(name: str) -> Response:
 
 
 def rag_query() -> Response:
+    """RAG endpoint for query."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9857,6 +10555,7 @@ def rag_query() -> Response:
 
 
 def assistant_rag_mcp() -> Response:
+    """Handle the assistant rag mcp route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -9973,6 +10672,7 @@ def assistant_rag_mcp() -> Response:
 
 
 def mcp_servers() -> Response:
+    """MCP endpoint for servers."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10008,6 +10708,7 @@ def mcp_servers() -> Response:
 
 
 def mcp_server_delete(name: str) -> Response:
+    """MCP endpoint for server delete."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10020,6 +10721,7 @@ def mcp_server_delete(name: str) -> Response:
 
 
 def mcp_server_tools(name: str) -> Response:
+    """MCP endpoint for server tools."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10038,6 +10740,7 @@ def mcp_server_tools(name: str) -> Response:
 
 
 def mcp_server_call(name: str) -> Response:
+    """MCP endpoint for server call."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10063,6 +10766,7 @@ def mcp_server_call(name: str) -> Response:
 
 
 def mcp_server_resources(name: str) -> Response:
+    """MCP endpoint for server resources."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10081,6 +10785,7 @@ def mcp_server_resources(name: str) -> Response:
 
 
 def mcp_server_resource(name: str) -> Response:
+    """MCP endpoint for server resource."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10103,6 +10808,7 @@ def mcp_server_resource(name: str) -> Response:
 
 
 def request_refund(job_id: str) -> Response:
+    """Handle the request refund route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10157,6 +10863,7 @@ def request_refund(job_id: str) -> Response:
 
 
 def list_refunds() -> Response:
+    """Handle the list refunds route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10189,6 +10896,7 @@ def list_refunds() -> Response:
 
 
 def screen_refund(job_id: str, request_id: str) -> Response:
+    """Handle the screen refund route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10255,6 +10963,7 @@ def screen_refund(job_id: str, request_id: str) -> Response:
 
 
 def decide_refund(job_id: str, request_id: str) -> Response:
+    """Handle the decide refund route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10321,6 +11030,7 @@ def decide_refund(job_id: str, request_id: str) -> Response:
 
 
 def refund_file(job_id: str, request_id: str, filename: str) -> Response:
+    """Handle the refund file route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10340,6 +11050,7 @@ def refund_file(job_id: str, request_id: str, filename: str) -> Response:
 
 
 def jobs() -> Response:
+    """Jobs collection endpoint (submit/list)."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10398,6 +11109,7 @@ def jobs() -> Response:
 
 
 def job_detail(job_id: str) -> Response:
+    """Job endpoint for detail."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10633,6 +11345,7 @@ def _enqueue_workspace_task(
 
 
 def job_workspace(job_id: str) -> Response:
+    """Job endpoint for workspace."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10751,6 +11464,7 @@ def job_workspace(job_id: str) -> Response:
 
 
 def job_tasks(job_id: str) -> Response:
+    """Job endpoint for tasks."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10772,6 +11486,7 @@ def job_tasks(job_id: str) -> Response:
 
 
 def job_task_detail(job_id: str, task_id: str) -> Response:
+    """Job endpoint for task detail."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10788,6 +11503,7 @@ def job_task_detail(job_id: str, task_id: str) -> Response:
 
 
 def job_task_cancel(job_id: str, task_id: str) -> Response:
+    """Job endpoint for task cancel."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10810,6 +11526,7 @@ def job_task_cancel(job_id: str, task_id: str) -> Response:
 
 
 def job_workspace_open(job_id: str) -> Response:
+    """Job endpoint for workspace open."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10837,6 +11554,7 @@ def job_workspace_open(job_id: str) -> Response:
 
 
 def job_editor_roots(job_id: str) -> Response:
+    """Job endpoint for editor roots."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10862,6 +11580,7 @@ def job_editor_roots(job_id: str) -> Response:
 
 
 def job_editor_list(job_id: str) -> Response:
+    """Job endpoint for editor list."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10886,6 +11605,7 @@ def job_editor_list(job_id: str) -> Response:
 
 
 def job_editor_file(job_id: str) -> Response:
+    """Job endpoint for editor file."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -10937,6 +11657,7 @@ def job_editor_file(job_id: str) -> Response:
 
 
 def job_editor_ops(job_id: str) -> Response:
+    """Job endpoint for editor ops."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11021,6 +11742,7 @@ def job_editor_ops(job_id: str) -> Response:
 
 
 def job_requirements_progress(job_id: str) -> Response:
+    """Job endpoint for requirements progress."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11103,6 +11825,7 @@ def job_requirements_progress(job_id: str) -> Response:
 
 
 def job_requirements_summary(job_id: str) -> Response:
+    """Job endpoint for requirements summary."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11168,6 +11891,7 @@ def job_requirements_summary(job_id: str) -> Response:
 
 
 def job_logs(job_id: str) -> Response:
+    """Job endpoint for logs."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11185,6 +11909,7 @@ def job_logs(job_id: str) -> Response:
 
 
 def job_logs_stream(job_id: str) -> Response:
+    """Job endpoint for logs stream."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11214,6 +11939,7 @@ def job_logs_stream(job_id: str) -> Response:
 
 
 def job_actions(job_id: str) -> Response:
+    """Job endpoint for actions."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11258,6 +11984,7 @@ def job_actions(job_id: str) -> Response:
 
 
 def job_transfer(job_id: str) -> Response:
+    """Job endpoint for transfer."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11440,6 +12167,7 @@ def job_transfer(job_id: str) -> Response:
 
 
 def job_archive(job_id: str) -> Response:
+    """Job endpoint for archive."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11461,6 +12189,7 @@ def job_archive(job_id: str) -> Response:
 
 
 def jobs_bulk_delete() -> Response:
+    """Handle the jobs bulk delete route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11487,6 +12216,7 @@ def jobs_bulk_delete() -> Response:
 
 
 def tokens() -> Response:
+    """Token-balance management endpoint."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11650,6 +12380,7 @@ def tokens() -> Response:
 
 
 def tokens_ledger() -> Response:
+    """Return token ledger history entries."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11668,6 +12399,7 @@ def tokens_ledger() -> Response:
 
 
 def secrets() -> Response:
+    """Handle the secrets route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11687,6 +12419,7 @@ def secrets() -> Response:
 
 
 def delete_secret(name: str) -> Response:
+    """Handle the delete secret route."""
     if not SECRET_NAME_RE.match(name):
         return jsonify({"error": "invalid secret name"}), 400
     user = _current_user()
@@ -11701,6 +12434,7 @@ def delete_secret(name: str) -> Response:
 
 
 def github_tree() -> Response:
+    """Handle the github tree route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11970,6 +12704,7 @@ def _assistant_reply_payload(
 
 
 def assistant_requirements() -> Response:
+    """Handle the assistant requirements route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -12139,6 +12874,7 @@ def assistant_requirements() -> Response:
 
 
 def assistant_form_fill() -> Response:
+    """Handle the assistant form fill route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -12259,6 +12995,7 @@ def assistant_form_fill() -> Response:
 
 
 def playground_plan() -> Response:
+    """Handle the playground plan route."""
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -12421,6 +13158,7 @@ if hasattr(app, "add_url_rule"):
         health=health,
         capabilities_report=capabilities_report,
         admin_stats=admin_stats,
+        workers_telemetry=workers_telemetry,
         api_audit=api_audit,
     )
     register_auth_routes(

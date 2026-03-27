@@ -63,11 +63,23 @@
 
   <section class="status-strip">
     <div class="status-card" id="systemStats">
-      <div>
-        <span class="label">Workers</span>
+      <div class="workers-summary">
+        <div class="workers-head">
+          <span class="label">Workers</span>
+          <button type="button" class="ghost workers-detail-btn" id="workersDetailOpen">Timeline</button>
+        </div>
         <span class="value" id="workerCount">--</span>
+        <div class="workers-meta-grid">
+          <div><span>Capacity</span><strong id="workerCapacity">--</strong></div>
+          <div><span>Online</span><strong id="workerOnline">--</strong></div>
+          <div><span>Available</span><strong id="workerAvailable">--</strong></div>
+          <div><span>In-use</span><strong id="workerInUse">--</strong></div>
+          <div><span>Coming online</span><strong id="workerComingOnline">--</strong></div>
+          <div><span>Failed</span><strong id="workerFailed">--</strong></div>
+        </div>
+        <div id="workersInlineStatus" class="status-banner" hidden></div>
       </div>
-      <div>
+      <div class="workers-jobs">
         <span class="label">Jobs</span>
         <span class="value" id="jobCount">--</span>
       </div>
@@ -767,6 +779,25 @@
       <div class="assistant-actions">
         <button type="button" class="ghost" id="transferModalCancel">Cancel</button>
         <button type="button" class="primary" id="transferModalConfirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="workersModal" class="modal" data-open="false" aria-hidden="true" hidden>
+    <div class="modal-content workers-modal-content">
+      <div class="modal-header">
+        <h3>Workers Capacity Timeline</h3>
+        <button type="button" id="workersModalClose" class="ghost">Close</button>
+      </div>
+      <p class="subtitle" id="workersModalSubtitle">Combined workers telemetry over time.</p>
+      <div class="workers-modal-stats" id="workersModalStats"></div>
+      <div class="workers-chart-wrap">
+        <svg id="workersTimelineChart" viewBox="0 0 760 260" role="img" aria-label="Workers telemetry timeline"></svg>
+      </div>
+      <div class="workers-legend" id="workersTimelineLegend"></div>
+      <div id="workersModalStatus" class="status-banner" hidden></div>
+      <div class="assistant-actions">
+        <button type="button" class="ghost" id="workersModalRefresh">Refresh from Continuum</button>
       </div>
     </div>
   </div>
