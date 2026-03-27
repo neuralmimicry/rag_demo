@@ -25,6 +25,7 @@ class _FakeResponse:
 
 def _setup_workspace_auth(monkeypatch, job):
     monkeypatch.setattr(refiner_web, "_current_user", lambda: "integration_tester")
+    monkeypatch.setattr(refiner_web.user_store, "has_users", lambda: True)
     monkeypatch.setattr(refiner_web.manager, "get_job", lambda *_args, **_kwargs: job)
     monkeypatch.setattr(refiner_web, "_can_view_job", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(refiner_web, "_can_manage_job", lambda *_args, **_kwargs: True)

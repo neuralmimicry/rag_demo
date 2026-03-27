@@ -56,20 +56,20 @@ def _status_payload(desired: int) -> dict:
 
 
 def _build_autoscaler(manager: "_FakeManager", **kwargs):
-    return refiner_web.ContinuumQueueAutoscaler(
-        manager,
-        enabled=True,
-        poll_sec=60.0,
-        min_replicas=1,
-        max_replicas=8,
-        backlog_per_replica=1,
-        scale_up_step=1,
-        scale_down_step=1,
-        idle_sec=120.0,
-        cooldown_sec=0.0,
-        timeout_sec=2.0,
-        **kwargs,
-    )
+    config = {
+        "enabled": True,
+        "poll_sec": 60.0,
+        "min_replicas": 1,
+        "max_replicas": 8,
+        "backlog_per_replica": 1,
+        "scale_up_step": 1,
+        "scale_down_step": 1,
+        "idle_sec": 120.0,
+        "cooldown_sec": 0.0,
+        "timeout_sec": 2.0,
+    }
+    config.update(kwargs)
+    return refiner_web.ContinuumQueueAutoscaler(manager, **config)
 
 
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Autoscaler tests require real Flask runtime")

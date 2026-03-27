@@ -21,11 +21,16 @@ class _FakeProvider:
         )
 
 
+def _setup_authenticated_user(monkeypatch):
+    monkeypatch.setattr(refiner_web, "_current_user", lambda: "integration_tester")
+    monkeypatch.setattr(refiner_web.user_store, "has_users", lambda: True)
+
+
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
 def test_assistant_requirements_returns_bsl_motion_payload(monkeypatch):
     fake_provider = _FakeProvider()
 
-    monkeypatch.setattr(refiner_web, "_current_user", lambda: "integration_tester")
+    _setup_authenticated_user(monkeypatch)
     monkeypatch.setattr(refiner_web, "get_provider", lambda *args, **kwargs: fake_provider)
     monkeypatch.setattr(refiner_web, "stt_learning_store", None)
     monkeypatch.setattr(refiner_web, "STT_GESTURE_ENABLED", True)
@@ -67,7 +72,7 @@ def test_assistant_requirements_returns_bsl_motion_payload(monkeypatch):
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
 def test_assistant_requirements_returns_capacity_unavailable(monkeypatch):
     fake_provider = _FakeProvider()
-    monkeypatch.setattr(refiner_web, "_current_user", lambda: "integration_tester")
+    _setup_authenticated_user(monkeypatch)
     monkeypatch.setattr(refiner_web, "get_provider", lambda *args, **kwargs: fake_provider)
     monkeypatch.setattr(refiner_web, "_acquire_request_capacity", lambda *args, **kwargs: False)
 
