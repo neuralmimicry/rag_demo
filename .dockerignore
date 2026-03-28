@@ -12,6 +12,8 @@ venv/
 .idea/
 .vscode/
 node_modules/
+target/
+stt_rust/target/
 dist/
 job_data/
 output.md

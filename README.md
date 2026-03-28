@@ -200,7 +200,8 @@ The `Containerfile` is now aligned for both local container runtime use and Kube
 - non-root runtime user (`uid/gid 10001`)
 - writable job-data volume at `/app/job_data`
 - built-in healthcheck against `/api/health`
-- explicit entrypoint modes: `full`, `backend`, `frontend`, `tests`, `smoke`, `cli`
+- built-in Rust STT binary for the managed stack launcher
+- explicit entrypoint modes: `full` (managed STT + `refiner_web.py`), `backend` (backend only, for external STT), `frontend`, `tests`, `smoke`, `cli`
 
 #### 1) Build image locally
 Podman:
@@ -216,7 +217,7 @@ Multi-arch:
 Note: Podman default OCI output does not retain Dockerfile `HEALTHCHECK` metadata. Keep `--format docker` if you need health checks visible via `podman ps`/`podman healthcheck`.
 
 #### 2) Run Refiner suite in Podman
-Backend/API mode:
+Backend/API-only mode (use when STT is provided externally via `REFINER_STT_*` env vars):
 - `podman run --rm -p 5001:5001 -v "$(pwd)/job_data:/app/job_data:Z" refiner:latest backend`
 
 Frontend helper mode:
@@ -224,6 +225,8 @@ Frontend helper mode:
 
 Default/full mode:
 - `podman run --rm -p 5001:5001 -v "$(pwd)/job_data:/app/job_data:Z" refiner:latest`
+- This starts the same managed STT + `refiner_web.py` stack as `./scripts/start_refiner_stack.sh`.
+- If no STT model is present, the container auto-downloads it into `/app/job_data/models`.
 
 Run full automated test suite inside the image:
 - `podman run --rm refiner:latest tests`
@@ -278,7 +281,7 @@ spec:
       - name: refiner
         image: ghcr.io/<org>/refiner:latest
         imagePullPolicy: IfNotPresent
-        args: ["backend"]
+        args: ["full"]
         ports:
         - containerPort: 5001
           name: http
