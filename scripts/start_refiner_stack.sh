@@ -295,8 +295,13 @@ if [[ "${stt_host}" == "0.0.0.0" || "${stt_host}" == "::" || "${stt_host}" == "[
   stt_host="127.0.0.1"
 fi
 
+refiner_health_host="${REFINER_HOST}"
+if [[ "${refiner_health_host}" == "0.0.0.0" || "${refiner_health_host}" == "::" || "${refiner_health_host}" == "[::]" ]]; then
+  refiner_health_host="127.0.0.1"
+fi
+
 STT_HEALTH_URL="${STT_HEALTH_URL:-http://${stt_host}:${stt_port}/health}"
-REFINER_HEALTH_URL="${REFINER_HEALTH_URL:-http://${REFINER_HOST}:${REFINER_PORT}/api/health}"
+REFINER_HEALTH_URL="${REFINER_HEALTH_URL:-http://${refiner_health_host}:${REFINER_PORT}/api/health}"
 
 require_cmd curl
 require_cmd "${PYTHON_BIN}"

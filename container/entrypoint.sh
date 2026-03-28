@@ -63,11 +63,11 @@ case "$mode" in
   cli)
     exec python run_refiner.py "$@"
     ;;
-  full|combined)
-    exec python refiner_web.py "$@"
+  full|combined|stack)
+    exec ./scripts/start_refiner_stack.sh "$@"
     ;;
   *)
-    echo "Usage: $0 [backend|frontend|full|tests|smoke|cli] [args...]" >&2
+    echo "Usage: $0 [backend|frontend|full|stack|tests|smoke|cli] [args...]" >&2
     exit 1
     ;;
 esac
