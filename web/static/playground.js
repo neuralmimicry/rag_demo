@@ -154,6 +154,14 @@ if (planBtn) planBtn.addEventListener('click', requestPlan);
 if (buildBtn) buildBtn.addEventListener('click', startBuild);
 if (promptEl) promptEl.addEventListener('input', clearStatus);
 
+if (promptEl) {
+  const params = new URLSearchParams(window.location.search);
+  const stagedPrompt = params.get('prompt')?.trim();
+  if (stagedPrompt) {
+    promptEl.value = stagedPrompt;
+  }
+}
+
 if (quickTaskButtons.length && promptEl) {
   quickTaskButtons.forEach((btn) => {
     btn.addEventListener('click', () => {

@@ -68,6 +68,17 @@ from stt_gesture_planner import plan_stt_avatar_motion, sanitize_avatar_mode, sa
 from stt_rust_contracts import RustGesturePlanRequest, sanitize_rust_motion_response
 from mcp_client import MCPClient, MCPServerConfig, MCPServerStore
 from capabilities import get_capabilities, capability_summary, select_skills, format_skill_brief
+from thought_inbox import (
+    build_fingerprint as inbox_build_fingerprint,
+    build_route_suggestion,
+    build_thought_item,
+    extract_keywords as inbox_extract_keywords,
+    infer_kind as inbox_infer_kind,
+    infer_priority as inbox_infer_priority,
+    merge_duplicate_capture,
+    normalize_text as normalize_thought_text,
+    score_query_match,
+)
 from refiner_routes.voice import register_voice_routes
 from refiner_routes.assistant import register_assistant_routes
 from refiner_routes.admin import register_admin_routes
@@ -168,6 +179,8 @@ AUDIT_LOG_PATH = os.getenv("REFINER_AUDIT_LOG_PATH", os.path.join(JOB_ROOT, "aud
 ACCESS_STORE_PATH = os.path.join(JOB_ROOT, "access.json")
 SESSIONS_ROOT = os.path.join(JOB_ROOT, "sessions")
 TODO_ROOT = os.path.join(JOB_ROOT, "todos")
+TODO_CLAIM_TTL_SEC = max(60, int(os.getenv("REFINER_TODO_CLAIM_TTL_SEC", "300")))
+TODO_RETENTION_DAYS = max(0, int(os.getenv("REFINER_TODO_RETENTION_DAYS", "0")))
 VOICE_TOKEN_PATH = os.path.join(JOB_ROOT, "voice_tokens.json")
 VOICE_DEFAULT_USER = (os.getenv("REFINER_VOICE_DEFAULT_USER") or "").strip()
 VOICE_ENV_TOKEN = (os.getenv("REFINER_VOICE_TOKEN") or "").strip()
@@ -2501,11 +2514,24 @@ class VoiceTokenStore:
 
 
 class TodoStore:
-    """Per-user TODO persistence used by assistant planning endpoints."""
+    """Per-user Thought Inbox persistence with local triage and claim tracking.
 
-    def __init__(self, root: str):
+    The original implementation stored a flat list of free-form strings. The
+    upgraded store keeps the same surface area but enriches each item with
+    deterministic metadata inspired by always-on assistant runtimes:
+
+    - duplicate captures collapse into one item via a stable fingerprint,
+    - route hints map thoughts onto existing Refiner assistant/job endpoints,
+    - stale claims are automatically recovered so "next when idle" cannot get
+      permanently wedged, and
+    - lightweight local search works without needing an external memory system.
+    """
+
+    def __init__(self, root: str, *, claim_ttl_sec: int = TODO_CLAIM_TTL_SEC, retention_days: int = TODO_RETENTION_DAYS):
         self.root = root
         self.lock = threading.RLock()
+        self.claim_ttl_sec = max(60, int(claim_ttl_sec))
+        self.retention_days = max(0, int(retention_days))
         ensure_dir_permissions(root, mode=0o700)
 
     def _safe_user(self, user: str) -> str:
@@ -2517,22 +2543,232 @@ class TodoStore:
     def _load(self, user: str) -> Dict[str, Any]:
         path = self._path(user)
         if not os.path.exists(path):
-            return {"version": 1, "items": []}
+            return {"version": 2, "items": []}
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
             if not isinstance(data, dict):
-                return {"version": 1, "items": []}
+                return {"version": 2, "items": []}
             if not isinstance(data.get("items"), list):
                 data["items"] = []
             if "version" not in data:
-                data["version"] = 1
+                data["version"] = 2
             return data
         except Exception:
-            return {"version": 1, "items": []}
+            return {"version": 2, "items": []}
 
     def _write(self, user: str, data: Dict[str, Any]) -> None:
         _write_json_atomic(self._path(user), data)
+
+    def _coerce_text_list(self, value: Any) -> List[str]:
+        if isinstance(value, str):
+            value = [item.strip() for item in value.split(",") if item.strip()]
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item or "").strip()]
+
+    def _refresh_text_fields(self, item: Dict[str, Any]) -> bool:
+        """Backfill or recompute the derived fields tied directly to thought text."""
+        changed = False
+        cleaned_text = normalize_thought_text(str(item.get("text") or ""))
+        if cleaned_text != item.get("text"):
+            item["text"] = cleaned_text
+            changed = True
+        kind = inbox_infer_kind(cleaned_text, source=item.get("source"))
+        if item.get("kind") != kind:
+            item["kind"] = kind
+            changed = True
+        priority = inbox_infer_priority(
+            cleaned_text,
+            kind=kind,
+            defer_until_idle=bool(item.get("defer_until_idle")),
+        )
+        if item.get("priority") != priority:
+            item["priority"] = priority
+            changed = True
+        keywords = inbox_extract_keywords(cleaned_text)
+        if item.get("keywords") != keywords:
+            item["keywords"] = keywords
+            changed = True
+        fingerprint = inbox_build_fingerprint(cleaned_text)
+        if item.get("fingerprint") != fingerprint:
+            item["fingerprint"] = fingerprint
+            changed = True
+        return changed
+
+    def _hydrate_item(self, item: Dict[str, Any]) -> bool:
+        """Normalize a stored item into the current schema in-place."""
+        changed = False
+        if not isinstance(item, dict):
+            return False
+        if not item.get("id"):
+            item["id"] = uuid.uuid4().hex
+            changed = True
+        if not item.get("status"):
+            item["status"] = "todo"
+            changed = True
+        if "defer_until_idle" not in item:
+            item["defer_until_idle"] = False
+            changed = True
+        if "created_at" not in item:
+            item["created_at"] = _now_iso()
+            changed = True
+        if "updated_at" not in item:
+            item["updated_at"] = item.get("created_at") or _now_iso()
+            changed = True
+        if "first_captured_at" not in item:
+            item["first_captured_at"] = item.get("created_at") or _now_iso()
+            changed = True
+        if "last_captured_at" not in item:
+            item["last_captured_at"] = item.get("updated_at") or item.get("created_at") or _now_iso()
+            changed = True
+        if "occurrences" not in item or int(item.get("occurrences") or 0) <= 0:
+            item["occurrences"] = 1
+            changed = True
+        if "source_history" not in item:
+            item["source_history"] = self._coerce_text_list(item.get("source_history"))
+            if item.get("source"):
+                item["source_history"] = [str(item.get("source")).strip()]
+            changed = True
+        else:
+            coerced = self._coerce_text_list(item.get("source_history"))
+            if coerced != item.get("source_history"):
+                item["source_history"] = coerced
+                changed = True
+        if "device_history" not in item:
+            item["device_history"] = self._coerce_text_list(item.get("device_history"))
+            if item.get("device"):
+                item["device_history"] = [str(item.get("device")).strip()]
+            changed = True
+        else:
+            coerced = self._coerce_text_list(item.get("device_history"))
+            if coerced != item.get("device_history"):
+                item["device_history"] = coerced
+                changed = True
+        if "execution_state" not in item:
+            item["execution_state"] = "ready" if str(item.get("status") or "todo").lower() == "todo" else "completed"
+            changed = True
+        if "tags" in item:
+            coerced_tags = self._coerce_text_list(item.get("tags"))
+            if coerced_tags != item.get("tags"):
+                item["tags"] = coerced_tags
+                changed = True
+        if "links" in item and not isinstance(item.get("links"), dict):
+            item.pop("links", None)
+            changed = True
+        changed = self._refresh_text_fields(item) or changed
+        return changed
+
+    def _maintenance_locked(self, data: Dict[str, Any]) -> bool:
+        """Repair stale items and prune terminal records when retention is enabled."""
+        changed = False
+        items = data.get("items")
+        if not isinstance(items, list):
+            data["items"] = []
+            return True
+        active_items: List[Dict[str, Any]] = []
+        cutoff_ts = time.time() - (self.retention_days * 86400) if self.retention_days > 0 else None
+        now_iso = _now_iso()
+        for raw_item in items:
+            if not isinstance(raw_item, dict):
+                changed = True
+                continue
+            item = raw_item
+            changed = self._hydrate_item(item) or changed
+            claim_expires_at = item.get("claim_expires_at")
+            execution_state = str(item.get("execution_state") or "").strip().lower()
+            if execution_state in {"claimed", "processing"} and _timestamp_sort_key(claim_expires_at) > 0:
+                if _timestamp_sort_key(claim_expires_at) <= time.time():
+                    item["execution_state"] = "ready"
+                    item["updated_at"] = now_iso
+                    item.pop("claim_expires_at", None)
+                    item.pop("claimed_at", None)
+                    changed = True
+            status = str(item.get("status") or "todo").lower()
+            updated_ts = _timestamp_sort_key(item.get("updated_at") or item.get("created_at"))
+            if cutoff_ts is not None and status in {"done", "archived"} and updated_ts and updated_ts < cutoff_ts:
+                changed = True
+                continue
+            active_items.append(item)
+        if len(active_items) != len(items):
+            data["items"] = active_items
+            changed = True
+        data["version"] = 2
+        return changed
+
+    def _priority_weight(self, item: Dict[str, Any]) -> int:
+        return {"high": 3, "medium": 2, "low": 1}.get(str(item.get("priority") or "low").lower(), 1)
+
+    def _item_sort_key(self, item: Dict[str, Any]) -> Tuple[int, int, int, float, float]:
+        status = str(item.get("status") or "todo").lower()
+        status_rank = {"todo": 0, "done": 1, "archived": 2}.get(status, 3)
+        occurrences = max(1, int(item.get("occurrences") or 1))
+        updated = _timestamp_sort_key(item.get("last_captured_at") or item.get("updated_at") or item.get("created_at"))
+        created = _timestamp_sort_key(item.get("created_at"))
+        return (
+            status_rank,
+            -self._priority_weight(item),
+            -occurrences,
+            -updated,
+            -created,
+        )
+
+    def _next_sort_key(self, item: Dict[str, Any]) -> Tuple[int, int, float, float]:
+        occurrences = max(1, int(item.get("occurrences") or 1))
+        created = _timestamp_sort_key(item.get("first_captured_at") or item.get("created_at"))
+        updated = _timestamp_sort_key(item.get("last_captured_at") or item.get("updated_at") or item.get("created_at"))
+        return (
+            -self._priority_weight(item),
+            -occurrences,
+            created or updated,
+            updated,
+        )
+
+    def _is_ready_item(self, item: Dict[str, Any]) -> bool:
+        status = str(item.get("status") or "todo").lower()
+        execution_state = str(item.get("execution_state") or "ready").lower()
+        available_after = item.get("available_after")
+        if status != "todo":
+            return False
+        if execution_state in {"claimed", "processing"}:
+            return False
+        if available_after and _timestamp_sort_key(available_after) > time.time():
+            return False
+        return True
+
+    def _next_candidate_locked(self, data: Dict[str, Any], *, idle_only: bool = False) -> Optional[Dict[str, Any]]:
+        """Select the next eligible item without mutating claim state."""
+        items = data.get("items")
+        if not isinstance(items, list):
+            return None
+        candidates = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and self._is_ready_item(item)
+            and (not idle_only or bool(item.get("defer_until_idle")))
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=self._next_sort_key)
+        return candidates[0]
+
+    def get_item(self, user: str, todo_id: str) -> Optional[Dict[str, Any]]:
+        if not todo_id:
+            return None
+        with self.lock:
+            data = self._load(user)
+            changed = self._maintenance_locked(data)
+            for item in data.get("items", []):
+                if isinstance(item, dict) and item.get("id") == todo_id:
+                    if changed:
+                        data["updated_at"] = _now_iso()
+                        self._write(user, data)
+                    return dict(item)
+            if changed:
+                data["updated_at"] = _now_iso()
+                self._write(user, data)
+            return None
 
     def list_items(
         self,
@@ -2540,14 +2776,46 @@ class TodoStore:
         *,
         statuses: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        query: Optional[str] = None,
+        ready_only: bool = False,
+        include_routes: bool = False,
     ) -> List[Dict[str, Any]]:
-        data = self._load(user)
-        items = [item for item in data.get("items", []) if isinstance(item, dict)]
+        with self.lock:
+            data = self._load(user)
+            changed = self._maintenance_locked(data)
+            items = [dict(item) for item in data.get("items", []) if isinstance(item, dict)]
+            if changed:
+                data["updated_at"] = _now_iso()
+                self._write(user, data)
         if statuses:
             wanted = {s.strip().lower() for s in statuses if s and str(s).strip()}
             if wanted:
                 items = [item for item in items if str(item.get("status") or "todo").lower() in wanted]
-        items.sort(key=lambda item: _timestamp_sort_key(item.get("created_at")), reverse=True)
+        if ready_only:
+            items = [item for item in items if self._is_ready_item(item)]
+        query_text = str(query or "").strip()
+        if query_text:
+            scored_items: List[Dict[str, Any]] = []
+            for item in items:
+                score = score_query_match(item, query_text)
+                if score <= 0:
+                    continue
+                item["_query_score"] = score
+                scored_items.append(item)
+            scored_items.sort(
+                key=lambda item: (
+                    -float(item.get("_query_score") or 0.0),
+                    *self._item_sort_key(item),
+                )
+            )
+            items = scored_items
+        else:
+            items.sort(key=self._item_sort_key)
+        if include_routes:
+            for item in items:
+                item["route"] = build_route_suggestion(item)
+        for item in items:
+            item.pop("_query_score", None)
         if limit is not None and limit >= 0:
             items = items[:limit]
         return items
@@ -2561,40 +2829,118 @@ class TodoStore:
         device: Optional[str] = None,
         meta: Optional[Dict[str, Any]] = None,
         defer_until_idle: bool = True,
+        available_after: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = _now_iso()
-        item = {
-            "id": uuid.uuid4().hex,
-            "text": text,
-            "status": "todo",
-            "source": source,
-            "device": device,
-            "defer_until_idle": bool(defer_until_idle),
-            "created_at": now,
-            "updated_at": now,
-        }
-        if meta:
-            item["meta"] = meta
+        item = build_thought_item(
+            text,
+            now_iso=now,
+            source=source,
+            device=device,
+            meta=meta,
+            defer_until_idle=defer_until_idle,
+        )
+        if available_after:
+            item["available_after"] = available_after
         with self.lock:
             data = self._load(user)
+            self._maintenance_locked(data)
             items = data.get("items")
             if not isinstance(items, list):
                 items = []
-            items.append(item)
+            duplicate = next(
+                (
+                    existing
+                    for existing in items
+                    if isinstance(existing, dict)
+                    and str(existing.get("status") or "todo").lower() == "todo"
+                    and existing.get("fingerprint") == item.get("fingerprint")
+                ),
+                None,
+            )
+            if duplicate is not None:
+                merged = merge_duplicate_capture(
+                    duplicate,
+                    text=text,
+                    now_iso=now,
+                    source=source,
+                    device=device,
+                    meta=meta,
+                    defer_until_idle=defer_until_idle,
+                )
+                if available_after:
+                    merged["available_after"] = available_after
+                duplicate.clear()
+                duplicate.update(merged)
+                item = dict(duplicate)
+            else:
+                items.append(item)
             data["items"] = items
+            data["version"] = 2
             data["updated_at"] = now
             self._write(user, data)
-        return item
+        return dict(item)
+
+    def peek_next_item(self, user: str, *, idle_only: bool = False) -> Optional[Dict[str, Any]]:
+        """Return the next eligible thought without claiming it."""
+        with self.lock:
+            data = self._load(user)
+            changed = self._maintenance_locked(data)
+            item = self._next_candidate_locked(data, idle_only=idle_only)
+            if item is None:
+                if changed:
+                    data["updated_at"] = _now_iso()
+                    self._write(user, data)
+                return None
+            if changed:
+                data["updated_at"] = _now_iso()
+                self._write(user, data)
+            result = dict(item)
+        result["route"] = build_route_suggestion(result)
+        return result
+
+    def claim_next_item(self, user: str, *, idle_only: bool = False) -> Optional[Dict[str, Any]]:
+        """Claim the next eligible thought so concurrent clients cannot race it."""
+        with self.lock:
+            data = self._load(user)
+            changed = self._maintenance_locked(data)
+            claimed = self._next_candidate_locked(data, idle_only=idle_only)
+            if claimed is None:
+                if changed:
+                    data["updated_at"] = _now_iso()
+                    self._write(user, data)
+                return None
+            now = _now_iso()
+            expiry = dt.datetime.now(UK_TZ) + dt.timedelta(seconds=self.claim_ttl_sec)
+            claimed["execution_state"] = "claimed"
+            claimed["claimed_at"] = now
+            claimed["claim_expires_at"] = expiry.strftime(UK_DATETIME_FORMAT)
+            claimed["updated_at"] = now
+            data["updated_at"] = now
+            self._write(user, data)
+            result = dict(claimed)
+        result["route"] = build_route_suggestion(result)
+        return result
 
     def update_item(self, user: str, todo_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not todo_id:
             return None
-        allowed_keys = {"text", "status", "notes", "tags", "priority", "defer_until_idle"}
+        allowed_keys = {
+            "text",
+            "status",
+            "notes",
+            "tags",
+            "priority",
+            "defer_until_idle",
+            "available_after",
+            "execution_state",
+        }
         cleaned = {k: v for k, v in updates.items() if k in allowed_keys}
         if not cleaned:
             return None
         with self.lock:
             data = self._load(user)
+            self._maintenance_locked(data)
             items = data.get("items")
             if not isinstance(items, list):
                 items = []
@@ -2604,12 +2950,26 @@ class TodoStore:
                     continue
                 if item.get("id") == todo_id:
                     for key, value in cleaned.items():
+                        if key == "text":
+                            value = normalize_thought_text(str(value or ""))
+                        if key == "tags":
+                            value = self._coerce_text_list(value)
                         item[key] = value
+                    if "text" in cleaned or "defer_until_idle" in cleaned:
+                        self._refresh_text_fields(item)
+                    status = str(item.get("status") or "todo").lower()
+                    if status != "todo":
+                        item["execution_state"] = "completed"
+                        item.pop("claim_expires_at", None)
+                        item.pop("claimed_at", None)
+                    elif str(item.get("execution_state") or "").lower() in {"", "completed", "failed", "cancelled"}:
+                        item["execution_state"] = "ready"
                     item["updated_at"] = _now_iso()
                     target = dict(item)
                     break
             if target:
                 data["items"] = items
+                data["version"] = 2
                 data["updated_at"] = _now_iso()
                 self._write(user, data)
             return target
@@ -9242,6 +9602,29 @@ def api_profile() -> Response:
     return jsonify({"status": "ok", "email": user_store.get_email(user)})
 
 
+def _todo_meta_from_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize optional session/job/project linkage metadata for inbox items."""
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    meta = dict(meta or {})
+    for key in (
+        "session_id",
+        "session_ids",
+        "room_id",
+        "room_ids",
+        "job_id",
+        "job_ids",
+        "project_id",
+        "project_ids",
+        "team_id",
+        "team_ids",
+    ):
+        value = payload.get(key)
+        if value in (None, "", []):
+            continue
+        meta[key] = value
+    return meta or None
+
+
 def api_todos() -> Response:
     """API endpoint for todos."""
     user = _current_user()
@@ -9256,11 +9639,23 @@ def api_todos() -> Response:
         except Exception:
             limit_val = 50
         limit_val = max(0, min(limit_val, 200))
-        items = todo_store.list_items(user, statuses=statuses, limit=limit_val)
+        query = (request.args.get("query") or request.args.get("q") or "").strip() or None
+        ready_only = str(request.args.get("ready") or "").strip().lower() in {"1", "true", "yes", "y"}
+        include_routes = str(request.args.get("include_route") or "").strip().lower() in {"1", "true", "yes", "y"}
+        items = todo_store.list_items(
+            user,
+            statuses=statuses,
+            limit=None,
+            query=query,
+            ready_only=ready_only,
+            include_routes=include_routes,
+        )
         defer_raw = request.args.get("defer")
         if defer_raw is not None:
             want_defer = str(defer_raw).strip().lower() in {"1", "true", "yes", "y"}
             items = [item for item in items if bool(item.get("defer_until_idle")) == want_defer]
+        if limit_val >= 0:
+            items = items[:limit_val]
         return jsonify({"items": items})
 
     payload = request.get_json(force=True, silent=True) or {}
@@ -9272,7 +9667,8 @@ def api_todos() -> Response:
     defer_until_idle = payload.get("defer_until_idle")
     if defer_until_idle is None:
         defer_until_idle = False
-    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else None
+    available_after = _normalise_timestamp(payload.get("available_after")) if payload.get("available_after") else None
+    meta = _todo_meta_from_payload(payload)
     item = todo_store.add_item(
         user,
         text,
@@ -9280,6 +9676,7 @@ def api_todos() -> Response:
         device=device,
         meta=meta,
         defer_until_idle=bool(defer_until_idle),
+        available_after=available_after,
     )
     _audit_event("todo_create", actor=user, status="success", details={"todo_id": item.get("id"), "source": source})
     return jsonify({"status": "ok", "todo": item}), 201
@@ -9291,12 +9688,18 @@ def api_todo_next() -> Response:
     if not user:
         return jsonify({"error": "unauthorized"}), 401
     idle_only = str(request.args.get("idle") or "").strip().lower() in {"1", "true", "yes", "y"}
+    claim_item = str(request.args.get("claim") or "").strip().lower() in {"1", "true", "yes", "y"}
     if idle_only:
         busy_jobs = _busy_jobs_snapshot(exclude_user=user)
         if busy_jobs:
             return jsonify({"status": "busy", "busy_jobs": len(busy_jobs)}), 409
-    items = todo_store.list_items(user, statuses=["todo"], limit=1)
-    return jsonify({"todo": items[0] if items else None})
+    item = (
+        todo_store.claim_next_item(user, idle_only=idle_only)
+        if claim_item
+        else todo_store.peek_next_item(user, idle_only=idle_only)
+    )
+    route = item.get("route") if isinstance(item, dict) else None
+    return jsonify({"todo": item, "route": route})
 
 
 def api_todo_detail(todo_id: str) -> Response:
@@ -9334,11 +9737,26 @@ def api_todo_detail(todo_id: str) -> Response:
         updates["tags"] = tags
     if "defer_until_idle" in payload:
         updates["defer_until_idle"] = bool(payload.get("defer_until_idle"))
+    if "available_after" in payload:
+        value = payload.get("available_after")
+        updates["available_after"] = _normalise_timestamp(value) if value else None
     updated = todo_store.update_item(user, todo_id, updates)
     if not updated:
         return jsonify({"error": "not_found"}), 404
     _audit_event("todo_update", actor=user, status="success", details={"todo_id": todo_id})
     return jsonify({"status": "ok", "todo": updated})
+
+
+def api_todo_route(todo_id: str) -> Response:
+    """Return the recommended Refiner workflow for a captured thought."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    item = todo_store.get_item(user, todo_id)
+    if not item:
+        return jsonify({"error": "not_found"}), 404
+    route = build_route_suggestion(item)
+    return jsonify({"status": "ok", "todo": item, "route": route})
 
 
 def api_voice_tokens() -> Response:
@@ -13198,6 +13616,7 @@ if hasattr(app, "add_url_rule"):
         {
             "api_todos": api_todos,
             "api_todo_next": api_todo_next,
+            "api_todo_route": api_todo_route,
             "api_todo_detail": api_todo_detail,
             "api_projects": api_projects,
             "api_project_detail": api_project_detail,
