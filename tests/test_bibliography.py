@@ -35,6 +35,19 @@ def test_bibliography_generation(researcher):
     assert "## Web Sources" in bib
     assert "[Web Title 1](https://example.com/page)" in bib
 
+
+def test_bibliography_preserves_locator_hints(researcher):
+    researcher._record_web_contribution(
+        "https://example.com/spec.pdf",
+        "System Spec",
+        locator="pages 1-3",
+        locators=["p.1 b.1", "p.2 b.4"],
+    )
+
+    bib = researcher._generate_bibliography()
+
+    assert "[System Spec](https://example.com/spec.pdf) (pages 1-3)" in bib
+
 @patch("topic_researcher.jira_fetch_issues")
 @patch("topic_researcher._conf_get")
 def test_bibliography_saving_in_run(mock_conf_get, mock_jira_fetch, researcher, tmp_path, mock_llm):
