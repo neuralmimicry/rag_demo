@@ -2029,7 +2029,8 @@ def _save_programme_projects_epics_gantt_html(proj_agg: dict, epic_agg: dict, ou
             style_visibility = ' style="display:none"'
         if kind == 'story' and (r.get('visible') is False):
             style_visibility = ' style="display:none"'
-        lines.append(f'<div class="{' '.join(row_classes)}"{attr_str}{style_visibility}>')
+        row_class_attr = " ".join(row_classes)
+        lines.append(f'<div class="{row_class_attr}"{attr_str}{style_visibility}>')
         # Left column label (separate from the chart area)
         if toggle_html:
             lines.append(f"  <div class=\"label\">{toggle_html}{label}</div>")
@@ -2383,7 +2384,8 @@ def _save_kpis_html(proj_agg: dict, epic_agg: dict, output_path: str) -> bool:
             attrs.append(f'data-project="{pkey}"')
             toggle_html = f"<button class=\"toggle\" data-project=\"{pkey}\" aria-expanded=\"true\">▾</button>"
         attr_str = (" " + " ".join(attrs)) if attrs else ""
-        lines.append(f'<div class="{' '.join(row_classes)}"{attr_str}>')
+        row_class_attr = " ".join(row_classes)
+        lines.append(f'<div class="{row_class_attr}"{attr_str}>')
         if toggle_html:
             lines.append(f"  <div class=\"label\">{toggle_html}{label}</div>")
         else:
