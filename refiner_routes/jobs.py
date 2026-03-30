@@ -8,6 +8,11 @@ def register_jobs_routes(app, handlers: Dict[str, Callable]) -> None:
     app.add_url_rule("/api/todos", view_func=handlers["api_todos"], methods=["GET", "POST"])
     app.add_url_rule("/api/todos/next", view_func=handlers["api_todo_next"])
     app.add_url_rule(
+        "/api/todos/<todo_id>/route",
+        view_func=handlers["api_todo_route"],
+        methods=["POST"],
+    )
+    app.add_url_rule(
         "/api/todos/<todo_id>",
         view_func=handlers["api_todo_detail"],
         methods=["PATCH", "DELETE"],

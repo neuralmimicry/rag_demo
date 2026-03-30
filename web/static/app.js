@@ -70,6 +70,7 @@ const projectIdEl = document.getElementById('projectId');
 const projectRoleHintEl = document.getElementById('projectRoleHint');
 const todoPanelEl = document.getElementById('todoPanel');
 const todoInputEl = document.getElementById('todoInput');
+const todoSearchInputEl = document.getElementById('todoSearchInput');
 const todoDeferInputEl = document.getElementById('todoDeferInput');
 const todoAddBtn = document.getElementById('todoAdd');
 const todoRefreshBtn = document.getElementById('todoRefresh');
@@ -163,6 +164,7 @@ const requirementsSummaryCache = new Map();
 
 let currentScope = 'team';
 let projectOptions = [];
+let pendingProjectSelection = '';
 let activeSessionId = null;
 let sessionStream = null;
 let sessionSnapshot = null;
@@ -172,6 +174,9 @@ let workersTelemetrySnapshot = null;
 let jobsPollTimer = null;
 let todoFilterStatus = 'todo';
 let todoDeferOnly = false;
+let todoSearchQuery = '';
+let todoSearchTimer = null;
+let todoItemsById = new Map();
 
 const assistantMessagesEl = document.getElementById('assistantMessages');
 const assistantInputEl = document.getElementById('assistantInput');
@@ -887,32 +892,50 @@ function showToast(title, message, tone = 'success', onClick = null) {
 
 function renderTodoList(items = []) {
   if (!todoListEl) return;
+  todoItemsById = new Map();
   todoListEl.innerHTML = '';
   if (!items.length) {
     const empty = document.createElement('div');
     empty.className = 'todo-empty';
-    empty.textContent = 'No thoughts captured yet.';
+    empty.textContent = todoSearchQuery ? 'No thoughts matched your search.' : 'No thoughts captured yet.';
     todoListEl.appendChild(empty);
     return;
   }
   items.forEach((item) => {
+    if (item?.id) {
+      todoItemsById.set(item.id, item);
+    }
     const row = document.createElement('div');
     row.className = 'todo-item';
     row.dataset.todoId = item.id;
     const status = item.status || 'todo';
+    const route = item.route || null;
     const badge = `<span class="todo-badge ${status}">${status}</span>`;
     const metaParts = [];
+    if (item.kind) metaParts.push(`Kind: ${item.kind}`);
+    if (item.priority) metaParts.push(`Priority: ${item.priority}`);
+    if ((item.occurrences || 0) > 1) metaParts.push(`Captured ${item.occurrences} times`);
     if (item.source) metaParts.push(`Source: ${item.source}`);
     if (item.device) metaParts.push(`Device: ${item.device}`);
     if (item.defer_until_idle) metaParts.push('Idle-only');
+    if (item.execution_state && item.execution_state !== 'ready') metaParts.push(`State: ${item.execution_state}`);
+    if (item.available_after) metaParts.push(`Available ${formatAbsoluteTime(item.available_after)}`);
     if (item.created_at) metaParts.push(`Created ${formatAbsoluteTime(item.created_at)}`);
+    const routeHtml = route ? `
+      <div class="todo-route">
+        <strong>${escapeHtml(route.label || 'Suggested route')}</strong>
+        <span>${escapeHtml(route.reason || '')}</span>
+      </div>
+    ` : '';
     row.innerHTML = `
       <div class="todo-item-header">
         <div class="todo-text">${escapeHtml(item.text || '')}</div>
         ${badge}
       </div>
       <div class="todo-meta">${metaParts.join(' · ')}</div>
+      ${routeHtml}
       <div class="todo-actions">
+        ${route && status === 'todo' ? '<button type="button" class="ghost" data-todo-action="stage-route">Use Route</button>' : ''}
         ${status === 'todo' ? '<button type="button" class="ghost" data-todo-action="done">Done</button>' : ''}
         ${status !== 'todo' ? '<button type="button" class="ghost" data-todo-action="reopen">Reopen</button>' : ''}
         ${status !== 'archived' ? '<button type="button" class="ghost" data-todo-action="archive">Archive</button>' : ''}
@@ -925,9 +948,12 @@ function renderTodoList(items = []) {
 
 async function fetchTodos(showStatus = false) {
   if (!todoPanelEl) return;
+  todoSearchQuery = todoSearchInputEl?.value?.trim() || '';
   const params = new URLSearchParams();
   if (todoFilterStatus) params.set('status', todoFilterStatus);
   if (todoDeferOnly) params.set('defer', '1');
+  if (todoSearchQuery) params.set('q', todoSearchQuery);
+  params.set('include_route', '1');
   params.set('limit', '50');
   try {
     const res = await apiFetch(`/api/todos?${params.toString()}`);
@@ -989,6 +1015,134 @@ async function deleteTodo(todoId) {
   return data;
 }
 
+async function fetchTodoRoute(todoId) {
+  const cached = todoItemsById.get(todoId);
+  if (cached?.route) {
+    return cached;
+  }
+  const res = await apiFetch(`/api/todos/${todoId}/route`, { method: 'POST' });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to load route.');
+  }
+  const item = {
+    ...(cached || {}),
+    ...(data.todo || {}),
+    route: data.route || cached?.route || null,
+  };
+  if (item.id) {
+    todoItemsById.set(item.id, item);
+  }
+  return item;
+}
+
+function focusTodoRouteTarget(el) {
+  if (!el) return;
+  el.focus();
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function selectProjectOption(projectId) {
+  const wanted = `${projectId || ''}`.trim();
+  if (!projectIdEl || !wanted) {
+    return false;
+  }
+  const option = Array.from(projectIdEl.options || []).find((entry) => entry.value === wanted);
+  if (!option) {
+    pendingProjectSelection = wanted;
+    return false;
+  }
+  projectIdEl.value = wanted;
+  pendingProjectSelection = '';
+  updateProjectRoleHint();
+  return true;
+}
+
+function stageTodoRoute(item) {
+  const route = item?.route;
+  if (!route) {
+    showTodoStatus('No route is available for this thought.', true);
+    return;
+  }
+
+  // Stage the routed thought into Refiner's existing surfaces instead of
+  // auto-submitting work. That keeps the inbox aligned with the native
+  // workflows while avoiding accidental job creation.
+  const payload = route.payload || {};
+  const linkedProjectId = `${payload.project_id || ''}`.trim();
+  if (linkedProjectId) {
+    selectProjectOption(linkedProjectId);
+  }
+
+  if (route.workflow === 'project_solver') {
+    const projectNameEl = document.getElementById('projectName');
+    setActiveTab('job');
+    workflowSelect.value = 'project_solver';
+    updateWorkflowSections();
+    if (projectNameEl && payload.project_name) {
+      projectNameEl.value = payload.project_name;
+    }
+    if (requirementsTextEl) {
+      requirementsTextEl.value = payload.requirements_text || item.text || '';
+      extractRequirementsFromField(true);
+    }
+    persistFormState();
+    scheduleEstimate();
+    showTodoStatus('Thought staged as a Project Solver job. Review the inputs and submit when ready.');
+    focusTodoRouteTarget(requirementsTextEl || projectNameEl);
+    return;
+  }
+
+  if (route.workflow === 'topic_research') {
+    const topicSourceEl = document.getElementById('topicSource');
+    setActiveTab('job');
+    workflowSelect.value = 'topic_research';
+    updateWorkflowSections();
+    if (topicSourceEl) {
+      topicSourceEl.value = payload.topic_source || item.text || '';
+    }
+    persistFormState();
+    scheduleEstimate();
+    showTodoStatus('Thought staged as a Topic Research job. Review the inputs and submit when ready.');
+    focusTodoRouteTarget(topicSourceEl);
+    return;
+  }
+
+  if (route.workflow === 'assistant_requirements') {
+    setActiveTab('job');
+    workflowSelect.value = 'project_solver';
+    updateWorkflowSections();
+    if (payload.requirements_text && requirementsTextEl) {
+      requirementsTextEl.value = payload.requirements_text;
+      extractRequirementsFromField(true);
+    }
+    if (payload.prompt && assistantInputEl) {
+      assistantInputEl.value = payload.prompt;
+    }
+    persistFormState();
+    scheduleEstimate();
+    if (payload.mode === 'ask') {
+      showTodoStatus('Question staged in the Requirements Assistant. Click Ask to continue.');
+      focusTodoRouteTarget(assistantInputEl || requirementsTextEl);
+    } else {
+      showTodoStatus('Thought staged in the Requirements Assistant. Click Draft Requirements to continue.');
+      focusTodoRouteTarget(requirementsTextEl || assistantInputEl);
+    }
+    return;
+  }
+
+  if (route.workflow === 'playground_plan') {
+    const params = new URLSearchParams();
+    if (payload.prompt) {
+      params.set('prompt', payload.prompt);
+    }
+    window.location.href = params.toString() ? `/playground?${params.toString()}` : '/playground';
+    return;
+  }
+
+  showTodoStatus('No staging flow is available for this route yet.', true);
+}
+
 function initTodoPanel() {
   if (!todoPanelEl) return;
   if (todoStatusFiltersEl) {
@@ -1009,6 +1163,32 @@ function initTodoPanel() {
   }
   if (todoRefreshBtn) {
     todoRefreshBtn.addEventListener('click', () => fetchTodos(true));
+  }
+  if (todoSearchInputEl) {
+    const triggerSearch = () => {
+      if (todoSearchTimer) {
+        clearTimeout(todoSearchTimer);
+        todoSearchTimer = null;
+      }
+      fetchTodos(false);
+    };
+    todoSearchInputEl.addEventListener('input', () => {
+      if (todoSearchTimer) {
+        clearTimeout(todoSearchTimer);
+      }
+      // Keep the local search responsive without refetching on every keystroke.
+      todoSearchTimer = setTimeout(() => {
+        todoSearchTimer = null;
+        fetchTodos(false);
+      }, 220);
+    });
+    todoSearchInputEl.addEventListener('search', triggerSearch);
+    todoSearchInputEl.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        triggerSearch();
+      }
+    });
   }
   if (todoAddBtn) {
     todoAddBtn.addEventListener('click', async () => {
@@ -1055,8 +1235,8 @@ function initTodoPanel() {
           showTodoStatus('No idle-only todos queued.');
           return;
         }
-        showTodoStatus(`Next up: ${data.todo.text}`);
-        fetchTodos();
+        const routeLabel = data.route?.label ? ` · ${data.route.label}` : '';
+        showTodoStatus(`Next up: ${data.todo.text}${routeLabel}`);
       } catch (err) {
         showTodoStatus('Failed to fetch next todo.', true);
       }
@@ -1071,7 +1251,10 @@ function initTodoPanel() {
       if (!todoId) return;
       const action = btn.dataset.todoAction;
       try {
-        if (action === 'delete') {
+        if (action === 'stage-route') {
+          const item = await fetchTodoRoute(todoId);
+          stageTodoRoute(item);
+        } else if (action === 'delete') {
           await deleteTodo(todoId);
         } else if (action === 'done') {
           await updateTodo(todoId, { status: 'done' });
@@ -1080,7 +1263,9 @@ function initTodoPanel() {
         } else if (action === 'reopen') {
           await updateTodo(todoId, { status: 'todo' });
         }
-        fetchTodos();
+        if (action !== 'stage-route') {
+          fetchTodos();
+        }
       } catch (err) {
         showTodoStatus(err.message || 'Todo update failed.', true);
       }
@@ -2863,7 +3048,11 @@ async function fetchProjects() {
       option.dataset.capGrant = String(Boolean(project.capabilities?.grant));
       projectIdEl.appendChild(option);
     });
-    updateProjectRoleHint();
+    if (pendingProjectSelection) {
+      selectProjectOption(pendingProjectSelection);
+    } else {
+      updateProjectRoleHint();
+    }
   } catch (err) {
     console.error('Failed to fetch projects', err);
   }
