@@ -1951,7 +1951,8 @@ class TopicResearcher:
                     
                     if len(cleaned) == 1 and op.upper() in ("IN", "NOT IN"):
                         new_op = "=" if op.upper() == "IN" else "!="
-                        return f"{field} {new_op} \"{cleaned[0].strip('\"')}\""
+                        cleaned_value = cleaned[0].strip('"')
+                        return f'{field} {new_op} "{cleaned_value}"'
                         
                     return f"{field} {op} ({', '.join(cleaned)})"
 
@@ -2032,7 +2033,8 @@ class TopicResearcher:
                     
                     if len(cleaned) == 1 and op.upper() in ("IN", "NOT IN"):
                         new_op = "=" if op.upper() == "IN" else "!="
-                        return f"{field} {new_op} \"{cleaned[0].strip('\"')}\""
+                        cleaned_value = cleaned[0].strip('"')
+                        return f'{field} {new_op} "{cleaned_value}"'
                         
                     return f"{field} {op} ({', '.join(cleaned)})"
 

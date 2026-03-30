@@ -7,6 +7,11 @@ if HAS_REAL_FLASK:
     import refiner_web  # noqa: E402
 
 
+def _setup_authenticated_user(monkeypatch, username="alice"):
+    monkeypatch.setattr(refiner_web.user_store, "has_users", lambda: True)
+    return username
+
+
 def test_merge_duplicate_capture_accumulates_histories_and_links():
     first = build_thought_item(
         "Follow up on token ledger edge cases",
@@ -109,9 +114,11 @@ def test_api_todo_next_returns_claimed_route(monkeypatch, tmp_path):
     )
 
     monkeypatch.setattr(refiner_web, "todo_store", store)
-    monkeypatch.setattr(refiner_web, "_current_user", lambda: "alice")
+    username = _setup_authenticated_user(monkeypatch, "alice")
 
     with refiner_web.app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["user"] = username
         response = client.get("/api/todos/next?idle=1&claim=1")
 
     assert response.status_code == 200
@@ -133,9 +140,11 @@ def test_api_todo_route_projects_code_tasks_into_project_solver(monkeypatch, tmp
     )
 
     monkeypatch.setattr(refiner_web, "todo_store", store)
-    monkeypatch.setattr(refiner_web, "_current_user", lambda: "alice")
+    username = _setup_authenticated_user(monkeypatch, "alice")
 
     with refiner_web.app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["user"] = username
         response = client.post(f"/api/todos/{item['id']}/route")
 
     assert response.status_code == 200
