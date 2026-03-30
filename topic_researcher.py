@@ -635,16 +635,21 @@ class TopicResearcher:
 
     def _record_jira_contribution(self, key: str, summary: Optional[str] = None):
         """Records a Jira issue as a contributor to the research."""
+        if not key:
+            return
+        url = f"{self.jira_base_url.rstrip('/')}/browse/{key}"
         if key not in self.contributing_jira:
             self.contributing_jira.add(key)
-            url = f"{self.jira_base_url.rstrip('/')}/browse/{key}"
-            self.source_metadata[url] = {
+            logger.info(f"Tracked Jira contribution: {key}")
+        self._upsert_source_metadata(
+            url,
+            {
                 "type": "Jira",
                 "identifier": key,
                 "title": summary or key,
-                "url": url
-            }
-            logger.info(f"Tracked Jira contribution: {key}")
+                "url": url,
+            },
+        )
 
     def _track_issue_evidence(self, issue: Any, richness: Optional[Dict[str, Any]] = None):
         """Tracks evidence per subject for Jira issues."""
@@ -793,33 +798,101 @@ class TopicResearcher:
             
         return "\n".join(lines)
 
+    def _upsert_source_metadata(self, url: str, payload: Dict[str, Any]) -> None:
+        """Merge source metadata without discarding richer locator details.
+
+        The bibliography and source audit trail are assembled over several passes.
+        Some passes only know the title, while later binary extraction may learn
+        page ranges or block locators. This merge step keeps the richer metadata.
+        """
+        if not url:
+            return
+        merged = dict(self.source_metadata.get(url) or {})
+        for key, value in (payload or {}).items():
+            if value in (None, "", [], {}):
+                continue
+            if key == "locators":
+                existing = [str(item) for item in (merged.get("locators") or []) if str(item).strip()]
+                for item in value:
+                    item_text = str(item).strip()
+                    if item_text and item_text not in existing:
+                        existing.append(item_text)
+                if existing:
+                    merged["locators"] = existing[:16]
+                continue
+            merged[key] = value
+        if merged.get("locators") and not merged.get("locator"):
+            merged["locator"] = ", ".join(list(merged["locators"])[:3])
+        self.source_metadata[url] = merged
+
+    def _locator_metadata_from_extraction(self, extraction: Any) -> Dict[str, Any]:
+        """Return compact locator metadata from a structured file extraction."""
+        if not extraction:
+            return {}
+        locator = ""
+        try:
+            locator = str(extraction.locator_summary() or "").strip()
+        except Exception:
+            locator = ""
+        locators = []
+        for element in getattr(extraction, "elements", []) or []:
+            try:
+                item = str(element.locator() or "").strip()
+            except Exception:
+                item = ""
+            if item and item not in locators:
+                locators.append(item)
+            if len(locators) >= 8:
+                break
+        metadata: Dict[str, Any] = {}
+        if locator:
+            metadata["locator"] = locator
+        if locators:
+            metadata["locators"] = locators
+        return metadata
+
     def _record_confluence_contribution(self, page_id: Optional[str], title: str, url: Optional[str] = None):
         """Records a Confluence page as a contributor to the research."""
         entry = f"{title} ({page_id})" if page_id else title
         if entry not in self.contributing_confluence:
             self.contributing_confluence.add(entry)
-            if not url and page_id:
-                url = f"{self.jira_base_url.rstrip('/')}/wiki/pages/viewpage.action?pageId={page_id}"
-            
-            if url:
-                self.source_metadata[url] = {
+            logger.info(f"Tracked Confluence contribution: {entry}")
+        if not url and page_id:
+            url = f"{self.jira_base_url.rstrip('/')}/wiki/pages/viewpage.action?pageId={page_id}"
+        if url:
+            self._upsert_source_metadata(
+                url,
+                {
                     "type": "Confluence",
                     "identifier": page_id,
                     "title": title,
-                    "url": url
-                }
-            logger.info(f"Tracked Confluence contribution: {entry}")
+                    "url": url,
+                },
+            )
 
-    def _record_web_contribution(self, url: str, title: str):
+    def _record_web_contribution(
+        self,
+        url: str,
+        title: str,
+        *,
+        locator: Optional[str] = None,
+        locators: Optional[List[str]] = None,
+    ):
         """Records a web page as a contributor to the research."""
-        if url and url != "#" and url not in self.contributing_web:
-            self.contributing_web.add(url)
-            self.source_metadata[url] = {
-                "type": "Web",
-                "title": title,
-                "url": url
-            }
-            logger.info(f"Tracked Web contribution: {url}")
+        if url and url != "#":
+            if url not in self.contributing_web:
+                self.contributing_web.add(url)
+                logger.info(f"Tracked Web contribution: {url}")
+            self._upsert_source_metadata(
+                url,
+                {
+                    "type": "Web",
+                    "title": title,
+                    "url": url,
+                    "locator": locator,
+                    "locators": list(locators or []),
+                },
+            )
 
     def _fetch_available_containers(self) -> None:
         """
@@ -1168,11 +1241,15 @@ class TopicResearcher:
             for src in sorted_sources:
                 title = src["title"]
                 url = src["url"]
+                locator = str(src.get("locator") or "").strip()
                 if t == "Jira":
                     key = src.get("identifier")
-                    lines.append(f"* [{key}: {title}]({url})")
+                    line = f"* [{key}: {title}]({url})"
                 else:
-                    lines.append(f"* [{title}]({url})")
+                    line = f"* [{title}]({url})"
+                if locator:
+                    line += f" ({locator})"
+                lines.append(line)
             lines.append("")
             
         return "\n".join(lines).strip()
@@ -1238,7 +1315,12 @@ class TopicResearcher:
                         elif m_type == "Confluence":
                             self._record_confluence_contribution(metadata.get("identifier"), metadata.get("title"), url=path_or_url)
                         elif m_type == "Web":
-                            self._record_web_contribution(path_or_url, metadata.get("title"))
+                            self._record_web_contribution(
+                                path_or_url,
+                                metadata.get("title"),
+                                locator=metadata.get("locator"),
+                                locators=metadata.get("locators"),
+                            )
                     return content
 
             # Check if it's a Jira or Confluence URL from our own instance
@@ -1276,6 +1358,7 @@ class TopicResearcher:
 
                 if not content:
                     # Standard fetch
+                    locator_meta = {}
                     resp = self._fetch_url(path_or_url)
                     
                     # Check if it's text-based or binary
@@ -1292,7 +1375,16 @@ class TopicResearcher:
                             tmp.write(resp.content)
                             tmp_path = tmp.name
                         try:
-                            content = self.file_converter.convert(tmp_path, mime_type=content_type)
+                            extraction = self.file_converter.extract(tmp_path, mime_type=content_type)
+                            content = extraction.text
+                            locator_meta = self._locator_metadata_from_extraction(extraction)
+                            if locator_meta:
+                                self._record_web_contribution(
+                                    path_or_url,
+                                    path_or_url,
+                                    locator=locator_meta.get("locator"),
+                                    locators=locator_meta.get("locators"),
+                                )
                         finally:
                             if os.path.exists(tmp_path):
                                 os.remove(tmp_path)
@@ -1301,6 +1393,8 @@ class TopicResearcher:
                     # or the caller (e.g. _execute_queries) will record it.
                     # However, if context_sources contains a URL, we should record it here.
                     metadata = {"type": "Web", "title": path_or_url}
+                    if locator_meta:
+                        metadata.update(locator_meta)
                 
                 # Save to cache if we got content
                 if content:
@@ -1318,7 +1412,8 @@ class TopicResearcher:
                     return content
                 raise # Re-raise if no fallback data found
         else:
-            return self.file_converter.convert(path_or_url)
+            extraction = self.file_converter.extract(path_or_url)
+            return extraction.text
 
     def _fetch_context(self, context_sources: List[str]) -> str:
         """

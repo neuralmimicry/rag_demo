@@ -61,6 +61,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 from llm_providers import get_provider, LLMError
+from document_schema import coerce_document_elements
 from file_converter import FileConverter
 from rag_engine import RagDocument, RagIndex, RagStore
 from stt_learning import SttLearningStore
@@ -1430,6 +1431,7 @@ def _build_rag_documents(
         path = entry.get("path")
         metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
         source_label = entry.get("source") or entry.get("title")
+        elements = coerce_document_elements(entry.get("elements") or [])
         if path and isinstance(path, str):
             path = path.strip()
             if not path:
@@ -1444,9 +1446,18 @@ def _build_rag_documents(
             except Exception:
                 continue
             source_label = source_label or _safe_source_label(path)
-            text = converter.convert(path)
+            extraction = converter.extract(path)
+            text = extraction.text
             if isinstance(text, str) and text.startswith("Error:"):
                 continue
+            elements = extraction.elements
+            extraction_meta = extraction.summary_metadata()
+            merged_meta = dict(metadata)
+            for key, value in extraction_meta.items():
+                merged_meta.setdefault(key, value)
+            if path:
+                merged_meta.setdefault("source_path", path)
+            metadata = merged_meta
         if not text or not isinstance(text, str):
             continue
         doc_id = entry.get("id") or f"doc-{idx:03d}"
@@ -1456,9 +1467,42 @@ def _build_rag_documents(
                 source=str(source_label or doc_id),
                 text=text,
                 metadata=metadata,
+                elements=elements,
             )
         )
     return docs
+
+
+def _rag_match_citation(match: Any) -> str:
+    metadata = match.metadata if isinstance(getattr(match, "metadata", None), dict) else {}
+    citation = str(getattr(match, "citation", "") or metadata.get("citation") or "").strip()
+    return citation or str(getattr(match, "source", "") or "source")
+
+
+def _serialize_rag_match(match: Any) -> Dict[str, Any]:
+    metadata = match.metadata if isinstance(getattr(match, "metadata", None), dict) else {}
+    return {
+        "chunk_id": match.chunk_id,
+        "source": match.source,
+        "score": round(match.score, 4),
+        "text": match.text,
+        "metadata": metadata,
+        "citation": _rag_match_citation(match),
+    }
+
+
+def _render_rag_context(matches: List[Any]) -> str:
+    blocks = []
+    for match in matches:
+        citation = _rag_match_citation(match)
+        metadata = match.metadata if isinstance(getattr(match, "metadata", None), dict) else {}
+        heading_path = metadata.get("heading_path") if isinstance(metadata.get("heading_path"), list) else []
+        if heading_path:
+            heading_label = " > ".join([str(part) for part in heading_path[-3:] if str(part).strip()])
+            blocks.append(f"[{citation}]\nHeading path: {heading_label}\n{match.text}")
+        else:
+            blocks.append(f"[{citation}]\n{match.text}")
+    return "\n\n".join(blocks)
 
 if _env_flag("REFINER_TRUST_PROXY", False):
     from werkzeug.middleware.proxy_fix import ProxyFix
@@ -10952,21 +10996,12 @@ def rag_query() -> Response:
     top_k = _safe_int(payload.get("top_k"), 5) or 5
     min_score = float(payload.get("min_score") or 0.0)
     matches = index.search(query, limit=top_k, min_score=min_score)
-    context = "\n\n".join([f"[{m.source}]\n{m.text}" for m in matches])
+    context = _render_rag_context(matches)
     return jsonify(
         {
             "name": name,
             "query": query,
-            "matches": [
-                {
-                    "chunk_id": m.chunk_id,
-                    "source": m.source,
-                    "score": round(m.score, 4),
-                    "text": m.text,
-                    "metadata": m.metadata,
-                }
-                for m in matches
-            ],
+            "matches": [_serialize_rag_match(m) for m in matches],
             "context": context,
         }
     )
@@ -10996,17 +11031,8 @@ def assistant_rag_mcp() -> Response:
             return jsonify({"error": "rag_index_not_found"}), 404
         top_k = _safe_int(rag_cfg.get("top_k"), 4) or 4
         matches = index.search(prompt, limit=top_k, min_score=0.0)
-        rag_matches = [
-            {
-                "chunk_id": m.chunk_id,
-                "source": m.source,
-                "score": round(m.score, 4),
-                "text": m.text,
-                "metadata": m.metadata,
-            }
-            for m in matches
-        ]
-        rag_context = "\n\n".join([f"[{m.source}]\n{m.text}" for m in matches])
+        rag_matches = [_serialize_rag_match(m) for m in matches]
+        rag_context = _render_rag_context(matches)
 
     mcp_cfg = payload.get("mcp") if isinstance(payload.get("mcp"), dict) else {}
     mcp_result = None
@@ -11056,6 +11082,11 @@ def assistant_rag_mcp() -> Response:
     if skills_hint:
         system_lines.append("Relevant skills:")
         system_lines.append(skills_hint)
+    if rag_context:
+        system_lines.append(
+            "When using RAG context, preserve the supplied source citation labels, "
+            "including page/block locators, in the answer where they support factual claims."
+        )
     system = "\n".join(system_lines)
     user_blocks = [f"User request:\n{prompt}"]
     if rag_context:
