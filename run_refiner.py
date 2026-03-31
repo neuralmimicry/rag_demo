@@ -250,6 +250,8 @@ def _run_confluence_analysis(
     from confluence_analysis import analyze_space_and_write_report
 
     cfg = load_config()
+    instance_cfg = cfg.get("instances", [{}])[0]
+    instance_name = instance_cfg.get("name")
     llm_configs = cfg.get("llm_providers", [])
     
     # Resolve LLM config from name if provided
@@ -279,8 +281,8 @@ def _run_confluence_analysis(
             fallback_llm_provider = f_type
             fallback_llm_api_key = get_llm_credentials(f_name, f_type)
 
-    base_url = cfg.get("instances", [{}])[0].get("jira_url") or "https://your-domain.atlassian.net"
-    auth = get_credentials()
+    base_url = instance_cfg.get("jira_url") or "https://your-domain.atlassian.net"
+    auth = get_credentials(instance_name)
     out_path = output or "confluence_report.html"
     analyze_space_and_write_report(
         base_url,
@@ -345,6 +347,8 @@ def _run_jira_analysis(
     from jira_analysis import analyze_jira_and_write_report
 
     cfg = load_config()
+    instance_cfg = cfg.get("instances", [{}])[0]
+    instance_name = instance_cfg.get("name")
     llm_configs = cfg.get("llm_providers", [])
     
     # Resolve LLM config from name if provided
@@ -374,8 +378,8 @@ def _run_jira_analysis(
             fallback_llm_provider = f_type
             fallback_llm_api_key = get_llm_credentials(f_name, f_type)
 
-    base_url = cfg.get("instances", [{}])[0].get("jira_url") or "https://your-domain.atlassian.net"
-    auth = get_credentials()
+    base_url = instance_cfg.get("jira_url") or "https://your-domain.atlassian.net"
+    auth = get_credentials(instance_name)
     out_path = output or "jira_report.html"
     analyze_jira_and_write_report(
         base_url=base_url,
@@ -434,9 +438,10 @@ def _run_topic_research(
     from topic_researcher import TopicResearcher
 
     cfg = load_config()
-    base_url = cfg.get("instances", [{}])[0].get("jira_url") or "https://your-domain.atlassian.net"
-    company_name = cfg.get("instances", [{}])[0].get("name")
-    auth = get_credentials()
+    instance_cfg = cfg.get("instances", [{}])[0]
+    base_url = instance_cfg.get("jira_url") or "https://your-domain.atlassian.net"
+    company_name = instance_cfg.get("name")
+    auth = get_credentials(company_name)
 
     llm_configs = cfg.get("llm_providers", [])
     search_configs = cfg.get("search_engines", [])

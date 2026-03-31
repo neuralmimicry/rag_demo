@@ -1,8 +1,18 @@
 import os
 import re
+import sys
 from typing import Optional, Tuple
 
-def get_credentials(instance_name: Optional[str] = None):
+
+def _can_prompt() -> bool:
+    """Return True when stdin is interactive enough for credential prompts."""
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def get_credentials(instance_name: Optional[str] = None, allow_prompt: bool = True) -> Tuple[str, str]:
     """
     Retrieves JIRA credentials from environment variables or prompts the user.
     Supports instance-specific overrides via JIRA_USERNAME_NAME and JIRA_PASSWORD_NAME.
@@ -17,21 +27,25 @@ def get_credentials(instance_name: Optional[str] = None):
         if u and p:
             return u, p
 
-    username = os.getenv("JIRA_USERNAME")
+    username = os.getenv("JIRA_USERNAME") or ""
+    password = os.getenv("JIRA_PASSWORD") or ""
+
+    if not allow_prompt or not _can_prompt():
+        return username, password
+
     if not username:
         try:
             username = input("Enter your JIRA username: ")
-        except (EOFError, b"") as e:
+        except (EOFError, KeyboardInterrupt, OSError):
             username = ""
 
-    password = os.getenv("JIRA_PASSWORD")
     if not password:
         try:
             import getpass
             password = getpass.getpass("Enter your JIRA password or API token: ")
-        except (EOFError, b"") as e:
+        except (EOFError, KeyboardInterrupt, OSError):
             password = ""
-            
+
     return username, password
 
 

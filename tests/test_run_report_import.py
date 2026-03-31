@@ -59,7 +59,11 @@ def test_run_topic_research_uses_config_loader_not_main(monkeypatch, tmp_path):
             "search_engines": [],
         },
     )
-    monkeypatch.setattr(credentials, "get_credentials", lambda instance_name=None: ("user", "token"))
+    def fake_get_credentials(instance_name=None):
+        calls["instance_name"] = instance_name
+        return ("user", "token")
+
+    monkeypatch.setattr(credentials, "get_credentials", fake_get_credentials)
     monkeypatch.setattr(credentials, "get_llm_credentials", lambda name=None, provider_type="openai": None)
 
     rc = run_refiner._run_topic_research(str(source_file), str(output_file), max_iterations=1)
@@ -69,6 +73,7 @@ def test_run_topic_research_uses_config_loader_not_main(monkeypatch, tmp_path):
     assert calls["init"]["jira_base_url"] == "https://example.atlassian.net"
     assert calls["init"]["jira_auth"] == ("user", "token")
     assert calls["init"]["company_name"] == "Example Co"
+    assert calls["instance_name"] == "Example Co"
     assert calls["run"]["source"] == str(source_file)
     assert calls["run"]["output"] == str(output_file)
     assert calls["run"]["max_iterations"] == 1
