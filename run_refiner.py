@@ -38,7 +38,7 @@ Notes:
     gracefully to heuristic analysis via the Confluence REST APIs.
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import json
 import os
 import argparse
@@ -208,6 +208,55 @@ def _resolve_agentic_roles(
     return resolved
 
 
+def _match_llm_config(llm_configs: List[dict], provider_key: Optional[str]) -> Optional[dict]:
+    """Match a provider selector against config entries by name first, then type."""
+    if not provider_key:
+        return None
+    normalized = str(provider_key).strip().lower()
+    if not normalized:
+        return None
+    for item in llm_configs or []:
+        name = str(item.get("name") or "").strip().lower()
+        if name and name == normalized:
+            return item
+    for item in llm_configs or []:
+        provider_type = str(item.get("type") or "").strip().lower()
+        if provider_type and provider_type == normalized:
+            return item
+    return None
+
+
+def _resolve_llm_selection(
+    llm_configs: List[dict],
+    requested_provider: Optional[str],
+    requested_model: Optional[str],
+    requested_base_url: Optional[str],
+    get_llm_credentials,
+    default_cfg: Optional[dict] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[dict]]:
+    """Resolve one LLM slot from explicit CLI input or config defaults."""
+    matched_cfg = _match_llm_config(llm_configs, requested_provider)
+    provider = requested_provider
+    model = requested_model
+    base_url = requested_base_url
+    api_key = None
+
+    if matched_cfg is None and not provider and default_cfg:
+        matched_cfg = default_cfg
+
+    if matched_cfg:
+        provider_name = matched_cfg.get("name")
+        provider_type = matched_cfg.get("type", provider or "openai")
+        provider = provider_type
+        model = model or matched_cfg.get("model")
+        base_url = base_url or matched_cfg.get("base_url")
+        api_key = get_llm_credentials(provider_name, provider_type)
+    elif provider:
+        api_key = get_llm_credentials(None, provider)
+
+    return provider, model, base_url, api_key, matched_cfg
+
+
 def _run_jira_workflow() -> int:
     """Run the default Jira statistics workflow."""
     # Defer import to keep import side-effects minimal for unit tests
@@ -253,33 +302,32 @@ def _run_confluence_analysis(
     instance_cfg = cfg.get("instances", [{}])[0]
     instance_name = instance_cfg.get("name")
     llm_configs = cfg.get("llm_providers", [])
-    
-    # Resolve LLM config from name if provided
-    if llm_provider:
-        p_cfg = next((p for p in llm_configs if p.get("name") == llm_provider), None)
-        if p_cfg:
-            p_name = p_cfg.get("name")
-            p_type = p_cfg.get("type", "openai")
-            llm_model = llm_model or p_cfg.get("model")
-            ollama_base_url = ollama_base_url or p_cfg.get("base_url")
-            llm_provider = p_type
-            
-            # Fetch and set credentials in environment for downstream use
-            key = get_llm_credentials(p_name, p_type)
-            if key:
-                if p_type in ("openai", "gpt", "chatgpt"):
-                    os.environ["OPENAI_API_KEY"] = key
-                elif p_type in ("gemini", "google"):
-                    os.environ["GEMINI_API_KEY"] = key
-    fallback_llm_api_key = None
-    if fallback_llm_provider:
-        f_cfg = next((p for p in llm_configs if p.get("name") == fallback_llm_provider), None)
-        if f_cfg:
-            f_name = f_cfg.get("name")
-            f_type = f_cfg.get("type", "openai")
-            fallback_llm_model = fallback_llm_model or f_cfg.get("model")
-            fallback_llm_provider = f_type
-            fallback_llm_api_key = get_llm_credentials(f_name, f_type)
+    primary_default = llm_configs[0] if llm_configs else None
+    llm_provider, llm_model, ollama_base_url, llm_api_key, primary_cfg = _resolve_llm_selection(
+        llm_configs,
+        llm_provider,
+        llm_model,
+        ollama_base_url,
+        get_llm_credentials,
+        default_cfg=primary_default,
+    )
+    if llm_api_key:
+        if llm_provider in ("openai", "gpt", "chatgpt"):
+            os.environ["OPENAI_API_KEY"] = llm_api_key
+        elif llm_provider in ("gemini", "google"):
+            os.environ["GEMINI_API_KEY"] = llm_api_key
+
+    fallback_default = next((cfg for cfg in llm_configs if cfg is not primary_cfg), None)
+    fallback_llm_provider, fallback_llm_model, fallback_base_url, fallback_llm_api_key, _ = _resolve_llm_selection(
+        llm_configs,
+        fallback_llm_provider,
+        fallback_llm_model,
+        ollama_base_url,
+        get_llm_credentials,
+        default_cfg=fallback_default,
+    )
+    if fallback_llm_provider == "ollama" and fallback_base_url:
+        ollama_base_url = fallback_base_url
 
     base_url = instance_cfg.get("jira_url") or "https://your-domain.atlassian.net"
     auth = get_credentials(instance_name)
@@ -350,33 +398,32 @@ def _run_jira_analysis(
     instance_cfg = cfg.get("instances", [{}])[0]
     instance_name = instance_cfg.get("name")
     llm_configs = cfg.get("llm_providers", [])
-    
-    # Resolve LLM config from name if provided
-    if llm_provider:
-        p_cfg = next((p for p in llm_configs if p.get("name") == llm_provider), None)
-        if p_cfg:
-            p_name = p_cfg.get("name")
-            p_type = p_cfg.get("type", "openai")
-            llm_model = llm_model or p_cfg.get("model")
-            ollama_base_url = ollama_base_url or p_cfg.get("base_url")
-            llm_provider = p_type
-            
-            # Fetch and set credentials in environment for downstream use
-            key = get_llm_credentials(p_name, p_type)
-            if key:
-                if p_type in ("openai", "gpt", "chatgpt"):
-                    os.environ["OPENAI_API_KEY"] = key
-                elif p_type in ("gemini", "google"):
-                    os.environ["GEMINI_API_KEY"] = key
-    fallback_llm_api_key = None
-    if fallback_llm_provider:
-        f_cfg = next((p for p in llm_configs if p.get("name") == fallback_llm_provider), None)
-        if f_cfg:
-            f_name = f_cfg.get("name")
-            f_type = f_cfg.get("type", "openai")
-            fallback_llm_model = fallback_llm_model or f_cfg.get("model")
-            fallback_llm_provider = f_type
-            fallback_llm_api_key = get_llm_credentials(f_name, f_type)
+    primary_default = llm_configs[0] if llm_configs else None
+    llm_provider, llm_model, ollama_base_url, llm_api_key, primary_cfg = _resolve_llm_selection(
+        llm_configs,
+        llm_provider,
+        llm_model,
+        ollama_base_url,
+        get_llm_credentials,
+        default_cfg=primary_default,
+    )
+    if llm_api_key:
+        if llm_provider in ("openai", "gpt", "chatgpt"):
+            os.environ["OPENAI_API_KEY"] = llm_api_key
+        elif llm_provider in ("gemini", "google"):
+            os.environ["GEMINI_API_KEY"] = llm_api_key
+
+    fallback_default = next((cfg for cfg in llm_configs if cfg is not primary_cfg), None)
+    fallback_llm_provider, fallback_llm_model, fallback_base_url, fallback_llm_api_key, _ = _resolve_llm_selection(
+        llm_configs,
+        fallback_llm_provider,
+        fallback_llm_model,
+        ollama_base_url,
+        get_llm_credentials,
+        default_cfg=fallback_default,
+    )
+    if fallback_llm_provider == "ollama" and fallback_base_url:
+        ollama_base_url = fallback_base_url
 
     base_url = instance_cfg.get("jira_url") or "https://your-domain.atlassian.net"
     auth = get_credentials(instance_name)
@@ -445,34 +492,26 @@ def _run_topic_research(
 
     llm_configs = cfg.get("llm_providers", [])
     search_configs = cfg.get("search_engines", [])
-
-    llm_api_key = None
-    # If llm_provider is a name in llm_providers list, load its config
-    if llm_provider:
-        provider_cfg = next((p for p in llm_configs if p.get("name") == llm_provider), None)
-        if provider_cfg:
-            llm_provider_name = provider_cfg.get("name")
-            llm_provider_type = provider_cfg.get("type", "openai")
-            llm_model = llm_model or provider_cfg.get("model")
-            ollama_base_url = ollama_base_url or provider_cfg.get("base_url")
-            
-            # Update llm_provider to the type for TopicResearcher/get_provider
-            llm_provider = llm_provider_type
-            
-            # Fetch credentials for this specific provider
-            llm_api_key = get_llm_credentials(llm_provider_name, llm_provider_type)
-
-    fallback_llm_api_key = None
-    # Same for fallback
-    if fallback_llm_provider:
-        f_provider_cfg = next((p for p in llm_configs if p.get("name") == fallback_llm_provider), None)
-        if f_provider_cfg:
-            f_name = f_provider_cfg.get("name")
-            f_type = f_provider_cfg.get("type", "openai")
-            fallback_llm_model = fallback_llm_model or f_provider_cfg.get("model")
-            fallback_llm_provider = f_type
-            
-            fallback_llm_api_key = get_llm_credentials(f_name, f_type)
+    primary_default = llm_configs[0] if llm_configs else None
+    llm_provider, llm_model, ollama_base_url, llm_api_key, primary_cfg = _resolve_llm_selection(
+        llm_configs,
+        llm_provider,
+        llm_model,
+        ollama_base_url,
+        get_llm_credentials,
+        default_cfg=primary_default,
+    )
+    fallback_default = next((cfg for cfg in llm_configs if cfg is not primary_cfg), None)
+    fallback_llm_provider, fallback_llm_model, fallback_base_url, fallback_llm_api_key, _ = _resolve_llm_selection(
+        llm_configs,
+        fallback_llm_provider,
+        fallback_llm_model,
+        ollama_base_url,
+        get_llm_credentials,
+        default_cfg=fallback_default,
+    )
+    if fallback_llm_provider == "ollama" and fallback_base_url:
+        ollama_base_url = fallback_base_url
 
     agentic_roles = _resolve_agentic_roles(cfg, agentic_role_overrides, get_llm_credentials)
     if not agentic_roles:
