@@ -4,7 +4,7 @@ Provides Swagger UI and OpenAPI specification endpoints.
 """
 
 import os
-from typing import Dict, Any
+from typing import Any, Callable, Dict, Optional
 from flask import Flask, send_from_directory, jsonify
 import yaml
 import logging
@@ -131,33 +131,38 @@ def register_api_docs(app: Flask) -> None:
     logger.info("API documentation routes registered at /api/docs")
 
 
-def register_health_endpoints(app: Flask) -> None:
+def register_health_endpoints(
+    app: Flask,
+    *,
+    stt_server_url: str = "",
+    redis_enabled: Optional[Callable[[], bool]] = None,
+    continuum_enabled: Optional[Callable[[], bool]] = None,
+) -> None:
     """Register health and version endpoints."""
 
     @app.route("/health", methods=["GET"])
     def health_check():
         """Service health check endpoint."""
-        from datetime import datetime
+        from datetime import datetime, timezone
         version = get_public_version_info()
 
         # Check optional service availability
         services = {}
 
         # Check STT service
-        from refiner_web import STT_SERVER_URL
-        if STT_SERVER_URL:
+        if stt_server_url:
             try:
                 import requests
-                resp = requests.get(f"{STT_SERVER_URL}/health", timeout=2)
+                resp = requests.get(f"{stt_server_url.rstrip('/')}/health", timeout=2)
                 services["stt"] = "available" if resp.ok else "unavailable"
             except Exception:
                 services["stt"] = "unavailable"
 
         # Check Redis
         try:
-            import redis as redis_module
-            from refiner_web import _env_flag
-            if _env_flag("REFINER_ENABLE_REDIS", False):
+            import redis as _redis  # noqa: F401
+
+            if redis_enabled and redis_enabled():
                 services["redis"] = "connected"
             else:
                 services["redis"] = "disabled"
@@ -165,8 +170,10 @@ def register_health_endpoints(app: Flask) -> None:
             services["redis"] = "unavailable"
 
         # Check Continuum
-        from refiner_web import _continuum_enabled
-        services["continuum"] = "enabled" if _continuum_enabled() else "disabled"
+        try:
+            services["continuum"] = "enabled" if continuum_enabled and continuum_enabled() else "disabled"
+        except Exception:
+            services["continuum"] = "unavailable"
 
         # Determine overall status
         status = "healthy"
@@ -176,7 +183,7 @@ def register_health_endpoints(app: Flask) -> None:
         return jsonify({
             "status": status,
             "version": version["version"],
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "services": services
         })
 
@@ -189,14 +196,25 @@ def register_health_endpoints(app: Flask) -> None:
     logger.info("Health and version endpoints registered")
 
 
-def add_api_documentation_support(app: Flask) -> None:
+def add_api_documentation_support(
+    app: Flask,
+    *,
+    stt_server_url: str = "",
+    redis_enabled: Optional[Callable[[], bool]] = None,
+    continuum_enabled: Optional[Callable[[], bool]] = None,
+) -> None:
     """Add complete API documentation support to Flask app.
 
     This is the main entry point for integrating API documentation.
     Call this after app initialization but before running the server.
     """
     register_api_docs(app)
-    register_health_endpoints(app)
+    register_health_endpoints(
+        app,
+        stt_server_url=stt_server_url,
+        redis_enabled=redis_enabled,
+        continuum_enabled=continuum_enabled,
+    )
 
     logger.info(
         "API documentation available at: http://localhost:5555/api/docs (or configured host/port)"
