@@ -9,6 +9,7 @@ if HAS_REAL_FLASK:
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
 def test_voice_and_assistant_routes_are_registered():
     rules = {rule.rule for rule in refiner_web.app.url_map.iter_rules()}
+    assert "/api/version" in rules
     assert "/api/voice/stt" in rules
     assert "/api/voice/tokens" in rules
     assert "/api/assistant/requirements" in rules

@@ -52,6 +52,15 @@
       <a href="{{ site_base }}/terms">Terms</a>
       <span>|</span>
       <a href="{{ site_base }}/contact">Contact</a>
+      <span
+        class="control-version"
+        id="controlVersion"
+        data-local-version="{{ app_version.version }}"
+        data-local-build="{{ app_version.build }}"
+        data-local-commit="{{ app_version.commit_short }}"
+        title="Version {{ app_version.version }} · build {{ app_version.build }} · commit {{ app_version.commit_short }}"
+        aria-label="Control Room version {{ app_version.version }}"
+      >{{ app_version.version }}</span>
     </div>
   </header>
   <header class="hero hero-compact">

@@ -15,6 +15,7 @@ def register_admin_routes(
     metrics: Callable,
     setup: Callable,
     health: Callable,
+    api_version: Callable,
     capabilities_report: Callable,
     admin_stats: Callable,
     workers_telemetry: Callable,
@@ -29,6 +30,7 @@ def register_admin_routes(
     app.add_url_rule(metrics_path, view_func=metrics)
     app.add_url_rule("/setup", view_func=setup, methods=["GET", "POST"])
     app.add_url_rule("/api/health", view_func=health)
+    app.add_url_rule("/api/version", view_func=api_version)
     app.add_url_rule("/api/capabilities", view_func=capabilities_report)
     app.add_url_rule("/api/admin/stats", view_func=admin_stats)
     app.add_url_rule("/api/workers/telemetry", view_func=workers_telemetry)

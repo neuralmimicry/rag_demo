@@ -185,6 +185,21 @@ a:hover {
   color: rgba(242, 239, 235, 0.35);
 }
 
+.control-version {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  color: rgba(242, 239, 235, 0.5);
+  opacity: 0.85;
+  white-space: nowrap;
+  transition: color 0.2s ease;
+}
+
+.control-version:hover {
+  color: rgba(242, 239, 235, 0.68);
+}
+
 .bg {
   position: fixed;
   inset: 0;
@@ -2902,5 +2917,15 @@ button.danger:hover {
   .site-nav-links {
     width: 100%;
     justify-content: flex-start;
+  }
+
+  .site-utility {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .control-version {
+    margin-left: 0;
+    width: 100%;
   }
 }

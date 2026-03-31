@@ -92,6 +92,7 @@ from security_utils import (
     ensure_file_permissions,
     hash_identifier,
 )
+from versioning import get_public_version_info, get_version_info
 
 logger = logging.getLogger(__name__)
 try:
@@ -945,6 +946,12 @@ if SECRET_KEY_REQUIRED and not _secret_key_env:
 if not _secret_key_env:
     logger.warning("REFINER_SECRET_KEY not set; using a transient session key.")
 app.secret_key = _secret_key_env or os.urandom(32)
+
+
+@app.context_processor
+def inject_template_globals() -> Dict[str, Any]:
+    """Expose shared template metadata."""
+    return {"app_version": get_version_info()}
 
 
 def _env_list(name: str) -> List[str]:
@@ -10709,6 +10716,7 @@ def setup() -> Response:
 
 def health() -> Response:
     """Render or serve the health route."""
+    version = get_public_version_info()
     learning = None
     autoscaler_status = _continuum_autoscaler_status()
     if stt_learning_store:
@@ -10719,6 +10727,7 @@ def health() -> Response:
     return jsonify(
         {
             "status": "ok",
+            "version": version["version"],
             "jobs": len(manager.jobs),
             "workers": len(manager.workers),
             "job_actions": {
@@ -10733,6 +10742,11 @@ def health() -> Response:
             "stt_learning": learning,
         }
     )
+
+
+def api_version() -> Response:
+    """Return the running application version payload."""
+    return jsonify(get_public_version_info())
 
 
 def capabilities_report() -> Response:
@@ -13605,6 +13619,7 @@ if hasattr(app, "add_url_rule"):
         metrics=metrics,
         setup=setup,
         health=health,
+        api_version=api_version,
         capabilities_report=capabilities_report,
         admin_stats=admin_stats,
         workers_telemetry=workers_telemetry,

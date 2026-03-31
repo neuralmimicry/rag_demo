@@ -8,6 +8,7 @@ from typing import Dict, Any
 from flask import Flask, send_from_directory, jsonify
 import yaml
 import logging
+from versioning import get_public_version_info
 
 logger = logging.getLogger(__name__)
 
@@ -17,21 +18,27 @@ OPENAPI_SPEC_PATH = os.path.join(BASE_DIR, "openapi_refiner.yaml")
 
 def load_openapi_spec() -> Dict[str, Any]:
     """Load and parse OpenAPI specification from YAML file."""
+    version = get_public_version_info()
     try:
         with open(OPENAPI_SPEC_PATH, "r", encoding="utf-8") as f:
             spec = yaml.safe_load(f)
-        return spec
+        if not isinstance(spec, dict):
+            spec = {}
     except Exception as e:
         logger.error(f"Failed to load OpenAPI spec: {e}")
-        return {
+        spec = {
             "openapi": "3.0.3",
             "info": {
                 "title": "Refiner API",
-                "version": "1.0.0",
+                "version": version["version"],
                 "description": "API documentation unavailable"
             },
             "paths": {}
         }
+    info = spec.setdefault("info", {})
+    if isinstance(info, dict):
+        info["version"] = version["version"]
+    return spec
 
 
 def register_api_docs(app: Flask) -> None:
@@ -109,8 +116,7 @@ def register_api_docs(app: Flask) -> None:
     def api_docs_yaml():
         """Serve OpenAPI specification in YAML format."""
         try:
-            with open(OPENAPI_SPEC_PATH, "r", encoding="utf-8") as f:
-                content = f.read()
+            content = yaml.safe_dump(load_openapi_spec(), sort_keys=False)
             return content, 200, {"Content-Type": "text/yaml; charset=utf-8"}
         except Exception as e:
             logger.error(f"Failed to serve OpenAPI YAML: {e}")
@@ -132,6 +138,7 @@ def register_health_endpoints(app: Flask) -> None:
     def health_check():
         """Service health check endpoint."""
         from datetime import datetime
+        version = get_public_version_info()
 
         # Check optional service availability
         services = {}
@@ -168,19 +175,16 @@ def register_health_endpoints(app: Flask) -> None:
 
         return jsonify({
             "status": status,
-            "version": "1.0.0",
+            "version": version["version"],
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "services": services
         })
 
-    @app.route("/api/version", methods=["GET"])
-    def api_version():
-        """API version information."""
-        return jsonify({
-            "version": "1.0.0",
-            "build": os.getenv("BUILD_NUMBER", "dev"),
-            "commit": os.getenv("GIT_COMMIT", "unknown")[:8]
-        })
+    if "api_version" not in app.view_functions:
+        @app.route("/api/version", methods=["GET"])
+        def api_version():
+            """API version information."""
+            return jsonify(get_public_version_info())
 
     logger.info("Health and version endpoints registered")
 

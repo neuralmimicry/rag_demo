@@ -204,6 +204,7 @@ const formAssistantApplyAllBtn = document.getElementById('formAssistantApplyAll'
 const formAssistantClearBtn = document.getElementById('formAssistantClear');
 const formAssistantListEl = document.getElementById('formAssistantList');
 const formAssistantStatusEl = document.getElementById('formAssistantStatus');
+const controlVersionEl = document.getElementById('controlVersion');
 
 const API_BASE = (() => {
   if (typeof window !== 'undefined' && typeof window.__RAG_API_BASE === 'string' && window.__RAG_API_BASE.trim()) {
@@ -229,6 +230,43 @@ const apiFetch = (path, options = {}) => {
 };
 
 const apiEventSource = (path) => new EventSource(apiUrl(path), { withCredentials: true });
+
+function setControlVersion(payload) {
+  if (!controlVersionEl || !payload || typeof payload.version !== 'string') {
+    return;
+  }
+  const version = payload.version.trim();
+  if (!version) {
+    return;
+  }
+  const build = payload.build != null ? String(payload.build).trim() : '';
+  const commit = payload.commit != null ? String(payload.commit).trim() : '';
+  controlVersionEl.textContent = version;
+  const titleParts = [`Version ${version}`];
+  if (build) {
+    titleParts.push(`build ${build}`);
+  }
+  if (commit && commit !== 'unknown') {
+    titleParts.push(`commit ${commit}`);
+  }
+  controlVersionEl.title = titleParts.join(' · ');
+}
+
+async function fetchVersion() {
+  if (!controlVersionEl) {
+    return;
+  }
+  try {
+    const res = await apiFetch('/api/version', { cache: 'no-store' });
+    if (!res.ok) {
+      return;
+    }
+    const data = await res.json();
+    setControlVersion(data);
+  } catch (err) {
+    // Keep the server-rendered fallback when the API version endpoint is unavailable.
+  }
+}
 
 const assistantState = {
   messages: [],
@@ -5304,6 +5342,7 @@ fetchProjects();
 fetchAccessTree();
 fetchJobs();
 fetchHealth();
+fetchVersion();
 fetchCapabilities();
 fetchTokens();
 setInterval(fetchHealth, 15000);

@@ -9,6 +9,7 @@ import os
 import time
 
 from flask import Flask, render_template, send_from_directory, request
+from versioning import get_public_version_info, get_version_info
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PUBLIC_DIR = os.path.join(BASE_DIR, "web", "public")
@@ -43,6 +44,12 @@ if METRICS_ENABLED:
     UPTIME = Gauge("refiner_frontend_uptime_seconds", "Frontend uptime in seconds")
 
 app = Flask(__name__, static_folder="web/static", template_folder="web/templates")
+
+
+@app.context_processor
+def inject_template_globals():
+    """Expose shared template metadata."""
+    return {"app_version": get_version_info()}
 
 
 @app.route("/")
@@ -84,7 +91,13 @@ def setup() -> str:
 @app.route("/health")
 def health() -> dict:
     """Health endpoint used by container/runtime checks."""
-    return {"status": "ok"}
+    return {"status": "ok", "version": get_public_version_info()["version"]}
+
+
+@app.route("/api/version")
+def api_version() -> dict:
+    """Version endpoint for standalone frontend deployments."""
+    return get_public_version_info()
 
 
 @app.route(METRICS_PATH)

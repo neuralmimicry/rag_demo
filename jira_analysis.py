@@ -133,7 +133,7 @@ class _FallbackProvider:
             raise
 
 # Prefer using existing project facilities/config
-from main import load_config
+from config_loader import load_config
 from atlassian_utils import IssueInfo, JiraClient, parse_atlassian_datetime as _parse_dt
 
 try:

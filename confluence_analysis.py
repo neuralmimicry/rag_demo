@@ -283,7 +283,7 @@ def fetch_space_pages(base_url: str, auth: Tuple[str, str], space_key: str, limi
     # Resolve paging preferences from config if available
     page_size = 100
     try:
-        from main import load_config  # lazy import to avoid heavy dependencies at import time
+        from config_loader import load_config  # lazy import to avoid heavy dependencies at import time
         cfg = load_config() or {}
         conf_cfg = (cfg.get("confluence") or {}) if isinstance(cfg, dict) else {}
         page_size = int(conf_cfg.get("page_size", 100) or 100)
@@ -1362,7 +1362,7 @@ def _conf_list_comments(base_url: str, auth: Tuple[str, str], page_id: str, limi
     # Allow page size override via config
     per_page = 100
     try:
-        from main import load_config  # optional
+        from config_loader import load_config  # optional
         cfg = load_config() or {}
         conf_cfg = (cfg.get("confluence") or {}) if isinstance(cfg, dict) else {}
         per_page = int(conf_cfg.get("comments_page_size", 100) or 100)

@@ -245,7 +245,8 @@ def _run_confluence_analysis(
     llm_inter_request_gap: float = 3.0,
 ) -> int:
     """Execute Confluence analysis mode from parsed CLI options."""
-    from main import load_config, get_credentials, get_llm_credentials
+    from config_loader import load_config
+    from credentials import get_credentials, get_llm_credentials
     from confluence_analysis import analyze_space_and_write_report
 
     cfg = load_config()
@@ -339,7 +340,8 @@ def _run_jira_analysis(
     llm_inter_request_gap: float = 3.0,
 ) -> int:
     """Execute Jira quality analysis mode from parsed CLI options."""
-    from main import load_config, get_credentials, get_llm_credentials
+    from config_loader import load_config
+    from credentials import get_credentials, get_llm_credentials
     from jira_analysis import analyze_jira_and_write_report
 
     cfg = load_config()
@@ -427,7 +429,8 @@ def _run_topic_research(
     agentic_role_overrides: Optional[Dict[str, Dict[str, object]]] = None,
 ) -> int:
     """Execute topic research mode and optionally emit reference bibliography."""
-    from main import load_config, get_credentials, get_llm_credentials
+    from config_loader import load_config
+    from credentials import get_credentials, get_llm_credentials
     from topic_researcher import TopicResearcher
 
     cfg = load_config()

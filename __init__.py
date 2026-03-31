@@ -12,7 +12,7 @@ Public API:
 - seconds_to_work_units: utility conversion
 - normalize_name, sorting_key: small helpers used across reporting
 
-Note: Configuration is read in main.py at import time via load_config();
+Note: Configuration is read via config_loader.load_config();
 see README.md for details and config.json format.
 """
 import os
