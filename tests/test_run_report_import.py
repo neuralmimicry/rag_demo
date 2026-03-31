@@ -55,7 +55,10 @@ def test_run_topic_research_uses_config_loader_not_main(monkeypatch, tmp_path):
         "load_config",
         lambda path="config.json": {
             "instances": [{"jira_url": "https://example.atlassian.net", "name": "Example Co"}],
-            "llm_providers": [],
+            "llm_providers": [
+                {"name": "OpenAIPrimary", "type": "openai", "model": "gpt-4o-mini"},
+                {"name": "GeminiFallback", "type": "gemini", "model": "gemini-1.5-flash"},
+            ],
             "search_engines": [],
         },
     )
@@ -64,7 +67,11 @@ def test_run_topic_research_uses_config_loader_not_main(monkeypatch, tmp_path):
         return ("user", "token")
 
     monkeypatch.setattr(credentials, "get_credentials", fake_get_credentials)
-    monkeypatch.setattr(credentials, "get_llm_credentials", lambda name=None, provider_type="openai": None)
+    monkeypatch.setattr(
+        credentials,
+        "get_llm_credentials",
+        lambda name=None, provider_type="openai": f"{provider_type}:{name or 'default'}",
+    )
 
     rc = run_refiner._run_topic_research(str(source_file), str(output_file), max_iterations=1)
 
@@ -73,6 +80,12 @@ def test_run_topic_research_uses_config_loader_not_main(monkeypatch, tmp_path):
     assert calls["init"]["jira_base_url"] == "https://example.atlassian.net"
     assert calls["init"]["jira_auth"] == ("user", "token")
     assert calls["init"]["company_name"] == "Example Co"
+    assert calls["init"]["llm_provider"] == "openai"
+    assert calls["init"]["llm_model"] == "gpt-4o-mini"
+    assert calls["init"]["llm_api_key"] == "openai:OpenAIPrimary"
+    assert calls["init"]["fallback_llm_provider"] == "gemini"
+    assert calls["init"]["fallback_llm_model"] == "gemini-1.5-flash"
+    assert calls["init"]["fallback_llm_api_key"] == "gemini:GeminiFallback"
     assert calls["instance_name"] == "Example Co"
     assert calls["run"]["source"] == str(source_file)
     assert calls["run"]["output"] == str(output_file)

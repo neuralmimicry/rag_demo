@@ -107,3 +107,17 @@ def test_mock_search_engine():
     assert len(results) == 1
     assert "Search result for: test query" in results[0]["title"]
     assert "Search result content" in results[0]["snippet"]
+
+
+@patch('topic_researcher.get_provider', return_value=None)
+def test_topic_researcher_uses_noop_provider_when_provider_resolution_returns_none(mock_get_provider):
+    researcher = TopicResearcher(
+        jira_base_url="https://test.atlassian.net",
+        jira_auth=("user", "pass"),
+        llm_provider="openai"
+    )
+
+    response = researcher._predict_with_fallback([{"role": "user", "content": "Hello"}])
+
+    assert response.text == ""
+    assert researcher.llm is not None

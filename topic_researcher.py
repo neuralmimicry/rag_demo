@@ -120,13 +120,16 @@ class TopicResearcher:
                 p_kwargs["api_key"] = llm_api_key
         
         try:
-            self.llm = get_provider(
+            provider = get_provider(
                 llm_provider,
                 model=llm_model,
                 base_url=ollama_base_url,
                 inter_request_gap=llm_inter_request_gap,
                 **p_kwargs,
             )
+            if provider is None:
+                raise LLMError("No LLM provider configured")
+            self.llm = provider
         except Exception as e:
             # Keep sanitization/offline workflows usable when provider credentials are absent.
             logger.warning(f"Failed to initialize primary LLM provider '{llm_provider}': {e}. Using no-op provider.")
@@ -145,7 +148,16 @@ class TopicResearcher:
                 else:
                     f_kwargs["api_key"] = fallback_llm_api_key
             try:
-                self.fallback_llm = get_provider(fallback_llm_provider, model=fallback_llm_model, base_url=ollama_base_url, inter_request_gap=llm_inter_request_gap, **f_kwargs)
+                fallback_provider = get_provider(
+                    fallback_llm_provider,
+                    model=fallback_llm_model,
+                    base_url=ollama_base_url,
+                    inter_request_gap=llm_inter_request_gap,
+                    **f_kwargs,
+                )
+                if fallback_provider is None:
+                    raise LLMError("No fallback LLM provider configured")
+                self.fallback_llm = fallback_provider
                 logger.info(f"Initialized fallback LLM provider: {fallback_llm_provider}")
             except Exception as e:
                 logger.warning(f"Failed to initialize fallback LLM provider {fallback_llm_provider}: {e}")
