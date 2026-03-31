@@ -13726,7 +13726,12 @@ if __name__ == "__main__":
     # Register API documentation and health endpoints
     try:
         from api_docs import add_api_documentation_support
-        add_api_documentation_support(app)
+        add_api_documentation_support(
+            app,
+            stt_server_url=STT_SERVER_URL,
+            redis_enabled=lambda: _env_flag("REFINER_ENABLE_REDIS", False),
+            continuum_enabled=_continuum_enabled,
+        )
         logger.info("API documentation enabled at /api/docs")
     except Exception as exc:
         logger.warning(f"Failed to register API documentation: {exc}")
