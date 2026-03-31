@@ -11,8 +11,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 def test_containerfile_builds_managed_stt_runtime() -> None:
     containerfile = (PROJECT_ROOT / "Containerfile").read_text(encoding="utf-8")
     assert "FROM ${RUST_BASE_IMAGE} AS stt-builder" in containerfile
+    assert "FROM ${BASE_IMAGE} AS source-metadata" in containerfile
     assert "cargo build --locked --release" in containerfile
     assert "stt_rust/target/release/refiner-stt" in containerfile
+    assert ".refiner-build.json" in containerfile
+    assert "git rev-list --count HEAD" in containerfile
 
 
 def test_entrypoint_full_mode_delegates_to_stack_launcher_help() -> None:

@@ -204,6 +204,8 @@ The `Containerfile` is now aligned for both local container runtime use and Kube
 - explicit entrypoint modes: `full` (managed STT + `refiner_web.py`), `backend` (backend only, for external STT), `frontend`, `tests`, `smoke`, `cli`
 
 #### 1) Build image locally
+Refiner stamps the runtime build number from git commit count during image build, so the Control Room version shows as `x.y.zzzz` and changes on every commit.
+
 Podman:
 - `podman build --format docker -t refiner:latest -f Containerfile .`
 

@@ -18,6 +18,21 @@ COPY stt_rust /build/stt_rust
 WORKDIR /build/stt_rust
 RUN cargo build --locked --release
 
+FROM ${BASE_IMAGE} AS source-metadata
+
+WORKDIR /src
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /src
+
+RUN build_number="$(git rev-list --count HEAD 2>/dev/null || echo 0)" \
+    && git_commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
+    && printf '{"build_number":%s,"commit":"%s"}\n' "${build_number}" "${git_commit}" > /src/.refiner-build.json \
+    && rm -rf /src/.git
+
 FROM ${BASE_IMAGE}
 
 ARG APP_HOME=/app
@@ -73,7 +88,7 @@ RUN sed -i '/-proposed/d' /etc/apt/sources.list /etc/apt/sources.list.d/*.list |
     && groupadd --gid "${APP_GID}" "${APP_USER}" \
     && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /bin/sh "${APP_USER}"
 
-COPY . ${APP_HOME}
+COPY --from=source-metadata /src ${APP_HOME}
 COPY --from=stt-builder /build/stt_rust/target/release/refiner-stt /tmp/refiner-stt
 RUN python -m pip install --no-cache-dir -e ${APP_HOME} \
     && chmod +x ${APP_HOME}/container/entrypoint.sh \
