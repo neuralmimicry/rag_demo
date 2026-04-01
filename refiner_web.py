@@ -68,6 +68,7 @@ from stt_learning import SttLearningStore
 from stt_gesture_planner import plan_stt_avatar_motion, sanitize_avatar_mode, sanitize_gesture_mode
 from stt_rust_contracts import RustGesturePlanRequest, sanitize_rust_motion_response
 from mcp_client import MCPClient, MCPServerConfig, MCPServerStore
+from nmchain_client import NmChainClient, NmChainError
 from capabilities import get_capabilities, capability_summary, select_skills, format_skill_brief
 from thought_inbox import (
     build_fingerprint as inbox_build_fingerprint,
@@ -357,6 +358,7 @@ JOB_META_VERSION = 1
 ACTIVE_WINDOW_SEC = int(os.getenv("REFINER_ACTIVE_WINDOW_SEC", "120"))
 LEDGER_ROOT = os.path.join(JOB_ROOT, "ledger")
 TEAM_LEDGER_ROOT = os.path.join(JOB_ROOT, "team_ledger")
+REFINER_CHAIN_SYSTEM = (_env_first("REFINER_CHAIN_SYSTEM", default="refiner") or "refiner").strip() or "refiner"
 ESTIMATE_REPO_TTL_SEC = int(os.getenv("REFINER_ESTIMATE_REPO_TTL", "30"))
 ESTIMATE_REPO_MAX_FILES = int(os.getenv("REFINER_ESTIMATE_REPO_MAX_FILES", "900"))
 ESTIMATE_REPO_MAX_SEC = float(os.getenv("REFINER_ESTIMATE_REPO_MAX_SEC", "0.35"))
@@ -377,6 +379,9 @@ RAG_MAX_DOC_BYTES = int(os.getenv("REFINER_RAG_MAX_DOC_BYTES", "600000"))
 RAG_DEFAULT_CHUNK_SIZE = int(os.getenv("REFINER_RAG_CHUNK_SIZE", "1200"))
 RAG_DEFAULT_CHUNK_OVERLAP = int(os.getenv("REFINER_RAG_CHUNK_OVERLAP", "200"))
 RAG_DEFAULT_MAX_CHUNKS = int(os.getenv("REFINER_RAG_MAX_CHUNKS", "2000"))
+NMCHAIN = NmChainClient.from_env()
+if NMCHAIN:
+    logger.info("nmchain integration enabled for Refiner via %s", NMCHAIN.base_url)
 RAG_ALLOWED_ROOTS = [
     p for p in (os.getenv("REFINER_RAG_ALLOWED_ROOTS") or "").split(",") if p.strip()
 ]
@@ -4979,18 +4984,22 @@ class JobManager:
             job.append_log("No tokens reserved for estimate.")
         base_meta = {"job_id": job.job_id, "estimate": job.token_estimate, "workflow": job.workflow}
         if team_reserved and team_id:
-            team_token_ledger.record(
+            _record_token_event(
+                "team",
                 team_id,
                 "reserve",
                 0,
                 {**base_meta, "reserved": team_reserved, "team_id": team_id, "source": "team"},
+                request_id=_chain_request_id("job-reserve", job.job_id, "team"),
             )
         if user_reserved:
-            token_ledger.record(
+            _record_token_event(
+                "user",
                 job.owner,
                 "reserve",
                 0,
                 {**base_meta, "reserved": user_reserved, "team_id": team_id, "source": "user"},
+                request_id=_chain_request_id("job-reserve", job.job_id, "user"),
             )
         job.persist(force=True)
 
@@ -5000,18 +5009,22 @@ class JobManager:
         team_id = self._effective_team_id(job)
         reserved_user, reserved_team = self._reserved_split(job)
         if reserved_team and team_id:
-            team_token_ledger.record(
+            _record_token_event(
+                "team",
                 team_id,
                 "release",
                 0,
                 {"job_id": job.job_id, "reserved": reserved_team, "reason": reason, "team_id": team_id},
+                request_id=_chain_request_id("job-release", job.job_id, reason, "team"),
             )
         if reserved_user:
-            token_ledger.record(
+            _record_token_event(
+                "user",
                 job.owner,
                 "release",
                 0,
                 {"job_id": job.job_id, "reserved": reserved_user, "reason": reason, "team_id": team_id},
+                request_id=_chain_request_id("job-release", job.job_id, reason, "user"),
             )
         job.token_reserved = 0
         job.token_reserved_user = 0
@@ -5033,11 +5046,13 @@ class JobManager:
             team_shortfall = 0
             team_debited = 0
             if team_id and team_share > 0:
-                entry_team = team_token_ledger.record(
+                entry_team = _record_token_event(
+                    "team",
                     team_id,
                     "debit",
                     -team_share,
                     {**base_meta, "team_id": team_id, "source": "team"},
+                    request_id=_chain_request_id("job-debit", job.job_id, "team"),
                 )
                 team_shortfall = int(entry_team.get("shortfall") or 0)
                 team_debited = team_share - team_shortfall
@@ -5045,11 +5060,13 @@ class JobManager:
             user_shortfall = 0
             user_debited = 0
             if user_request > 0:
-                entry_user = token_ledger.record(
+                entry_user = _record_token_event(
+                    "user",
                     job.owner,
                     "debit",
                     -user_request,
                     {**base_meta, "team_id": team_id, "source": "user"},
+                    request_id=_chain_request_id("job-debit", job.job_id, "user"),
                 )
                 user_shortfall = int(entry_user.get("shortfall") or 0)
                 user_debited = user_request - user_shortfall
@@ -6251,6 +6268,195 @@ session_history = SessionHistoryStore(SESSIONS_ROOT)
 session_store = SessionStore()
 voice_token_store = VoiceTokenStore(VOICE_TOKEN_PATH)
 todo_store = TodoStore(TODO_ROOT)
+
+
+def _chain_enabled() -> bool:
+    return bool(NMCHAIN and NMCHAIN.enabled)
+
+
+def _chain_request_id(prefix: str, *parts: Any) -> str:
+    values = [str(prefix).strip()]
+    for part in parts:
+        if part in (None, ""):
+            continue
+        normalized = re.sub(r"[^A-Za-z0-9_.:@\\-]+", "-", str(part).strip())
+        if normalized:
+            values.append(normalized)
+    return ":".join(values)
+
+
+def _local_account_summary(scope: str, account_id: str) -> Dict[str, Any]:
+    ledger = team_token_ledger if scope == "team" else token_ledger
+    return ledger.get_summary(account_id)
+
+
+def _chain_account_summary(scope: str, account_id: str) -> Dict[str, Any]:
+    if not _chain_enabled():
+        raise NmChainError("nmchain not configured")
+    snapshot = NMCHAIN.account_snapshot(scope, account_id)
+    return {
+        "balance": int(snapshot.get("balance") or 0),
+        "paid_balance": int(snapshot.get("paid_balance") or snapshot.get("balance") or 0),
+        "free_balance": int(snapshot.get("free_balance") or 0),
+        "last_topup_tokens": int(snapshot.get("last_topup_tokens") or snapshot.get("capacity") or 0),
+        "last_topup_at": snapshot.get("last_topup_at"),
+        "updated_at": snapshot.get("updated_at"),
+        "spent_total": int(snapshot.get("spent_total") or 0),
+        "cashout_total": int(snapshot.get("cashout_total") or 0),
+        "shortfall_total": int(snapshot.get("shortfall_total") or 0),
+        "free_grant_total": int(snapshot.get("free_grant_total") or 0),
+        "reserved": int(snapshot.get("reserved") or 0),
+        "available": int(snapshot.get("available") or 0),
+        "identity": snapshot.get("identity") if isinstance(snapshot.get("identity"), dict) else None,
+    }
+
+
+def _account_summary(scope: str, account_id: str) -> Dict[str, Any]:
+    if _chain_enabled():
+        try:
+            return _chain_account_summary(scope, account_id)
+        except Exception as exc:
+            logger.warning("nmchain summary fetch failed for %s/%s: %s", scope, account_id, exc)
+    return _local_account_summary(scope, account_id)
+
+
+def _account_entries(scope: str, account_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    limit_val = max(1, min(int(limit), 500))
+    if _chain_enabled():
+        try:
+            payload = NMCHAIN.ledger_entries(scope, account_id, limit=limit_val)
+            entries = payload.get("entries")
+            if isinstance(entries, list):
+                return entries
+        except Exception as exc:
+            logger.warning("nmchain ledger fetch failed for %s/%s: %s", scope, account_id, exc)
+    ledger = team_token_ledger if scope == "team" else token_ledger
+    return ledger.list_entries(account_id, limit=limit_val)
+
+
+def _record_token_event(
+    scope: str,
+    account_id: str,
+    entry_type: str,
+    delta: int,
+    meta: Optional[Dict[str, Any]] = None,
+    *,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    meta_dict = dict(meta or {})
+    if _chain_enabled():
+        result = NMCHAIN.apply_token(
+            scope,
+            account_id,
+            entry_type=entry_type,
+            delta=int(delta),
+            request_id=request_id,
+            meta=meta_dict,
+        )
+        entry = result.get("entry")
+        if isinstance(entry, dict):
+            return entry
+        snapshot = result.get("snapshot") if isinstance(result.get("snapshot"), dict) else {}
+        return {
+            "ts": _now_iso(),
+            "type": entry_type,
+            "user": account_id,
+            "delta": int(delta),
+            "balance_after": int(snapshot.get("balance") or 0),
+            "meta": meta_dict,
+            "shortfall": 0,
+        }
+    ledger = team_token_ledger if scope == "team" else token_ledger
+    return ledger.record(account_id, entry_type, int(delta), meta_dict)
+
+
+def _capture_payment_event(
+    user: str,
+    tokens: int,
+    meta: Optional[Dict[str, Any]] = None,
+    *,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    meta_dict = dict(meta or {})
+    if _chain_enabled():
+        result = NMCHAIN.capture_payment(
+            user,
+            tokens=int(tokens),
+            amount_minor=_safe_int(meta_dict.get("amount_minor")),
+            currency=str(meta_dict.get("currency") or "").strip() or None,
+            provider=str(meta_dict.get("payment_provider") or meta_dict.get("provider") or "").strip() or None,
+            payment_id=str(meta_dict.get("payment_id") or meta_dict.get("btc_txid") or "").strip() or None,
+            checkout_flow=str(meta_dict.get("checkout_flow") or "").strip() or None,
+            request_id=request_id,
+            meta=meta_dict,
+        )
+        entry = result.get("entry")
+        if isinstance(entry, dict):
+            return entry
+        snapshot = result.get("snapshot") if isinstance(result.get("snapshot"), dict) else {}
+        return {
+            "ts": _now_iso(),
+            "type": "topup",
+            "user": user,
+            "delta": int(tokens),
+            "balance_after": int(snapshot.get("balance") or 0),
+            "meta": meta_dict,
+            "shortfall": 0,
+        }
+    return token_ledger.record(user, "topup", int(tokens), meta_dict)
+
+
+def _record_identity_event(
+    user: str,
+    *,
+    role: Optional[str] = None,
+    email: Optional[str] = None,
+    provider: Optional[str] = None,
+    subject: Optional[str] = None,
+    request_id: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not _chain_enabled():
+        return
+    try:
+        NMCHAIN.upsert_identity(
+            user,
+            role=role,
+            email=email,
+            provider=provider,
+            subject=subject,
+            request_id=request_id,
+            meta=meta or {},
+        )
+    except Exception as exc:
+        logger.warning("nmchain identity upsert failed for %s: %s", user, exc)
+
+
+def _record_login_event(
+    user: str,
+    *,
+    auth_mode: str,
+    provider: Optional[str] = None,
+    session_id: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not _chain_enabled():
+        return
+    details = dict(meta or {})
+    if provider and "provider" not in details:
+        details["provider"] = provider
+    remote_addr = request.remote_addr if has_request_context() else None
+    try:
+        NMCHAIN.observe_login(
+            user,
+            system=REFINER_CHAIN_SYSTEM,
+            auth_mode=auth_mode,
+            session_id=session_id,
+            remote_addr=remote_addr,
+            meta=details,
+        )
+    except Exception as exc:
+        logger.warning("nmchain login record failed for %s: %s", user, exc)
 if STT_LEARNING_ENABLED:
     try:
         stt_learning_store: Optional[SttLearningStore] = SttLearningStore(
@@ -8201,7 +8407,7 @@ def _notify_portal_usage(job: "Job") -> None:
     spent = int(job.token_debited or 0)
     if spent <= 0 and not job.token_shortfall:
         return
-    summary = token_ledger.get_summary(job.owner)
+    summary = _account_summary("user", job.owner)
     payload = {
         "event": "job_tokens_settled",
         "user": job.owner,
@@ -8863,7 +9069,7 @@ def _max_timestamp(left: Optional[str], right: Optional[str]) -> Optional[str]:
 
 
 def _user_token_snapshot(user: str) -> Dict[str, Any]:
-    summary = token_ledger.get_summary(user)
+    summary = _account_summary("user", user)
     reserved = manager.reserved_tokens(owner=user, source="user")
     in_use = manager.in_use_tokens(owner=user, source="user")
     balance = int(summary.get("balance") or 0)
@@ -8892,7 +9098,7 @@ def _user_token_snapshot(user: str) -> Dict[str, Any]:
 
 
 def _team_token_snapshot(team_id: str) -> Dict[str, Any]:
-    summary = team_token_ledger.get_summary(team_id)
+    summary = _account_summary("team", team_id)
     reserved = manager.reserved_tokens(team_id=team_id, source="team")
     in_use = manager.in_use_tokens(team_id=team_id, source="team")
     balance = int(summary.get("balance") or 0)
@@ -9275,6 +9481,14 @@ def login() -> Response:
             error = "Too many attempts. Please try again later."
         elif user_store.verify(username, password):
             session["user"] = username
+            _record_identity_event(
+                username,
+                role=user_store.get_role(username),
+                email=user_store.get_email(username),
+                provider="local",
+                meta={"source": "login_form"},
+            )
+            _record_login_event(username, auth_mode="local", provider="local", meta={"source": "login_form"})
             _record_login_attempt(username, ok=True)
             _audit_event("login", actor=username, status="success")
             return redirect(url_for("index"))
@@ -9404,6 +9618,21 @@ def oidc_callback() -> Response:
     subject = claims.get("sub") if isinstance(claims.get("sub"), str) else None
     user_store.upsert_external_user(username, role=role, email=email, provider="oidc", subject=subject)
     session["user"] = username
+    _record_identity_event(
+        username,
+        role=role,
+        email=email,
+        provider="oidc",
+        subject=subject,
+        meta={"source": "oidc_callback"},
+    )
+    _record_login_event(
+        username,
+        auth_mode="oidc",
+        provider="oidc",
+        session_id=subject,
+        meta={"source": "oidc_callback"},
+    )
     for key in ("oidc_state", "oidc_nonce", "oidc_code_verifier", "oidc_started_at"):
         session.pop(key, None)
     _audit_event("oidc_login", actor=username, status="success", details={"role": role})
@@ -9481,6 +9710,21 @@ def api_oidc_exchange() -> Response:
     subject = claims.get("sub") if isinstance(claims.get("sub"), str) else None
     user_store.upsert_external_user(username, role=role, email=email, provider="oidc", subject=subject)
     session["user"] = username
+    _record_identity_event(
+        username,
+        role=role,
+        email=email,
+        provider="oidc",
+        subject=subject,
+        meta={"source": "api_oidc_exchange"},
+    )
+    _record_login_event(
+        username,
+        auth_mode="oidc",
+        provider="oidc",
+        session_id=subject,
+        meta={"source": "api_oidc_exchange"},
+    )
     sso_token = _issue_sso_token(username)
     _audit_event("oidc_exchange", actor=username, status="success", details={"role": role})
     return jsonify(
@@ -9502,6 +9746,14 @@ def sso_login() -> Response:
         _audit_event("sso_login", actor=None, status="failed")
         return redirect(url_for("login"))
     session["user"] = user
+    _record_identity_event(
+        user,
+        role=user_store.get_role(user),
+        email=user_store.get_email(user),
+        provider="sso",
+        meta={"source": "sso_login"},
+    )
+    _record_login_event(user, auth_mode="sso", provider="sso", meta={"source": "sso_login"})
     _audit_event("sso_login", actor=user, status="success")
     return redirect(next_path)
 
@@ -9536,6 +9788,14 @@ def api_login() -> Response:
         _audit_event("api_login", actor=username, status="failed")
         return jsonify({"error": "invalid_credentials"}), 401
     session["user"] = username
+    _record_identity_event(
+        username,
+        role=user_store.get_role(username),
+        email=user_store.get_email(username),
+        provider="local",
+        meta={"source": "api_login"},
+    )
+    _record_login_event(username, auth_mode="local", provider="local", meta={"source": "api_login"})
     _record_login_attempt(username, ok=True)
     _audit_event("api_login", actor=username, status="success")
     sso_token = _issue_sso_token(username)
@@ -9582,6 +9842,14 @@ def api_setup() -> Response:
         return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
     user_store.create_user(username, password, role="admin", email=email or None)
     session["user"] = username
+    _record_identity_event(
+        username,
+        role=user_store.get_role(username),
+        email=user_store.get_email(username),
+        provider="setup",
+        meta={"source": "api_setup"},
+    )
+    _record_login_event(username, auth_mode="setup", provider="local", meta={"source": "api_setup"})
     _audit_event("setup", actor=username, status="success")
     sso_token = _issue_sso_token(username)
     return (
@@ -9650,6 +9918,13 @@ def api_profile() -> Response:
     if email and not EMAIL_RE.match(email):
         return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
     user_store.set_email(user, email or None)
+    _record_identity_event(
+        user,
+        role=user_store.get_role(user),
+        email=user_store.get_email(user),
+        provider="profile",
+        meta={"source": "api_profile"},
+    )
     return jsonify({"status": "ok", "email": user_store.get_email(user)})
 
 
@@ -10466,7 +10741,14 @@ def api_team_tokens(team_id: str) -> Response:
             "granted_by": user,
         }
         entry_type = "topup" if action == "add" else "grant"
-        team_token_ledger.record(team_id, entry_type, tokens, meta)
+        _record_token_event(
+            "team",
+            team_id,
+            entry_type,
+            tokens,
+            meta,
+            request_id=_chain_request_id("team-token", team_id, entry_type, uuid.uuid4().hex),
+        )
         _audit_event(
             "team_tokens_topup" if action == "add" else "team_tokens_grant",
             actor=user,
@@ -10503,7 +10785,8 @@ def api_team_tokens(team_id: str) -> Response:
         snapshot = _team_token_snapshot(team_id)
         delta = target_balance - snapshot["balance"]
         status = "matched" if delta == 0 else "adjusted"
-        team_token_ledger.record(
+        _record_token_event(
+            "team",
             team_id,
             "sync",
             delta,
@@ -10516,6 +10799,7 @@ def api_team_tokens(team_id: str) -> Response:
                 "target_paid_balance": target_paid_val,
                 "target_free_balance": target_free_val,
             },
+            request_id=None,
         )
         _audit_event("team_tokens_sync", actor=user, status=status, details={"team_id": team_id, "delta": delta})
         snapshot = _team_token_snapshot(team_id)
@@ -10709,6 +10993,14 @@ def setup() -> Response:
         else:
             user_store.create_user(username, password, role="admin", email=email or None)
             session["user"] = username
+            _record_identity_event(
+                username,
+                role=user_store.get_role(username),
+                email=user_store.get_email(username),
+                provider="setup",
+                meta={"source": "setup_form"},
+            )
+            _record_login_event(username, auth_mode="setup", provider="local", meta={"source": "setup_form"})
             _audit_event("setup", actor=username, status="success")
             return redirect(url_for("index"))
     return render_template("setup.html", error=error, api_base=API_BASE, site_base=SITE_BASE)
@@ -11471,7 +11763,8 @@ def decide_refund(job_id: str, request_id: str) -> Response:
     if status in {"settled", "partial-refund"}:
         if refund.get("settled_at"):
             return jsonify({"error": "already_settled"}), 409
-        entry = token_ledger.record(
+        entry = _record_token_event(
+            "user",
             job.owner,
             "refund",
             int(amount or 0),
@@ -11484,6 +11777,7 @@ def decide_refund(job_id: str, request_id: str) -> Response:
                 "admin": user,
                 "note": note,
             },
+            request_id=_chain_request_id("refund", request_id),
         )
         refund["settled_at"] = _now_iso()
         refund["ledger_entry"] = entry
@@ -12739,8 +13033,17 @@ def tokens() -> Response:
             "btc_txid": payload.get("btc_txid"),
             "btc_address": payload.get("btc_address"),
             "source": payload.get("source") or "portal",
+            "currency": payload.get("settlement_currency") or "GBP",
+            "payment_provider": payload.get("payment_provider"),
+            "payment_channel": payload.get("payment_channel"),
+            "payment_method": payload.get("payment_method"),
+            "checkout_flow": payload.get("checkout_flow"),
+            "payment_id": payload.get("payment_id") or payload.get("checkout_id"),
         }
-        token_ledger.record(user, "topup", tokens, meta)
+        payment_request_id = str(meta.get("payment_id") or meta.get("btc_txid") or "").strip() or _chain_request_id(
+            "portal-topup", user, uuid.uuid4().hex
+        )
+        _capture_payment_event(user, tokens, meta, request_id=payment_request_id)
         _audit_event("tokens_topup", actor=user, status="success", details={"amount": tokens})
         snapshot = _token_snapshot(user)
         return jsonify({"message": "Tokens added.", **snapshot})
@@ -12760,7 +13063,15 @@ def tokens() -> Response:
             "btc_address": payload.get("btc_address"),
             "source": payload.get("source") or "portal",
         }
-        token_ledger.record(user, "cashout", -tokens, meta)
+        _record_token_event(
+            "user",
+            user,
+            "cashout",
+            -tokens,
+            meta,
+            request_id=str(payload.get("payout_reference") or payload.get("settlement_reference") or "").strip()
+            or _chain_request_id("cashout", user, uuid.uuid4().hex),
+        )
         _audit_event("tokens_cashout", actor=user, status="success", details={"amount": tokens})
         snapshot = _token_snapshot(user)
         return jsonify({"message": "Cashout recorded.", **snapshot})
@@ -12784,7 +13095,14 @@ def tokens() -> Response:
             "note": payload.get("note") or payload.get("reason"),
             "source": payload.get("source") or "admin",
         }
-        token_ledger.record(target_user, "grant", tokens, meta)
+        _record_token_event(
+            "user",
+            target_user,
+            "grant",
+            tokens,
+            meta,
+            request_id=_chain_request_id("grant", target_user, uuid.uuid4().hex),
+        )
         _audit_event(
             "tokens_grant",
             actor=user,
@@ -12821,7 +13139,8 @@ def tokens() -> Response:
             target_free_val = None
         delta = target_balance - snapshot["balance"]
         status = "matched" if delta == 0 else "adjusted"
-        token_ledger.record(
+        _record_token_event(
+            "user",
             user,
             "sync",
             delta,
@@ -12834,6 +13153,7 @@ def tokens() -> Response:
                 "target_paid_balance": target_paid_val,
                 "target_free_balance": target_free_val,
             },
+            request_id=None,
         )
         _audit_event("tokens_sync", actor=user, status=status, details={"delta": delta})
         snapshot = _token_snapshot(user)
@@ -12857,7 +13177,7 @@ def tokens_ledger() -> Response:
         limit_val = int(limit) if limit else 50
     except Exception:
         limit_val = 50
-    entries = token_ledger.list_entries(user, limit=limit_val)
+    entries = _account_entries("user", user, limit=limit_val)
     return jsonify({"entries": entries})
 
 
