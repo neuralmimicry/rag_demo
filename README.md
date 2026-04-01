@@ -194,6 +194,11 @@ Notes:
 - BTC conversion rate defaults to `0.000016` BTC per LLM token (override with `REFINER_TOKEN_BTC_RATE`).
 - Admins can grant free (non-cashable) tokens via `POST /api/tokens` with action `grant`.
 - Cashout operations only draw down paid token balance; free grants are not cashable.
+- To move the ledger of record onto the private blockchain service, set:
+  - `REFINER_CHAIN_API_BASE=http://nmchain-host:9080`
+  - `REFINER_CHAIN_API_TOKEN=<refiner-app-token>`
+  - `REFINER_CHAIN_APP_ID=refiner`
+- When `REFINER_CHAIN_API_BASE` is configured, Refiner mirrors successful local/OIDC/SSO logins to `nmchain` and routes token top-up, grant, cashout, refund, reservation, release, debit, and sync writes through the chain-backed ledger.
 
 ### Container build and deployment (Podman + Kubernetes)
 The `Containerfile` is now aligned for both local container runtime use and Kubernetes:
