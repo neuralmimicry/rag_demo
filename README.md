@@ -32,6 +32,18 @@ Key aspects:
 - Topic research: refiner --topic-research req.txt --output researched_document.md --llm-provider openai
 - Project solver: refiner --project /path/to/project --llm-provider openai --output project_solution.json
 
+## Release workflow
+
+GitHub Actions release automation lives in `.github/workflows/build-and-release.yml`.
+
+- `pyproject.toml` is the release version source of truth.
+- official GitHub releases require a matching `vX.Y.Z` tag.
+- `scripts/package-release.sh --version <pyproject-version> --output-dir ./dist` builds the sdist/wheel set and a checksum manifest.
+- manual `workflow_dispatch` runs can package artifacts from any ref.
+- publish steps only run from a `v*` tag ref, either automatically on tag push or manually from `workflow_dispatch`.
+
+`versioning.py` still derives a git-aware runtime build identity for the UI and APIs. That build metadata is exposed alongside `release_version`, but it does not override the packaged release version from `pyproject.toml`.
+
 ## Web UI + API auth
 The web UI is backed by the same Flask server (`refiner_web.py`). It uses session cookies, with dedicated JSON endpoints for headless or cloud-hosted frontends.
 
@@ -209,7 +221,7 @@ The `Containerfile` is now aligned for both local container runtime use and Kube
 - explicit entrypoint modes: `full` (managed STT + `refiner_web.py`), `backend` (backend only, for external STT), `frontend`, `tests`, `smoke`, `cli`
 
 #### 1) Build image locally
-Refiner stamps the runtime build number from git commit count during image build, so the Control Room version shows as `x.y.zzzz` and changes on every commit.
+Refiner stamps runtime build metadata from git commit count during image build, so the Control Room build version can show as `x.y.zzzz` and change on every commit. Official release tags and Python package artifacts still follow `pyproject.toml`.
 
 Podman:
 - `podman build --format docker -t refiner:latest -f Containerfile .`

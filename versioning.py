@@ -96,6 +96,7 @@ def _read_build_info_file() -> Dict[str, Any]:
 @lru_cache(maxsize=1)
 def _cached_version_info() -> Dict[str, Any]:
     base_version = _env_first("REFINER_BASE_VERSION") or _read_pyproject_version()
+    release_version = _env_first("REFINER_RELEASE_VERSION") or base_version
     major = _env_int("REFINER_VERSION_MAJOR")
     minor = _env_int("REFINER_VERSION_MINOR")
     if major is None or minor is None:
@@ -155,6 +156,8 @@ def _cached_version_info() -> Dict[str, Any]:
 
     return {
         "version": version,
+        "build_version": version,
+        "release_version": release_version,
         "major": int(major),
         "minor": int(minor),
         "build": build,
@@ -177,6 +180,8 @@ def get_public_version_info(refresh: bool = False) -> Dict[str, Any]:
     info = get_version_info(refresh=refresh)
     return {
         "version": info["version"],
+        "build_version": info["build_version"],
+        "release_version": info["release_version"],
         "major": info["major"],
         "minor": info["minor"],
         "build": info["build"],
