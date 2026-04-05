@@ -123,6 +123,15 @@
         <div><span>Completed</span><strong id="queueCompletedCount">--</strong></div>
       </div>
     </div>
+    <div class="status-card automation-summary" id="automationSummary">
+      <div class="label">Automation</div>
+      <div class="queue-metrics">
+        <div><span>Scheduler</span><strong id="schedulerState">--</strong></div>
+        <div><span>Poll</span><strong id="schedulerPoll">--</strong></div>
+        <div><span>Subtasks queued</span><strong id="subtaskQueueDepth">--</strong></div>
+        <div><span>Subtasks active</span><strong id="subtaskInflight">--</strong></div>
+      </div>
+    </div>
   </section>
 
   <main class="control-grid">
@@ -728,6 +737,20 @@
       </div>
       <div id="todoStatus" class="status-banner" hidden></div>
       <div id="todoList" class="todo-list"></div>
+    </section>
+
+    <section class="card subtask-panel" id="subtaskPanel">
+      <div class="card-header">
+        <div>
+          <h2>Subtask Monitor</h2>
+          <p>Track scheduled todo execution and background assistant work without leaving the Control Room.</p>
+        </div>
+        <div class="actions">
+          <button type="button" id="subtaskRefresh" class="ghost">Refresh</button>
+        </div>
+      </div>
+      <div id="subtaskStatus" class="status-banner" hidden></div>
+      <div id="subtaskList" class="subtask-list"></div>
     </section>
 
     <section class="card capability-card" id="capabilityCard">

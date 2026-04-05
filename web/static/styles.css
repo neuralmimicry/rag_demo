@@ -311,7 +311,7 @@ a:hover {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) minmax(320px, 1.2fr) minmax(320px, 1.15fr);
+  grid-template-columns: minmax(220px, 0.95fr) minmax(320px, 1.2fr) minmax(260px, 1fr) minmax(260px, 1fr);
   gap: 22px;
   padding: 0 6vw 20px;
   align-items: stretch;
@@ -377,6 +377,28 @@ a:hover {
   display: flex;
   justify-content: space-between;
   gap: 8px;
+}
+
+.automation-summary {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.automation-summary.degraded {
+  border-color: rgba(194, 65, 12, 0.55);
+  box-shadow: 0 0 0 1px rgba(194, 65, 12, 0.22) inset;
+}
+
+.automation-summary .state-good {
+  color: var(--ok);
+}
+
+.automation-summary .state-warn {
+  color: var(--warn);
+}
+
+.automation-summary .state-muted {
+  color: var(--muted);
 }
 
 .workers-summary {
@@ -1879,6 +1901,161 @@ button.ghost:hover {
   color: var(--ink);
 }
 
+.task-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.task-pill.planned {
+  border-color: rgba(227, 85, 40, 0.45);
+  color: var(--accent);
+}
+
+.task-pill.active {
+  border-color: rgba(240, 122, 82, 0.5);
+  color: var(--warn);
+}
+
+.task-pill.done {
+  border-color: rgba(34, 197, 94, 0.45);
+  color: var(--ok);
+}
+
+.task-pill.error {
+  border-color: rgba(180, 64, 0, 0.45);
+  color: var(--danger);
+}
+
+.task-pill.muted {
+  color: var(--muted);
+}
+
+.todo-schedule-panel {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.14);
+  padding: 12px;
+}
+
+.todo-schedule-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.todo-schedule-header strong {
+  color: var(--ink);
+}
+
+.todo-schedule-header span,
+.todo-schedule-item-meta,
+.todo-schedule-more,
+.subtask-meta,
+.subtask-detail {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.todo-schedule-list,
+.subtask-list {
+  display: grid;
+  gap: 10px;
+}
+
+.todo-schedule-item,
+.subtask-item {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.todo-schedule-item-head,
+.subtask-item-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.todo-schedule-item-title,
+.subtask-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.todo-schedule-item-title strong,
+.subtask-title-row strong {
+  color: var(--ink);
+}
+
+.todo-schedule-compose {
+  display: grid;
+  gap: 10px;
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+}
+
+.todo-schedule-quick {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.todo-schedule-form {
+  display: grid;
+  gap: 10px;
+}
+
+.todo-schedule-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.todo-schedule-form input[type="number"] {
+  width: 100%;
+  padding: 9px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--input-border);
+  background: var(--input-bg);
+  color: var(--ink);
+}
+
+.todo-schedule-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.todo-schedule-empty,
+.subtask-empty {
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  text-align: center;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.02);
+}
+
 .todo-actions {
   display: flex;
   gap: 8px;
@@ -1891,6 +2068,10 @@ button.ghost:hover {
   padding: 12px;
   text-align: center;
   color: var(--muted);
+}
+
+.subtask-panel {
+  margin-bottom: 18px;
 }
 
 .cli-builder {
@@ -2840,10 +3021,6 @@ button.danger:hover {
 
   .status-strip {
     grid-template-columns: minmax(260px, 1fr) minmax(320px, 1.2fr);
-  }
-
-  #queueSummary {
-    grid-column: 1 / -1;
   }
 
   #systemStats {

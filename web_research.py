@@ -18,7 +18,7 @@ import re
 import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
@@ -102,6 +102,10 @@ class SearchEngine:
         """Return normalized search results for a query."""
         raise NotImplementedError
 
+    def provider_id(self) -> str:
+        """Return a stable provider identifier for caching and logging."""
+        return self.__class__.__name__.lower()
+
     def verify(self) -> Tuple[bool, str]:
         """Check provider readiness."""
         return True, "Success"
@@ -120,6 +124,9 @@ class MockSearchEngine(SearchEngine):
         self.llm_params = llm_params or {}
         self.fallback_llm = fallback_llm
         self._quota_reached = False
+
+    def provider_id(self) -> str:
+        return "mock"
 
     def search(self, query: str) -> List[Dict[str, str]]:
         """Generate synthetic search results via the configured LLM."""
@@ -333,6 +340,302 @@ class GoogleSearchEngine(SearchEngine):
                 message = self._format_error(e.response)
             return False, message
 
+    def provider_id(self) -> str:
+        return f"google:{self.cse_id or 'default'}"
+
+
+def _extract_duckduckgo_url(raw_url: str) -> str:
+    cleaned = str(raw_url or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.startswith("//"):
+        cleaned = f"https:{cleaned}"
+    parsed = urlparse(cleaned)
+    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+        encoded = parse_qs(parsed.query).get("uddg") or []
+        if encoded:
+            return unquote(encoded[0])
+    return cleaned
+
+
+def _parse_duckduckgo_results(html_text: str) -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+    if not html_text:
+        return results
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+    except Exception:
+        pattern = re.compile(
+            r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
+            r'(?:<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>|'
+            r'<div[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</div>)',
+            re.IGNORECASE | re.DOTALL,
+        )
+        for href, title, snippet_a, snippet_b in pattern.findall(html_text):
+            results.append(
+                {
+                    "title": html_lib.unescape(re.sub(r"<[^>]+>", " ", title)).strip(),
+                    "snippet": html_lib.unescape(re.sub(r"<[^>]+>", " ", snippet_a or snippet_b)).strip(),
+                    "url": _extract_duckduckgo_url(href),
+                }
+            )
+        return [item for item in results if item.get("url")]
+    soup = BeautifulSoup(html_text, "html.parser")
+    for result in soup.select(".result"):
+        title_link = result.select_one(".result__a")
+        if not title_link:
+            continue
+        snippet_node = result.select_one(".result__snippet")
+        results.append(
+            {
+                "title": title_link.get_text(" ", strip=True),
+                "snippet": snippet_node.get_text(" ", strip=True) if snippet_node else "",
+                "url": _extract_duckduckgo_url(title_link.get("href") or ""),
+            }
+        )
+    return [item for item in results if item.get("url")]
+
+
+class DuckDuckGoSearchEngine(SearchEngine):
+    """HTML DuckDuckGo search integration without API credentials."""
+
+    def __init__(self, *, timeout: Optional[int] = None, max_results: int = 5):
+        self.timeout = timeout or 10
+        self.max_results = max(1, min(int(max_results or 5), 20))
+        self.endpoint = "https://html.duckduckgo.com/html/"
+
+    def provider_id(self) -> str:
+        return "duckduckgo"
+
+    def search(self, query: str) -> List[Dict[str, str]]:
+        normalized_query = normalize_query(query, max_chars=_env_int("WEB_SEARCH_MAX_QUERY_CHARS", 512))
+        if not normalized_query:
+            return []
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; RefinerResearchBot/1.0; +https://duckduckgo.com/)",
+        }
+        try:
+            resp = requests.post(
+                self.endpoint,
+                data={"q": normalized_query},
+                headers=headers,
+                timeout=self.timeout,
+            )
+            if int(getattr(resp, "status_code", 0) or 0) >= 400:
+                logger.error("DuckDuckGo search failed: HTTP %s", getattr(resp, "status_code", "0"))
+                return []
+            return _parse_duckduckgo_results(getattr(resp, "text", ""))[: self.max_results]
+        except Exception as exc:
+            logger.error("DuckDuckGo search failed: %s", exc)
+            return []
+
+
+class BraveSearchEngine(SearchEngine):
+    """Brave Search API integration."""
+
+    def __init__(self, api_key: str, *, timeout: Optional[int] = None, max_results: int = 5):
+        self.api_key = api_key
+        self.timeout = timeout or 10
+        self.max_results = max(1, min(int(max_results or 5), 20))
+        self.endpoint = "https://api.search.brave.com/res/v1/web/search"
+
+    def provider_id(self) -> str:
+        return "brave"
+
+    def verify(self) -> Tuple[bool, str]:
+        if not self.api_key:
+            return False, "Brave Search API key is missing."
+        return True, "Success"
+
+    def search(self, query: str) -> List[Dict[str, str]]:
+        if not self.api_key:
+            return []
+        normalized_query = normalize_query(query, max_chars=_env_int("WEB_SEARCH_MAX_QUERY_CHARS", 512))
+        if not normalized_query:
+            return []
+        try:
+            resp = requests.get(
+                self.endpoint,
+                headers={
+                    "Accept": "application/json",
+                    "X-Subscription-Token": self.api_key,
+                },
+                params={"q": normalized_query, "count": self.max_results},
+                timeout=self.timeout,
+            )
+            if int(getattr(resp, "status_code", 0) or 0) >= 400:
+                logger.error("Brave search failed: HTTP %s", getattr(resp, "status_code", "0"))
+                return []
+            data = resp.json()
+            results = []
+            web_results = data.get("web", {}).get("results", []) if isinstance(data, dict) else []
+            for item in web_results:
+                if not isinstance(item, dict):
+                    continue
+                results.append(
+                    {
+                        "title": str(item.get("title") or ""),
+                        "snippet": str(item.get("description") or item.get("snippet") or ""),
+                        "url": str(item.get("url") or ""),
+                    }
+                )
+            return [item for item in results if item.get("url")]
+        except Exception as exc:
+            logger.error("Brave search failed: %s", exc)
+            return []
+
+
+class TavilySearchEngine(SearchEngine):
+    """Tavily Search API integration."""
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        timeout: Optional[int] = None,
+        max_results: int = 5,
+        search_depth: str = "basic",
+    ):
+        self.api_key = api_key
+        self.timeout = timeout or 10
+        self.max_results = max(1, min(int(max_results or 5), 20))
+        self.search_depth = str(search_depth or "basic").strip() or "basic"
+        self.endpoint = "https://api.tavily.com/search"
+
+    def provider_id(self) -> str:
+        return "tavily"
+
+    def verify(self) -> Tuple[bool, str]:
+        if not self.api_key:
+            return False, "Tavily API key is missing."
+        return True, "Success"
+
+    def search(self, query: str) -> List[Dict[str, str]]:
+        if not self.api_key:
+            return []
+        normalized_query = normalize_query(query, max_chars=_env_int("WEB_SEARCH_MAX_QUERY_CHARS", 512))
+        if not normalized_query:
+            return []
+        try:
+            resp = requests.post(
+                self.endpoint,
+                json={
+                    "api_key": self.api_key,
+                    "query": normalized_query,
+                    "max_results": self.max_results,
+                    "search_depth": self.search_depth,
+                    "include_answer": False,
+                    "include_raw_content": False,
+                },
+                timeout=self.timeout,
+            )
+            if int(getattr(resp, "status_code", 0) or 0) >= 400:
+                logger.error("Tavily search failed: HTTP %s", getattr(resp, "status_code", "0"))
+                return []
+            data = resp.json()
+            results = []
+            for item in data.get("results", []) if isinstance(data, dict) else []:
+                if not isinstance(item, dict):
+                    continue
+                results.append(
+                    {
+                        "title": str(item.get("title") or item.get("url") or ""),
+                        "snippet": str(item.get("content") or item.get("snippet") or ""),
+                        "url": str(item.get("url") or ""),
+                    }
+                )
+            return [item for item in results if item.get("url")]
+        except Exception as exc:
+            logger.error("Tavily search failed: %s", exc)
+            return []
+
+
+def build_search_engine(
+    config: Dict[str, Any],
+    *,
+    llm: Optional[LLMProvider] = None,
+    llm_params: Optional[Dict[str, Any]] = None,
+    fallback_llm: Optional[LLMProvider] = None,
+    timeout: Optional[int] = None,
+    cache_ttl_hours: int = 24,
+    cache_root: Optional[str] = None,
+) -> Optional[SearchEngine]:
+    """Create a search engine instance from a config dict."""
+    if not isinstance(config, dict):
+        return None
+
+    def _coerce_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    search_type = str(config.get("type") or "google").strip().lower() or "google"
+    name = str(config.get("name") or "").strip() or None
+    max_results = max(1, min(_coerce_int(config.get("max_results") or config.get("num") or 5, 5), 20))
+    resolved_timeout = _coerce_int(config.get("timeout") or timeout or 10, 10)
+
+    if search_type == "google":
+        api_key = str(config.get("api_key") or config.get("key") or "").strip()
+        cse_id = str(config.get("cse_id") or config.get("cx") or config.get("engine_id") or "").strip()
+        if not api_key or not cse_id:
+            try:
+                from credentials import get_search_credentials
+
+                env_key, env_cse = get_search_credentials(name)
+            except Exception:
+                env_key, env_cse = "", ""
+            api_key = api_key or str(env_key or "").strip()
+            cse_id = cse_id or str(env_cse or "").strip()
+        if not api_key or not cse_id:
+            return None
+        return GoogleSearchEngine(
+            api_key,
+            cse_id,
+            timeout=resolved_timeout,
+            cache_ttl_hours=cache_ttl_hours,
+            cache_root=cache_root,
+        )
+
+    if search_type in {"duckduckgo", "ddg"}:
+        return DuckDuckGoSearchEngine(timeout=resolved_timeout, max_results=max_results)
+
+    if search_type == "brave":
+        api_key = str(config.get("api_key") or config.get("key") or "").strip()
+        if not api_key:
+            try:
+                from credentials import get_search_api_key
+
+                api_key = str(get_search_api_key("brave", name) or "").strip()
+            except Exception:
+                api_key = ""
+        if not api_key:
+            return None
+        return BraveSearchEngine(api_key, timeout=resolved_timeout, max_results=max_results)
+
+    if search_type == "tavily":
+        api_key = str(config.get("api_key") or config.get("key") or "").strip()
+        if not api_key:
+            try:
+                from credentials import get_search_api_key
+
+                api_key = str(get_search_api_key("tavily", name) or "").strip()
+            except Exception:
+                api_key = ""
+        if not api_key:
+            return None
+        return TavilySearchEngine(
+            api_key,
+            timeout=resolved_timeout,
+            max_results=max_results,
+            search_depth=str(config.get("search_depth") or "basic").strip() or "basic",
+        )
+
+    if search_type == "mock":
+        return MockSearchEngine(llm, llm_params=llm_params, fallback_llm=fallback_llm)
+
+    return None
+
 
 def search_web(
     engines: List[SearchEngine],
@@ -348,8 +651,15 @@ def search_web(
     normalized = normalize_query(query, max_chars=max_chars, drop_todo_fixme=drop_todo_fixme)
     if not normalized:
         return []
+    cache_key = json.dumps(
+        {
+            "query": normalized,
+            "providers": [engine.provider_id() for engine in engines],
+        },
+        sort_keys=True,
+    )
     if cache:
-        cached = cache.read("search", normalized, cache_ttl_hours)
+        cached = cache.read("search", cache_key, cache_ttl_hours)
         if isinstance(cached, list):
             return cached
     results: List[Dict[str, str]] = []
@@ -386,7 +696,7 @@ def search_web(
         if max_results and len(deduped) >= max_results:
             break
     if cache and deduped:
-        cache.write("search", normalized, deduped)
+        cache.write("search", cache_key, deduped)
     return deduped
 
 

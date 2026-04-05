@@ -39,6 +39,7 @@ from repo_context import RepoIndex
 from web_research import (
     WebResearchCache,
     GoogleSearchEngine,
+    build_search_engine,
     fetch_url_content,
     normalize_query,
     search_web,
@@ -4582,10 +4583,6 @@ def _load_search_engines(
     cache_ttl_hours: int,
 ) -> List[object]:
     engines: List[object] = []
-    try:
-        from credentials import get_search_credentials
-    except Exception:
-        return engines
     cache_root = os.path.join(project_root, ".research_cache", "project_solver_web")
     cfg_path = os.getenv("SOLVER_CONFIG_PATH", "config.json") or "config.json"
     config_locations = [
@@ -4598,37 +4595,41 @@ def _load_search_engines(
             config = _load_solver_config(path)
             if config:
                 break
+    seen = set()
     search_configs = config.get("search_engines") if isinstance(config, dict) else []
     if isinstance(search_configs, list):
         for sc in search_configs:
             if not isinstance(sc, dict):
                 continue
-            if str(sc.get("type", "google")).lower() != "google":
-                continue
-            name = sc.get("name")
-            key, cse = get_search_credentials(name)
-            if key and cse:
-                engines.append(
-                    GoogleSearchEngine(
-                        key,
-                        cse,
-                        timeout=timeout,
-                        cache_ttl_hours=cache_ttl_hours,
-                        cache_root=cache_root,
-                    )
-                )
-    if not engines:
-        key, cse = get_search_credentials(None)
-        if key and cse:
-            engines.append(
-                GoogleSearchEngine(
-                    key,
-                    cse,
-                    timeout=timeout,
-                    cache_ttl_hours=cache_ttl_hours,
-                    cache_root=cache_root,
-                )
+            engine = build_search_engine(
+                sc,
+                timeout=timeout,
+                cache_ttl_hours=cache_ttl_hours,
+                cache_root=cache_root,
             )
+            if not engine:
+                continue
+            signature = engine.provider_id()
+            if isinstance(engine, GoogleSearchEngine):
+                signature = f"google:{engine.cse_id}"
+            if signature in seen:
+                continue
+            ok, _msg = engine.verify()
+            if not ok:
+                continue
+            seen.add(signature)
+            engines.append(engine)
+    if not engines:
+        engine = build_search_engine(
+            {"type": "google"},
+            timeout=timeout,
+            cache_ttl_hours=cache_ttl_hours,
+            cache_root=cache_root,
+        )
+        if engine:
+            ok, _msg = engine.verify()
+            if ok:
+                engines.append(engine)
     return engines
 
 

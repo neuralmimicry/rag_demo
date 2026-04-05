@@ -519,7 +519,7 @@ flowchart TD
 flowchart TD
     A[Load config + LLM/search settings] --> B[Read topic + requirements]
     B --> C[Gather Jira/Confluence context (unless disabled)]
-    C --> D{Google Search configured?}
+    C --> D{Search engine configured?}
     D -- Yes --> E[Search the web and fetch sources]
     D -- No --> F[Skip web search]
     E --> G[Iterative draft/critique/refine loop]
@@ -814,6 +814,12 @@ Project solver workflow:
 - LLM_TIMEOUT_SECONDS: Override the default 180-second timeout for LLM requests (e.g. 300 for Ollama).
 - GOOGLE_API_KEY: Google Search API Key.
 - GOOGLE_CSE_ID: Google Search Engine ID (CX).
+- GOOGLE_API_KEY_<NAME>: Optional named Google Search API key override for a `search_engines` entry. Example: `GOOGLE_API_KEY_GOOGLERESEARCH`.
+- GOOGLE_CSE_ID_<NAME>: Optional named Google Custom Search Engine ID override.
+- BRAVE_SEARCH_API_KEY / BRAVE_API_KEY: Brave Search API key.
+- BRAVE_SEARCH_API_KEY_<NAME> / BRAVE_API_KEY_<NAME>: Optional named Brave Search API key override.
+- TAVILY_API_KEY: Tavily API key.
+- TAVILY_API_KEY_<NAME>: Optional named Tavily API key override.
 - OPENAI_API_KEY: OpenAI API key for OpenAI/GPT providers.
 - GEMINI_API_KEY: Google Gemini API key.
 - GEMINI_ACCESS_TOKEN: Google Gemini OAuth 2.0 access token.
@@ -837,6 +843,99 @@ Project solver workflow:
 - SOLVER_WEB_RESEARCH_FETCH_TIMEOUT: Fetch timeout in seconds (default: 20).
 - SOLVER_WEB_RESEARCH_FETCH_MAX_BYTES: Max bytes fetched per URL (default: 200000).
 - SOLVER_WEB_RESEARCH_CACHE_TTL_HOURS: Cache TTL in hours (default: 24).
+
+### Search engine config examples
+Refiner supports `google`, `duckduckgo`, `brave`, and `tavily` providers in `config.json`.
+
+Example `search_engines` block
+```json
+{
+  "search_engines": [
+    {
+      "name": "GoogleResearch",
+      "type": "google"
+    },
+    {
+      "name": "DuckDuckGoFallback",
+      "type": "duckduckgo",
+      "max_results": 5
+    },
+    {
+      "name": "BraveResearch",
+      "type": "brave",
+      "max_results": 5
+    },
+    {
+      "name": "TavilyDeep",
+      "type": "tavily",
+      "search_depth": "advanced",
+      "max_results": 5
+    }
+  ]
+}
+```
+
+Google snippet
+```json
+{
+  "name": "GoogleResearch",
+  "type": "google"
+}
+```
+Uses `GOOGLE_API_KEY` and `GOOGLE_CSE_ID`, or the named overrides `GOOGLE_API_KEY_GOOGLERESEARCH` and `GOOGLE_CSE_ID_GOOGLERESEARCH`.
+
+DuckDuckGo snippet
+```json
+{
+  "name": "DuckDuckGoFallback",
+  "type": "duckduckgo",
+  "max_results": 5
+}
+```
+DuckDuckGo does not require an API key.
+
+Brave snippet
+```json
+{
+  "name": "BraveResearch",
+  "type": "brave",
+  "max_results": 5
+}
+```
+Uses `BRAVE_SEARCH_API_KEY` or `BRAVE_API_KEY`, with optional named overrides such as `BRAVE_SEARCH_API_KEY_BRAVERESEARCH`.
+
+Tavily snippet
+```json
+{
+  "name": "TavilyDeep",
+  "type": "tavily",
+  "search_depth": "advanced",
+  "max_results": 5
+}
+```
+Uses `TAVILY_API_KEY`, or a named override such as `TAVILY_API_KEY_TAVILYDEEP`.
+
+Inline-key variants are also supported when you want credentials embedded directly in a local config file:
+```json
+{
+  "search_engines": [
+    {
+      "type": "google",
+      "api_key": "YOUR_GOOGLE_API_KEY",
+      "cse_id": "YOUR_GOOGLE_CSE_ID"
+    },
+    {
+      "type": "brave",
+      "api_key": "YOUR_BRAVE_SEARCH_API_KEY"
+    },
+    {
+      "type": "tavily",
+      "api_key": "YOUR_TAVILY_API_KEY",
+      "search_depth": "basic"
+    }
+  ]
+}
+```
 
 
 ### Jira insights (optional)

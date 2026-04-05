@@ -17,6 +17,33 @@ def register_jobs_routes(app, handlers: Dict[str, Callable]) -> None:
         view_func=handlers["api_todo_detail"],
         methods=["PATCH", "DELETE"],
     )
+    app.add_url_rule(
+        "/api/todos/<todo_id>/schedule",
+        view_func=handlers["api_todo_schedule"],
+        methods=["GET", "POST"],
+    )
+    app.add_url_rule("/api/schedules", view_func=handlers["api_schedules"], methods=["GET"])
+    app.add_url_rule(
+        "/api/schedules/<schedule_id>",
+        view_func=handlers["api_schedule_detail"],
+        methods=["GET"],
+    )
+    app.add_url_rule(
+        "/api/schedules/<schedule_id>/cancel",
+        view_func=handlers["api_schedule_cancel"],
+        methods=["POST"],
+    )
+    app.add_url_rule("/api/subtasks", view_func=handlers["api_subtasks"], methods=["GET", "POST"])
+    app.add_url_rule(
+        "/api/subtasks/<task_id>",
+        view_func=handlers["api_subtask_detail"],
+        methods=["GET"],
+    )
+    app.add_url_rule(
+        "/api/subtasks/<task_id>/cancel",
+        view_func=handlers["api_subtask_cancel"],
+        methods=["POST"],
+    )
 
     app.add_url_rule("/api/projects", view_func=handlers["api_projects"], methods=["GET", "POST"])
     app.add_url_rule(

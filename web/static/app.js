@@ -79,6 +79,15 @@ const todoStatusFiltersEl = document.getElementById('todoStatusFilters');
 const todoDeferOnlyEl = document.getElementById('todoDeferOnly');
 const todoStatusEl = document.getElementById('todoStatus');
 const todoListEl = document.getElementById('todoList');
+const automationSummaryEl = document.getElementById('automationSummary');
+const schedulerStateEl = document.getElementById('schedulerState');
+const schedulerPollEl = document.getElementById('schedulerPoll');
+const subtaskQueueDepthEl = document.getElementById('subtaskQueueDepth');
+const subtaskInflightEl = document.getElementById('subtaskInflight');
+const subtaskPanelEl = document.getElementById('subtaskPanel');
+const subtaskRefreshBtn = document.getElementById('subtaskRefresh');
+const subtaskStatusEl = document.getElementById('subtaskStatus');
+const subtaskListEl = document.getElementById('subtaskList');
 
 const tokenPanelEl = document.getElementById('tokenPanel');
 const tokenBalanceEl = document.getElementById('tokenBalance');
@@ -176,7 +185,18 @@ let todoFilterStatus = 'todo';
 let todoDeferOnly = false;
 let todoSearchQuery = '';
 let todoSearchTimer = null;
+let todoItems = [];
 let todoItemsById = new Map();
+let todoSchedulesByTodoId = new Map();
+let todoSchedulesById = new Map();
+let todoScheduleDrafts = new Map();
+let openTodoScheduleId = '';
+let todoSchedulesRequestSeq = 0;
+let subtasksRequestSeq = 0;
+let automationSnapshot = {
+  scheduler: null,
+  subtasks: null,
+};
 
 const assistantMessagesEl = document.getElementById('assistantMessages');
 const assistantInputEl = document.getElementById('assistantInput');
@@ -928,18 +948,335 @@ function showToast(title, message, tone = 'success', onClick = null) {
   }, 7000);
 }
 
+function normaliseUiLabel(value) {
+  const cleaned = `${value || ''}`.trim().replace(/[_-]+/g, ' ');
+  if (!cleaned) return '--';
+  return cleaned
+    .split(/\s+/)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function shortUiRef(value, width = 8) {
+  const text = `${value || ''}`.trim();
+  return text ? text.slice(0, Math.max(4, width)) : '--';
+}
+
+function taskToneForStatus(status) {
+  switch (`${status || ''}`.trim().toLowerCase()) {
+    case 'scheduled':
+      return 'planned';
+    case 'dispatching':
+    case 'queued':
+    case 'running':
+      return 'active';
+    case 'completed':
+    case 'done':
+      return 'done';
+    case 'failed':
+      return 'error';
+    case 'cancelled':
+    case 'archived':
+      return 'muted';
+    default:
+      return 'muted';
+  }
+}
+
+function renderTaskPill(label, status) {
+  return `<span class="task-pill ${taskToneForStatus(status)}">${escapeHtml(label)}</span>`;
+}
+
+function canCancelSchedule(schedule) {
+  const status = `${schedule?.status || ''}`.trim().toLowerCase();
+  return !['completed', 'failed', 'cancelled'].includes(status);
+}
+
+function canCancelSubtask(task) {
+  const status = `${task?.status || ''}`.trim().toLowerCase();
+  return !['completed', 'failed', 'cancelled'].includes(status);
+}
+
+function getTodoScheduleDraft(todoId, item = null) {
+  const existing = todoScheduleDrafts.get(todoId);
+  if (existing) {
+    return { ...existing };
+  }
+  const draft = {
+    delay_minutes: 30,
+    use_route: Boolean(item?.route),
+  };
+  todoScheduleDrafts.set(todoId, draft);
+  return { ...draft };
+}
+
+function updateTodoScheduleDraft(todoId, updates = {}, item = null) {
+  const routeAvailable = item ? Boolean(item.route) : true;
+  const current = getTodoScheduleDraft(todoId, item);
+  const next = {
+    ...current,
+    ...updates,
+  };
+  const delayMinutes = Number(next.delay_minutes);
+  next.delay_minutes = Number.isFinite(delayMinutes) && delayMinutes > 0 ? delayMinutes : current.delay_minutes || 30;
+  next.use_route = routeAvailable ? Boolean(next.use_route) : false;
+  todoScheduleDrafts.set(todoId, next);
+  return next;
+}
+
+function setTodoSchedules(schedules = []) {
+  const visibleTodoIds = new Set(todoItems.map((item) => item?.id).filter(Boolean));
+  const grouped = new Map();
+  const indexed = new Map();
+  schedules.forEach((schedule) => {
+    if (!schedule?.id) return;
+    indexed.set(schedule.id, schedule);
+    const todoId = `${schedule.todo_id || ''}`.trim();
+    if (!todoId || (visibleTodoIds.size && !visibleTodoIds.has(todoId))) return;
+    const items = grouped.get(todoId) || [];
+    items.push(schedule);
+    grouped.set(todoId, items);
+  });
+  todoSchedulesById = indexed;
+  todoSchedulesByTodoId = grouped;
+}
+
+function getTodoSchedules(todoId) {
+  return todoSchedulesByTodoId.get(todoId) || [];
+}
+
+function updateAutomationSummary({ scheduler, subtasks } = {}) {
+  if (scheduler !== undefined) automationSnapshot.scheduler = scheduler;
+  if (subtasks !== undefined) automationSnapshot.subtasks = subtasks;
+  const schedulerSnapshot = automationSnapshot.scheduler || {};
+  const subtaskSnapshot = automationSnapshot.subtasks || {};
+  if (schedulerStateEl) {
+    const enabled = Boolean(schedulerSnapshot.enabled);
+    const running = Boolean(schedulerSnapshot.running);
+    schedulerStateEl.textContent = enabled ? (running ? 'Running' : 'Stopped') : 'Disabled';
+    schedulerStateEl.classList.toggle('state-good', enabled && running);
+    schedulerStateEl.classList.toggle('state-warn', enabled && !running);
+    schedulerStateEl.classList.toggle('state-muted', !enabled);
+  }
+  if (schedulerPollEl) {
+    const pollSec = Number(schedulerSnapshot.poll_sec);
+    schedulerPollEl.textContent = Number.isFinite(pollSec) && pollSec > 0 ? `${pollSec}s` : '--';
+  }
+  if (subtaskQueueDepthEl) {
+    const queued = Number.isFinite(Number(subtaskSnapshot.queue_depth))
+      ? Number(subtaskSnapshot.queue_depth)
+      : (Number.isFinite(Number(schedulerSnapshot.queue_depth)) ? Number(schedulerSnapshot.queue_depth) : null);
+    subtaskQueueDepthEl.textContent = queued === null ? '--' : `${queued}`;
+  }
+  if (subtaskInflightEl) {
+    const inflight = Number.isFinite(Number(subtaskSnapshot.inflight))
+      ? Number(subtaskSnapshot.inflight)
+      : (Number.isFinite(Number(schedulerSnapshot.inflight)) ? Number(schedulerSnapshot.inflight) : null);
+    subtaskInflightEl.textContent = inflight === null ? '--' : `${inflight}`;
+  }
+  if (automationSummaryEl) {
+    const degraded = Boolean(schedulerSnapshot.enabled) && !Boolean(schedulerSnapshot.running);
+    automationSummaryEl.classList.toggle('degraded', degraded);
+  }
+}
+
+function showSubtaskStatus(message, isError = false) {
+  if (!subtaskStatusEl) return;
+  subtaskStatusEl.textContent = message;
+  subtaskStatusEl.hidden = false;
+  subtaskStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function clearSubtaskStatus() {
+  if (!subtaskStatusEl) return;
+  subtaskStatusEl.hidden = true;
+  subtaskStatusEl.textContent = '';
+  subtaskStatusEl.classList.remove('error');
+}
+
+function formatSubtaskAction(action) {
+  switch (`${action || ''}`.trim().toLowerCase()) {
+    case 'todo_execute':
+      return 'Execute Todo';
+    case 'assistant_requirements':
+      return 'Requirements Assistant';
+    case 'playground_plan':
+      return 'Playground Plan';
+    case 'submit_job':
+      return 'Submit Job';
+    default:
+      return normaliseUiLabel(action || 'subtask');
+  }
+}
+
+function formatSubtaskScope(scopeType, scopeId) {
+  const type = `${scopeType || ''}`.trim().toLowerCase();
+  const ref = shortUiRef(scopeId);
+  if (type === 'schedule') {
+    return scopeId ? `Schedule ${ref}` : 'Schedule';
+  }
+  if (type === 'user' || !type) {
+    return 'User queue';
+  }
+  return scopeId ? `${normaliseUiLabel(type)} ${ref}` : normaliseUiLabel(type);
+}
+
+function describeSubtask(task) {
+  if (task?.error) return normaliseUiLabel(task.error);
+  if (task?.cancel_requested && !`${task?.status || ''}`.trim().toLowerCase().startsWith('cancel')) {
+    return 'Cancellation requested.';
+  }
+  switch (`${task?.action || ''}`.trim().toLowerCase()) {
+    case 'todo_execute':
+      return task?.scope_type === 'schedule'
+        ? `Runs scheduled Thought Inbox work for ${formatSubtaskScope(task.scope_type, task.scope_id)}.`
+        : 'Runs a routed Thought Inbox item in the background.';
+    case 'assistant_requirements':
+      return 'Builds requirements suggestions asynchronously.';
+    case 'playground_plan':
+      return 'Creates a playground plan without blocking the UI.';
+    case 'submit_job':
+      return 'Queues a job from the background orchestration layer.';
+    default:
+      return 'Background orchestration task.';
+  }
+}
+
+function renderSubtaskList(tasks = []) {
+  if (!subtaskListEl) return;
+  if (!Array.isArray(tasks) || !tasks.length) {
+    subtaskListEl.innerHTML = '<div class="subtask-empty">No subtasks recorded for this user yet.</div>';
+    return;
+  }
+  const html = tasks
+    .map((task) => {
+      const status = `${task?.status || 'queued'}`.trim().toLowerCase();
+      const metaParts = [
+        `Task ${shortUiRef(task?.task_id)}`,
+        formatSubtaskScope(task?.scope_type, task?.scope_id),
+      ];
+      if (task?.created_at) metaParts.push(`Created ${formatRelativeTime(task.created_at)}`);
+      if (task?.started_at) metaParts.push(`Started ${formatRelativeTime(task.started_at)}`);
+      if (task?.finished_at) metaParts.push(`Finished ${formatRelativeTime(task.finished_at)}`);
+      return `
+        <div class="subtask-item" data-task-id="${escapeHtml(task?.task_id || '')}">
+          <div class="subtask-item-header">
+            <div>
+              <div class="subtask-title-row">
+                <strong>${escapeHtml(formatSubtaskAction(task?.action))}</strong>
+                ${renderTaskPill(normaliseUiLabel(status), status)}
+              </div>
+              <div class="subtask-meta">${escapeHtml(metaParts.join(' · '))}</div>
+            </div>
+            ${canCancelSubtask(task) ? '<button type="button" class="ghost" data-subtask-action="cancel">Cancel</button>' : ''}
+          </div>
+          <div class="subtask-detail">${escapeHtml(describeSubtask(task))}</div>
+        </div>
+      `;
+    })
+    .join('');
+  subtaskListEl.innerHTML = html;
+}
+
+function renderTodoSchedulePanel(item, schedules = []) {
+  const activeCount = schedules.filter((schedule) => ['scheduled', 'dispatching', 'queued', 'running'].includes(`${schedule?.status || ''}`.trim().toLowerCase())).length;
+  const nextRun = schedules.find((schedule) => ['scheduled', 'dispatching', 'queued', 'running'].includes(`${schedule?.status || ''}`.trim().toLowerCase())) || schedules[0] || null;
+  const summaryParts = [];
+  if (nextRun?.run_at) summaryParts.push(`Next run ${formatAbsoluteTime(nextRun.run_at)}`);
+  if (activeCount) {
+    summaryParts.push(`${activeCount} active`);
+  } else if (schedules.length) {
+    summaryParts.push(`${schedules.length} total`);
+  } else {
+    summaryParts.push('Queue this thought for later execution.');
+  }
+  const draft = getTodoScheduleDraft(item.id, item);
+  const routeSummary = item.route?.label || item.route?.workflow || 'suggested route';
+  const entries = schedules
+    .slice(0, 3)
+    .map((schedule) => {
+      const status = `${schedule?.status || 'scheduled'}`.trim().toLowerCase();
+      const metaParts = [];
+      if (schedule?.queued_at && ['queued', 'running', 'completed', 'failed', 'cancelled'].includes(status)) {
+        metaParts.push(`Queued ${formatRelativeTime(schedule.queued_at)}`);
+      }
+      if (schedule?.started_at && ['running', 'completed', 'failed', 'cancelled'].includes(status)) {
+        metaParts.push(`Started ${formatRelativeTime(schedule.started_at)}`);
+      }
+      if (schedule?.finished_at && ['completed', 'failed', 'cancelled'].includes(status)) {
+        metaParts.push(`Finished ${formatRelativeTime(schedule.finished_at)}`);
+      }
+      if (schedule?.route_override) metaParts.push('Pinned route');
+      if (schedule?.subtask_id) metaParts.push(`Subtask ${shortUiRef(schedule.subtask_id)}`);
+      if (schedule?.error) metaParts.push(normaliseUiLabel(schedule.error));
+      return `
+        <div class="todo-schedule-item" data-schedule-id="${escapeHtml(schedule.id || '')}">
+          <div class="todo-schedule-item-head">
+            <div class="todo-schedule-item-title">
+              ${renderTaskPill(normaliseUiLabel(status), status)}
+              <strong>Runs ${escapeHtml(formatAbsoluteTime(schedule?.run_at || schedule?.created_at))}</strong>
+            </div>
+            ${canCancelSchedule(schedule) ? '<button type="button" class="ghost" data-todo-action="cancel-schedule">Cancel</button>' : ''}
+          </div>
+          <div class="todo-schedule-item-meta">${escapeHtml(metaParts.join(' · ') || 'Waiting for the scheduler to dispatch this thought.')}</div>
+        </div>
+      `;
+    })
+    .join('');
+  const showComposer = openTodoScheduleId === item.id && `${item?.status || 'todo'}`.trim().toLowerCase() === 'todo';
+  const composerHtml = showComposer
+    ? `
+      <div class="todo-schedule-compose">
+        <div class="todo-schedule-quick">
+          <button type="button" class="ghost" data-todo-action="schedule-quick" data-delay-min="30">30m</button>
+          <button type="button" class="ghost" data-todo-action="schedule-quick" data-delay-min="120">2h</button>
+          <button type="button" class="ghost" data-todo-action="schedule-quick" data-delay-min="1440">24h</button>
+        </div>
+        <div class="todo-schedule-form">
+          <label>
+            Delay (minutes)
+            <input type="number" min="1" step="5" value="${escapeHtml(String(draft.delay_minutes || 30))}" data-schedule-minutes>
+          </label>
+          <label class="check todo-schedule-check">
+            <input type="checkbox" data-schedule-use-route ${draft.use_route && item.route ? 'checked' : ''} ${item.route ? '' : 'disabled'}>
+            Use ${escapeHtml(routeSummary)}
+          </label>
+          <button type="button" class="primary" data-todo-action="create-schedule">Add Schedule</button>
+        </div>
+      </div>
+    `
+    : '';
+  const emptyHtml = schedules.length ? '' : '<div class="todo-schedule-empty">No schedules queued for this thought yet.</div>';
+  const moreHtml = schedules.length > 3
+    ? `<div class="todo-schedule-more">Showing 3 of ${escapeHtml(String(schedules.length))} schedules.</div>`
+    : '';
+  return `
+    <div class="todo-schedule-panel">
+      <div class="todo-schedule-header">
+        <strong>Schedule Queue</strong>
+        <span>${escapeHtml(summaryParts.join(' · '))}</span>
+      </div>
+      ${emptyHtml}
+      ${schedules.length ? `<div class="todo-schedule-list">${entries}</div>` : ''}
+      ${moreHtml}
+      ${composerHtml}
+    </div>
+  `;
+}
+
 function renderTodoList(items = []) {
   if (!todoListEl) return;
+  todoItems = Array.isArray(items) ? items : [];
   todoItemsById = new Map();
   todoListEl.innerHTML = '';
-  if (!items.length) {
+  if (!todoItems.length) {
     const empty = document.createElement('div');
     empty.className = 'todo-empty';
     empty.textContent = todoSearchQuery ? 'No thoughts matched your search.' : 'No thoughts captured yet.';
     todoListEl.appendChild(empty);
     return;
   }
-  items.forEach((item) => {
+  todoItems.forEach((item) => {
     if (item?.id) {
       todoItemsById.set(item.id, item);
     }
@@ -948,6 +1285,8 @@ function renderTodoList(items = []) {
     row.dataset.todoId = item.id;
     const status = item.status || 'todo';
     const route = item.route || null;
+    const schedules = getTodoSchedules(item.id);
+    const activeSchedules = schedules.filter((schedule) => ['scheduled', 'dispatching', 'queued', 'running'].includes(`${schedule?.status || ''}`.trim().toLowerCase())).length;
     const badge = `<span class="todo-badge ${status}">${status}</span>`;
     const metaParts = [];
     if (item.kind) metaParts.push(`Kind: ${item.kind}`);
@@ -959,12 +1298,18 @@ function renderTodoList(items = []) {
     if (item.execution_state && item.execution_state !== 'ready') metaParts.push(`State: ${item.execution_state}`);
     if (item.available_after) metaParts.push(`Available ${formatAbsoluteTime(item.available_after)}`);
     if (item.created_at) metaParts.push(`Created ${formatAbsoluteTime(item.created_at)}`);
+    if (schedules.length) {
+      metaParts.push(activeSchedules ? `${activeSchedules} active schedule${activeSchedules === 1 ? '' : 's'}` : `${schedules.length} schedule${schedules.length === 1 ? '' : 's'}`);
+    }
     const routeHtml = route ? `
       <div class="todo-route">
         <strong>${escapeHtml(route.label || 'Suggested route')}</strong>
         <span>${escapeHtml(route.reason || '')}</span>
       </div>
     ` : '';
+    const showSchedulePanel = schedules.length > 0 || openTodoScheduleId === item.id;
+    const scheduleHtml = showSchedulePanel ? renderTodoSchedulePanel(item, schedules) : '';
+    const scheduleActionLabel = openTodoScheduleId === item.id ? 'Hide Schedule' : (schedules.length ? 'Add Schedule' : 'Schedule');
     row.innerHTML = `
       <div class="todo-item-header">
         <div class="todo-text">${escapeHtml(item.text || '')}</div>
@@ -972,8 +1317,10 @@ function renderTodoList(items = []) {
       </div>
       <div class="todo-meta">${metaParts.join(' · ')}</div>
       ${routeHtml}
+      ${scheduleHtml}
       <div class="todo-actions">
         ${route && status === 'todo' ? '<button type="button" class="ghost" data-todo-action="stage-route">Use Route</button>' : ''}
+        ${status === 'todo' ? `<button type="button" class="ghost" data-todo-action="toggle-schedule">${scheduleActionLabel}</button>` : ''}
         ${status === 'todo' ? '<button type="button" class="ghost" data-todo-action="done">Done</button>' : ''}
         ${status !== 'todo' ? '<button type="button" class="ghost" data-todo-action="reopen">Reopen</button>' : ''}
         ${status !== 'archived' ? '<button type="button" class="ghost" data-todo-action="archive">Archive</button>' : ''}
@@ -1004,7 +1351,12 @@ async function fetchTodos(showStatus = false) {
       showTodoStatus(data.error || 'Failed to load todos.', true);
       return;
     }
-    renderTodoList(data.items || []);
+    todoItems = data.items || [];
+    if (openTodoScheduleId && !todoItems.some((item) => item?.id === openTodoScheduleId)) {
+      openTodoScheduleId = '';
+    }
+    renderTodoList(todoItems);
+    void fetchTodoSchedules({ silent: true });
     if (showStatus) {
       clearTodoStatus();
     }
@@ -1072,6 +1424,101 @@ async function fetchTodoRoute(todoId) {
     todoItemsById.set(item.id, item);
   }
   return item;
+}
+
+async function createTodoSchedule(todoId, payload) {
+  const res = await apiFetch(`/api/todos/${todoId}/schedule`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.details || data.error || 'Failed to create schedule.');
+  }
+  return data.schedule;
+}
+
+async function cancelSchedule(scheduleId) {
+  const res = await apiFetch(`/api/schedules/${scheduleId}/cancel`, { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.details || data.error || 'Failed to cancel schedule.');
+  }
+  return data.schedule;
+}
+
+async function fetchTodoSchedules({ silent = true } = {}) {
+  if (!todoPanelEl) return [];
+  if (!todoItems.length) {
+    todoSchedulesById = new Map();
+    todoSchedulesByTodoId = new Map();
+    return [];
+  }
+  const requestSeq = ++todoSchedulesRequestSeq;
+  try {
+    const res = await apiFetch('/api/schedules?limit=200');
+    const data = await res.json().catch(() => ({}));
+    if (requestSeq !== todoSchedulesRequestSeq) {
+      return [];
+    }
+    if (!res.ok) {
+      if (!silent) {
+        showTodoStatus(data.error || 'Failed to load schedules.', true);
+      }
+      return [];
+    }
+    updateAutomationSummary({ scheduler: data.scheduler });
+    setTodoSchedules(data.schedules || []);
+    renderTodoList(todoItems);
+    return data.schedules || [];
+  } catch (err) {
+    if (!silent) {
+      showTodoStatus('Failed to load schedules.', true);
+    }
+    return [];
+  }
+}
+
+async function cancelSubtask(taskId) {
+  const res = await apiFetch(`/api/subtasks/${taskId}/cancel`, { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.details || data.error || 'Failed to cancel subtask.');
+  }
+  return data.task;
+}
+
+async function fetchSubtasks({ silent = true } = {}) {
+  if (!subtaskPanelEl) return [];
+  const requestSeq = ++subtasksRequestSeq;
+  try {
+    const res = await apiFetch('/api/subtasks?limit=10');
+    const data = await res.json().catch(() => ({}));
+    if (requestSeq !== subtasksRequestSeq) {
+      return [];
+    }
+    if (!res.ok) {
+      if (!silent) {
+        showSubtaskStatus(data.error || 'Failed to load subtasks.', true);
+      }
+      return [];
+    }
+    clearSubtaskStatus();
+    updateAutomationSummary({
+      subtasks: {
+        queue_depth: data.queue_depth,
+        inflight: data.inflight,
+      },
+    });
+    renderSubtaskList(data.tasks || []);
+    return data.tasks || [];
+  } catch (err) {
+    if (!silent) {
+      showSubtaskStatus('Failed to load subtasks.', true);
+    }
+    return [];
+  }
 }
 
 function focusTodoRouteTarget(el) {
@@ -1281,17 +1728,74 @@ function initTodoPanel() {
     });
   }
   if (todoListEl) {
+    todoListEl.addEventListener('input', (event) => {
+      const input = event.target.closest('[data-schedule-minutes]');
+      if (!input) return;
+      const card = input.closest('[data-todo-id]');
+      const todoId = card?.dataset?.todoId;
+      if (!todoId) return;
+      updateTodoScheduleDraft(todoId, { delay_minutes: input.value }, todoItemsById.get(todoId));
+    });
+    todoListEl.addEventListener('change', (event) => {
+      const input = event.target.closest('[data-schedule-use-route]');
+      if (!input) return;
+      const card = input.closest('[data-todo-id]');
+      const todoId = card?.dataset?.todoId;
+      if (!todoId) return;
+      updateTodoScheduleDraft(todoId, { use_route: Boolean(input.checked) }, todoItemsById.get(todoId));
+    });
     todoListEl.addEventListener('click', async (event) => {
       const btn = event.target.closest('[data-todo-action]');
       if (!btn) return;
       const card = btn.closest('[data-todo-id]');
       const todoId = card?.dataset?.todoId;
       if (!todoId) return;
+      const item = todoItemsById.get(todoId);
       const action = btn.dataset.todoAction;
       try {
         if (action === 'stage-route') {
-          const item = await fetchTodoRoute(todoId);
-          stageTodoRoute(item);
+          const routedItem = await fetchTodoRoute(todoId);
+          stageTodoRoute(routedItem);
+        } else if (action === 'toggle-schedule') {
+          openTodoScheduleId = openTodoScheduleId === todoId ? '' : todoId;
+          renderTodoList(todoItems);
+        } else if (action === 'schedule-quick' || action === 'create-schedule') {
+          if (!item || `${item.status || 'todo'}`.trim().toLowerCase() !== 'todo') {
+            throw new Error('Only pending thoughts can be scheduled.');
+          }
+          const draft = getTodoScheduleDraft(todoId, item);
+          const delayMinutes = action === 'schedule-quick'
+            ? Number(btn.dataset.delayMin || 0)
+            : Number(card.querySelector('[data-schedule-minutes]')?.value || draft.delay_minutes || 0);
+          if (!Number.isFinite(delayMinutes) || delayMinutes <= 0) {
+            throw new Error('Enter a delay greater than zero minutes.');
+          }
+          const payload = {
+            delay_sec: Math.round(delayMinutes * 60),
+          };
+          const routeEnabled = Boolean(card.querySelector('[data-schedule-use-route]')?.checked ?? draft.use_route);
+          if (routeEnabled && item.route) {
+            payload.route_override = item.route;
+          }
+          showTodoStatus('Scheduling thought...');
+          const schedule = await createTodoSchedule(todoId, payload);
+          openTodoScheduleId = '';
+          await fetchTodoSchedules({ silent: true });
+          await fetchSubtasks({ silent: true });
+          showTodoStatus(`Scheduled for ${formatAbsoluteTime(schedule?.run_at)}.`);
+          setTimeout(clearTodoStatus, 2400);
+        } else if (action === 'cancel-schedule') {
+          const scheduleCard = btn.closest('[data-schedule-id]');
+          const scheduleId = scheduleCard?.dataset?.scheduleId;
+          if (!scheduleId) {
+            throw new Error('Schedule reference is missing.');
+          }
+          showTodoStatus('Cancelling schedule...');
+          await cancelSchedule(scheduleId);
+          await fetchTodoSchedules({ silent: true });
+          await fetchSubtasks({ silent: true });
+          showTodoStatus('Schedule cancelled.');
+          setTimeout(clearTodoStatus, 2400);
         } else if (action === 'delete') {
           await deleteTodo(todoId);
         } else if (action === 'done') {
@@ -1301,7 +1805,7 @@ function initTodoPanel() {
         } else if (action === 'reopen') {
           await updateTodo(todoId, { status: 'todo' });
         }
-        if (action !== 'stage-route') {
+        if (!['stage-route', 'toggle-schedule', 'schedule-quick', 'create-schedule', 'cancel-schedule'].includes(action)) {
           fetchTodos();
         }
       } catch (err) {
@@ -1310,6 +1814,36 @@ function initTodoPanel() {
     });
   }
   fetchTodos();
+}
+
+function initSubtaskPanel() {
+  if (!subtaskPanelEl) return;
+  if (subtaskRefreshBtn) {
+    subtaskRefreshBtn.addEventListener('click', () => {
+      showSubtaskStatus('Refreshing subtasks...');
+      void fetchSubtasks({ silent: false });
+    });
+  }
+  if (subtaskListEl) {
+    subtaskListEl.addEventListener('click', async (event) => {
+      const btn = event.target.closest('[data-subtask-action]');
+      if (!btn) return;
+      const card = btn.closest('[data-task-id]');
+      const taskId = card?.dataset?.taskId;
+      if (!taskId) return;
+      try {
+        showSubtaskStatus('Cancelling subtask...');
+        await cancelSubtask(taskId);
+        await fetchSubtasks({ silent: true });
+        await fetchTodoSchedules({ silent: true });
+        showSubtaskStatus('Subtask cancelled.');
+        setTimeout(clearSubtaskStatus, 2400);
+      } catch (err) {
+        showSubtaskStatus(err.message || 'Failed to cancel subtask.', true);
+      }
+    });
+  }
+  fetchSubtasks({ silent: true });
 }
 
 function updateTokenMeter(snapshot, estimate = null) {
@@ -3394,9 +3928,22 @@ async function fetchHealth() {
     const inlineMessage = String(continuum?.message || '').trim();
     setWorkersInlineStatus(inlineMessage, Boolean(continuum?.degraded));
     setWorkersCardDegraded(Boolean(continuum?.degraded));
+    updateAutomationSummary({
+      scheduler: data?.todo_scheduler || null,
+      subtasks: data?.subtasks || null,
+    });
+    if (todoPanelEl && todoItems.length) {
+      void fetchTodoSchedules({ silent: true });
+    }
+    if (subtaskPanelEl) {
+      void fetchSubtasks({ silent: true });
+    }
   } catch (err) {
     setWorkersInlineStatus('Health check failed. Showing last known worker values.', true);
     setWorkersCardDegraded(true);
+    if (automationSummaryEl) {
+      automationSummaryEl.classList.add('degraded');
+    }
   }
 }
 
@@ -5328,6 +5875,7 @@ if (workersModalEl) {
 initFilters();
 initScopeFilters();
 initTodoPanel();
+initSubtaskPanel();
 updateWorkflowSections();
 if (cliBubblesEl) {
   renderCliBubbles();
