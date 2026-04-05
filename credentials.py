@@ -99,3 +99,21 @@ def get_search_credentials(name: Optional[str] = None):
     key = os.getenv("GOOGLE_API_KEY")
     cse = os.getenv("GOOGLE_CSE_ID")
     return key, cse
+
+
+def get_search_api_key(provider_type: str, name: Optional[str] = None) -> Optional[str]:
+    """
+    Retrieve single-key search provider credentials from environment variables.
+    Supports provider/name-specific overrides for Brave and Tavily.
+    """
+    provider = str(provider_type or "").strip().lower()
+    if provider not in {"brave", "tavily"}:
+        return None
+    if name:
+        suffix = re.sub(r'[^A-Z0-9]', '_', str(name).upper())
+        if provider == "brave":
+            return os.getenv(f"BRAVE_SEARCH_API_KEY_{suffix}") or os.getenv(f"BRAVE_API_KEY_{suffix}")
+        return os.getenv(f"TAVILY_API_KEY_{suffix}")
+    if provider == "brave":
+        return os.getenv("BRAVE_SEARCH_API_KEY") or os.getenv("BRAVE_API_KEY")
+    return os.getenv("TAVILY_API_KEY")

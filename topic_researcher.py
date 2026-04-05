@@ -18,7 +18,17 @@ from agentic_workflow import AgenticWorkflow, PhaseResult, ProgressTracker
 from jira_analysis import fetch_issues as jira_fetch_issues, _jira_get, _extract_confluence_ids
 from confluence_analysis import _conf_get, PageInfo
 from file_converter import FileConverter
-from web_research import MockSearchEngine, GoogleSearchEngine, search_web, fetch_url, heuristic_relevance_check
+from web_research import (
+    BraveSearchEngine,
+    DuckDuckGoSearchEngine,
+    GoogleSearchEngine,
+    MockSearchEngine,
+    TavilySearchEngine,
+    build_search_engine,
+    fetch_url,
+    heuristic_relevance_check,
+    search_web,
+)
 from skills_engine import build_skill_context, format_skill_directives
 
 # Setup logging
@@ -175,27 +185,50 @@ class TopicResearcher:
             self._init_role_providers()
         
         self.search_engines = []
+
+        def _engine_signature(engine: object) -> str:
+            if isinstance(engine, GoogleSearchEngine):
+                return f"google:{engine.cse_id}"
+            if isinstance(engine, BraveSearchEngine):
+                return "brave"
+            if isinstance(engine, TavilySearchEngine):
+                return "tavily"
+            if isinstance(engine, DuckDuckGoSearchEngine):
+                return "duckduckgo"
+            if isinstance(engine, MockSearchEngine):
+                return "mock"
+            return engine.__class__.__name__.lower()
+
+        seen_search_engines = set()
         # Support multiple search engines from config
         if search_configs:
-            from credentials import get_search_credentials
             for sc in search_configs:
-                s_name = sc.get("name")
-                s_type = sc.get("type", "google")
-                if s_type == "google":
-                    s_key, s_cse = get_search_credentials(s_name)
-                    if s_key and s_cse:
-                        engine = GoogleSearchEngine(
-                            s_key,
-                            s_cse,
-                            timeout=llm_timeout,
-                            cache_ttl_hours=self.cache_ttl_hours,
-                            cache_root=RESEARCH_CACHE_ROOT,
-                        )
-                        ok, msg = engine.verify()
-                        if ok:
-                            self.search_engines.append(engine)
-                        else:
-                            logger.error(f"Search engine '{s_name}' verification failed: {msg}")
+                if not isinstance(sc, dict):
+                    continue
+                try:
+                    engine = build_search_engine(
+                        sc,
+                        llm=self.llm,
+                        llm_params=self.llm_params,
+                        fallback_llm=self.fallback_llm,
+                        timeout=llm_timeout,
+                        cache_ttl_hours=self.cache_ttl_hours,
+                        cache_root=RESEARCH_CACHE_ROOT,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to initialize search engine config {sc.get('name') or sc.get('type')}: {e}")
+                    continue
+                if not engine:
+                    continue
+                signature = _engine_signature(engine)
+                if signature in seen_search_engines:
+                    continue
+                ok, msg = engine.verify()
+                if ok:
+                    self.search_engines.append(engine)
+                    seen_search_engines.add(signature)
+                else:
+                    logger.error(f"Search engine '{sc.get('name') or sc.get('type')}' verification failed: {msg}")
 
         # Fallback to legacy single Google Search if provided and not already in list
         if google_api_key and google_cse_id:

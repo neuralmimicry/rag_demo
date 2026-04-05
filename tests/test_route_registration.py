@@ -16,7 +16,14 @@ def test_voice_and_assistant_routes_are_registered():
     assert "/api/assistant/form-fill" in rules
     assert "/api/playground/plan" in rules
     assert "/api/todos/<todo_id>/route" in rules
+    assert "/api/todos/<todo_id>/schedule" in rules
+    assert "/api/schedules" in rules
+    assert "/api/schedules/<schedule_id>" in rules
+    assert "/api/schedules/<schedule_id>/cancel" in rules
     assert "/api/jobs/<job_id>/tasks" in rules
     assert "/api/jobs/<job_id>/tasks/<task_id>" in rules
     assert "/api/jobs/<job_id>/tasks/<task_id>/cancel" in rules
+    assert "/api/subtasks" in rules
+    assert "/api/subtasks/<task_id>" in rules
+    assert "/api/subtasks/<task_id>/cancel" in rules
     assert "/api/workers/telemetry" in rules

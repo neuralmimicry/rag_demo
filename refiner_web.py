@@ -182,8 +182,16 @@ AUDIT_LOG_PATH = os.getenv("REFINER_AUDIT_LOG_PATH", os.path.join(JOB_ROOT, "aud
 ACCESS_STORE_PATH = os.path.join(JOB_ROOT, "access.json")
 SESSIONS_ROOT = os.path.join(JOB_ROOT, "sessions")
 TODO_ROOT = os.path.join(JOB_ROOT, "todos")
+SCHEDULE_ROOT = os.path.join(JOB_ROOT, "schedules")
 TODO_CLAIM_TTL_SEC = max(60, int(os.getenv("REFINER_TODO_CLAIM_TTL_SEC", "300")))
 TODO_RETENTION_DAYS = max(0, int(os.getenv("REFINER_TODO_RETENTION_DAYS", "0")))
+TODO_SCHEDULER_ENABLED = _env_flag("REFINER_TODO_SCHEDULER_ENABLED", True)
+TODO_SCHEDULER_POLL_SEC = max(1.0, float(os.getenv("REFINER_TODO_SCHEDULER_POLL_SEC", "5")))
+TODO_SCHEDULE_CLAIM_TTL_SEC = max(30, int(os.getenv("REFINER_TODO_SCHEDULE_CLAIM_TTL_SEC", "180")))
+TODO_SCHEDULE_EXECUTION_TIMEOUT_SEC = max(
+    5.0,
+    float(os.getenv("REFINER_TODO_SCHEDULE_EXECUTION_TIMEOUT_SEC", "90")),
+)
 VOICE_TOKEN_PATH = os.path.join(JOB_ROOT, "voice_tokens.json")
 VOICE_DEFAULT_USER = (os.getenv("REFINER_VOICE_DEFAULT_USER") or "").strip()
 VOICE_ENV_TOKEN = (os.getenv("REFINER_VOICE_TOKEN") or "").strip()
@@ -243,6 +251,11 @@ JOB_ACTION_WORKERS = max(1, int(os.getenv("REFINER_JOB_ACTION_WORKERS", "2")))
 JOB_ACTION_MAX_QUEUE = max(1, int(os.getenv("REFINER_JOB_ACTION_MAX_QUEUE", "64")))
 JOB_ACTION_TASK_TTL_SEC = max(60, int(os.getenv("REFINER_JOB_ACTION_TASK_TTL_SEC", "1800")))
 JOB_ACTION_TIMEOUT_SEC = max(5.0, float(os.getenv("REFINER_JOB_ACTION_TIMEOUT_SEC", "45")))
+SUBTASK_WORKERS = max(1, int(os.getenv("REFINER_SUBTASK_WORKERS", "2")))
+SUBTASK_MAX_QUEUE = max(1, int(os.getenv("REFINER_SUBTASK_MAX_QUEUE", "64")))
+SUBTASK_TASK_TTL_SEC = max(60, int(os.getenv("REFINER_SUBTASK_TASK_TTL_SEC", "1800")))
+SUBTASK_TIMEOUT_SEC = max(5.0, float(os.getenv("REFINER_SUBTASK_TIMEOUT_SEC", "90")))
+SUBTASK_ORPHAN_TTL_SEC = max(60, int(os.getenv("REFINER_SUBTASK_ORPHAN_TTL_SEC", "900")))
 EXTERNAL_HTTP_RETRIES = max(0, int(os.getenv("REFINER_EXTERNAL_HTTP_RETRIES", "2")))
 EXTERNAL_HTTP_BACKOFF_BASE = max(0.0, float(os.getenv("REFINER_EXTERNAL_HTTP_BACKOFF_BASE", "0.25")))
 EXTERNAL_HTTP_BACKOFF_MAX = max(
@@ -1527,6 +1540,8 @@ def _ensure_dirs() -> None:
     ensure_dir_permissions(PROJECTS_ROOT, mode=0o700)
     ensure_dir_permissions(SECRET_STORE_ROOT, mode=0o700)
     ensure_dir_permissions(WORKSPACE_ROOT, mode=0o700)
+    ensure_dir_permissions(TODO_ROOT, mode=0o700)
+    ensure_dir_permissions(SCHEDULE_ROOT, mode=0o700)
     ensure_dir_permissions(LEDGER_ROOT, mode=0o700)
     ensure_dir_permissions(TEAM_LEDGER_ROOT, mode=0o700)
     ensure_dir_permissions(RAG_STORE_ROOT, mode=0o700)
@@ -2978,6 +2993,209 @@ class TodoStore:
         result["route"] = build_route_suggestion(result)
         return result
 
+    def _append_link_locked(self, item: Dict[str, Any], bucket: str, value: str, *, limit: int = 12) -> bool:
+        bucket_name = str(bucket or "").strip()
+        link_value = str(value or "").strip()
+        if not bucket_name or not link_value:
+            return False
+        links = item.get("links")
+        if not isinstance(links, dict):
+            links = {}
+            item["links"] = links
+        existing = links.get(bucket_name)
+        values: List[str] = []
+        if isinstance(existing, list):
+            values = [str(entry).strip() for entry in existing if str(entry or "").strip()]
+        elif existing:
+            values = [str(existing).strip()]
+        if link_value in values:
+            return False
+        values.append(link_value)
+        links[bucket_name] = values[-limit:] if limit > 0 else values
+        return True
+
+    def append_link(self, user: str, todo_id: str, bucket: str, value: str) -> Optional[Dict[str, Any]]:
+        if not todo_id:
+            return None
+        with self.lock:
+            data = self._load(user)
+            changed = self._maintenance_locked(data)
+            target = None
+            for item in data.get("items", []):
+                if not isinstance(item, dict) or item.get("id") != todo_id:
+                    continue
+                if self._append_link_locked(item, bucket, value):
+                    now = _now_iso()
+                    item["updated_at"] = now
+                    data["updated_at"] = now
+                    self._write(user, data)
+                elif changed:
+                    data["updated_at"] = _now_iso()
+                    self._write(user, data)
+                target = dict(item)
+                break
+            return target
+
+    def claim_item(self, user: str, todo_id: str) -> Optional[Dict[str, Any]]:
+        if not todo_id:
+            return None
+        with self.lock:
+            data = self._load(user)
+            changed = self._maintenance_locked(data)
+            target = None
+            for item in data.get("items", []):
+                if not isinstance(item, dict) or item.get("id") != todo_id:
+                    continue
+                if not self._is_ready_item(item):
+                    break
+                now = _now_iso()
+                expiry = dt.datetime.now(UK_TZ) + dt.timedelta(seconds=self.claim_ttl_sec)
+                item["execution_state"] = "claimed"
+                item["claimed_at"] = now
+                item["claim_expires_at"] = expiry.strftime(UK_DATETIME_FORMAT)
+                item["updated_at"] = now
+                data["updated_at"] = now
+                self._write(user, data)
+                target = dict(item)
+                break
+            if not target and changed:
+                data["updated_at"] = _now_iso()
+                self._write(user, data)
+            return target
+
+    def begin_processing(self, user: str, todo_id: str) -> Optional[Dict[str, Any]]:
+        if not todo_id:
+            return None
+        with self.lock:
+            data = self._load(user)
+            changed = self._maintenance_locked(data)
+            target = None
+            for item in data.get("items", []):
+                if not isinstance(item, dict) or item.get("id") != todo_id:
+                    continue
+                if str(item.get("status") or "todo").lower() != "todo":
+                    break
+                now = _now_iso()
+                expiry = dt.datetime.now(UK_TZ) + dt.timedelta(seconds=self.claim_ttl_sec)
+                item["execution_state"] = "processing"
+                item["claimed_at"] = item.get("claimed_at") or now
+                item["claim_expires_at"] = expiry.strftime(UK_DATETIME_FORMAT)
+                item["updated_at"] = now
+                data["updated_at"] = now
+                self._write(user, data)
+                target = dict(item)
+                break
+            if not target and changed:
+                data["updated_at"] = _now_iso()
+                self._write(user, data)
+            return target
+
+    def release_execution(
+        self,
+        user: str,
+        todo_id: str,
+        *,
+        execution_state: str = "ready",
+        error: Optional[str] = None,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not todo_id:
+            return None
+        next_state = str(execution_state or "ready").strip().lower() or "ready"
+        if next_state not in {"ready", "failed", "cancelled"}:
+            next_state = "ready"
+        with self.lock:
+            data = self._load(user)
+            changed = self._maintenance_locked(data)
+            target = None
+            for item in data.get("items", []):
+                if not isinstance(item, dict) or item.get("id") != todo_id:
+                    continue
+                now = _now_iso()
+                item["execution_state"] = next_state
+                item.pop("claim_expires_at", None)
+                item.pop("claimed_at", None)
+                item["updated_at"] = now
+                if error:
+                    item["last_error"] = str(error)
+                    item["last_execution_at"] = now
+                elif next_state == "ready":
+                    item.pop("last_error", None)
+                if result is not None:
+                    item["last_result"] = result
+                    item["last_execution_at"] = now
+                data["updated_at"] = now
+                self._write(user, data)
+                target = dict(item)
+                break
+            if not target and changed:
+                data["updated_at"] = _now_iso()
+                self._write(user, data)
+            return target
+
+    def complete_execution(
+        self,
+        user: str,
+        todo_id: str,
+        result: Optional[Dict[str, Any]] = None,
+        *,
+        status: str = "done",
+        links: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not todo_id:
+            return None
+        next_status = str(status or "done").strip().lower() or "done"
+        if next_status not in {"todo", "done", "archived"}:
+            next_status = "done"
+        with self.lock:
+            data = self._load(user)
+            changed = self._maintenance_locked(data)
+            target = None
+            for item in data.get("items", []):
+                if not isinstance(item, dict) or item.get("id") != todo_id:
+                    continue
+                now = _now_iso()
+                item["status"] = next_status
+                item["execution_state"] = "completed"
+                item["updated_at"] = now
+                item["last_execution_at"] = now
+                item.pop("claim_expires_at", None)
+                item.pop("claimed_at", None)
+                item.pop("last_error", None)
+                if result is not None:
+                    item["last_result"] = result
+                if isinstance(links, dict):
+                    for bucket, raw_values in links.items():
+                        values = raw_values if isinstance(raw_values, list) else [raw_values]
+                        for raw_value in values:
+                            self._append_link_locked(item, str(bucket or ""), str(raw_value or ""))
+                data["updated_at"] = now
+                self._write(user, data)
+                target = dict(item)
+                break
+            if not target and changed:
+                data["updated_at"] = _now_iso()
+                self._write(user, data)
+            return target
+
+    def fail_execution(
+        self,
+        user: str,
+        todo_id: str,
+        error: str,
+        *,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not todo_id:
+            return None
+        return self.release_execution(
+            user,
+            todo_id,
+            execution_state="failed",
+            error=error,
+            result=result,
+        )
+
     def update_item(self, user: str, todo_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not todo_id:
             return None
@@ -3045,6 +3263,282 @@ class TodoStore:
             data["updated_at"] = _now_iso()
             self._write(user, data)
         return True
+
+
+class ScheduleStore:
+    """Persistent schedule queue for deferred TODO execution."""
+
+    def __init__(self, root: str, *, claim_ttl_sec: int = TODO_SCHEDULE_CLAIM_TTL_SEC):
+        self.root = root
+        self.path = os.path.join(root, "schedules.json")
+        self.lock = threading.RLock()
+        self.claim_ttl_sec = max(30, int(claim_ttl_sec))
+        ensure_dir_permissions(root, mode=0o700)
+
+    def _load(self) -> Dict[str, Any]:
+        if not os.path.exists(self.path):
+            return {"version": 1, "items": []}
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                return {"version": 1, "items": []}
+            if not isinstance(data.get("items"), list):
+                data["items"] = []
+            if "version" not in data:
+                data["version"] = 1
+            return data
+        except Exception:
+            return {"version": 1, "items": []}
+
+    def _write(self, data: Dict[str, Any]) -> None:
+        _write_json_atomic(self.path, data)
+
+    def _hydrate_item(self, item: Dict[str, Any]) -> bool:
+        changed = False
+        if not isinstance(item, dict):
+            return False
+        if not item.get("id"):
+            item["id"] = uuid.uuid4().hex
+            changed = True
+        for key in ("user", "todo_id", "status"):
+            if key not in item:
+                item[key] = ""
+                changed = True
+        if not item.get("created_at"):
+            item["created_at"] = _now_iso()
+            changed = True
+        if not item.get("updated_at"):
+            item["updated_at"] = item.get("created_at") or _now_iso()
+            changed = True
+        run_at = _normalise_timestamp(item.get("run_at")) if item.get("run_at") else None
+        if run_at and run_at != item.get("run_at"):
+            item["run_at"] = run_at
+            changed = True
+        if item.get("route_override") is not None and not isinstance(item.get("route_override"), dict):
+            item.pop("route_override", None)
+            changed = True
+        return changed
+
+    def _maintenance_locked(self, data: Dict[str, Any]) -> bool:
+        changed = False
+        items = data.get("items")
+        if not isinstance(items, list):
+            data["items"] = []
+            return True
+        now_ts = time.time()
+        now_iso = _now_iso()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            changed = self._hydrate_item(item) or changed
+            status = str(item.get("status") or "scheduled").strip().lower() or "scheduled"
+            claim_expires_at = item.get("claim_expires_at")
+            if status == "dispatching" and _timestamp_sort_key(claim_expires_at) and _timestamp_sort_key(claim_expires_at) <= now_ts:
+                item["status"] = "scheduled"
+                item["updated_at"] = now_iso
+                item.pop("claim_expires_at", None)
+                changed = True
+        data["version"] = 1
+        return changed
+
+    def _item_sort_key(self, item: Dict[str, Any]) -> Tuple[int, float, float]:
+        status = str(item.get("status") or "scheduled").strip().lower() or "scheduled"
+        status_rank = {
+            "scheduled": 0,
+            "dispatching": 1,
+            "queued": 2,
+            "running": 3,
+            "failed": 4,
+            "completed": 5,
+            "cancelled": 6,
+        }.get(status, 9)
+        run_at = _timestamp_sort_key(item.get("run_at") or item.get("created_at"))
+        updated = _timestamp_sort_key(item.get("updated_at") or item.get("created_at"))
+        return (status_rank, run_at or 0.0, -updated)
+
+    def create(
+        self,
+        *,
+        user: str,
+        todo_id: str,
+        run_at: str,
+        route_override: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        schedule = {
+            "id": uuid.uuid4().hex,
+            "user": str(user or "").strip(),
+            "todo_id": str(todo_id or "").strip(),
+            "run_at": _normalise_timestamp(run_at) or run_at,
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+            "status": "scheduled",
+        }
+        if isinstance(route_override, dict) and route_override:
+            schedule["route_override"] = dict(route_override)
+        with self.lock:
+            data = self._load()
+            self._maintenance_locked(data)
+            items = data.get("items")
+            if not isinstance(items, list):
+                items = []
+            items.append(schedule)
+            data["items"] = items
+            data["updated_at"] = _now_iso()
+            self._write(data)
+        return dict(schedule)
+
+    def list_items(
+        self,
+        *,
+        user: Optional[str] = None,
+        todo_id: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        with self.lock:
+            data = self._load()
+            changed = self._maintenance_locked(data)
+            items = [dict(item) for item in data.get("items", []) if isinstance(item, dict)]
+            if changed:
+                data["updated_at"] = _now_iso()
+                self._write(data)
+        if user:
+            items = [item for item in items if item.get("user") == user]
+        if todo_id:
+            items = [item for item in items if item.get("todo_id") == todo_id]
+        if statuses:
+            wanted = {str(status or "").strip().lower() for status in statuses if str(status or "").strip()}
+            items = [item for item in items if str(item.get("status") or "").strip().lower() in wanted]
+        items.sort(key=self._item_sort_key)
+        if limit is not None and limit >= 0:
+            items = items[:limit]
+        return items
+
+    def list_due(self, *, limit: int = 10) -> List[Dict[str, Any]]:
+        now_ts = time.time()
+        due = [
+            item
+            for item in self.list_items(statuses=["scheduled"])
+            if _timestamp_sort_key(item.get("run_at") or item.get("created_at")) <= now_ts
+        ]
+        return due[: max(1, int(limit))]
+
+    def list_active(self, *, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.list_items(statuses=["dispatching", "queued", "running"], limit=limit)
+
+    def get_item(self, schedule_id: str, *, user: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        if not schedule_id:
+            return None
+        items = self.list_items(user=user)
+        for item in items:
+            if item.get("id") == schedule_id:
+                return item
+        return None
+
+    def _update_item_locked(self, data: Dict[str, Any], schedule_id: str, mutator) -> Optional[Dict[str, Any]]:
+        items = data.get("items")
+        if not isinstance(items, list):
+            return None
+        for item in items:
+            if not isinstance(item, dict) or item.get("id") != schedule_id:
+                continue
+            mutator(item)
+            item["updated_at"] = _now_iso()
+            data["updated_at"] = item["updated_at"]
+            self._write(data)
+            return dict(item)
+        return None
+
+    def mark_dispatching(self, schedule_id: str) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            data = self._load()
+            self._maintenance_locked(data)
+
+            def _mutate(item: Dict[str, Any]) -> None:
+                item["status"] = "dispatching"
+                item["claim_expires_at"] = (
+                    dt.datetime.now(UK_TZ) + dt.timedelta(seconds=self.claim_ttl_sec)
+                ).strftime(UK_DATETIME_FORMAT)
+
+            return self._update_item_locked(data, schedule_id, _mutate)
+
+    def mark_queued(self, schedule_id: str, subtask_id: str) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            data = self._load()
+            self._maintenance_locked(data)
+
+            def _mutate(item: Dict[str, Any]) -> None:
+                now = _now_iso()
+                item["status"] = "queued"
+                item["subtask_id"] = subtask_id
+                item["queued_at"] = item.get("queued_at") or now
+                item["claim_expires_at"] = (
+                    dt.datetime.now(UK_TZ) + dt.timedelta(seconds=self.claim_ttl_sec)
+                ).strftime(UK_DATETIME_FORMAT)
+
+            return self._update_item_locked(data, schedule_id, _mutate)
+
+    def mark_running(self, schedule_id: str, subtask_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            data = self._load()
+            self._maintenance_locked(data)
+
+            def _mutate(item: Dict[str, Any]) -> None:
+                now = _now_iso()
+                item["status"] = "running"
+                item["started_at"] = item.get("started_at") or now
+                if subtask_id:
+                    item["subtask_id"] = subtask_id
+                item["claim_expires_at"] = (
+                    dt.datetime.now(UK_TZ) + dt.timedelta(seconds=self.claim_ttl_sec)
+                ).strftime(UK_DATETIME_FORMAT)
+
+            return self._update_item_locked(data, schedule_id, _mutate)
+
+    def complete(self, schedule_id: str, result: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            data = self._load()
+            self._maintenance_locked(data)
+
+            def _mutate(item: Dict[str, Any]) -> None:
+                item["status"] = "completed"
+                item["finished_at"] = _now_iso()
+                item.pop("claim_expires_at", None)
+                item.pop("error", None)
+                if result is not None:
+                    item["result"] = result
+
+            return self._update_item_locked(data, schedule_id, _mutate)
+
+    def fail(self, schedule_id: str, error: str, *, result: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            data = self._load()
+            self._maintenance_locked(data)
+
+            def _mutate(item: Dict[str, Any]) -> None:
+                item["status"] = "failed"
+                item["finished_at"] = _now_iso()
+                item["error"] = str(error or "schedule_failed")
+                item.pop("claim_expires_at", None)
+                if result is not None:
+                    item["result"] = result
+
+            return self._update_item_locked(data, schedule_id, _mutate)
+
+    def cancel(self, schedule_id: str, *, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            data = self._load()
+            self._maintenance_locked(data)
+
+            def _mutate(item: Dict[str, Any]) -> None:
+                item["status"] = "cancelled"
+                item["finished_at"] = _now_iso()
+                item.pop("claim_expires_at", None)
+                if reason:
+                    item["error"] = str(reason)
+
+            return self._update_item_locked(data, schedule_id, _mutate)
 
 
 class SessionHistoryStore:
@@ -4281,6 +4775,472 @@ class JobActionManager:
                     self._inflight = max(0, self._inflight - 1)
                     self._purge_expired_locked()
                 self.queue.task_done()
+
+
+class SubtaskExecutionError(RuntimeError):
+    """Typed failure for generic background subtasks with stable API semantics."""
+
+    def __init__(self, code: str, details: Optional[str] = None, status_code: int = 400):
+        super().__init__(details or code)
+        self.code = code
+        self.details = details or code
+        self.status_code = int(status_code)
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "error": self.code,
+            "details": self.details,
+            "status_code": self.status_code,
+        }
+
+
+@dataclass
+class Subtask:
+    """Queued background subtask associated with a user and optional scope."""
+
+    task_id: str
+    owner: str
+    action: str
+    payload: Dict[str, Any] = field(default_factory=dict)
+    scope_type: str = "user"
+    scope_id: Optional[str] = None
+    status: str = "queued"
+    created_at: str = field(default_factory=_now_iso)
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    timeout_sec: float = SUBTASK_TIMEOUT_SEC
+    cancel_requested: bool = False
+    error: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+
+    def is_terminal(self) -> bool:
+        return self.status in {"completed", "failed", "cancelled"}
+
+    def to_dict(self, include_result: bool = True) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "task_id": self.task_id,
+            "owner": self.owner,
+            "action": self.action,
+            "scope_type": self.scope_type,
+            "scope_id": self.scope_id,
+            "status": self.status,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "timeout_sec": self.timeout_sec,
+            "cancel_requested": bool(self.cancel_requested),
+            "error": self.error,
+        }
+        if include_result and self.result is not None:
+            payload["result"] = self.result
+        return payload
+
+
+class SubtaskManager:
+    """Bounded async execution pool for generic assistant/job orchestration subtasks."""
+
+    def __init__(
+        self,
+        *,
+        workers: int = SUBTASK_WORKERS,
+        max_queue: int = SUBTASK_MAX_QUEUE,
+        task_ttl_sec: int = SUBTASK_TASK_TTL_SEC,
+    ):
+        self.queue: queue.Queue = queue.Queue(maxsize=max(1, int(max_queue)))
+        self.task_ttl_sec = max(60, int(task_ttl_sec))
+        self.lock = threading.RLock()
+        self.tasks: Dict[str, Subtask] = {}
+        self.owner_task_ids: Dict[str, Deque[str]] = {}
+        self.scope_task_ids: Dict[str, Deque[str]] = {}
+        self.workers: List[threading.Thread] = []
+        self._inflight = 0
+        for idx in range(max(1, int(workers))):
+            worker = threading.Thread(target=self._worker_loop, args=(idx,), daemon=True)
+            worker.start()
+            self.workers.append(worker)
+
+    @staticmethod
+    def _scope_key(scope_type: Optional[str], scope_id: Optional[str]) -> Optional[str]:
+        scope_type = str(scope_type or "").strip().lower()
+        scope_id = str(scope_id or "").strip()
+        if not scope_type or not scope_id:
+            return None
+        return f"{scope_type}:{scope_id}"
+
+    def queue_depth(self) -> int:
+        return self.queue.qsize()
+
+    def inflight(self) -> int:
+        with self.lock:
+            return int(self._inflight)
+
+    def submit(
+        self,
+        *,
+        owner: str,
+        action: str,
+        payload: Optional[Dict[str, Any]] = None,
+        scope_type: str = "user",
+        scope_id: Optional[str] = None,
+        timeout_sec: Optional[float] = None,
+    ) -> Subtask:
+        task = Subtask(
+            task_id=uuid.uuid4().hex,
+            owner=str(owner or "").strip(),
+            action=str(action or "").strip(),
+            payload=payload if isinstance(payload, dict) else {},
+            scope_type=str(scope_type or "user").strip().lower() or "user",
+            scope_id=str(scope_id).strip() if scope_id is not None else None,
+            timeout_sec=max(1.0, float(timeout_sec or SUBTASK_TIMEOUT_SEC)),
+        )
+        with self.lock:
+            self._purge_expired_locked()
+            self.tasks[task.task_id] = task
+            owner_ids = self.owner_task_ids.get(task.owner)
+            if owner_ids is None:
+                owner_ids = deque(maxlen=200)
+                self.owner_task_ids[task.owner] = owner_ids
+            owner_ids.appendleft(task.task_id)
+            scope_key = self._scope_key(task.scope_type, task.scope_id)
+            if scope_key:
+                scope_ids = self.scope_task_ids.get(scope_key)
+                if scope_ids is None:
+                    scope_ids = deque(maxlen=200)
+                    self.scope_task_ids[scope_key] = scope_ids
+                scope_ids.appendleft(task.task_id)
+        try:
+            self.queue.put_nowait(task.task_id)
+        except queue.Full:
+            with self.lock:
+                self.tasks.pop(task.task_id, None)
+                owner_ids = self.owner_task_ids.get(task.owner)
+                if owner_ids and task.task_id in owner_ids:
+                    owner_ids.remove(task.task_id)
+                    if not owner_ids:
+                        self.owner_task_ids.pop(task.owner, None)
+                scope_key = self._scope_key(task.scope_type, task.scope_id)
+                scope_ids = self.scope_task_ids.get(scope_key or "")
+                if scope_ids and task.task_id in scope_ids:
+                    scope_ids.remove(task.task_id)
+                    if not scope_ids and scope_key:
+                        self.scope_task_ids.pop(scope_key, None)
+            raise
+        return task
+
+    def get_task(self, task_id: str) -> Optional[Subtask]:
+        with self.lock:
+            self._purge_expired_locked()
+            return self.tasks.get(task_id)
+
+    def list_for_owner(self, owner: str, *, limit: int = 20, include_results: bool = False) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 200))
+        with self.lock:
+            self._purge_expired_locked()
+            task_ids = list(self.owner_task_ids.get(owner) or [])
+            results: List[Dict[str, Any]] = []
+            for task_id in task_ids:
+                task = self.tasks.get(task_id)
+                if not task:
+                    continue
+                results.append(task.to_dict(include_result=include_results))
+                if len(results) >= limit:
+                    break
+            return results
+
+    def list_for_scope(
+        self,
+        scope_type: str,
+        scope_id: str,
+        *,
+        limit: int = 20,
+        include_results: bool = False,
+    ) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 200))
+        scope_key = self._scope_key(scope_type, scope_id)
+        if not scope_key:
+            return []
+        with self.lock:
+            self._purge_expired_locked()
+            task_ids = list(self.scope_task_ids.get(scope_key) or [])
+            results: List[Dict[str, Any]] = []
+            for task_id in task_ids:
+                task = self.tasks.get(task_id)
+                if not task:
+                    continue
+                results.append(task.to_dict(include_result=include_results))
+                if len(results) >= limit:
+                    break
+            return results
+
+    def cancel(self, task_id: str, *, owner: Optional[str] = None) -> bool:
+        with self.lock:
+            task = self.tasks.get(task_id)
+            if not task:
+                return False
+            if owner and task.owner != owner:
+                return False
+            if task.is_terminal():
+                return task.status == "cancelled"
+            task.cancel_requested = True
+            if task.status == "queued":
+                task.status = "cancelled"
+                task.finished_at = _now_iso()
+                task.error = "cancelled_by_user"
+                task.result = {
+                    "error": "cancelled",
+                    "details": "Cancelled before execution started.",
+                    "status_code": 409,
+                }
+            return True
+
+    def _purge_expired_locked(self) -> None:
+        now_ts = time.time()
+        expired: List[str] = []
+        for task_id, task in self.tasks.items():
+            if not task.is_terminal():
+                continue
+            anchor_ts = _timestamp_sort_key(task.finished_at or task.created_at)
+            if anchor_ts <= 0:
+                continue
+            if now_ts - anchor_ts >= self.task_ttl_sec:
+                expired.append(task_id)
+        if not expired:
+            return
+        for task_id in expired:
+            task = self.tasks.pop(task_id, None)
+            if not task:
+                continue
+            owner_ids = self.owner_task_ids.get(task.owner)
+            if owner_ids and task_id in owner_ids:
+                owner_ids.remove(task_id)
+                if not owner_ids:
+                    self.owner_task_ids.pop(task.owner, None)
+            scope_key = self._scope_key(task.scope_type, task.scope_id)
+            if scope_key:
+                scope_ids = self.scope_task_ids.get(scope_key)
+                if scope_ids and task_id in scope_ids:
+                    scope_ids.remove(task_id)
+                    if not scope_ids:
+                        self.scope_task_ids.pop(scope_key, None)
+
+    def _worker_loop(self, worker_id: int) -> None:
+        while True:
+            task_id = self.queue.get()
+            if task_id is None:
+                self.queue.task_done()
+                break
+            with self.lock:
+                task = self.tasks.get(task_id)
+                if not task:
+                    self.queue.task_done()
+                    continue
+                if task.status == "cancelled" or task.cancel_requested and task.status == "queued":
+                    task.status = "cancelled"
+                    task.finished_at = _now_iso()
+                    task.error = task.error or "cancelled_before_execution"
+                    self.queue.task_done()
+                    continue
+                task.status = "running"
+                task.started_at = _now_iso()
+                self._inflight += 1
+            try:
+                result = _execute_subtask(task)
+                with self.lock:
+                    task.status = "completed"
+                    task.result = result if isinstance(result, dict) else {}
+                    if task.cancel_requested:
+                        task.result = dict(task.result or {})
+                        task.result["cancel_requested"] = True
+                    task.error = None
+                    task.finished_at = _now_iso()
+            except SubtaskExecutionError as exc:
+                with self.lock:
+                    task.status = "cancelled" if exc.code == "cancelled" else "failed"
+                    task.error = exc.code
+                    task.result = exc.to_payload()
+                    task.finished_at = _now_iso()
+            except Exception as exc:
+                with self.lock:
+                    task.status = "failed"
+                    task.error = str(exc)
+                    task.result = {"error": "subtask_failed", "details": str(exc), "status_code": 500}
+                    task.finished_at = _now_iso()
+            finally:
+                with self.lock:
+                    self._inflight = max(0, self._inflight - 1)
+                    self._purge_expired_locked()
+                self.queue.task_done()
+
+
+class TodoScheduler:
+    """Daemon scheduler that dispatches due TODO schedules into the subtask queue."""
+
+    def __init__(
+        self,
+        *,
+        schedule_store: ScheduleStore,
+        todo_store: TodoStore,
+        subtask_manager: SubtaskManager,
+        poll_sec: float = TODO_SCHEDULER_POLL_SEC,
+        execution_timeout_sec: float = TODO_SCHEDULE_EXECUTION_TIMEOUT_SEC,
+        orphan_ttl_sec: int = SUBTASK_ORPHAN_TTL_SEC,
+    ):
+        self.schedule_store = schedule_store
+        self.todo_store = todo_store
+        self.subtask_manager = subtask_manager
+        self.poll_sec = max(1.0, float(poll_sec))
+        self.execution_timeout_sec = max(1.0, float(execution_timeout_sec))
+        self.orphan_ttl_sec = max(60, int(orphan_ttl_sec))
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, name="todo-scheduler", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=max(0.1, float(timeout)))
+
+    def status(self) -> Dict[str, Any]:
+        thread = self._thread
+        return {
+            "enabled": bool(TODO_SCHEDULER_ENABLED),
+            "running": bool(thread and thread.is_alive()),
+            "poll_sec": self.poll_sec,
+            "queue_depth": self.subtask_manager.queue_depth(),
+            "inflight": self.subtask_manager.inflight(),
+        }
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.run_once()
+            except Exception:
+                logger.exception("TODO scheduler cycle failed")
+            self._stop_event.wait(self.poll_sec)
+
+    def run_once(self, *, dispatch_limit: int = 8, active_limit: int = 64) -> None:
+        self._reconcile_active_schedules(limit=active_limit)
+        self._dispatch_due_schedules(limit=dispatch_limit)
+
+    def _dispatch_due_schedules(self, *, limit: int) -> None:
+        schedules = self.schedule_store.list_due(limit=max(1, int(limit)))
+        now_ts = time.time()
+        for schedule in schedules:
+            schedule_id = str(schedule.get("id") or "").strip()
+            user = str(schedule.get("user") or "").strip()
+            todo_id = str(schedule.get("todo_id") or "").strip()
+            if not schedule_id or not user or not todo_id:
+                continue
+            todo = self.todo_store.get_item(user, todo_id)
+            if not todo:
+                self.schedule_store.fail(
+                    schedule_id,
+                    "todo_not_found",
+                    result={"error": "todo_not_found", "todo_id": todo_id},
+                )
+                _audit_event("todo_schedule_dispatch", actor=user, status="failed", details={"schedule_id": schedule_id, "todo_id": todo_id, "error": "todo_not_found"})
+                continue
+            if str(todo.get("status") or "todo").strip().lower() != "todo":
+                self.schedule_store.cancel(schedule_id, reason="todo_not_pending")
+                _audit_event("todo_schedule_dispatch", actor=user, status="cancelled", details={"schedule_id": schedule_id, "todo_id": todo_id, "reason": "todo_not_pending"})
+                continue
+            available_after = todo.get("available_after")
+            if available_after and _timestamp_sort_key(available_after) > now_ts:
+                continue
+            if str(todo.get("execution_state") or "ready").strip().lower() in {"claimed", "processing"}:
+                continue
+            claimed = self.todo_store.claim_item(user, todo_id)
+            if not claimed:
+                continue
+            self.schedule_store.mark_dispatching(schedule_id)
+            try:
+                task = self.subtask_manager.submit(
+                    owner=user,
+                    action="todo_execute",
+                    payload={
+                        "todo_id": todo_id,
+                        "schedule_id": schedule_id,
+                        "route_override": schedule.get("route_override"),
+                    },
+                    scope_type="schedule",
+                    scope_id=schedule_id,
+                    timeout_sec=self.execution_timeout_sec,
+                )
+            except queue.Full:
+                self.schedule_store.fail(
+                    schedule_id,
+                    "subtask_capacity_unavailable",
+                    result={"error": "subtask_capacity_unavailable", "todo_id": todo_id},
+                )
+                self.todo_store.release_execution(user, todo_id, execution_state="ready", error="subtask_capacity_unavailable")
+                _audit_event("todo_schedule_dispatch", actor=user, status="failed", details={"schedule_id": schedule_id, "todo_id": todo_id, "error": "subtask_capacity_unavailable"})
+                continue
+            except Exception as exc:
+                self.schedule_store.fail(
+                    schedule_id,
+                    "schedule_dispatch_failed",
+                    result={"error": "schedule_dispatch_failed", "details": str(exc), "todo_id": todo_id},
+                )
+                self.todo_store.release_execution(user, todo_id, execution_state="ready", error="schedule_dispatch_failed")
+                _audit_event("todo_schedule_dispatch", actor=user, status="failed", details={"schedule_id": schedule_id, "todo_id": todo_id, "error": str(exc)})
+                continue
+            self.todo_store.append_link(user, todo_id, "schedules", schedule_id)
+            self.todo_store.append_link(user, todo_id, "subtasks", task.task_id)
+            self.schedule_store.mark_queued(schedule_id, task.task_id)
+            _audit_event("todo_schedule_dispatch", actor=user, status="success", details={"schedule_id": schedule_id, "todo_id": todo_id, "subtask_id": task.task_id})
+
+    def _reconcile_active_schedules(self, *, limit: int) -> None:
+        active_schedules = self.schedule_store.list_active(limit=max(1, int(limit)))
+        now_ts = time.time()
+        for schedule in active_schedules:
+            schedule_id = str(schedule.get("id") or "").strip()
+            user = str(schedule.get("user") or "").strip()
+            todo_id = str(schedule.get("todo_id") or "").strip()
+            subtask_id = str(schedule.get("subtask_id") or "").strip()
+            status = str(schedule.get("status") or "scheduled").strip().lower()
+            if not schedule_id or not user or not todo_id:
+                continue
+            if status == "dispatching" and not subtask_id:
+                updated_ts = _timestamp_sort_key(schedule.get("updated_at") or schedule.get("created_at"))
+                if updated_ts and now_ts - updated_ts >= self.orphan_ttl_sec:
+                    self.schedule_store.fail(schedule_id, "subtask_orphaned")
+                    self.todo_store.release_execution(user, todo_id, execution_state="ready", error="subtask_orphaned")
+                continue
+            if not subtask_id:
+                continue
+            task = self.subtask_manager.get_task(subtask_id)
+            if not task:
+                updated_ts = _timestamp_sort_key(schedule.get("updated_at") or schedule.get("created_at"))
+                if updated_ts and now_ts - updated_ts >= self.orphan_ttl_sec:
+                    self.schedule_store.fail(schedule_id, "subtask_orphaned")
+                    self.todo_store.release_execution(user, todo_id, execution_state="ready", error="subtask_orphaned")
+                continue
+            if task.status == "queued":
+                self.schedule_store.mark_queued(schedule_id, subtask_id)
+                continue
+            if task.status == "running":
+                self.schedule_store.mark_running(schedule_id, subtask_id)
+                continue
+            if task.status == "completed":
+                self.schedule_store.complete(schedule_id, task.result or {})
+                _audit_event("todo_schedule_complete", actor=user, status="success", details={"schedule_id": schedule_id, "todo_id": todo_id, "subtask_id": subtask_id})
+                continue
+            if task.status == "cancelled":
+                self.schedule_store.cancel(schedule_id, reason=task.error or "cancelled")
+                todo = self.todo_store.get_item(user, todo_id)
+                if todo and str(todo.get("status") or "todo").strip().lower() == "todo":
+                    self.todo_store.release_execution(user, todo_id, execution_state="ready", error=task.error or "cancelled")
+                _audit_event("todo_schedule_complete", actor=user, status="cancelled", details={"schedule_id": schedule_id, "todo_id": todo_id, "subtask_id": subtask_id})
+                continue
+            if task.status == "failed":
+                self.schedule_store.fail(schedule_id, task.error or "subtask_failed", result=task.result or {})
+                _audit_event("todo_schedule_complete", actor=user, status="failed", details={"schedule_id": schedule_id, "todo_id": todo_id, "subtask_id": subtask_id, "error": task.error or "subtask_failed"})
 
 
 class JobManager:
@@ -6268,6 +7228,13 @@ session_history = SessionHistoryStore(SESSIONS_ROOT)
 session_store = SessionStore()
 voice_token_store = VoiceTokenStore(VOICE_TOKEN_PATH)
 todo_store = TodoStore(TODO_ROOT)
+schedule_store = ScheduleStore(SCHEDULE_ROOT)
+subtask_manager = SubtaskManager()
+todo_scheduler = TodoScheduler(
+    schedule_store=schedule_store,
+    todo_store=todo_store,
+    subtask_manager=subtask_manager,
+)
 
 
 def _chain_enabled() -> bool:
@@ -10085,6 +11052,187 @@ def api_todo_route(todo_id: str) -> Response:
     return jsonify({"status": "ok", "todo": item, "route": route})
 
 
+def _coerce_schedule_run_at(payload: Dict[str, Any], item: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    run_at_raw = payload.get("run_at") or payload.get("scheduled_for") or payload.get("available_after")
+    if run_at_raw:
+        normalized = _normalise_timestamp(str(run_at_raw))
+        return normalized if _parse_timestamp(normalized) else None
+    delay_sec = max(0.0, _safe_float(payload.get("delay_sec"), 0.0))
+    if delay_sec > 0:
+        run_at = dt.datetime.now(UK_TZ) + dt.timedelta(seconds=delay_sec)
+        return run_at.strftime(UK_DATETIME_FORMAT)
+    if isinstance(item, dict) and item.get("available_after"):
+        normalized = _normalise_timestamp(item.get("available_after"))
+        return normalized if _parse_timestamp(normalized) else None
+    return _now_iso()
+
+
+def api_todo_schedule(todo_id: str) -> Response:
+    """Create or list deferred execution schedules for a TODO item."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    item = todo_store.get_item(user, todo_id)
+    if not item:
+        return jsonify({"error": "not_found"}), 404
+    if request.method == "GET":
+        try:
+            limit = int(request.args.get("limit") or 20)
+        except Exception:
+            limit = 20
+        limit = max(1, min(limit, 100))
+        schedules = schedule_store.list_items(user=user, todo_id=todo_id, limit=limit)
+        return jsonify({"schedules": schedules, "todo": item})
+
+    payload = request.get_json(force=True, silent=True) or {}
+    run_at = _coerce_schedule_run_at(payload, item)
+    if not run_at:
+        return jsonify({"error": "invalid_run_at", "details": "Provide run_at, scheduled_for, available_after, or delay_sec."}), 400
+    route_override = payload.get("route_override")
+    if not isinstance(route_override, dict):
+        route_override = payload.get("route") if isinstance(payload.get("route"), dict) else None
+    schedule = schedule_store.create(
+        user=user,
+        todo_id=todo_id,
+        run_at=run_at,
+        route_override=route_override if isinstance(route_override, dict) else None,
+    )
+    todo_store.append_link(user, todo_id, "schedules", schedule.get("id") or "")
+    _audit_event("todo_schedule_create", actor=user, status="success", details={"schedule_id": schedule.get("id"), "todo_id": todo_id})
+    return jsonify({"status": "scheduled", "schedule": schedule, "todo": todo_store.get_item(user, todo_id)}), 201
+
+
+def api_schedules() -> Response:
+    """List the current user's TODO schedules."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    status_raw = str(request.args.get("status") or "").strip()
+    statuses = [item.strip().lower() for item in status_raw.split(",") if item.strip()] if status_raw else None
+    todo_id = str(request.args.get("todo_id") or "").strip() or None
+    try:
+        limit = int(request.args.get("limit") or 50)
+    except Exception:
+        limit = 50
+    limit = max(1, min(limit, 200))
+    schedules = schedule_store.list_items(user=user, todo_id=todo_id, statuses=statuses, limit=limit)
+    return jsonify({"schedules": schedules, "scheduler": todo_scheduler.status()})
+
+
+def api_schedule_detail(schedule_id: str) -> Response:
+    """Return details for one deferred TODO schedule."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    schedule = schedule_store.get_item(schedule_id, user=user)
+    if not schedule:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify({"schedule": schedule})
+
+
+def api_schedule_cancel(schedule_id: str) -> Response:
+    """Cancel a deferred TODO schedule."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    schedule = schedule_store.get_item(schedule_id, user=user)
+    if not schedule:
+        return jsonify({"error": "not_found"}), 404
+    status = str(schedule.get("status") or "").strip().lower()
+    if status in {"completed", "failed"}:
+        return jsonify({"error": "schedule_not_cancellable"}), 409
+    subtask_id = str(schedule.get("subtask_id") or "").strip()
+    if subtask_id:
+        subtask_manager.cancel(subtask_id, owner=user)
+    updated = schedule_store.cancel(schedule_id, reason="cancelled_by_user")
+    todo_id = str(schedule.get("todo_id") or "").strip()
+    todo = todo_store.get_item(user, todo_id)
+    if todo and str(todo.get("status") or "todo").strip().lower() == "todo":
+        todo_store.release_execution(user, todo_id, execution_state="ready", error="cancelled_by_user")
+    _audit_event("todo_schedule_cancel", actor=user, status="success", details={"schedule_id": schedule_id, "todo_id": todo_id})
+    return jsonify({"schedule": updated or schedule_store.get_item(schedule_id, user=user)})
+
+
+def api_subtasks() -> Response:
+    """Create or list generic background subtasks."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if request.method == "GET":
+        try:
+            limit = int(request.args.get("limit") or 50)
+        except Exception:
+            limit = 50
+        limit = max(1, min(limit, 200))
+        include_results = _is_truthy(request.args.get("include_results"))
+        scope_type = str(request.args.get("scope_type") or "").strip().lower()
+        scope_id = str(request.args.get("scope_id") or "").strip()
+        if scope_type and scope_id:
+            tasks = subtask_manager.list_for_scope(scope_type, scope_id, limit=limit, include_results=include_results)
+            if not _is_admin_user(user):
+                tasks = [task for task in tasks if task.get("owner") == user]
+        else:
+            tasks = subtask_manager.list_for_owner(user, limit=limit, include_results=include_results)
+        return jsonify({"tasks": tasks, "queue_depth": subtask_manager.queue_depth(), "inflight": subtask_manager.inflight()})
+
+    payload = request.get_json(force=True, silent=True) or {}
+    action = str(payload.get("action") or "").strip()
+    if action not in {"todo_execute", "assistant_requirements", "playground_plan", "submit_job"}:
+        return jsonify({"error": "invalid_action"}), 400
+    subtask_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else None
+    if subtask_payload is None:
+        subtask_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"action", "scope_type", "scope_id", "timeout_sec"}
+        }
+    scope_type = str(payload.get("scope_type") or "user").strip().lower() or "user"
+    scope_id = str(payload.get("scope_id") or "").strip() or None
+    timeout_sec = max(1.0, min(_safe_float(payload.get("timeout_sec"), SUBTASK_TIMEOUT_SEC), 600.0))
+    try:
+        task = subtask_manager.submit(
+            owner=user,
+            action=action,
+            payload=subtask_payload,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            timeout_sec=timeout_sec,
+        )
+    except queue.Full:
+        return jsonify({"error": "subtask_capacity_unavailable"}), 503
+    _audit_event("subtask_create", actor=user, status="success", details={"task_id": task.task_id, "action": action, "scope_type": scope_type, "scope_id": scope_id})
+    return jsonify({"task": task.to_dict(include_result=False)}), 202
+
+
+def api_subtask_detail(task_id: str) -> Response:
+    """Return one generic background subtask."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    task = subtask_manager.get_task(task_id)
+    if not task or (task.owner != user and not _is_admin_user(user)):
+        return jsonify({"error": "task_not_found"}), 404
+    include_result = _is_truthy(request.args.get("include_result")) or _is_admin_user(user)
+    return jsonify({"task": task.to_dict(include_result=include_result)})
+
+
+def api_subtask_cancel(task_id: str) -> Response:
+    """Cancel one generic background subtask."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    task = subtask_manager.get_task(task_id)
+    if not task or (task.owner != user and not _is_admin_user(user)):
+        return jsonify({"error": "task_not_found"}), 404
+    if task.is_terminal() and task.status != "cancelled":
+        return jsonify({"error": "task_not_cancellable"}), 409
+    if not subtask_manager.cancel(task_id, owner=task.owner):
+        return jsonify({"error": "task_not_cancellable"}), 409
+    _audit_event("subtask_cancel", actor=user, status="success", details={"task_id": task_id, "action": task.action})
+    refreshed = subtask_manager.get_task(task_id)
+    return jsonify({"task": refreshed.to_dict(include_result=True) if refreshed else {"task_id": task_id, "status": "cancelled"}})
+
+
 def api_voice_tokens() -> Response:
     """API endpoint for voice tokens."""
     user = _current_user()
@@ -11028,6 +12176,13 @@ def health() -> Response:
                 "inflight": job_action_manager.inflight(),
                 "queue_capacity": JOB_ACTION_MAX_QUEUE,
             },
+            "subtasks": {
+                "workers": len(subtask_manager.workers),
+                "queue_depth": subtask_manager.queue_depth(),
+                "inflight": subtask_manager.inflight(),
+                "queue_capacity": SUBTASK_MAX_QUEUE,
+            },
+            "todo_scheduler": todo_scheduler.status(),
             "continuum_autoscaler": autoscaler_status,
             "workers_summary": autoscaler_status.get("workers") if isinstance(autoscaler_status, dict) else {},
             "sso": _sso_store_health(),
@@ -11078,6 +12233,11 @@ def admin_stats() -> Response:
             "job_action_queue_depth": job_action_manager.queue_depth(),
             "job_action_inflight": job_action_manager.inflight(),
             "job_action_queue_capacity": JOB_ACTION_MAX_QUEUE,
+            "subtask_workers": len(subtask_manager.workers),
+            "subtask_queue_depth": subtask_manager.queue_depth(),
+            "subtask_inflight": subtask_manager.inflight(),
+            "subtask_queue_capacity": SUBTASK_MAX_QUEUE,
+            "todo_scheduler": todo_scheduler.status(),
             "jobs_total": len(jobs_snapshot),
             "jobs_running": jobs_by_status.get("running", 0),
             "jobs_queued": jobs_by_status.get("queued", 0),
@@ -12062,6 +13222,171 @@ def _workspace_action_create(
     job.persist(force=True)
     job.append_log(f"Continuum workspace created: {workspace_env.get('vm_id') or '--'}.")
     return {"status": "created", "workspace": workspace_env}
+
+
+def _invoke_internal_post_json(
+    *,
+    user: str,
+    path: str,
+    handler,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Execute an existing POST handler under a synthetic internal request context."""
+    request_payload = payload if isinstance(payload, dict) else {}
+    with app.test_request_context(path, method="POST", json=request_payload):
+        session["user"] = user
+        response = app.make_response(handler())
+        status_code = int(response.status_code or 200)
+        data = response.get_json(silent=True)
+    if 200 <= status_code < 300:
+        return data if isinstance(data, dict) else {"data": data}
+    if isinstance(data, dict):
+        error_code = str(data.get("error") or "route_execution_failed").strip() or "route_execution_failed"
+        details = str(data.get("details") or data.get("message") or error_code).strip() or error_code
+    else:
+        error_code = "route_execution_failed"
+        details = f"Internal route {path} returned HTTP {status_code}."
+    raise SubtaskExecutionError(error_code, details, status_code=status_code)
+
+
+def _execute_todo_route(
+    *,
+    owner: str,
+    todo_id: str,
+    schedule_id: Optional[str] = None,
+    route_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Execute the routed action for a TODO item and persist the outcome back to the inbox."""
+    todo_id = str(todo_id or "").strip()
+    if not todo_id:
+        raise SubtaskExecutionError("todo_id_required", "A todo_id is required.", status_code=400)
+    item = todo_store.get_item(owner, todo_id)
+    if not item:
+        raise SubtaskExecutionError("todo_not_found", "TODO item no longer exists.", status_code=404)
+    if str(item.get("status") or "todo").strip().lower() != "todo":
+        raise SubtaskExecutionError("todo_not_pending", "TODO item is no longer pending.", status_code=409)
+    current_state = str(item.get("execution_state") or "ready").strip().lower()
+    if current_state not in {"claimed", "processing"}:
+        claimed = todo_store.claim_item(owner, todo_id)
+        if not claimed:
+            raise SubtaskExecutionError("todo_not_ready", "TODO item is not ready for execution.", status_code=409)
+    processing = todo_store.begin_processing(owner, todo_id)
+    if not processing:
+        raise SubtaskExecutionError("todo_not_ready", "TODO item could not enter processing state.", status_code=409)
+    item = processing
+    try:
+        route = route_override if isinstance(route_override, dict) and route_override else build_route_suggestion(item)
+        target = str(route.get("target") or "").strip().lower()
+        workflow = str(route.get("workflow") or "").strip()
+        route_payload = route.get("payload") if isinstance(route.get("payload"), dict) else {}
+        if target == "job":
+            response = _invoke_internal_post_json(
+                user=owner,
+                path="/api/jobs",
+                handler=jobs,
+                payload=route_payload,
+            )
+            job_id = str(response.get("job_id") or "").strip()
+            result = {
+                "todo_id": todo_id,
+                "schedule_id": schedule_id,
+                "route": route,
+                "response": response,
+            }
+            links: Dict[str, Any] = {}
+            if schedule_id:
+                links["schedules"] = schedule_id
+            if job_id:
+                result["job_id"] = job_id
+                links["jobs"] = job_id
+            todo_store.complete_execution(owner, todo_id, result, status="done", links=links)
+            return result
+        if target != "assistant":
+            raise SubtaskExecutionError("unsupported_todo_route", f"Unsupported TODO target: {target or '--'}", status_code=400)
+        if workflow == "assistant_requirements":
+            response = _invoke_internal_post_json(
+                user=owner,
+                path="/api/assistant/requirements",
+                handler=assistant_requirements,
+                payload=route_payload,
+            )
+        elif workflow == "playground_plan":
+            response = _invoke_internal_post_json(
+                user=owner,
+                path="/api/playground/plan",
+                handler=playground_plan,
+                payload=route_payload,
+            )
+        else:
+            raise SubtaskExecutionError("unsupported_todo_route", f"Unsupported TODO assistant workflow: {workflow or '--'}", status_code=400)
+        result = {
+            "todo_id": todo_id,
+            "schedule_id": schedule_id,
+            "route": route,
+            "response": response,
+        }
+        links = {"schedules": schedule_id} if schedule_id else None
+        todo_store.complete_execution(owner, todo_id, result, status="done", links=links)
+        return result
+    except SubtaskExecutionError as exc:
+        todo_store.fail_execution(
+            owner,
+            todo_id,
+            exc.code,
+            result={"error": exc.code, "details": exc.details, "schedule_id": schedule_id},
+        )
+        raise
+    except Exception as exc:
+        todo_store.fail_execution(
+            owner,
+            todo_id,
+            "todo_execution_failed",
+            result={"error": "todo_execution_failed", "details": str(exc), "schedule_id": schedule_id},
+        )
+        raise
+
+
+def _execute_subtask(task: Subtask) -> Dict[str, Any]:
+    """Dispatch generic subtasks to existing API handlers or TODO route execution helpers."""
+    if task.cancel_requested:
+        raise SubtaskExecutionError("cancelled", "Subtask was cancelled before execution.", status_code=409)
+    payload = task.payload if isinstance(task.payload, dict) else {}
+    if task.action == "todo_execute":
+        return _execute_todo_route(
+            owner=task.owner,
+            todo_id=str(payload.get("todo_id") or "").strip(),
+            schedule_id=str(payload.get("schedule_id") or "").strip() or None,
+            route_override=payload.get("route_override") if isinstance(payload.get("route_override"), dict) else None,
+        )
+    if task.action == "assistant_requirements":
+        response = _invoke_internal_post_json(
+            user=task.owner,
+            path="/api/assistant/requirements",
+            handler=assistant_requirements,
+            payload=payload,
+        )
+        return {"action": task.action, "response": response}
+    if task.action == "playground_plan":
+        response = _invoke_internal_post_json(
+            user=task.owner,
+            path="/api/playground/plan",
+            handler=playground_plan,
+            payload=payload,
+        )
+        return {"action": task.action, "response": response}
+    if task.action == "submit_job":
+        response = _invoke_internal_post_json(
+            user=task.owner,
+            path="/api/jobs",
+            handler=jobs,
+            payload=payload,
+        )
+        result = {"action": task.action, "response": response}
+        job_id = str(response.get("job_id") or "").strip()
+        if job_id:
+            result["job_id"] = job_id
+        return result
+    raise SubtaskExecutionError("invalid_action", f"Unsupported subtask action: {task.action}", status_code=400)
 
 
 def _execute_job_action_task(task: JobActionTask) -> Dict[str, Any]:
@@ -13984,6 +15309,13 @@ if hasattr(app, "add_url_rule"):
             "api_todo_next": api_todo_next,
             "api_todo_route": api_todo_route,
             "api_todo_detail": api_todo_detail,
+            "api_todo_schedule": api_todo_schedule,
+            "api_schedules": api_schedules,
+            "api_schedule_detail": api_schedule_detail,
+            "api_schedule_cancel": api_schedule_cancel,
+            "api_subtasks": api_subtasks,
+            "api_subtask_detail": api_subtask_detail,
+            "api_subtask_cancel": api_subtask_cancel,
             "api_projects": api_projects,
             "api_project_detail": api_project_detail,
             "api_teams": api_teams,
@@ -14040,6 +15372,8 @@ if hasattr(app, "add_url_rule"):
             "github_tree": github_tree,
         },
     )
+    if TODO_SCHEDULER_ENABLED:
+        todo_scheduler.start()
 
 
 if __name__ == "__main__":
