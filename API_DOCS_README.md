@@ -1,552 +1,323 @@
 # Refiner API Documentation
 
-Complete API documentation for Refiner services with Swagger/OpenAPI specifications.
+Refiner exposes three HTTP surfaces:
+- `refiner_web.py`: the main backend and Control Room UI (`127.0.0.1:5001` by default)
+- `frontend_server.py`: an optional frontend-only shell (`0.0.0.0:8080` by default)
+- `stt_rust`: an optional Rust speech-to-text service (`127.0.0.1:7079` by default)
 
-## Overview
+This document tracks the backend routes that are actually registered today. The matching backend OpenAPI spec lives in `openapi_refiner.yaml`, and the STT service spec lives in `stt_rust/openapi_stt.yaml`.
 
-Refiner provides two main services:
+## Backend docs endpoints
 
-1. **Refiner Web Service** (Python/Flask) - AI assistant, voice integration, project management
-2. **STT Service** (Rust/Axum) - High-performance speech-to-text with gesture planning
+Starting the backend with `python refiner_web.py` registers the documentation helper routes from `api_docs.py`.
 
-Both services now include comprehensive OpenAPI 3.0 documentation with interactive Swagger UI.
+Public routes:
+- `GET /api/docs` - Swagger UI shell for the backend OpenAPI spec
+- `GET /api/docs/openapi.yaml` - backend OpenAPI YAML
+- `GET /api/docs/openapi.json` - backend OpenAPI JSON
+- `GET /health` - lightweight public health helper used by the docs module
 
-## Quick Start
+Backend routes that are always part of the Flask app:
+- `GET /api/health` - operational health summary used by the container healthcheck
+- `GET /api/version` - public build/version payload
+- `GET /metrics` - Prometheus metrics when enabled
 
-### Refiner Web Service
+Notes:
+- The Swagger UI HTML is served locally, but the Swagger assets are loaded from jsDelivr at runtime.
+- If you embed `refiner_web.app` in another runner instead of launching `python refiner_web.py`, call `api_docs.add_api_documentation_support(app, ...)` yourself if you want `/api/docs` and `/health`.
 
-**Start the service:**
-```bash
-python refiner_web.py
-```
+## Authentication model
 
-**Access API documentation (NO AUTHENTICATION REQUIRED):**
-- 📖 Swagger UI: http://localhost:5001/api/docs
-- 📄 OpenAPI YAML: http://localhost:5001/api/docs/openapi.yaml
-- 📄 OpenAPI JSON: http://localhost:5001/api/docs/openapi.json
-- ✅ Health Check: http://localhost:5001/health
-- ℹ️ Version Info: http://localhost:5001/api/version
+Primary backend auth is session-cookie based:
+- `POST /api/setup` creates the first local admin account when no users exist yet.
+- `POST /api/login` starts a session and also returns a short-lived SSO token.
+- `POST /api/logout` clears the current session.
+- `GET /api/session` reports whether the caller is authenticated.
+- `GET/POST /api/profile` reads or updates the current user's email.
 
-**⚠️ Important:** The API documentation endpoints listed above are **publicly accessible** and do not require authentication. This allows developers to explore the API structure, understand requirements, and plan integration before implementing authentication. However, **calling the actual API functions** (like `/api/assistant/chat`, `/api/jobs`, `/api/stt/transcribe`, etc.) **requires proper authentication** as documented for each endpoint.
+Optional auth paths:
+- `POST /api/sso/issue` issues a one-time SSO token for the current session.
+- `GET /sso` exchanges that token into a first-party session.
+- `POST /api/oidc/exchange` supports OIDC code or `id_token` exchange when OIDC is enabled.
 
-**Default Configuration:**
-- Host: `127.0.0.1` (set via `REFINER_HOST`)
-- Port: `5001` (set via `REFINER_PORT`)
+Voice and STT routes support additional auth patterns:
+- `GET/POST /api/voice/tokens` issues or lists per-user voice tokens.
+- `POST /api/voice/stt` accepts a logged-in session, or an STT token when `REFINER_STT_TOKEN` is configured, or public access when `REFINER_STT_PUBLIC=1`.
+- Voice capture routes such as `/api/voice/capture`, `/api/voice/siri`, `/api/voice/alexa`, and `/api/voice/google` resolve the caller from voice tokens or provider-specific user mappings.
 
-### STT Service
+## Current route inventory
 
-**Start the service:**
-```bash
-cd stt_rust
-cargo run --release -- --model models/ggml-base.en.bin --bind 127.0.0.1:7079
-```
+### System and admin
+- `GET /api/health` - backend health summary with workers, queue depth, scheduler, SSO store state, and STT learning status
+- `GET /api/version` - public version payload
+- `GET /api/capabilities` - current capability inventory for authenticated users
+- `GET /api/admin/stats` - admin-only usage and worker summary
+- `GET /api/workers/telemetry` - worker/autoscaler telemetry for the Control Room
+- `GET /api/audit` - admin-only audit trail
 
-**Access API documentation:**
-- OpenAPI YAML: `stt_rust/openapi_stt.yaml`
-- Health Check: http://localhost:7079/health
-- Transcribe: `POST http://localhost:7079/transcribe`
-- Gesture Plan: `POST http://localhost:7079/gesture-plan`
+### Assistant and planning
+- `POST /api/assistant/requirements` - requirements chat/drafting assistant; supports `mode`, `prompt`, `requirements_text`, `messages`, provider/model overrides, and gesture metadata
+- `POST /api/assistant/form-fill` - returns JSON suggestions for structured form fields
+- `POST /api/assistant/rag-mcp` - combines LLM prompting with optional RAG matches and an optional MCP tool call
+- `POST /api/playground/plan` - returns a child-friendly build plan plus a ready-to-submit `job_payload`
 
-**Default Configuration:**
-- Host: `127.0.0.1:7079` (set via `--bind`)
-- Workers: Auto-detected (set via `--workers`)
-- Max Audio: 8MB (set via `--max-audio-bytes`)
+### Voice and speech
+- `GET/POST /api/voice/tokens` - issue/list voice tokens
+- `DELETE /api/voice/tokens/<token_id>` - revoke a voice token
+- `GET/POST /api/voice/capture` - convert a short text utterance into a deferred TODO item
+- `GET/POST /api/voice/siri` - Siri/Shortcuts capture path
+- `POST /api/voice/alexa` - Alexa capture path
+- `POST /api/voice/google` - Google Assistant/Dialogflow capture path
+- `POST /api/voice/stt` - transcribe audio and optionally return BSL/gesture/avatar motion data
 
-## API Documentation Features
+### Jobs, workspaces, and Control Room
+- `GET/POST /api/jobs` - list visible jobs or submit a new one
+- `POST /api/jobs/estimate` - estimate token cost before submission
+- `GET/DELETE /api/jobs/<job_id>` - inspect or delete a job
+- `GET/POST /api/jobs/<job_id>/workspace` - inspect, create, or refresh a workspace
+- `POST /api/jobs/<job_id>/workspace/open` - open a workspace target in an IDE/browser integration
+- `GET /api/jobs/<job_id>/tasks` - background workspace action tasks
+- `GET /api/jobs/<job_id>/tasks/<task_id>` - task detail
+- `POST /api/jobs/<job_id>/tasks/<task_id>/cancel` - cancel a task
+- `GET /api/jobs/<job_id>/editor/roots` - file browser roots for the editor
+- `GET /api/jobs/<job_id>/editor/list` - directory listing for the editor
+- `GET/PUT /api/jobs/<job_id>/editor/file` - read or update a file in the job workspace
+- `POST /api/jobs/<job_id>/editor/ops` - higher-level editor operations
+- `GET /api/jobs/<job_id>/requirements/progress` - requirements progress snapshot
+- `GET /api/jobs/<job_id>/requirements/summary` - summarized requirements/register data
+- `GET /api/jobs/<job_id>/logs` - recent logs
+- `GET /api/jobs/<job_id>/logs/stream` - server-sent event log stream
+- `POST /api/jobs/<job_id>/actions` - queue job-scoped actions
+- `POST /api/jobs/<job_id>/transfer` - transfer a job to another queue/owner context
+- `POST /api/jobs/<job_id>/archive` - archive a job
+- `POST /api/jobs/bulk-delete` - delete queued/archive jobs in bulk
 
-### ✅ Best Practices Implemented
+Typical `POST /api/jobs` payload fields:
+- `workflow`: one of the UI-driven workflows such as `project_solver`, `delivery_pipeline`, `topic_research`, `jira_quality`, or `confluence_analysis`
+- `project_root`, `requirements_text`, `requirements_path`, `project_run`
+- `topic_source`, `topic_output`
+- `projects`, `jql`, `space`, `use_rovo`
+- `delivery_config`, `delivery_run`, `delivery_allow_unfinished`
+- `llm_provider`, `llm_model`, `llm_temperature`, `llm_max_tokens`
+- `project_id`, `team_id`, `token_scope`, `job_secrets`
+- GitHub-oriented project solver/delivery fields such as `repo_url`, `repo_branch`, `work_branch`, `repo_subdir`, `requirements_relpath`, `fork_org`, and commit author metadata
 
-#### 1. **Complete OpenAPI 3.0.3 Specification**
-- Full schema definitions with types, constraints, examples
-- Comprehensive endpoint documentation
-- Request/response schemas with validation rules
-- Security schemes (session, bearer, token-based)
+### TODO inbox, schedules, and subtasks
+- `GET/POST /api/todos` - list or create TODO items
+- `GET /api/todos/next` - peek/claim the next TODO item, with optional idle gating
+- `PATCH/DELETE /api/todos/<todo_id>` - update or delete an item
+- `POST /api/todos/<todo_id>/route` - ask Refiner to suggest the best workflow for that TODO
+- `GET/POST /api/todos/<todo_id>/schedule` - inspect or create deferred execution schedules
+- `GET /api/schedules` - list schedules
+- `GET /api/schedules/<schedule_id>` - schedule detail
+- `POST /api/schedules/<schedule_id>/cancel` - cancel a schedule
+- `GET/POST /api/subtasks` - list or create generic background subtasks
+- `GET /api/subtasks/<task_id>` - subtask detail
+- `POST /api/subtasks/<task_id>/cancel` - cancel a subtask
 
-#### 2. **Interactive Swagger UI**
-- Try-it-out functionality for all endpoints
-- Automatic request/response validation
-- Schema visualization
-- Example payloads
-- Authentication support
+Routed TODOs can currently submit jobs or invoke assistant workflows such as `/api/assistant/requirements` and `/api/playground/plan`.
 
-#### 3. **Detailed API Descriptions**
-- Service overviews with feature lists
-- Endpoint-level descriptions with usage notes
-- Parameter descriptions with examples
-- Response status code documentation
-- Error handling documentation
+### Access control and collaboration
+- `GET/POST /api/projects` - list/create projects
+- `PATCH/DELETE /api/projects/<project_id>` - update/delete projects
+- `GET/POST /api/teams` - list/create teams
+- `PATCH/DELETE /api/teams/<team_id>` - update/delete teams
+- `GET/POST /api/teams/<team_id>/tokens` - inspect or administer team token balances
+- `GET /api/access/tree` - current user's project/team access tree
+- `POST /api/sessions` - create or join a collaboration session for a job
+- `GET /api/sessions/<session_id>` - session detail
+- `POST /api/sessions/<session_id>/leave` - leave a session
+- `GET /api/sessions/<session_id>/stream` - presence and job-status SSE stream
+- `GET /api/sessions/<session_id>/history` - persisted room history
+- `GET /api/sessions/history` - admin-only room history index
 
-#### 4. **Robust Schema Design**
-- Reusable component schemas
-- Type-safe definitions
-- Validation constraints (min/max, regex, enum)
-- Nested object support
-- Array and object examples
+### Requirements import/export, RAG, and MCP
+- `POST /api/requirements/import` - import a requirements register from `.csv`, `.xls`, `.xlsx`, or `.ods`
+- `POST /api/requirements/export` - export a normalized register in the same formats
+- `GET /api/rag/indexes` - list the caller's RAG indexes
+- `POST /api/rag/index` - create a RAG index from `sources` or allowed local `paths`
+- `DELETE /api/rag/index/<name>` - delete an index
+- `POST /api/rag/query` - search an index and return matches plus a rendered context block
+- `GET/POST /api/mcp/servers` - list/register MCP servers (admin-only)
+- `DELETE /api/mcp/servers/<name>` - delete an MCP server (admin-only)
+- `GET /api/mcp/servers/<name>/tools` - list tools
+- `POST /api/mcp/servers/<name>/call` - invoke a tool
+- `GET /api/mcp/servers/<name>/resources` - list resources
+- `POST /api/mcp/servers/<name>/resource` - fetch one resource by URI
 
-#### 5. **Security Documentation**
-- Authentication mechanisms clearly defined
-- Security scheme references per endpoint
-- Token-based auth for voice services
-- Session cookie documentation
-- **Public documentation endpoints** - No auth required for `/api/docs`, `/health`, `/api/version`
-- Clear distinction between public documentation and authenticated API calls
+### Tokens, refunds, secrets, and GitHub helpers
+- `GET/POST /api/tokens` - inspect or mutate a user's token balance (`review`, `add`, `cashout`, `grant`, `sync`)
+- `GET /api/tokens/ledger` - ledger history
+- `POST /api/jobs/<job_id>/refunds` - submit a refund request with screenshots
+- `GET /api/refunds` - admin refund queue
+- `POST /api/refunds/<job_id>/<request_id>/screen` - LLM-assisted refund screening
+- `POST /api/refunds/<job_id>/<request_id>/decision` - admin refund decision
+- `GET /api/refunds/<job_id>/<request_id>/file/<filename>` - refund screenshot download
+- `GET/POST /api/secrets` - list or store user-scoped secrets
+- `DELETE /api/secrets/<name>` - delete a secret
+- `POST /api/github/tree` - fetch a repository tree through the GitHub API using the configured GitHub token when available
 
-#### 6. **Health & Monitoring**
-- `/health` endpoints for service status
-- Version information endpoints
-- Service dependency checks
-- Graceful degradation indicators
+## Example requests
 
-#### 7. **Developer Experience**
-- Clear, concise documentation
-- Practical examples for all endpoints
-- Error response documentation
-- Rate limiting information
-- Usage notes and warnings
-
-## Refiner Web API
-
-### Public vs Authenticated Endpoints
-
-The Refiner API has two categories of endpoints:
-
-#### 🔓 Public Endpoints (No Authentication Required)
-
-These endpoints are accessible without authentication to facilitate API exploration and integration planning:
-
-```http
-GET /api/docs              # Swagger UI interface
-GET /api/docs/openapi.yaml # OpenAPI spec (YAML)
-GET /api/docs/openapi.json # OpenAPI spec (JSON)
-GET /health                # Health check
-GET /api/version           # Version information
-```
-
-**Use cases:**
-- Explore API capabilities before integration
-- Generate client SDKs from OpenAPI spec
-- Monitor service health
-- Validate API compatibility
-
-#### 🔒 Authenticated Endpoints (Authentication Required)
-
-All functional API endpoints require authentication (session cookie or bearer token):
-
-```http
-POST /api/assistant/chat      # Requires auth
-POST /api/stt/transcribe      # Requires auth
-GET  /api/jobs                # Requires auth
-POST /api/rag/documents       # Requires auth
-# ... and all other /api/* endpoints
-```
-
-### Core Endpoints
-
-#### Health & Version (Public)
-```http
-GET /health
-GET /api/version
-```
-
-#### Authentication (Public for login, requires auth for logout)
-```http
-POST /auth/login    # Public
-POST /auth/logout   # Requires auth
-```
-
-#### AI Assistant
-```http
-POST /api/assistant/chat
-```
-- Context-aware responses with RAG
-- LLM provider selection (OpenAI, Gemini, Ollama)
-- Temperature and token control
-- Session continuity
-
-#### Speech-to-Text
-```http
-POST /api/stt/transcribe
-POST /api/stt/gesture-plan
-```
-- Multi-format audio support (WAV, MP3, OGG, WEBM, FLAC)
-- Multi-language transcription
-- Gesture/motion generation (BSL, gesticulation)
-- Audio analysis and speaker detection
-
-#### Job Management
-```http
-GET /api/jobs
-POST /api/jobs
-GET /api/jobs/{job_id}
-```
-
-#### RAG Document Management
-```http
-POST /api/rag/documents
-GET /api/rag/documents
-DELETE /api/rag/documents/{doc_id}
-```
-
-### Authentication
-
-**Session-based (Web UI):**
-```bash
-curl -X POST http://localhost:5001/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username": "admin", "password": "secret"}' \
-  -c cookies.txt
-
-curl http://localhost:5001/api/assistant/chat \
-  -b cookies.txt \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Hello, assistant!"}'
-```
-
-**Bearer Token:**
-```bash
-curl http://localhost:5001/api/assistant/chat \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Hello!"}'
-```
-
-## STT Service API
-
-### Core Endpoints
-
-#### Health Check
-```http
-GET /health
-```
-
-#### Transcribe Audio
-```http
-POST /transcribe
-Content-Type: multipart/form-data
-
-- audio: (binary) Audio file
-- lang: (optional) Language code (e.g., en-GB)
-- prompt: (optional) Context prompt for accuracy
-- gesture_mode: (optional) gesticulation | bsl
-- avatar_mode: (optional) chat | office
-- collaboration_mode: (optional) true | false
-```
-
-#### Generate Gesture Plan
-```http
-POST /gesture-plan
-Content-Type: application/json
-
-{
-  "text": "Hello, welcome to NeuralMimicry!",
-  "gesture_mode": "gesticulation",
-  "avatar_mode": "chat"
-}
-```
-
-### Example: Transcribe Audio
+### First-user bootstrap
 
 ```bash
-# Basic transcription
-curl -X POST http://localhost:7079/transcribe \
-  -F "audio=@recording.wav" \
-  -F "lang=en-GB"
-
-# With gesture planning and collaboration mode
-curl -X POST http://localhost:7079/transcribe \
-  -F "audio=@meeting.mp3" \
-  -F "lang=en-GB" \
-  -F "gesture_mode=gesticulation" \
-  -F "avatar_mode=office" \
-  -F "collaboration_mode=true" \
-  -F "prompt=NeuralMimicry AARNN Paul Isaac's Tracey"
-```
-
-### Example: Generate Gestures
-
-```bash
-curl -X POST http://localhost:7079/gesture-plan \
-  -H "Content-Type: application/json" \
+curl -X POST http://127.0.0.1:5001/api/setup \
+  -H 'Content-Type: application/json' \
   -d '{
-    "text": "Tell me about AARNN and NeuralMimicry security.",
-    "gesture_mode": "bsl",
-    "avatar_mode": "office"
+    "username": "admin",
+    "password": "replace-me",
+    "confirm": "replace-me",
+    "email": "admin@example.com"
   }'
 ```
 
-### Response Format
+### Log in and keep the session cookie
 
-**Transcription Response:**
-```json
-{
-  "status": "ok",
-  "text": "Tell me about AARNN and NeuralMimicry security.",
-  "lang": "en-GB",
-  "gesture_mode": "gesticulation",
-  "avatar_mode": "chat",
-  "avatar_motion": {
-    "duration_ms": 2450,
-    "keyframes": [
+```bash
+curl -X POST http://127.0.0.1:5001/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"replace-me"}' \
+  -c cookies.txt
+```
+
+### Ask the requirements assistant
+
+```bash
+curl -X POST http://127.0.0.1:5001/api/assistant/requirements \
+  -H 'Content-Type: application/json' \
+  -b cookies.txt \
+  -d '{
+    "mode": "ask",
+    "prompt": "Turn these notes into testable requirements",
+    "requirements_text": "Need a dashboard, a login, and CSV export support.",
+    "provider": "openai"
+  }'
+```
+
+### Generate a playground build plan
+
+```bash
+curl -X POST http://127.0.0.1:5001/api/playground/plan \
+  -H 'Content-Type: application/json' \
+  -b cookies.txt \
+  -d '{"prompt":"Build a small revision quiz app for pupils."}'
+```
+
+The response includes `summary`, `steps`, `requirements_text`, and a ready-to-submit `job_payload` for `POST /api/jobs`.
+
+### Transcribe browser audio with gesture metadata
+
+```bash
+curl -X POST http://127.0.0.1:5001/api/voice/stt \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_STT_TOKEN' \
+  -d '{
+    "audio_base64": "BASE64_AUDIO_HERE",
+    "lang": "en-GB",
+    "motionStyle": "BSL (British Sign Language)",
+    "avatarMode": "office",
+    "collaborationMode": true
+  }'
+```
+
+Common STT request fields:
+- `audio_base64` or other supported audio inputs accepted by `_extract_audio_bytes`
+- `lang`
+- `motionStyle` / `gesture_mode`
+- `avatarMode` / `avatar_mode`
+- `collaborationMode` / `collaboration_mode`
+- optional context fields such as `prompt`, `message`, or `query`
+
+### Index ad-hoc text for RAG
+
+```bash
+curl -X POST http://127.0.0.1:5001/api/rag/index \
+  -H 'Content-Type: application/json' \
+  -b cookies.txt \
+  -d '{
+    "name": "notes",
+    "sources": [
       {
-        "t": 0,
-        "pose": {
-          "headYaw": 0.0,
-          "headPitch": 0.03,
-          "leftShoulderPitch": 0.16,
-          "rightShoulderPitch": 0.16,
-          ...
-        }
+        "id": "note-001",
+        "title": "meeting-notes",
+        "text": "Refiner now supports TODO routing, job workspaces, and MCP integrations."
       }
     ]
-  },
-  "gesture_summary": {
-    "style": "semantic_gesticulation",
-    "token_count": 8
-  },
-  "audio_analysis": {
-    "speech_ratio": 0.68,
-    "speech_confidence": 0.82,
-    "noise_level": "low",
-    "snr_db": 13.0,
-    "speaker_count_estimate": 1,
-    "collaboration_likely": false
-  }
-}
+  }'
 ```
-
-## Configuration
-
-### Refiner Web Service
-
-**Environment Variables:**
-```bash
-# Server
-export REFINER_HOST=0.0.0.0
-export REFINER_PORT=5555
-export REFINER_DEBUG=0
-
-# STT Integration
-export REFINER_STT_BACKEND=server
-export REFINER_STT_SERVER_URL=http://localhost:7079
-export REFINER_STT_GESTURE_ENABLED=1
-export REFINER_STT_BSL_ENABLED=1
-
-# Authentication
-export REFINER_SECRET_KEY=your-secret-key
-export REFINER_REQUIRE_SECRET_KEY=1
-
-# LLM Providers
-export OPENAI_API_KEY=sk-...
-export GEMINI_API_KEY=...
-```
-
-### STT Rust Service
-
-**Command-line Options:**
-```bash
-cargo run --release -- \
-  --model models/ggml-base.en.bin \
-  --bind 0.0.0.0:7079 \
-  --lang en-GB \
-  --threads 4 \
-  --workers 8 \
-  --max-audio-bytes 8000000 \
-  --translate false
-```
-
-**Environment Variables:**
-```bash
-# Gesture Configuration
-export REFINER_STT_GESTURE_ENABLED=1
-export REFINER_STT_BSL_ENABLED=1
-export REFINER_STT_GESTURE_DEFAULT_MODE=gesticulation
-export REFINER_STT_GESTURE_DEFAULT_AVATAR_MODE=chat
-
-# Prompts
-export REFINER_STT_BUILTIN_CONTEXT_ENABLED=1
-export REFINER_STT_BUILTIN_CONTEXT_PROMPT="NeuralMimicry terminology..."
-export REFINER_STT_PROMPT_ALLOW_CLIENT=0
-
-# Features
-export REFINER_STT_CANONICALIZE_ENTITIES=1
-export REFINER_STT_COLLABORATION_DEFAULT=0
-```
-
-## Advanced Features
-
-### Multi-Speaker Detection
-
-The STT service includes collaboration mode for multi-speaker scenarios:
 
 ```bash
-curl -X POST http://localhost:7079/transcribe \
-  -F "audio=@meeting.wav" \
-  -F "collaboration_mode=true"
+curl -X POST http://127.0.0.1:5001/api/rag/query \
+  -H 'Content-Type: application/json' \
+  -b cookies.txt \
+  -d '{"name":"notes","query":"What can Refiner route from the inbox?","top_k":5}'
 ```
 
-**Response includes:**
-- Speaker segments with timestamps
-- Speaker turn detection
-- Speaker count estimation
-- Confidence scores per segment
-
-### Entity Canonicalization
-
-Automatic correction of NeuralMimicry terminology:
-- `aaron` → `AARNN`
-- `tracy` → `Tracey`
-- `isaac`/`isaacs` → `Isaac's`
-- Common name variations
-
-### Gesture Modes
-
-**Gesticulation** (conversational):
-- Semantic intent classification (greeting, question, affirm, etc.)
-- Natural conversation gestures
-- Lower amplitude, subtle movements
-
-**BSL** (British Sign Language):
-- Formal signing motions
-- Fingerspelling for unknown words
-- Higher amplitude, precise movements
-
-### Avatar Modes
-
-- **Chat**: Casual mode with 50-74% amplitude
-- **Office**: Professional mode with 76-100% amplitude
-
-## Error Handling
-
-### Common Error Responses
-
-**Refiner Web:**
-```json
-{
-  "error": "Invalid request",
-  "details": "Missing required field: message",
-  "code": "INVALID_INPUT"
-}
-```
-
-**STT Service:**
-```json
-{
-  "error": "audio_too_large"
-}
-```
-
-### HTTP Status Codes
-
-| Code | Meaning |
-|------|---------|
-| 200 | Success |
-| 400 | Bad Request (invalid parameters) |
-| 401 | Unauthorized (authentication required) |
-| 413 | Payload Too Large (file size exceeded) |
-| 429 | Rate Limit Exceeded |
-| 500 | Internal Server Error |
-| 503 | Service Unavailable (capacity/dependency issue) |
-
-## Development
-
-### Install Dependencies
+### Submit a project-solver job directly
 
 ```bash
-# Python dependencies
-pip install -r requirements.txt
-
-# Rust dependencies (for STT service)
-cd stt_rust
-cargo build --release
+curl -X POST http://127.0.0.1:5001/api/jobs \
+  -H 'Content-Type: application/json' \
+  -b cookies.txt \
+  -d '{
+    "workflow": "project_solver",
+    "project_name": "Docs Sync Demo",
+    "requirements_text": "- REQ-001: Build a tiny demo\n- REQ-002: Add tests\n- REQ-003: Keep the UI responsive",
+    "project_run": true,
+    "llm_provider": "openai",
+    "token_scope": "personal"
+  }'
 ```
 
-### Run Tests
+### Requirements register import/export
+
+Import a spreadsheet:
 
 ```bash
-# Python tests
-pytest tests/
-
-# Rust tests
-cd stt_rust
-cargo test
+curl -X POST http://127.0.0.1:5001/api/requirements/import \
+  -b cookies.txt \
+  -F 'file=@requirements.xlsx'
 ```
 
-### Update API Documentation
+Export normalized rows back to CSV:
 
-1. Edit OpenAPI specifications:
-   - `openapi_refiner.yaml` (Refiner Web)
-   - `stt_rust/openapi_stt.yaml` (STT Service)
-
-2. Restart services to reload specs
-
-3. Verify at `/api/docs`
-
-## Monitoring & Observability
-
-### Health Checks
-
-**Refiner Web:**
 ```bash
-curl http://localhost:5001/health
+curl -X POST http://127.0.0.1:5001/api/requirements/export \
+  -H 'Content-Type: application/json' \
+  -b cookies.txt \
+  -d '{"format":"csv","items":[{"id":"REQ-001","title":"Ship docs"}]}' \
+  -o requirements_register.csv
 ```
 
-**STT Service:**
+## STT service quick reference
+
+The Rust STT service is documented separately in `stt_rust/README.md` and `stt_rust/openapi_stt.yaml`.
+
+Current Rust routes:
+- `GET /health`
+- `POST /transcribe`
+- `POST /gesture-plan`
+
+The backend uses that service when `REFINER_STT_BACKEND=server` and `REFINER_STT_SERVER_URL` are configured.
+
+## Verification
+
+Useful checks after updating backend routes or docs:
+
 ```bash
-curl http://localhost:7079/health
+python run_refiner.py --help
+python refiner_web.py
+curl http://127.0.0.1:5001/api/docs/openapi.json
+curl http://127.0.0.1:5001/api/health
 ```
 
-### Metrics
+Relevant tests:
+- `tests/test_api_docs.py`
+- `tests/test_route_registration.py`
+- `tests/test_stt_server_resilience.py`
+- `tests/test_assistant_bsl_integration.py`
 
-Refiner exposes Prometheus metrics at `/metrics` (if enabled).
+## Scope note
 
-### Logging
-
-Configure log levels via environment:
-```bash
-export RUST_LOG=info  # STT service
-export REFINER_LOG_LEVEL=INFO  # Refiner web
-```
-
-## Security Best Practices
-
-1. **Authentication**: Always use authentication in production
-2. **HTTPS**: Enable TLS for production deployments
-3. **Rate Limiting**: Configure rate limits per endpoint
-4. **Input Validation**: All inputs are validated against schemas
-5. **File Size Limits**: Audio uploads have configurable size limits
-6. **Secret Management**: Use environment variables for secrets
-7. **Audit Logging**: Enabled by default for sensitive operations
-
-## Troubleshooting
-
-### Swagger UI Not Loading
-
-**Check:**
-1. OpenAPI spec is valid YAML
-2. Flask app is running
-3. Access correct URL: `/api/docs`
-
-### STT Service Unavailable
-
-**Check:**
-1. Service is running: `curl http://localhost:7079/health`
-2. Port is correct
-3. Firewall rules allow connection
-4. Model file is accessible
-
-### Authentication Errors
-
-**Check:**
-1. Valid credentials/token provided
-2. Session cookie not expired
-3. CORS headers configured (if cross-origin)
-
-## Support
-
-- **Documentation**: http://localhost:5001/api/docs
-- **Issues**: https://github.com/neuralmimicry/refiner/issues
-- **Contact**: support@neuralmimicry.ai
-
-## License
-
-Proprietary - NeuralMimicry Ltd.
+`openapi_refiner.yaml` now describes the current backend route families and representative request/response shapes. The Markdown inventory above is the authoritative quick reference for the full route surface exposed by `refiner_routes/` and `refiner_web.py`.

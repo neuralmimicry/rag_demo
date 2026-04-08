@@ -36,6 +36,7 @@ No `ffmpeg` preprocess is needed in this server mode.
 
 - `GET /health` -> `ok`
 - `POST /transcribe` (multipart form)
+- `POST /gesture-plan` (JSON motion-planning helper when you already have text)
 - form field `audio` (required file)
 - form field `lang` (optional)
 - form field `prompt` (optional initial vocabulary/context hint)
@@ -60,6 +61,18 @@ Response:
   "gesture_timeline": [{ "word": "hello", "intent": "greeting", "template": "greeting", "start_ms": 80, "end_ms": 320 }],
   "avatar_motion": { "duration_ms": 2500, "keyframes": [{ "t": 0, "pose": { "...": "..." } }] }
 }
+```
+
+Gesture-only planning:
+
+```bash
+curl -X POST http://127.0.0.1:7079/gesture-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Hello and welcome to Refiner.",
+    "gesture_mode": "bsl",
+    "avatar_mode": "office"
+  }'
 ```
 
 Environment toggles:

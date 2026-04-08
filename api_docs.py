@@ -1,6 +1,6 @@
-"""API documentation integration for Refiner web service.
+"""API documentation integration for the Refiner backend.
 
-Provides Swagger UI and OpenAPI specification endpoints.
+Provides Swagger UI and OpenAPI specification endpoints for ``refiner_web.py``.
 """
 
 import os
@@ -50,7 +50,8 @@ def register_api_docs(app: Flask) -> None:
     - /api/docs/openapi.json - OpenAPI specification (JSON)
     """
 
-    # Swagger UI HTML template (self-contained, no CDN required)
+    # Swagger UI HTML template. The page shell is local, while the Swagger UI
+    # assets are loaded from jsDelivr at runtime.
     SWAGGER_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -217,5 +218,6 @@ def add_api_documentation_support(
     )
 
     logger.info(
-        "API documentation available at: http://localhost:5555/api/docs (or configured host/port)"
+        "API documentation available at /api/docs on the configured host/port "
+        "(default http://127.0.0.1:5001)"
     )

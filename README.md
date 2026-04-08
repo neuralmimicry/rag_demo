@@ -32,6 +32,19 @@ Key aspects:
 - Topic research: refiner --topic-research req.txt --output researched_document.md --llm-provider openai
 - Project solver: refiner --project /path/to/project --llm-provider openai --output project_solution.json
 
+## Runtime components
+- CLI workflows: `run_refiner.py` / `refiner`
+- Backend UI + JSON API: `python refiner_web.py` (defaults to `127.0.0.1:5001`)
+- Frontend-only helper server: `python frontend_server.py` (defaults to `0.0.0.0:8080`)
+- Native STT sidecar: [`stt_rust/`](stt_rust/README.md) (defaults to `127.0.0.1:7079`)
+
+Useful local URLs after starting `refiner_web.py`:
+- Swagger UI: `http://127.0.0.1:5001/api/docs`
+- OpenAPI JSON: `http://127.0.0.1:5001/api/docs/openapi.json`
+- API health: `http://127.0.0.1:5001/api/health`
+- Public docs health helper: `http://127.0.0.1:5001/health`
+- Version info: `http://127.0.0.1:5001/api/version`
+
 ## Release workflow
 
 GitHub Actions release automation lives in `.github/workflows/build-and-release.yml`.
@@ -46,6 +59,17 @@ GitHub Actions release automation lives in `.github/workflows/build-and-release.
 
 ## Web UI + API auth
 The web UI is backed by the same Flask server (`refiner_web.py`). It uses session cookies, with dedicated JSON endpoints for headless or cloud-hosted frontends.
+
+### Current JSON API surface
+- Auth + profile: `/api/setup`, `/api/login`, `/api/logout`, `/api/session`, `/api/profile`, `/api/sso/issue`, `/api/oidc/exchange`
+- Assistant + planning: `/api/assistant/requirements`, `/api/assistant/form-fill`, `/api/assistant/rag-mcp`, `/api/playground/plan`
+- Voice + capture: `/api/voice/tokens`, `/api/voice/capture`, `/api/voice/siri`, `/api/voice/alexa`, `/api/voice/google`, `/api/voice/stt`
+- Jobs + workspaces: `/api/jobs`, `/api/jobs/estimate`, `/api/jobs/<job_id>/workspace`, `/api/jobs/<job_id>/editor/*`, `/api/jobs/<job_id>/logs`, `/api/jobs/<job_id>/actions`, `/api/jobs/<job_id>/transfer`, `/api/jobs/<job_id>/archive`
+- Inbox automation: `/api/todos`, `/api/todos/next`, `/api/todos/<todo_id>/route`, `/api/todos/<todo_id>/schedule`, `/api/schedules`, `/api/subtasks`
+- Access + collaboration: `/api/projects`, `/api/teams`, `/api/teams/<team_id>/tokens`, `/api/access/tree`, `/api/sessions`, `/api/sessions/<session_id>/stream`
+- Admin + operations: `/api/health`, `/api/version`, `/api/capabilities`, `/api/admin/stats`, `/api/workers/telemetry`, `/api/audit`, `/api/secrets`, `/api/github/tree`
+
+For the detailed route inventory and example payloads, see [API_DOCS_README.md](API_DOCS_README.md) and [`openapi_refiner.yaml`](openapi_refiner.yaml).
 
 ## RAG + MCP integrations
 Refiner now includes lightweight RAG indexing (for unstructured documents) and MCP connectivity (for structured, action-oriented external systems).
