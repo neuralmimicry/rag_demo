@@ -1,5 +1,5 @@
-# .git is intentionally included in the build context so container images can
-# stamp commit-based build metadata for the runtime version badge and API.
+# Exclude VCS metadata; build metadata is injected via build args.
+.git
 .gitignore
 __pycache__/
 .pytest_cache/

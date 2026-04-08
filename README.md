@@ -245,17 +245,21 @@ The `Containerfile` is now aligned for both local container runtime use and Kube
 - explicit entrypoint modes: `full` (managed STT + `refiner_web.py`), `backend` (backend only, for external STT), `frontend`, `tests`, `smoke`, `cli`
 
 #### 1) Build image locally
-Refiner stamps runtime build metadata from git commit count during image build, so the Control Room build version can show as `x.y.zzzz` and change on every commit. Official release tags and Python package artifacts still follow `pyproject.toml`.
+Refiner stamps runtime build metadata from explicit build args, so the Control Room build version can show as `x.y.zzzz` and change on every commit without copying `.git` into the build context. Official release tags and Python package artifacts still follow `pyproject.toml`.
+
+Export reusable build metadata first:
+- `export BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 0)"`
+- `export GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"`
 
 Podman:
-- `podman build --format docker -t refiner:latest -f Containerfile .`
+- `podman build --format docker --build-arg BUILD_NUMBER="$BUILD_NUMBER" --build-arg GIT_COMMIT="$GIT_COMMIT" -t refiner:latest -f Containerfile .`
 
 Docker:
-- `docker build -t refiner:latest -f Containerfile .`
+- `docker build --build-arg BUILD_NUMBER="$BUILD_NUMBER" --build-arg GIT_COMMIT="$GIT_COMMIT" -t refiner:latest -f Containerfile .`
 
 Multi-arch:
-- `podman build --format docker --platform linux/amd64,linux/arm64 -t refiner:latest -f Containerfile .`
-- `docker buildx build --platform linux/amd64,linux/arm64 -t refiner:latest -f Containerfile .`
+- `podman build --format docker --platform linux/amd64,linux/arm64 --build-arg BUILD_NUMBER="$BUILD_NUMBER" --build-arg GIT_COMMIT="$GIT_COMMIT" -t refiner:latest -f Containerfile .`
+- `docker buildx build --platform linux/amd64,linux/arm64 --build-arg BUILD_NUMBER="$BUILD_NUMBER" --build-arg GIT_COMMIT="$GIT_COMMIT" -t refiner:latest -f Containerfile .`
 
 Note: Podman default OCI output does not retain Dockerfile `HEALTHCHECK` metadata. Keep `--format docker` if you need health checks visible via `podman ps`/`podman healthcheck`.
 
@@ -290,7 +294,7 @@ Tag + push:
 - `podman push ghcr.io/<org>/refiner:latest`
 
 Docker buildx push (multi-arch):
-- `docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/<org>/refiner:latest -f Containerfile . --push`
+- `docker buildx build --platform linux/amd64,linux/arm64 --build-arg BUILD_NUMBER="$BUILD_NUMBER" --build-arg GIT_COMMIT="$GIT_COMMIT" -t ghcr.io/<org>/refiner:latest -f Containerfile . --push`
 
 #### 4) Kubernetes deployment
 Create namespace + secret:

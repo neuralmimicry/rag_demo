@@ -20,18 +20,19 @@ RUN cargo build --locked --release
 
 FROM ${BASE_IMAGE} AS source-metadata
 
-WORKDIR /src
+ARG BUILD_NUMBER=0
+ARG GIT_COMMIT=unknown
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
 
 COPY . /src
 
-RUN build_number="$(git rev-list --count HEAD 2>/dev/null || echo 0)" \
-    && git_commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
-    && printf '{"build_number":%s,"commit":"%s"}\n' "${build_number}" "${git_commit}" > /src/.refiner-build.json \
-    && rm -rf /src/.git
+RUN case "${BUILD_NUMBER}" in \
+        ''|*[!0-9]*) build_number=0 ;; \
+        *) build_number="${BUILD_NUMBER}" ;; \
+    esac \
+    && git_commit="${GIT_COMMIT:-unknown}" \
+    && printf '{"build_number":%s,"commit":"%s"}\n' "${build_number}" "${git_commit}" > /src/.refiner-build.json
 
 FROM ${BASE_IMAGE}
 
