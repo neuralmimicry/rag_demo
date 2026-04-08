@@ -1,379 +1,1105 @@
 openapi: 3.0.3
 info:
   title: Refiner API
+  version: 0.1.0
   description: |
-    **Refiner** is NeuralMimicry's intelligent project management and AI assistant platform.
+    Backend API exposed by `refiner_web.py`.
 
-    ## Features
-    - 🤖 **AI-Powered Assistant**: Context-aware responses with RAG and LLM integration
-    - 🎙️ **Voice Integration**: Alexa and Google Assistant support with STT/TTS
-    - 📊 **Project Management**: Jira/Confluence integration and analysis
-    - 🔐 **Secure**: Token-based authentication, encryption, audit logging
-    - 🚀 **Scalable**: Job queues, MCP server integration, caching
+    Refiner combines session-based web auth, assistant and planning endpoints,
+    voice/STT ingestion, job orchestration, TODO routing, RAG indexing, MCP
+    connectivity, token accounting, and Control Room telemetry.
 
-    ## Authentication
-    Most endpoints require authentication via session cookies or bearer tokens.
-    Voice endpoints support platform-specific verification (Alexa, Google Assistant).
-
-  version: 1.0.0
-  contact:
-    name: NeuralMimicry Support
-    url: https://neuralmimicry.ai
-    email: support@neuralmimicry.ai
+    This specification tracks the current backend route families and
+    representative request/response shapes used by the shipped UI.
   license:
-    name: Proprietary
-    url: https://neuralmimicry.ai/license
-
+    name: MIT
+    url: https://opensource.org/licenses/MIT
 servers:
-  - url: http://localhost:5555
-    description: Local development server
-  - url: https://refiner.neuralmimicry.ai
-    description: Production server
-
+  - url: http://127.0.0.1:5001
+    description: Default local backend
+  - url: http://localhost:5001
+    description: Alternate local backend host
+security:
+  - sessionAuth: []
 tags:
-  - name: Health
-    description: Service health and status endpoints
-  - name: Authentication
-    description: User authentication and session management
+  - name: Public
+    description: Public health, metrics, and version routes
+  - name: Auth
+    description: Session, setup, login, SSO, and OIDC exchange routes
   - name: Assistant
-    description: AI assistant chat and context management
+    description: Requirements, form-fill, RAG+MCP, and playground planning APIs
   - name: Voice
-    description: Voice assistant integration (Alexa, Google Assistant)
-  - name: STT
-    description: Speech-to-text transcription and gesture planning
+    description: Voice tokens, capture adapters, and speech-to-text APIs
   - name: Jobs
-    description: Asynchronous job management and project operations
-  - name: Admin
-    description: Administrative operations and system management
+    description: Job submission, workspace access, logs, and background actions
+  - name: Inbox
+    description: TODO routing, schedules, and generic subtasks
+  - name: Access
+    description: Projects, teams, access tree, and collaboration sessions
   - name: RAG
-    description: Retrieval-Augmented Generation document management
-
+    description: Requirements import/export plus RAG indexing and query APIs
+  - name: MCP
+    description: Model Context Protocol server configuration and tool calls
+  - name: Tokens
+    description: Token ledger, secrets, and GitHub helper endpoints
+  - name: Admin
+    description: Control Room stats, worker telemetry, and audit logs
 components:
   securitySchemes:
     sessionAuth:
       type: apiKey
       in: cookie
       name: session
-      description: Session cookie authentication
+      description: Browser session cookie set by `/api/setup` or `/api/login`.
     bearerAuth:
       type: http
       scheme: bearer
-      description: Bearer token authentication
+      description: Bearer token accepted by selected voice/STT endpoints.
     voiceToken:
       type: apiKey
       in: header
       name: X-Voice-Token
-      description: Voice platform authentication token
-
+      description: Per-user voice token issued by `/api/voice/tokens`.
+  parameters:
+    jobId:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+    taskId:
+      name: task_id
+      in: path
+      required: true
+      schema:
+        type: string
+    todoId:
+      name: todo_id
+      in: path
+      required: true
+      schema:
+        type: string
+    scheduleId:
+      name: schedule_id
+      in: path
+      required: true
+      schema:
+        type: string
+    tokenId:
+      name: token_id
+      in: path
+      required: true
+      schema:
+        type: string
+    sessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        type: string
+    projectId:
+      name: project_id
+      in: path
+      required: true
+      schema:
+        type: string
+    teamId:
+      name: team_id
+      in: path
+      required: true
+      schema:
+        type: string
+    name:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+    requestId:
+      name: request_id
+      in: path
+      required: true
+      schema:
+        type: string
+    filename:
+      name: filename
+      in: path
+      required: true
+      schema:
+        type: string
+  responses:
+    BadRequest:
+      description: Invalid request payload or parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Authenticated, but not allowed to perform this action
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: Resource state prevented the operation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
   schemas:
-    HealthResponse:
+    GenericObject:
       type: object
-      required: [status, version, timestamp]
-      properties:
-        status:
-          type: string
-          enum: [healthy, degraded, unhealthy]
-          example: healthy
-        version:
-          type: string
-          example: "1.0.0"
-        timestamp:
-          type: string
-          format: date-time
-        services:
-          type: object
-          properties:
-            stt:
-              type: string
-              enum: [available, unavailable]
-            redis:
-              type: string
-              enum: [connected, disconnected]
-            continuum:
-              type: string
-              enum: [enabled, disabled]
-
+      additionalProperties: true
+    GenericObjectList:
+      type: array
+      items:
+        $ref: '#/components/schemas/GenericObject'
     Error:
       type: object
-      required: [error]
       properties:
         error:
           type: string
-          example: "Invalid request"
+          example: unauthorized
         details:
           type: string
-          example: "Additional error context"
         code:
           type: string
-          example: "INVALID_INPUT"
-
+      required:
+        - error
+    StatusMessage:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        version:
+          type: string
+        jobs:
+          type: integer
+        workers:
+          type: integer
+        job_actions:
+          $ref: '#/components/schemas/GenericObject'
+        subtasks:
+          $ref: '#/components/schemas/GenericObject'
+        todo_scheduler:
+          $ref: '#/components/schemas/GenericObject'
+        continuum_autoscaler:
+          $ref: '#/components/schemas/GenericObject'
+        workers_summary:
+          $ref: '#/components/schemas/GenericObject'
+        sso:
+          $ref: '#/components/schemas/GenericObject'
+        stt_learning:
+          $ref: '#/components/schemas/GenericObject'
+    SessionState:
+      type: object
+      properties:
+        authenticated:
+          type: boolean
+        user:
+          type: string
+          nullable: true
+        role:
+          type: string
+          nullable: true
     LoginRequest:
       type: object
-      required: [username, password]
       properties:
         username:
           type: string
-          minLength: 1
-          maxLength: 128
         password:
           type: string
           format: password
-          minLength: 1
-
-    LoginResponse:
+      required:
+        - username
+        - password
+    SetupRequest:
       type: object
-      required: [status, user]
       properties:
-        status:
+        username:
           type: string
-          enum: [ok]
+        password:
+          type: string
+          format: password
+        confirm:
+          type: string
+          format: password
+        email:
+          type: string
+          format: email
+      required:
+        - username
+        - password
+    UserProfile:
+      type: object
+      properties:
         user:
-          type: object
-          properties:
-            username:
-              type: string
-            role:
-              type: string
-              enum: [admin, user]
-
-    AssistantMessage:
+          type: string
+        role:
+          type: string
+        email:
+          type: string
+          nullable: true
+    ProfileUpdateRequest:
       type: object
-      required: [message]
       properties:
-        message:
+        email:
           type: string
-          minLength: 1
-          maxLength: 32000
-          description: User message or prompt
-        session_id:
+          format: email
+    OidcExchangeRequest:
+      type: object
+      properties:
+        code:
           type: string
-          format: uuid
-          description: Optional session ID for conversation continuity
-        rag_enabled:
-          type: boolean
-          default: true
-          description: Enable RAG context retrieval
-        skills_enabled:
-          type: boolean
-          default: true
-          description: Enable skills/capabilities lookup
-        llm_provider:
+        code_verifier:
           type: string
-          enum: [openai, gemini, ollama]
-          description: Override default LLM provider
-        llm_model:
+        client_id:
           type: string
-          description: Override default model name
+        redirect_uri:
+          type: string
+          format: uri
+        id_token:
+          type: string
+        access_token:
+          type: string
+    AssistantRequirementsRequest:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [ask, draft]
+          default: ask
+        prompt:
+          type: string
+        requirements_text:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/GenericObject'
+        provider:
+          type: string
+        model:
+          type: string
         temperature:
           type: number
-          minimum: 0.0
-          maximum: 2.0
-          default: 0.7
         max_tokens:
           type: integer
-          minimum: 1
-          maximum: 128000
-
-    AssistantResponse:
+        reasoning_effort:
+          type: string
+        motionStyle:
+          type: string
+        avatarMode:
+          type: string
+    AssistantReply:
       type: object
-      required: [status, response]
+      properties:
+        reply:
+          type: string
+        provider:
+          type: string
+        model:
+          type: string
+        gesture_mode:
+          type: string
+        avatar_mode:
+          type: string
+        avatar_motion:
+          $ref: '#/components/schemas/GenericObject'
+        gesture_summary:
+          $ref: '#/components/schemas/GenericObject'
+        gesture_timeline:
+          $ref: '#/components/schemas/GenericObjectList'
+    FormField:
+      type: object
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        type:
+          type: string
+        value:
+          nullable: true
+        options:
+          type: array
+          items:
+            type: string
+        description:
+          type: string
+      required:
+        - id
+    FormFillRequest:
+      type: object
+      properties:
+        prompt:
+          type: string
+        workflow:
+          type: string
+        scope:
+          type: string
+        fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/FormField'
+        provider:
+          type: string
+        model:
+          type: string
+        temperature:
+          type: number
+        max_tokens:
+          type: integer
+      required:
+        - fields
+    FormSuggestion:
+      type: object
+      properties:
+        field_id:
+          type: string
+        value:
+          nullable: true
+        rationale:
+          type: string
+    RagMcpRequest:
+      type: object
+      properties:
+        prompt:
+          type: string
+        rag:
+          $ref: '#/components/schemas/GenericObject'
+        mcp:
+          $ref: '#/components/schemas/GenericObject'
+        provider:
+          type: string
+        model:
+          type: string
+        temperature:
+          type: number
+        max_tokens:
+          type: integer
+      required:
+        - prompt
+    PlaygroundPlanRequest:
+      type: object
+      properties:
+        prompt:
+          type: string
+        provider:
+          type: string
+        model:
+          type: string
+        codingagent:
+          type: string
+      required:
+        - prompt
+    VoiceToken:
+      type: object
+      properties:
+        id:
+          type: string
+        user:
+          type: string
+        label:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        masked:
+          type: string
+    VoiceTokenCreateRequest:
+      type: object
+      properties:
+        user:
+          type: string
+        label:
+          type: string
+    VoiceCaptureRequest:
+      type: object
+      properties:
+        text:
+          type: string
+        thought:
+          type: string
+        todo:
+          type: string
+        note:
+          type: string
+        source:
+          type: string
+        locale:
+          type: string
+        shortcut:
+          type: string
+        token:
+          type: string
+        voice_token:
+          type: string
+        api_key:
+          type: string
+    VoiceSttRequest:
+      type: object
+      properties:
+        audio_base64:
+          type: string
+          description: Base64-encoded audio payload.
+        lang:
+          type: string
+        prompt:
+          type: string
+        message:
+          type: string
+        query:
+          type: string
+        motionStyle:
+          type: string
+        gesture_mode:
+          type: string
+        avatarMode:
+          type: string
+        avatar_mode:
+          type: string
+        collaborationMode:
+          type: boolean
+        collaboration_mode:
+          type: boolean
+        token:
+          type: string
+        voice_token:
+          type: string
+    VoiceSttResponse:
+      type: object
       properties:
         status:
           type: string
-          enum: [ok, error]
-        response:
+          example: ok
+        text:
           type: string
-          description: AI assistant response text
-        session_id:
+        lang:
           type: string
-          format: uuid
+        gesture_mode:
+          type: string
+        avatar_mode:
+          type: string
+        collaboration_mode:
+          type: boolean
+        reason:
+          type: string
+        avatar_motion:
+          $ref: '#/components/schemas/GenericObject'
+        gesture_summary:
+          $ref: '#/components/schemas/GenericObject'
+        gesture_timeline:
+          $ref: '#/components/schemas/GenericObjectList'
+    JobCreateRequest:
+      type: object
+      properties:
+        workflow:
+          type: string
+        project_id:
+          type: string
+        team_id:
+          type: string
+        project_name:
+          type: string
+        project_root:
+          type: string
+        create_project:
+          type: boolean
+        requirements_text:
+          type: string
+        requirements_path:
+          type: string
+        project_run:
+          type: boolean
+        topic_source:
+          type: string
+        topic_output:
+          type: string
+        projects:
+          type: string
+        jql:
+          type: string
+        action_plan:
+          type: boolean
+        dry_run:
+          type: boolean
+        space:
+          type: string
+        use_rovo:
+          type: boolean
+        delivery_project_root:
+          type: string
+        delivery_config:
+          type: string
+        delivery_run:
+          type: boolean
+        delivery_allow_unfinished:
+          type: boolean
+        llm_provider:
+          type: string
+        llm_model:
+          type: string
+        llm_temperature:
+          type: number
+        llm_max_tokens:
+          type: integer
+        repo_url:
+          type: string
+        repo_branch:
+          type: string
+        work_branch:
+          type: string
+        repo_subdir:
+          type: string
+        requirements_relpath:
+          type: string
+        fork_org:
+          type: string
+        commit_message:
+          type: string
+        git_author_name:
+          type: string
+        git_author_email:
+          type: string
+        token_scope:
+          type: string
+        job_secrets:
+          type: array
+          items:
+            type: string
+      required:
+        - workflow
+    Job:
+      type: object
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+        workflow:
+          type: string
+        owner:
+          type: string
+        project_id:
+          type: string
+          nullable: true
+        team_id:
+          type: string
+          nullable: true
+        progress:
+          type: integer
+        archived:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        workspace:
+          $ref: '#/components/schemas/GenericObject'
+        token_estimate:
+          type: integer
+        token_debited:
+          type: integer
+    WorkspaceRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          example: create
+        force:
+          type: boolean
+        timeout_sec:
+          type: number
+        name:
+          type: string
+        region:
+          type: string
+        sku:
+          type: string
+        os_image:
+          type: string
+        public_key_id:
+          type: string
+        init_script:
+          type: string
+    TodoCreateRequest:
+      type: object
+      properties:
+        text:
+          type: string
+        thought:
+          type: string
+        todo:
+          type: string
+        source:
+          type: string
+        device:
+          type: string
+        defer_until_idle:
+          type: boolean
+        available_after:
+          type: string
+          format: date-time
+        meta:
+          $ref: '#/components/schemas/GenericObject'
+    Todo:
+      type: object
+      properties:
+        id:
+          type: string
+        text:
+          type: string
+        status:
+          type: string
+        source:
+          type: string
+        device:
+          type: string
+        priority:
+          nullable: true
+        notes:
+          nullable: true
+        tags:
+          type: array
+          items:
+            type: string
+        defer_until_idle:
+          type: boolean
+        available_after:
+          type: string
+          nullable: true
+        execution_state:
+          type: string
+        route:
+          $ref: '#/components/schemas/GenericObject'
+        links:
+          $ref: '#/components/schemas/GenericObject'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Schedule:
+      type: object
+      properties:
+        id:
+          type: string
+        todo_id:
+          type: string
+        status:
+          type: string
+        run_at:
+          type: string
+          format: date-time
+        route_override:
+          $ref: '#/components/schemas/GenericObject'
+        subtask_id:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    ScheduleRequest:
+      type: object
+      properties:
+        run_at:
+          type: string
+          format: date-time
+        scheduled_for:
+          type: string
+          format: date-time
+        available_after:
+          type: string
+          format: date-time
+        delay_sec:
+          type: number
+        route_override:
+          $ref: '#/components/schemas/GenericObject'
+    SubtaskCreateRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum: [todo_execute, assistant_requirements, playground_plan, submit_job]
+        payload:
+          $ref: '#/components/schemas/GenericObject'
+        scope_type:
+          type: string
+        scope_id:
+          type: string
+        timeout_sec:
+          type: number
+      required:
+        - action
+    Subtask:
+      type: object
+      properties:
+        task_id:
+          type: string
+        action:
+          type: string
+        status:
+          type: string
+        owner:
+          type: string
+        scope_type:
+          type: string
+        scope_id:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        result:
+          $ref: '#/components/schemas/GenericObject'
+    Project:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        team_id:
+          type: string
+          nullable: true
+        leaders:
+          type: array
+          items:
+            type: string
+        contributors:
+          type: array
+          items:
+            type: string
+        viewers:
+          type: array
+          items:
+            type: string
+        permissions:
+          $ref: '#/components/schemas/GenericObject'
+    Team:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        parent_id:
+          type: string
+          nullable: true
+        leaders:
+          type: array
+          items:
+            type: string
+        members:
+          type: array
+          items:
+            type: string
+    RequirementItem:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        priority:
+          type: string
+        status:
+          type: string
+        acceptance_criteria:
+          type: array
+          items:
+            type: string
+    RagSource:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        source:
+          type: string
+        path:
+          type: string
+        text:
+          type: string
+        metadata:
+          $ref: '#/components/schemas/GenericObject'
+    RagIndexSummary:
+      type: object
+      properties:
+        name:
+          type: string
+        documents:
+          type: integer
+        chunks:
+          type: integer
+        updated_at:
+          type: string
+          nullable: true
+    RagIndexCreateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        chunk_size:
+          type: integer
+        chunk_overlap:
+          type: integer
+        max_chunks:
+          type: integer
         sources:
           type: array
           items:
-            type: object
-            properties:
-              type:
-                type: string
-                enum: [rag, skill, context]
-              title:
-                type: string
-              snippet:
-                type: string
-        usage:
-          type: object
-          properties:
-            prompt_tokens:
-              type: integer
-            completion_tokens:
-              type: integer
-            total_tokens:
-              type: integer
-
-    STTTranscribeResponse:
-      type: object
-      required: [status, text, lang]
-      properties:
-        status:
-          type: string
-          enum: [ok]
-        text:
-          type: string
-          description: Transcribed text
-        lang:
-          type: string
-          example: "en-GB"
-        gesture_mode:
-          type: string
-          enum: [gesticulation, bsl]
-        avatar_mode:
-          type: string
-          enum: [chat, office]
-        avatar_motion:
-          $ref: '#/components/schemas/AvatarMotion'
-        gesture_summary:
-          type: object
-          properties:
-            style:
-              type: string
-            token_count:
-              type: integer
-        audio_analysis:
-          type: object
-          properties:
-            speech_ratio:
-              type: number
-            speech_confidence:
-              type: number
-            noise_level:
-              type: string
-              enum: [low, moderate, high]
-            snr_db:
-              type: number
-            collaboration_likely:
-              type: boolean
-
-    AvatarMotion:
-      type: object
-      required: [duration_ms, keyframes]
-      properties:
-        duration_ms:
-          type: integer
-          minimum: 0
-          description: Total motion duration in milliseconds
-        keyframes:
+            $ref: '#/components/schemas/RagSource'
+        paths:
           type: array
           items:
-            type: object
-            required: [t, pose]
-            properties:
-              t:
-                type: integer
-                minimum: 0
-                description: Keyframe timestamp in milliseconds
-              pose:
-                type: object
-                description: Full-body avatar pose parameters
-
+            type: string
+      required:
+        - name
+    RagMatch:
+      type: object
+      properties:
+        chunk_id:
+          type: string
+        source:
+          type: string
+        score:
+          type: number
+        text:
+          type: string
+        citation:
+          type: string
+        metadata:
+          $ref: '#/components/schemas/GenericObject'
+    RagQueryRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        query:
+          type: string
+        top_k:
+          type: integer
+        min_score:
+          type: number
+      required:
+        - query
+    RagQueryResponse:
+      type: object
+      properties:
+        name:
+          type: string
+        query:
+          type: string
+        matches:
+          type: array
+          items:
+            $ref: '#/components/schemas/RagMatch'
+        context:
+          type: string
+    McpServerConfig:
+      type: object
+      properties:
+        name:
+          type: string
+        base_url:
+          type: string
+          format: uri
+        auth_type:
+          type: string
+          enum: [bearer, oauth, none]
+        auth_token:
+          type: string
+        headers:
+          $ref: '#/components/schemas/GenericObject'
+        timeout:
+          type: integer
+      required:
+        - name
+        - base_url
+    McpToolCallRequest:
+      type: object
+      properties:
+        tool:
+          type: string
+        arguments:
+          $ref: '#/components/schemas/GenericObject'
+      required:
+        - tool
+    TokenSnapshot:
+      type: object
+      properties:
+        balance:
+          type: integer
+        paid_balance:
+          type: integer
+        free_balance:
+          type: integer
+        reserved:
+          type: integer
+        in_use:
+          type: integer
+        available:
+          type: integer
+        capacity:
+          type: integer
+        low_threshold:
+          type: integer
+    TokenActionRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum: [review, add, cashout, grant, sync]
+        username:
+          type: string
+        target_user:
+          type: string
+        password:
+          type: string
+          format: password
+        token_amount:
+          type: integer
+        btc_amount:
+          type: number
+        balance:
+          type: integer
+        paid_balance:
+          type: integer
+        free_balance:
+          type: integer
+        capacity:
+          type: integer
+        source:
+          type: string
+    SecretSummary:
+      type: object
+      properties:
+        name:
+          type: string
+        masked:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+    SecretCreateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        value:
+          type: string
+      required:
+        - name
+        - value
 paths:
   /health:
     get:
-      summary: Health check
-      description: |
-        Returns service health status and version information.
-
-        **Note:** This endpoint is publicly accessible and does not require authentication.
-      tags: [Health]
-      security: []  # No authentication required
+      tags: [Public]
+      summary: Public docs health helper
+      description: Available when the docs helper is registered by `api_docs.add_api_documentation_support()`.
+      security: []
       responses:
         '200':
-          description: Service is healthy
+          description: Public health payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+  /api/health:
+    get:
+      tags: [Public]
+      summary: Backend operational health
+      security: []
+      responses:
+        '200':
+          description: Operational health summary
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
-
   /api/version:
     get:
-      summary: API version
-      description: |
-        Returns API version and build information.
-
-        **Note:** This endpoint is publicly accessible and does not require authentication.
-      tags: [Health]
-      security: []  # No authentication required
+      tags: [Public]
+      summary: Backend version info
+      security: []
       responses:
         '200':
-          description: Version information
+          description: Build/version metadata
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  version:
-                    type: string
-                  build:
-                    type: string
-                  commit:
-                    type: string
-
-  /api/docs:
+                $ref: '#/components/schemas/GenericObject'
+  /metrics:
     get:
-      summary: API documentation UI
-      description: |
-        Interactive Swagger UI for exploring and testing the API.
-
-        **Note:** This endpoint is publicly accessible and does not require authentication.
-        The documentation itself is public, but calling the actual API endpoints requires
-        appropriate authentication as documented.
-      tags: [Health]
-      security: []  # No authentication required
+      tags: [Public]
+      summary: Prometheus metrics
+      description: The path is configurable through `REFINER_METRICS_PATH`; `/metrics` is the default.
+      security: []
       responses:
         '200':
-          description: Swagger UI HTML page
+          description: Prometheus exposition format
           content:
-            text/html:
+            text/plain:
               schema:
                 type: string
-
-  /api/docs/openapi.json:
-    get:
-      summary: OpenAPI specification (JSON)
-      description: |
-        OpenAPI 3.0 specification in JSON format.
-
-        **Note:** This endpoint is publicly accessible and does not require authentication.
-      tags: [Health]
-      security: []  # No authentication required
-      responses:
-        '200':
-          description: OpenAPI specification
-          content:
-            application/json:
-              schema:
-                type: object
-
-  /api/docs/openapi.yaml:
-    get:
-      summary: OpenAPI specification (YAML)
-      description: |
-        OpenAPI 3.0 specification in YAML format.
-
-        **Note:** This endpoint is publicly accessible and does not require authentication.
-      tags: [Health]
-      security: []  # No authentication required
-      responses:
-        '200':
-          description: OpenAPI specification
-          content:
-            text/yaml:
-              schema:
-                type: string
-
-  /auth/login:
+  /api/setup:
     post:
-      summary: User login
-      description: Authenticate user and create session
-      tags: [Authentication]
+      tags: [Auth]
+      summary: Create the first local admin user
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetupRequest'
+      responses:
+        '201':
+          description: Admin user created and logged in
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/login:
+    post:
+      tags: [Auth]
+      summary: Log in with local credentials
+      security: []
       requestBody:
         required: true
         content:
@@ -382,218 +1108,549 @@ paths:
               $ref: '#/components/schemas/LoginRequest'
       responses:
         '200':
-          description: Login successful
+          description: Session established
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/LoginResponse'
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
-          description: Invalid credentials
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: Login throttled
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-
-  /auth/logout:
+  /api/logout:
     post:
-      summary: User logout
-      description: Terminate current session
-      tags: [Authentication]
-      security:
-        - sessionAuth: []
+      tags: [Auth]
+      summary: Log out the current session
       responses:
         '200':
-          description: Logout successful
+          description: Session cleared
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/session:
+    get:
+      tags: [Auth]
+      summary: Return the current session state
+      security: []
+      responses:
+        '200':
+          description: Session state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionState'
+  /api/profile:
+    get:
+      tags: [Auth]
+      summary: Get the current profile
+      responses:
+        '200':
+          description: Profile data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Auth]
+      summary: Update the current profile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProfileUpdateRequest'
+      responses:
+        '200':
+          description: Profile updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/sso/issue:
+    post:
+      tags: [Auth]
+      summary: Issue a one-time SSO token for the current user
+      responses:
+        '200':
+          description: SSO token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/oidc/exchange:
+    post:
+      tags: [Auth]
+      summary: Exchange an OIDC code or ID token for a Refiner session
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OidcExchangeRequest'
+      responses:
+        '200':
+          description: OIDC exchange succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: OIDC exchange is disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/capabilities:
+    get:
+      tags: [Admin]
+      summary: Return the backend capability inventory
+      parameters:
+        - name: refresh
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Capability report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/admin/stats:
+    get:
+      tags: [Admin]
+      summary: Return Control Room aggregate stats
+      responses:
+        '200':
+          description: Admin stats
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/workers/telemetry:
+    get:
+      tags: [Admin]
+      summary: Worker and autoscaler telemetry
+      parameters:
+        - name: refresh
+          in: query
+          schema:
+            type: boolean
+        - name: include_cluster
+          in: query
+          schema:
+            type: boolean
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Telemetry payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/audit:
+    get:
+      tags: [Admin]
+      summary: Read recent audit entries
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: actions
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Audit entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/assistant/requirements:
+    post:
+      tags: [Assistant]
+      summary: Requirements assistant and drafting endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssistantRequirementsRequest'
+      responses:
+        '200':
+          description: Assistant reply and optional gesture metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssistantReply'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Assistant capacity unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/assistant/form-fill:
+    post:
+      tags: [Assistant]
+      summary: Suggest values for structured form fields
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FormFillRequest'
+      responses:
+        '200':
+          description: Suggested values
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  status:
-                    type: string
-                    enum: [ok]
-
-  /api/assistant/chat:
+                  suggestions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FormSuggestion'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/assistant/rag-mcp:
     post:
-      summary: Send message to AI assistant
-      description: |
-        Send a message to the AI assistant. The assistant provides context-aware responses
-        using RAG (Retrieval-Augmented Generation), skills database, and LLM inference.
       tags: [Assistant]
+      summary: Ask a question using optional RAG context and optional MCP data
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RagMcpRequest'
+      responses:
+        '200':
+          description: Assistant answer with optional RAG matches and MCP result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/playground/plan:
+    post:
+      tags: [Assistant]
+      summary: Generate a child-friendly plan and starter job payload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlaygroundPlanRequest'
+      responses:
+        '200':
+          description: Summary, steps, requirements text, and job payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/voice/tokens:
+    get:
+      tags: [Voice]
+      summary: List voice tokens
+      parameters:
+        - name: user
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Token list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/VoiceToken'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Voice]
+      summary: Issue a new voice token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoiceTokenCreateRequest'
+      responses:
+        '201':
+          description: Token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/voice/tokens/{token_id}:
+    delete:
+      tags: [Voice]
+      summary: Revoke a voice token
+      parameters:
+        - $ref: '#/components/parameters/tokenId'
+      responses:
+        '200':
+          description: Token revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/voice/capture:
+    get:
+      tags: [Voice]
+      summary: Capture a short voice/text note into the TODO inbox
       security:
         - sessionAuth: []
+        - voiceToken: []
+        - bearerAuth: []
+      responses:
+        '200':
+          description: TODO captured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Voice]
+      summary: Capture a short voice/text note into the TODO inbox
+      security:
+        - sessionAuth: []
+        - voiceToken: []
         - bearerAuth: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/AssistantMessage'
+              $ref: '#/components/schemas/VoiceCaptureRequest'
       responses:
         '200':
-          description: Assistant response
+          description: TODO captured
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/AssistantResponse'
+                $ref: '#/components/schemas/GenericObject'
         '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/BadRequest'
         '401':
-          description: Unauthorized
-        '429':
-          description: Rate limit exceeded
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-
-  /api/stt/transcribe:
-    post:
-      summary: Transcribe audio to text
-      description: |
-        Upload audio file for speech-to-text transcription. Supports multiple formats
-        (wav, mp3, ogg, webm, flac). Returns transcribed text with optional gesture
-        planning and audio analysis.
-      tags: [STT]
+          $ref: '#/components/responses/Unauthorized'
+  /api/voice/siri:
+    get:
+      tags: [Voice]
+      summary: Siri/Shortcuts capture adapter
       security:
         - sessionAuth: []
         - voiceToken: []
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required: [audio]
-              properties:
-                audio:
-                  type: string
-                  format: binary
-                  description: Audio file (max 6MB)
-                lang:
-                  type: string
-                  default: "en-GB"
-                  example: "en-GB"
-                  description: Language code
-                prompt:
-                  type: string
-                  maxLength: 640
-                  description: Context prompt for improved accuracy
-                gesture_mode:
-                  type: string
-                  enum: [gesticulation, bsl]
-                  description: Gesture/motion style
-                avatar_mode:
-                  type: string
-                  enum: [chat, office]
-                  description: Avatar presentation mode
-                collaboration_mode:
-                  type: boolean
-                  description: Enable multi-speaker detection
+        - bearerAuth: []
       responses:
         '200':
-          description: Transcription successful
+          description: Capture result
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/STTTranscribeResponse'
-        '400':
-          description: Invalid audio or parameters
-          content:
-            application/json:
+                $ref: '#/components/schemas/GenericObject'
+            text/plain:
               schema:
-                $ref: '#/components/schemas/Error'
-        '413':
-          description: Audio file too large
-        '503':
-          description: STT service unavailable
-
-  /api/stt/gesture-plan:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
     post:
-      summary: Generate gesture plan from text
-      description: |
-        Generate avatar motion keyframes and gesture timeline from input text.
-        Supports both semantic gesticulation and BSL (British Sign Language) modes.
-      tags: [STT]
+      tags: [Voice]
+      summary: Siri/Shortcuts capture adapter
       security:
         - sessionAuth: []
+        - voiceToken: []
+        - bearerAuth: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [text]
-              properties:
-                text:
-                  type: string
-                  minLength: 1
-                  maxLength: 10000
-                gesture_mode:
-                  type: string
-                  enum: [gesticulation, bsl]
-                  default: gesticulation
-                avatar_mode:
-                  type: string
-                  enum: [chat, office]
-                  default: chat
+              $ref: '#/components/schemas/VoiceCaptureRequest'
       responses:
         '200':
-          description: Gesture plan generated
+          description: Capture result
           content:
             application/json:
               schema:
-                type: object
-                required: [status, text, gesture_mode, avatar_mode]
-                properties:
-                  status:
-                    type: string
-                    enum: [ok]
-                  text:
-                    type: string
-                  gesture_mode:
-                    type: string
-                  avatar_mode:
-                    type: string
-                  avatar_motion:
-                    $ref: '#/components/schemas/AvatarMotion'
+                $ref: '#/components/schemas/GenericObject'
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/voice/alexa:
+    post:
+      tags: [Voice]
+      summary: Alexa capture adapter
+      security:
+        - voiceToken: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenericObject'
+      responses:
+        '200':
+          description: Alexa response payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/voice/google:
+    post:
+      tags: [Voice]
+      summary: Google Assistant/Dialogflow capture adapter
+      security:
+        - voiceToken: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenericObject'
+      responses:
+        '200':
+          description: Google response payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/voice/stt:
+    post:
+      tags: [Voice]
+      summary: Transcribe audio and optionally attach gesture/avatar motion
+      security:
+        - sessionAuth: []
+        - voiceToken: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoiceSttRequest'
+      responses:
+        '200':
+          description: Transcript and motion metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoiceSttResponse'
         '400':
-          description: Invalid request
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: Audio too large
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-
+        '503':
+          description: STT capacity unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /api/jobs:
     get:
-      summary: List jobs
-      description: Get paginated list of user jobs
       tags: [Jobs]
-      security:
-        - sessionAuth: []
+      summary: List visible jobs
       parameters:
-        - name: page
-          in: query
-          schema:
-            type: integer
-            minimum: 1
-            default: 1
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 100
-            default: 20
         - name: status
           in: query
           schema:
             type: string
-            enum: [pending, running, completed, failed]
+        - name: scope
+          in: query
+          schema:
+            type: string
+            enum: [team, personal, all]
+        - name: project_id
+          in: query
+          schema:
+            type: string
       responses:
         '200':
           description: Job list
@@ -605,47 +1662,340 @@ paths:
                   jobs:
                     type: array
                     items:
-                      type: object
-                  total:
-                    type: integer
-                  page:
-                    type: integer
-                  limit:
-                    type: integer
+                      $ref: '#/components/schemas/Job'
         '401':
-          description: Unauthorized
-
-  /api/rag/documents:
+          $ref: '#/components/responses/Unauthorized'
     post:
-      summary: Upload RAG document
-      description: |
-        Upload document for indexing in RAG system. Supports PDF, DOCX, TXT,
-        Markdown, and other text formats. Documents are chunked and embedded
-        for semantic search.
-      tags: [RAG]
-      security:
-        - sessionAuth: []
+      tags: [Jobs]
+      summary: Submit a new job
       requestBody:
         required: true
         content:
-          multipart/form-data:
+          application/json:
             schema:
-              type: object
-              required: [file]
-              properties:
-                file:
-                  type: string
-                  format: binary
-                  description: Document file (max 600KB)
-                title:
-                  type: string
-                  maxLength: 256
-                tags:
-                  type: string
-                  description: Comma-separated tags
+              $ref: '#/components/schemas/JobCreateRequest'
       responses:
         '200':
-          description: Document uploaded and indexed
+          description: Job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          description: Insufficient tokens
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/jobs/estimate:
+    post:
+      tags: [Jobs]
+      summary: Estimate token cost for a prospective job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobCreateRequest'
+      responses:
+        '200':
+          description: Estimate and token snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/jobs/{job_id}:
+    get:
+      tags: [Jobs]
+      summary: Get job detail
+      parameters:
+        - $ref: '#/components/parameters/jobId'
+      responses:
+        '200':
+          description: Full job record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Jobs]
+      summary: Delete a job
+      parameters:
+        - $ref: '#/components/parameters/jobId'
+        - name: stop
+          in: query
+          schema:
+            type: boolean
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenericObject'
+      responses:
+        '200':
+          description: Job deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/jobs/{job_id}/workspace:
+    get:
+      tags: [Jobs]
+      summary: Get workspace status for a job
+      parameters:
+        - $ref: '#/components/parameters/jobId'
+      responses:
+        '200':
+          description: Workspace state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Jobs]
+      summary: Create or refresh a workspace
+      parameters:
+        - $ref: '#/components/parameters/jobId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkspaceRequest'
+      responses:
+        '200':
+          description: Workspace task or immediate result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/jobs/{job_id}/tasks/{task_id}:
+    get:
+      tags: [Jobs]
+      summary: Get a background workspace task
+      parameters:
+        - $ref: '#/components/parameters/jobId'
+        - $ref: '#/components/parameters/taskId'
+      responses:
+        '200':
+          description: Task detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/jobs/{job_id}/tasks/{task_id}/cancel:
+    post:
+      tags: [Jobs]
+      summary: Cancel a background workspace task
+      parameters:
+        - $ref: '#/components/parameters/jobId'
+        - $ref: '#/components/parameters/taskId'
+      responses:
+        '200':
+          description: Task cancel result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/jobs/{job_id}/editor/file:
+    get:
+      tags: [Jobs]
+      summary: Read a file from the job editor workspace
+      parameters:
+        - $ref: '#/components/parameters/jobId'
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: File content payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Jobs]
+      summary: Update a file in the job editor workspace
+      parameters:
+        - $ref: '#/components/parameters/jobId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenericObject'
+      responses:
+        '200':
+          description: File saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/jobs/{job_id}/logs/stream:
+    get:
+      tags: [Jobs]
+      summary: Stream job logs over server-sent events
+      parameters:
+        - $ref: '#/components/parameters/jobId'
+      responses:
+        '200':
+          description: Text/event-stream log feed
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/jobs/{job_id}/actions:
+    post:
+      tags: [Jobs]
+      summary: Queue a job-scoped action
+      parameters:
+        - $ref: '#/components/parameters/jobId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenericObject'
+      responses:
+        '200':
+          description: Action queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/jobs/{job_id}/archive:
+    post:
+      tags: [Jobs]
+      summary: Archive a job
+      parameters:
+        - $ref: '#/components/parameters/jobId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenericObject'
+      responses:
+        '200':
+          description: Job archived
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/todos:
+    get:
+      tags: [Inbox]
+      summary: List TODO items
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: query
+          in: query
+          schema:
+            type: string
+        - name: ready
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: TODO list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Todo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Inbox]
+      summary: Create a TODO item
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TodoCreateRequest'
+      responses:
+        '201':
+          description: TODO created
           content:
             application/json:
               schema:
@@ -653,12 +2003,1047 @@ paths:
                 properties:
                   status:
                     type: string
-                    enum: [ok]
-                  document_id:
-                    type: string
-                  chunks:
+                  todo:
+                    $ref: '#/components/schemas/Todo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/todos/next:
+    get:
+      tags: [Inbox]
+      summary: Peek or claim the next routed TODO item
+      parameters:
+        - name: idle
+          in: query
+          schema:
+            type: boolean
+        - name: claim
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Next TODO or empty result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/todos/{todo_id}:
+    patch:
+      tags: [Inbox]
+      summary: Update a TODO item
+      parameters:
+        - $ref: '#/components/parameters/todoId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenericObject'
+      responses:
+        '200':
+          description: TODO updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Inbox]
+      summary: Delete a TODO item
+      parameters:
+        - $ref: '#/components/parameters/todoId'
+      responses:
+        '200':
+          description: TODO deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/todos/{todo_id}/route:
+    post:
+      tags: [Inbox]
+      summary: Suggest the best workflow for a TODO item
+      parameters:
+        - $ref: '#/components/parameters/todoId'
+      responses:
+        '200':
+          description: Suggested route payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/todos/{todo_id}/schedule:
+    get:
+      tags: [Inbox]
+      summary: List schedules for a TODO item
+      parameters:
+        - $ref: '#/components/parameters/todoId'
+      responses:
+        '200':
+          description: TODO schedule list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Inbox]
+      summary: Schedule a TODO item for later execution
+      parameters:
+        - $ref: '#/components/parameters/todoId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduleRequest'
+      responses:
+        '201':
+          description: Schedule created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/schedules:
+    get:
+      tags: [Inbox]
+      summary: List deferred TODO schedules
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: todo_id
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Schedule list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schedules:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Schedule'
+                  scheduler:
+                    $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/schedules/{schedule_id}/cancel:
+    post:
+      tags: [Inbox]
+      summary: Cancel a deferred TODO schedule
+      parameters:
+        - $ref: '#/components/parameters/scheduleId'
+      responses:
+        '200':
+          description: Schedule cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/subtasks:
+    get:
+      tags: [Inbox]
+      summary: List generic background subtasks
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: include_results
+          in: query
+          schema:
+            type: boolean
+        - name: scope_type
+          in: query
+          schema:
+            type: string
+        - name: scope_id
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Subtask list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Subtask'
+                  queue_depth:
+                    type: integer
+                  inflight:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Inbox]
+      summary: Create a generic background subtask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubtaskCreateRequest'
+      responses:
+        '201':
+          description: Subtask queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/subtasks/{task_id}:
+    get:
+      tags: [Inbox]
+      summary: Get a subtask by ID
+      parameters:
+        - $ref: '#/components/parameters/taskId'
+        - name: include_result
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Subtask detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task:
+                    $ref: '#/components/schemas/Subtask'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/subtasks/{task_id}/cancel:
+    post:
+      tags: [Inbox]
+      summary: Cancel a subtask
+      parameters:
+        - $ref: '#/components/parameters/taskId'
+      responses:
+        '200':
+          description: Cancel result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/projects:
+    get:
+      tags: [Access]
+      summary: List visible projects
+      parameters:
+        - name: include_viewers
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Project list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  projects:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Project'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Access]
+      summary: Create a project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Project'
+      responses:
+        '201':
+          description: Project created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/projects/{project_id}:
+    patch:
+      tags: [Access]
+      summary: Update a project
+      parameters:
+        - $ref: '#/components/parameters/projectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Project'
+      responses:
+        '200':
+          description: Project updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Access]
+      summary: Delete a project
+      parameters:
+        - $ref: '#/components/parameters/projectId'
+      responses:
+        '200':
+          description: Project deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/teams:
+    get:
+      tags: [Access]
+      summary: List teams
+      responses:
+        '200':
+          description: Team list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  teams:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Team'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Access]
+      summary: Create a team
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Team'
+      responses:
+        '201':
+          description: Team created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Team'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/teams/{team_id}:
+    patch:
+      tags: [Access]
+      summary: Update a team
+      parameters:
+        - $ref: '#/components/parameters/teamId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Team'
+      responses:
+        '200':
+          description: Team updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Team'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Access]
+      summary: Delete a team
+      parameters:
+        - $ref: '#/components/parameters/teamId'
+      responses:
+        '200':
+          description: Team deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/teams/{team_id}/tokens:
+    get:
+      tags: [Access]
+      summary: Get a team token snapshot
+      parameters:
+        - $ref: '#/components/parameters/teamId'
+      responses:
+        '200':
+          description: Team token snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Access]
+      summary: Mutate a team token balance
+      parameters:
+        - $ref: '#/components/parameters/teamId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenActionRequest'
+      responses:
+        '200':
+          description: Team token mutation applied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/access/tree:
+    get:
+      tags: [Access]
+      summary: Return the current project/team access tree
+      responses:
+        '200':
+          description: Access tree
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/sessions:
+    post:
+      tags: [Access]
+      summary: Create or join a collaboration session for a job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenericObject'
+      responses:
+        '200':
+          description: Session snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/sessions/{session_id}:
+    get:
+      tags: [Access]
+      summary: Get a collaboration session snapshot
+      parameters:
+        - $ref: '#/components/parameters/sessionId'
+      responses:
+        '200':
+          description: Session detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/sessions/{session_id}/stream:
+    get:
+      tags: [Access]
+      summary: Stream collaboration presence and job status events
+      parameters:
+        - $ref: '#/components/parameters/sessionId'
+      responses:
+        '200':
+          description: Session event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/sessions/{session_id}/history:
+    get:
+      tags: [Access]
+      summary: Read persisted collaboration history for a room
+      parameters:
+        - $ref: '#/components/parameters/sessionId'
+      responses:
+        '200':
+          description: Session history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/requirements/import:
+    post:
+      tags: [RAG]
+      summary: Import a requirements register from CSV/XLS/XLSX/ODS
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+              required:
+                - file
+      responses:
+        '200':
+          description: Parsed requirements rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RequirementItem'
+                  count:
                     type: integer
         '400':
-          description: Invalid file or parameters
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '413':
-          description: File too large
+          description: Uploaded file too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/requirements/export:
+    post:
+      tags: [RAG]
+      summary: Export requirements rows to CSV/XLS/XLSX/ODS
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                format:
+                  type: string
+                  enum: [csv, xls, xlsx, ods]
+                items:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/RequirementItem'
+      responses:
+        '200':
+          description: Exported file
+          content:
+            text/csv:
+              schema:
+                type: string
+            application/vnd.ms-excel:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/vnd.oasis.opendocument.spreadsheet:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/rag/indexes:
+    get:
+      tags: [RAG]
+      summary: List RAG indexes for the current user
+      responses:
+        '200':
+          description: RAG indexes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  indexes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RagIndexSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/rag/index:
+    post:
+      tags: [RAG]
+      summary: Create or rebuild a RAG index
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RagIndexCreateRequest'
+      responses:
+        '200':
+          description: Index created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagIndexSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/rag/index/{name}:
+    delete:
+      tags: [RAG]
+      summary: Delete a RAG index
+      parameters:
+        - $ref: '#/components/parameters/name'
+      responses:
+        '200':
+          description: Index deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/rag/query:
+    post:
+      tags: [RAG]
+      summary: Search a RAG index and render a context block
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RagQueryRequest'
+      responses:
+        '200':
+          description: RAG matches and context
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagQueryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/mcp/servers:
+    get:
+      tags: [MCP]
+      summary: List configured MCP servers
+      responses:
+        '200':
+          description: MCP server list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  servers:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/McpServerConfig'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [MCP]
+      summary: Register or update an MCP server
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/McpServerConfig'
+      responses:
+        '200':
+          description: MCP server saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  server:
+                    $ref: '#/components/schemas/McpServerConfig'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/mcp/servers/{name}/tools:
+    get:
+      tags: [MCP]
+      summary: List tools exposed by an MCP server
+      parameters:
+        - $ref: '#/components/parameters/name'
+      responses:
+        '200':
+          description: Tool list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/mcp/servers/{name}/call:
+    post:
+      tags: [MCP]
+      summary: Call an MCP tool
+      parameters:
+        - $ref: '#/components/parameters/name'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/McpToolCallRequest'
+      responses:
+        '200':
+          description: Tool result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/mcp/servers/{name}/resource:
+    post:
+      tags: [MCP]
+      summary: Read one MCP resource by URI
+      parameters:
+        - $ref: '#/components/parameters/name'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                uri:
+                  type: string
+              required:
+                - uri
+      responses:
+        '200':
+          description: Resource payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/tokens:
+    get:
+      tags: [Tokens]
+      summary: Get the current token snapshot
+      parameters:
+        - name: project_id
+          in: query
+          schema:
+            type: string
+        - name: team_id
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Token snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Tokens]
+      summary: Review or mutate a token balance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenActionRequest'
+      responses:
+        '200':
+          description: Token action result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/tokens/ledger:
+    get:
+      tags: [Tokens]
+      summary: Read token ledger history
+      parameters:
+        - name: user
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Ledger entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/secrets:
+    get:
+      tags: [Tokens]
+      summary: List masked user secrets
+      responses:
+        '200':
+          description: Secret list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secrets:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SecretSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Tokens]
+      summary: Store a user secret
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SecretCreateRequest'
+      responses:
+        '200':
+          description: Secret saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/secrets/{name}:
+    delete:
+      tags: [Tokens]
+      summary: Delete a user secret
+      parameters:
+        - $ref: '#/components/parameters/name'
+      responses:
+        '200':
+          description: Secret deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusMessage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/github/tree:
+    post:
+      tags: [Tokens]
+      summary: Fetch a repository tree through the GitHub API
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                repo_url:
+                  type: string
+                repo:
+                  type: string
+                branch:
+                  type: string
+                max_entries:
+                  type: integer
+      responses:
+        '200':
+          description: Repository tree snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: Upstream GitHub call failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
