@@ -48,6 +48,7 @@ from flask import (
     Flask,
     Response,
     jsonify,
+    make_response,
     render_template,
     request,
     redirect,
@@ -93,6 +94,7 @@ from security_utils import (
     ensure_file_permissions,
     hash_identifier,
 )
+from refiner_central_store import create_central_store_from_env
 from versioning import get_public_version_info, get_version_info
 
 logger = logging.getLogger(__name__)
@@ -1049,6 +1051,7 @@ CORS_ALLOW_METHODS = ["GET", "POST", "DELETE", "OPTIONS"]
 CORS_MAX_AGE = int(os.getenv("REFINER_CORS_MAX_AGE", "600"))
 API_BASE = os.getenv("REFINER_API_BASE", "").strip().rstrip("/")
 COOKIE_DOMAIN = (os.getenv("REFINER_COOKIE_DOMAIN") or "").strip() or None
+EXTERNAL_REDIRECT_HOSTS = _env_list("REFINER_EXTERNAL_REDIRECT_HOSTS")
 
 COOKIE_SAMESITE = _normalize_samesite(os.getenv("REFINER_COOKIE_SAMESITE"))
 if not COOKIE_SAMESITE:
@@ -1312,8 +1315,25 @@ class RedisSsoStore(SsoStore):
             return {"type": self.type_name, "ok": False, "error": str(exc)}
 
 
+def _init_central_store() -> Optional[Any]:
+    try:
+        store = create_central_store_from_env()
+    except Exception as exc:
+        logger.warning("central auth store initialization failed: %s", exc)
+        return None
+    if store is not None:
+        logger.info("central auth store enabled with Postgres backing")
+    return store
+
+
+CENTRAL_STORE = _init_central_store()
+
+
 def _init_sso_store() -> Dict[str, Any]:
     status: Dict[str, Any] = {"mode": SSO_STORE_MODE}
+    if CENTRAL_STORE is not None:
+        status.update({"ok": True, "active_store": "postgres"})
+        return {"store": CENTRAL_STORE.sso_tokens, "status": status}
     mode = SSO_STORE_MODE
     if mode not in {"auto", "redis", "memory"}:
         status.update({"ok": False, "error": "invalid_mode"})
@@ -1395,6 +1415,38 @@ def _safe_next_path(value: Optional[str]) -> str:
     if not raw.startswith("/"):
         return f"/{raw}"
     return raw
+
+
+def _host_matches_pattern(host: str, pattern: str) -> bool:
+    host = (host or "").strip().lower()
+    normalized = (pattern or "").strip().lower().lstrip(".")
+    if not host or not normalized:
+        return False
+    return host == normalized or host.endswith("." + normalized)
+
+
+def _safe_external_redirect(value: Optional[str]) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return "/"
+    parsed = urlparse(raw)
+    if not parsed.scheme and not parsed.netloc:
+        return _safe_next_path(raw)
+    if parsed.scheme not in {"http", "https"}:
+        return "/"
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return "/"
+
+    allowed_patterns = [item for item in EXTERNAL_REDIRECT_HOSTS if item and item.strip()]
+    if COOKIE_DOMAIN:
+        allowed_patterns.append(COOKIE_DOMAIN)
+    if has_request_context() and request.host:
+        allowed_patterns.append(request.host.split(":", 1)[0])
+
+    if any(_host_matches_pattern(host, pattern) for pattern in allowed_patterns):
+        return raw
+    return "/"
 
 
 def _normalise_allowed_roots() -> List[str]:
@@ -1982,6 +2034,10 @@ class UserStore:
     def has_users(self) -> bool:
         with self.lock:
             return bool(self.users)
+
+    def count_users(self) -> int:
+        with self.lock:
+            return len(self.users)
 
     def ensure_admin_from_env(self) -> None:
         admin_user = (os.getenv("REFINER_ADMIN_USER") or "").strip()
@@ -7215,18 +7271,20 @@ manager = JobManager()
 job_action_manager = JobActionManager()
 continuum_autoscaler = ContinuumQueueAutoscaler(manager)
 continuum_autoscaler.start()
-user_store = UserStore(USERS_PATH)
+user_store = CENTRAL_STORE.users if CENTRAL_STORE is not None else UserStore(USERS_PATH)
 user_store.ensure_admin_from_env()
+if CENTRAL_STORE is not None:
+    CENTRAL_STORE.bootstrap_from_env((os.getenv("REFINER_ADMIN_USER") or "").strip())
 _secret_stores: Dict[str, SecretStore] = {}
 _user_activity: Dict[str, float] = {}
 _user_activity_lock = threading.Lock()
-token_ledger = TokenLedger(LEDGER_ROOT)
-team_token_ledger = TokenLedger(TEAM_LEDGER_ROOT)
+token_ledger = CENTRAL_STORE.user_ledger if CENTRAL_STORE is not None else TokenLedger(LEDGER_ROOT)
+team_token_ledger = CENTRAL_STORE.team_ledger if CENTRAL_STORE is not None else TokenLedger(TEAM_LEDGER_ROOT)
 rag_store = RagStore(RAG_STORE_ROOT)
 mcp_store = MCPServerStore(MCP_STORE_ROOT)
 session_history = SessionHistoryStore(SESSIONS_ROOT)
 session_store = SessionStore()
-voice_token_store = VoiceTokenStore(VOICE_TOKEN_PATH)
+voice_token_store = CENTRAL_STORE.voice_tokens if CENTRAL_STORE is not None else VoiceTokenStore(VOICE_TOKEN_PATH)
 todo_store = TodoStore(TODO_ROOT)
 schedule_store = ScheduleStore(SCHEDULE_ROOT)
 subtask_manager = SubtaskManager()
@@ -7279,6 +7337,8 @@ def _chain_account_summary(scope: str, account_id: str) -> Dict[str, Any]:
 
 
 def _account_summary(scope: str, account_id: str) -> Dict[str, Any]:
+    if CENTRAL_STORE is not None:
+        return _local_account_summary(scope, account_id)
     if _chain_enabled():
         try:
             return _chain_account_summary(scope, account_id)
@@ -7289,6 +7349,9 @@ def _account_summary(scope: str, account_id: str) -> Dict[str, Any]:
 
 def _account_entries(scope: str, account_id: str, limit: int = 50) -> List[Dict[str, Any]]:
     limit_val = max(1, min(int(limit), 500))
+    if CENTRAL_STORE is not None:
+        ledger = team_token_ledger if scope == "team" else token_ledger
+        return ledger.list_entries(account_id, limit=limit_val)
     if _chain_enabled():
         try:
             payload = NMCHAIN.ledger_entries(scope, account_id, limit=limit_val)
@@ -7311,6 +7374,9 @@ def _record_token_event(
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     meta_dict = dict(meta or {})
+    if CENTRAL_STORE is not None:
+        ledger = team_token_ledger if scope == "team" else token_ledger
+        return ledger.record(account_id, entry_type, int(delta), meta_dict, request_id=request_id)
     if _chain_enabled():
         result = NMCHAIN.apply_token(
             scope,
@@ -7345,6 +7411,8 @@ def _capture_payment_event(
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     meta_dict = dict(meta or {})
+    if CENTRAL_STORE is not None:
+        return token_ledger.record(user, "topup", int(tokens), meta_dict, request_id=request_id)
     if _chain_enabled():
         result = NMCHAIN.capture_payment(
             user,
@@ -9985,7 +10053,52 @@ def _extract_json_payload(text: str) -> Optional[Any]:
 
 
 def _current_user() -> Optional[str]:
-    return session.get("user")
+    if not has_request_context():
+        return None
+    if getattr(g, "auth_user_resolved", False):
+        return getattr(g, "auth_user", None)
+    session_user = session.get("user")
+    if session_user:
+        g.auth_user = session_user
+        g.auth_user_resolved = True
+        return session_user
+    auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+    token = _extract_bearer_token(auth_header)
+    if token and CENTRAL_STORE is not None:
+        try:
+            identity = CENTRAL_STORE.access_tokens.verify(token)
+        except Exception as exc:
+            logger.warning("central access token verification failed: %s", exc)
+            identity = None
+        if identity and identity.get("user"):
+            g.auth_user = str(identity.get("user")).strip()
+            g.auth_user_role = identity.get("role")
+            g.auth_user_resolved = True
+            return g.auth_user
+    g.auth_user = None
+    g.auth_user_resolved = True
+    return None
+
+
+def _issue_access_token_payload(user: str, *, source: str) -> Dict[str, Any]:
+    if CENTRAL_STORE is None or not user:
+        return {}
+    try:
+        issued = CENTRAL_STORE.access_tokens.issue(
+            user,
+            label=source,
+            meta={"source": source},
+        )
+    except Exception as exc:
+        logger.warning("central access token issue failed for %s: %s", user, exc)
+        return {}
+    payload = {
+        "access_token": issued.get("token"),
+    }
+    expires_at = issued.get("expires_at")
+    if expires_at:
+        payload["access_expires_at"] = expires_at
+    return payload
 
 
 def _touch_user_activity(user: Optional[str]) -> None:
@@ -10042,6 +10155,10 @@ def _user_token_snapshot(user: str) -> Dict[str, Any]:
     balance = int(summary.get("balance") or 0)
     paid_balance = int(summary.get("paid_balance") or balance)
     free_balance = int(summary.get("free_balance") or 0)
+    spent_total = int(summary.get("spent_total") or 0)
+    cashout_total = int(summary.get("cashout_total") or 0)
+    shortfall_total = int(summary.get("shortfall_total") or 0)
+    free_grant_total = int(summary.get("free_grant_total") or 0)
     available = max(0, balance - reserved)
     capacity = int(summary.get("last_topup_tokens") or balance or 0)
     display_capacity = max(1, capacity, balance)
@@ -10055,12 +10172,18 @@ def _user_token_snapshot(user: str) -> Dict[str, Any]:
         "available": available,
         "reserved": reserved,
         "in_use": in_use,
+        "last_topup_tokens": int(summary.get("last_topup_tokens") or 0),
         "capacity": capacity,
         "display_capacity": display_capacity,
         "low_threshold": low_threshold,
         "status": status,
         "last_topup_at": summary.get("last_topup_at"),
         "updated_at": summary.get("updated_at"),
+        "spent_total": spent_total,
+        "cashout_total": cashout_total,
+        "shortfall_total": shortfall_total,
+        "free_grant_total": free_grant_total,
+        "identity": summary.get("identity") if isinstance(summary.get("identity"), dict) else None,
     }
 
 
@@ -10071,6 +10194,10 @@ def _team_token_snapshot(team_id: str) -> Dict[str, Any]:
     balance = int(summary.get("balance") or 0)
     paid_balance = int(summary.get("paid_balance") or balance)
     free_balance = int(summary.get("free_balance") or 0)
+    spent_total = int(summary.get("spent_total") or 0)
+    cashout_total = int(summary.get("cashout_total") or 0)
+    shortfall_total = int(summary.get("shortfall_total") or 0)
+    free_grant_total = int(summary.get("free_grant_total") or 0)
     available = max(0, balance - reserved)
     capacity = int(summary.get("last_topup_tokens") or balance or 0)
     display_capacity = max(1, capacity, balance)
@@ -10084,12 +10211,17 @@ def _team_token_snapshot(team_id: str) -> Dict[str, Any]:
         "available": available,
         "reserved": reserved,
         "in_use": in_use,
+        "last_topup_tokens": int(summary.get("last_topup_tokens") or 0),
         "capacity": capacity,
         "display_capacity": display_capacity,
         "low_threshold": low_threshold,
         "status": status,
         "last_topup_at": summary.get("last_topup_at"),
         "updated_at": summary.get("updated_at"),
+        "spent_total": spent_total,
+        "cashout_total": cashout_total,
+        "shortfall_total": shortfall_total,
+        "free_grant_total": free_grant_total,
     }
 
 
@@ -10138,6 +10270,7 @@ def _token_snapshot(user: str, team_id: Optional[str] = None) -> Dict[str, Any]:
         "user_reserved": user_snapshot.get("reserved"),
         "user_in_use": user_snapshot.get("in_use"),
         "user_capacity": user_snapshot.get("capacity"),
+        "user_last_topup_tokens": user_snapshot.get("last_topup_tokens"),
         "team_balance": team_snapshot.get("balance"),
         "team_paid_balance": team_snapshot.get("paid_balance"),
         "team_free_balance": team_snapshot.get("free_balance"),
@@ -10145,6 +10278,7 @@ def _token_snapshot(user: str, team_id: Optional[str] = None) -> Dict[str, Any]:
         "team_reserved": team_snapshot.get("reserved"),
         "team_in_use": team_snapshot.get("in_use"),
         "team_capacity": team_snapshot.get("capacity"),
+        "team_last_topup_tokens": team_snapshot.get("last_topup_tokens"),
         "team_id": team_id,
         "team_name": team_name,
         "scope": "team",
@@ -10435,9 +10569,12 @@ def metrics() -> Response:
 
 def login() -> Response:
     """Render or serve the login route."""
+    next_path = _safe_next_path(request.args.get("next") or session.get("login_next"))
     if AUTH_MODE == "oidc":
-        return redirect(url_for("oidc_login"))
+        session["login_next"] = next_path
+        return redirect(url_for("oidc_login", next=next_path))
     if not user_store.has_users() and not OIDC_ENABLED:
+        session["login_next"] = next_path
         return redirect(url_for("setup"))
     error = None
     if request.method == "POST":
@@ -10458,7 +10595,8 @@ def login() -> Response:
             _record_login_event(username, auth_mode="local", provider="local", meta={"source": "login_form"})
             _record_login_attempt(username, ok=True)
             _audit_event("login", actor=username, status="success")
-            return redirect(url_for("index"))
+            session.pop("login_next", None)
+            return redirect(next_path)
         else:
             _record_login_attempt(username, ok=False)
             _audit_event("login", actor=username, status="failed")
@@ -10471,6 +10609,7 @@ def login() -> Response:
         oidc_enabled=OIDC_ENABLED,
         oidc_label=OIDC_BUTTON_LABEL,
         local_enabled=user_store.has_users(),
+        next_path=next_path,
     )
 
 
@@ -10494,6 +10633,8 @@ def oidc_login() -> Response:
     """Handle the oidc login route."""
     if not OIDC_ENABLED:
         return jsonify({"error": "oidc_not_enabled"}), 404
+    next_path = _safe_next_path(request.args.get("next") or session.get("login_next"))
+    session["login_next"] = next_path
     config = _oidc_discovery()
     if not config:
         return jsonify({"error": "oidc_config_missing"}), 500
@@ -10603,7 +10744,8 @@ def oidc_callback() -> Response:
     for key in ("oidc_state", "oidc_nonce", "oidc_code_verifier", "oidc_started_at"):
         session.pop(key, None)
     _audit_event("oidc_login", actor=username, status="success", details={"role": role})
-    return redirect(url_for("index"))
+    next_path = _safe_next_path(session.pop("login_next", None))
+    return redirect(next_path or url_for("index"))
 
 
 def api_oidc_exchange() -> Response:
@@ -10693,6 +10835,7 @@ def api_oidc_exchange() -> Response:
         meta={"source": "api_oidc_exchange"},
     )
     sso_token = _issue_sso_token(username)
+    access_token_payload = _issue_access_token_payload(username, source="api_oidc_exchange")
     _audit_event("oidc_exchange", actor=username, status="success", details={"role": role})
     return jsonify(
         {
@@ -10701,6 +10844,7 @@ def api_oidc_exchange() -> Response:
             "role": role,
             "sso_token": sso_token,
             "sso_expires_in": SSO_TTL_SECONDS,
+            **access_token_payload,
         }
     )
 
@@ -10725,10 +10869,25 @@ def sso_login() -> Response:
     return redirect(next_path)
 
 
+def external_login() -> Response:
+    """Bridge Refiner login back to sibling protected services."""
+    target = _safe_external_redirect(request.args.get("rd"))
+    user = _current_user()
+    if user:
+        _touch_user_activity(user)
+        return redirect(target)
+    next_path = url_for("external_login", rd=target)
+    session["login_next"] = next_path
+    if AUTH_MODE == "oidc":
+        return redirect(url_for("oidc_login", next=next_path))
+    return redirect(url_for("login", next=next_path))
+
+
 def logout() -> Response:
     """Render or serve the logout route."""
     user = _current_user()
     _clear_user_activity(user)
+    session.pop("login_next", None)
     session.pop("user", None)
     _audit_event("logout", actor=user, status="success")
     return redirect(url_for("login"))
@@ -10755,6 +10914,7 @@ def api_login() -> Response:
         _audit_event("api_login", actor=username, status="failed")
         return jsonify({"error": "invalid_credentials"}), 401
     session["user"] = username
+    session.pop("login_next", None)
     _record_identity_event(
         username,
         role=user_store.get_role(username),
@@ -10766,6 +10926,7 @@ def api_login() -> Response:
     _record_login_attempt(username, ok=True)
     _audit_event("api_login", actor=username, status="success")
     sso_token = _issue_sso_token(username)
+    access_token_payload = _issue_access_token_payload(username, source="api_login")
     return jsonify(
         {
             "status": "ok",
@@ -10773,6 +10934,7 @@ def api_login() -> Response:
             "role": user_store.get_role(username),
             "sso_token": sso_token,
             "sso_expires_in": SSO_TTL_SECONDS,
+            **access_token_payload,
         }
     )
 
@@ -10809,6 +10971,7 @@ def api_setup() -> Response:
         return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
     user_store.create_user(username, password, role="admin", email=email or None)
     session["user"] = username
+    session.pop("login_next", None)
     _record_identity_event(
         username,
         role=user_store.get_role(username),
@@ -10819,6 +10982,7 @@ def api_setup() -> Response:
     _record_login_event(username, auth_mode="setup", provider="local", meta={"source": "api_setup"})
     _audit_event("setup", actor=username, status="success")
     sso_token = _issue_sso_token(username)
+    access_token_payload = _issue_access_token_payload(username, source="api_setup")
     return (
         jsonify(
             {
@@ -10827,6 +10991,7 @@ def api_setup() -> Response:
                 "role": user_store.get_role(username),
                 "sso_token": sso_token,
                 "sso_expires_in": SSO_TTL_SECONDS,
+                **access_token_payload,
             }
         ),
         201,
@@ -10854,6 +11019,7 @@ def api_logout() -> Response:
     """API endpoint for logout."""
     user = _current_user()
     _clear_user_activity(user)
+    session.pop("login_next", None)
     session.pop("user", None)
     _audit_event("api_logout", actor=user, status="success")
     return jsonify({"status": "ok"})
@@ -10865,6 +11031,22 @@ def api_session() -> Response:
     if not user:
         return jsonify({"authenticated": False, "user": None}), 200
     return jsonify({"authenticated": True, "user": user, "role": user_store.get_role(user)})
+
+
+def api_authz_nginx() -> Response:
+    """Nginx auth_request-compatible session probe."""
+    user = _current_user()
+    if not user:
+        response = make_response("", 401)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    role = getattr(g, "auth_user_role", None) or user_store.get_role(user)
+    response = make_response("", 204)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Auth-Request-User"] = user
+    if role:
+        response.headers["X-Auth-Request-Role"] = str(role)
+    return response
 
 
 def api_profile() -> Response:
@@ -12120,10 +12302,12 @@ def api_sessions_history() -> Response:
 
 def setup() -> Response:
     """Render or serve the setup route."""
+    next_path = _safe_next_path(request.args.get("next") or session.get("login_next"))
     if AUTH_MODE == "oidc":
-        return redirect(url_for("oidc_login"))
+        session["login_next"] = next_path
+        return redirect(url_for("oidc_login", next=next_path))
     if user_store.has_users():
-        return redirect(url_for("login"))
+        return redirect(url_for("login", next=next_path))
     error = None
     if request.method == "POST":
         username = (request.form.get("username") or "").strip()
@@ -12150,8 +12334,15 @@ def setup() -> Response:
             )
             _record_login_event(username, auth_mode="setup", provider="local", meta={"source": "setup_form"})
             _audit_event("setup", actor=username, status="success")
-            return redirect(url_for("index"))
-    return render_template("setup.html", error=error, api_base=API_BASE, site_base=SITE_BASE)
+            session.pop("login_next", None)
+            return redirect(next_path)
+    return render_template(
+        "setup.html",
+        error=error,
+        api_base=API_BASE,
+        site_base=SITE_BASE,
+        next_path=next_path,
+    )
 
 
 def health() -> Response:
@@ -12214,8 +12405,7 @@ def admin_stats() -> Response:
         return jsonify({"error": "unauthorized"}), 401
     if user_store.get_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
-    with user_store.lock:
-        total_users = len(user_store.users)
+    total_users = user_store.count_users()
     jobs_snapshot = manager.list_jobs()
     jobs_by_status: Dict[str, int] = {}
     for job in jobs_snapshot:
@@ -14437,6 +14627,93 @@ def tokens() -> Response:
         snapshot = _token_snapshot(target_user)
         return jsonify({"message": "Free tokens granted.", "target": target_user, **snapshot})
 
+    if action == "debit":
+        tokens_raw = payload.get("token_amount")
+        try:
+            tokens = int(float(tokens_raw))
+        except Exception:
+            tokens = 0
+        if tokens <= 0:
+            return jsonify({"error": "invalid_amount", "details": "Token amount must be positive."}), 400
+        meta = {
+            "tokens": tokens,
+            "source": payload.get("source") or "api",
+            "note": payload.get("note") or payload.get("reason"),
+            "operation": payload.get("operation"),
+            "workspace_id": payload.get("workspace_id"),
+        }
+        request_id = str(payload.get("request_id") or payload.get("operation_id") or "").strip() or _chain_request_id(
+            "debit",
+            user,
+            uuid.uuid4().hex,
+        )
+        entry = _record_token_event(
+            "user",
+            user,
+            "debit",
+            -tokens,
+            meta,
+            request_id=request_id,
+        )
+        shortfall = int(entry.get("shortfall") or 0)
+        used_total = abs(int(entry.get("delta") or 0))
+        if shortfall > 0 or used_total < tokens:
+            _audit_event(
+                "tokens_debit",
+                actor=user,
+                status="failed",
+                details={"requested": tokens, "used": used_total, "shortfall": max(shortfall, tokens - used_total)},
+            )
+            snapshot = _token_snapshot(user)
+            return (
+                jsonify(
+                    {
+                        "error": "insufficient_tokens",
+                        "details": "Not enough tokens to debit.",
+                        "requested": tokens,
+                        "used": used_total,
+                        "shortfall": max(shortfall, tokens - used_total),
+                        **snapshot,
+                    }
+                ),
+                409,
+            )
+        _audit_event("tokens_debit", actor=user, status="success", details={"amount": tokens})
+        snapshot = _token_snapshot(user)
+        return jsonify({"message": "Tokens debited.", "entry": entry, **snapshot})
+
+    if action == "refund":
+        tokens_raw = payload.get("token_amount")
+        try:
+            tokens = int(float(tokens_raw))
+        except Exception:
+            tokens = 0
+        if tokens <= 0:
+            return jsonify({"error": "invalid_amount", "details": "Token amount must be positive."}), 400
+        meta = {
+            "tokens": tokens,
+            "source": payload.get("source") or "api",
+            "note": payload.get("note") or payload.get("reason"),
+            "operation": payload.get("operation"),
+            "workspace_id": payload.get("workspace_id"),
+        }
+        request_id = str(payload.get("request_id") or payload.get("operation_id") or "").strip() or _chain_request_id(
+            "refund",
+            user,
+            uuid.uuid4().hex,
+        )
+        entry = _record_token_event(
+            "user",
+            user,
+            "refund",
+            tokens,
+            meta,
+            request_id=request_id,
+        )
+        _audit_event("tokens_refund", actor=user, status="success", details={"amount": tokens})
+        snapshot = _token_snapshot(user)
+        return jsonify({"message": "Tokens refunded.", "entry": entry, **snapshot})
+
     if action == "sync":
         target = payload.get("balance")
         if target is None:
@@ -15273,6 +15550,7 @@ if hasattr(app, "add_url_rule"):
     register_auth_routes(
         app,
         login=login,
+        external_login=external_login,
         oidc_login=oidc_login,
         oidc_callback=oidc_callback,
         api_oidc_exchange=api_oidc_exchange,
@@ -15283,6 +15561,7 @@ if hasattr(app, "add_url_rule"):
         api_sso_issue=api_sso_issue,
         api_logout=api_logout,
         api_session=api_session,
+        api_authz_nginx=api_authz_nginx,
         api_profile=api_profile,
     )
     register_voice_routes(

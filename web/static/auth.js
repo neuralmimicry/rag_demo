@@ -4,6 +4,7 @@
 
   const authType = form.dataset.auth;
   if (!authType) return;
+  const nextPath = (form.dataset.next || '/').trim() || '/';
 
   const errorEl = document.getElementById('authError');
   const submitBtn = form.querySelector('button[type="submit"]');
@@ -94,7 +95,7 @@
         setError(errorMessage(data));
         return;
       }
-      window.location.href = '/';
+      window.location.href = nextPath;
     } catch (err) {
       setError('Network error. Please try again.');
     } finally {
