@@ -55,7 +55,7 @@
           <p class="subtitle">Enter your credentials to access the Refiner Control Room.</p>
           <p id="authError" class="auth-error" {% if not error %}hidden{% endif %}>{{ error }}</p>
           {% if local_enabled %}
-          <form id="authForm" data-auth="login" method="post" class="auth-form">
+          <form id="authForm" data-auth="login" data-next="{{ next_path or '/' }}" method="post" class="auth-form">
             <div class="field">
               <label for="username">Username</label>
               <input id="username" name="username" type="text" required>
@@ -71,7 +71,7 @@
           {% if local_enabled %}
           <div class="auth-divider">or</div>
           {% endif %}
-          <a class="primary auth-oidc" href="/oidc/login">{{ oidc_label }}</a>
+          <a class="primary auth-oidc" href="{{ url_for('oidc_login', next=(next_path or '/')) }}">{{ oidc_label }}</a>
           {% endif %}
         </div>
       </div>

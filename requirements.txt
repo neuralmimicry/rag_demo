@@ -21,3 +21,4 @@ cryptography
 PyJWT
 prometheus-client
 redis
+psycopg[binary,pool]

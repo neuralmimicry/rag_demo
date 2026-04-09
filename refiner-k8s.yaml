@@ -27,6 +27,83 @@ spec:
         runAsUser: 10001
         runAsGroup: 10001
         fsGroup: 10001
+      initContainers:
+        - name: sync-local-admin
+          image: ghcr.io/neuralmimicry/refiner:latest
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-lc"]
+          args:
+            - |
+              python - <<'PY'
+              import datetime
+              import json
+              import os
+              import tempfile
+              from werkzeug.security import generate_password_hash
+
+              path = "/app/job_data/users.json"
+              username = (os.getenv("REFINER_ADMIN_USER") or "").strip()
+              password = (
+                  os.getenv("REFINER_ADMIN_PASS")
+                  or os.getenv("REFINER_ADMIN_PASSWORD")
+                  or ""
+              ).strip()
+              email = (os.getenv("REFINER_ADMIN_EMAIL") or "").strip()
+              if not username or not password:
+                  raise SystemExit(0)
+
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              try:
+                  with open(path, "r", encoding="utf-8") as fh:
+                      data = json.load(fh)
+              except FileNotFoundError:
+                  data = {}
+              except Exception:
+                  data = {}
+
+              if not isinstance(data, dict):
+                  data = {}
+
+              now = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+              entry = data.get(username, {}) if isinstance(data.get(username), dict) else {}
+              entry["password"] = generate_password_hash(password)
+              entry["created_at"] = entry.get("created_at") or now
+              entry["updated_at"] = now
+              entry["role"] = "admin"
+              if email:
+                  entry["email"] = email
+              data[username] = entry
+
+              fd, tmp_path = tempfile.mkstemp(prefix=".users.", suffix=".json", dir=os.path.dirname(path))
+              try:
+                  with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                      json.dump(data, fh, indent=2, sort_keys=True)
+                      fh.write("\n")
+                  os.replace(tmp_path, path)
+                  os.chmod(path, 0o600)
+              finally:
+                  if os.path.exists(tmp_path):
+                      os.remove(tmp_path)
+              PY
+          env:
+            - name: REFINER_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_ADMIN_USER
+            - name: REFINER_ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_ADMIN_PASS
+            - name: REFINER_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_ADMIN_PASSWORD
+          volumeMounts:
+            - name: job-data
+              mountPath: /app/job_data
       containers:
         - name: refiner
           image: ghcr.io/neuralmimicry/refiner:latest
@@ -55,6 +132,16 @@ spec:
                 secretKeyRef:
                   name: refiner-secrets
                   key: REFINER_SECRET_KEY
+            - name: REFINER_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_ADMIN_USER
+            - name: REFINER_ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_ADMIN_PASS
             - name: REFINER_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:

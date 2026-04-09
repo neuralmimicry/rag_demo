@@ -55,7 +55,7 @@
       <h1>Refiner Setup</h1>
       <p class="subtitle">Create the first admin account for the Refiner Control Room.</p>
       <p id="authError" class="auth-error" {% if not error %}hidden{% endif %}>{{ error }}</p>
-      <form id="authForm" data-auth="setup" method="post" class="auth-form">
+      <form id="authForm" data-auth="setup" data-next="{{ next_path or '/' }}" method="post" class="auth-form">
         <div class="field">
           <label for="username">Admin Username</label>
           <input id="username" name="username" type="text" required>
