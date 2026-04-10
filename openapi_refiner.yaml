@@ -9,6 +9,15 @@ info:
     voice/STT ingestion, job orchestration, TODO routing, RAG indexing, MCP
     connectivity, token accounting, and Control Room telemetry.
 
+    In the split NeuralMimicry platform, Refiner remains the stable public API
+    gateway at `https://api.neuralmimicry.ai` while selected route families are
+    delegated to sibling services:
+
+    - Customers for registration, authentication, sessions, SSO/OIDC, profile,
+      and voice-token ownership
+    - Billing for token balance, ledger, and settlement APIs
+    - nmstt for speech-to-text and gesture planning
+
     This specification tracks the current backend route families and
     representative request/response shapes used by the shipped UI.
   license:

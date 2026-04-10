@@ -70,6 +70,8 @@ from stt_gesture_planner import plan_stt_avatar_motion, sanitize_avatar_mode, sa
 from stt_rust_contracts import RustGesturePlanRequest, sanitize_rust_motion_response
 from mcp_client import MCPClient, MCPServerConfig, MCPServerStore
 from nmchain_client import NmChainClient, NmChainError
+from customers_client import CustomersClient, CustomersServiceError
+from billing_client import BillingClient, BillingServiceError
 from capabilities import get_capabilities, capability_summary, select_skills, format_skill_brief
 from thought_inbox import (
     build_fingerprint as inbox_build_fingerprint,
@@ -231,6 +233,10 @@ STT_SERVER_POOL_CONNECTIONS = max(1, int(os.getenv("REFINER_STT_SERVER_POOL_CONN
 STT_SERVER_POOL_MAXSIZE = max(1, int(os.getenv("REFINER_STT_SERVER_POOL_MAXSIZE", "32")))
 STT_MAX_CONCURRENT = max(1, int(os.getenv("REFINER_STT_MAX_CONCURRENT", "8")))
 STT_CAPACITY_WAIT_SEC = max(0.0, float(os.getenv("REFINER_STT_CAPACITY_WAIT_SEC", "0.35")))
+CUSTOMERS_API_BASE = (_env_first("REFINER_CUSTOMERS_API_BASE", "CUSTOMERS_API_BASE") or "").strip().rstrip("/")
+CUSTOMERS_TIMEOUT = max(1.0, float(_env_first("REFINER_CUSTOMERS_TIMEOUT", default="5")))
+BILLING_API_BASE = (_env_first("REFINER_BILLING_API_BASE", "BILLING_API_BASE") or "").strip().rstrip("/")
+BILLING_TIMEOUT = max(1.0, float(_env_first("REFINER_BILLING_TIMEOUT", default="10")))
 STT_LEARNING_ENABLED = _env_flag("REFINER_STT_LEARNING_ENABLED", True)
 STT_LEARNING_ROOT = os.path.join(JOB_ROOT, "stt_learning")
 STT_LEARNING_ALLOW_NETWORK = _env_flag("REFINER_STT_LEARNING_ALLOW_NETWORK", True)
@@ -395,8 +401,14 @@ RAG_DEFAULT_CHUNK_SIZE = int(os.getenv("REFINER_RAG_CHUNK_SIZE", "1200"))
 RAG_DEFAULT_CHUNK_OVERLAP = int(os.getenv("REFINER_RAG_CHUNK_OVERLAP", "200"))
 RAG_DEFAULT_MAX_CHUNKS = int(os.getenv("REFINER_RAG_MAX_CHUNKS", "2000"))
 NMCHAIN = NmChainClient.from_env()
+CUSTOMERS_SERVICE = CustomersClient.from_env()
+BILLING_SERVICE = BillingClient.from_env()
 if NMCHAIN:
     logger.info("nmchain integration enabled for Refiner via %s", NMCHAIN.base_url)
+if CUSTOMERS_SERVICE:
+    logger.info("customers integration enabled for Refiner via %s", CUSTOMERS_SERVICE.base_url)
+if BILLING_SERVICE:
+    logger.info("billing integration enabled for Refiner via %s", BILLING_SERVICE.base_url)
 RAG_ALLOWED_ROOTS = [
     p for p in (os.getenv("REFINER_RAG_ALLOWED_ROOTS") or "").split(",") if p.strip()
 ]
@@ -7299,6 +7311,85 @@ def _chain_enabled() -> bool:
     return bool(NMCHAIN and NMCHAIN.enabled)
 
 
+def _customers_enabled() -> bool:
+    return bool(CUSTOMERS_SERVICE and CUSTOMERS_SERVICE.base_url)
+
+
+def _billing_enabled() -> bool:
+    return bool(BILLING_SERVICE and BILLING_SERVICE.base_url)
+
+
+def _user_role(user: Optional[str]) -> Optional[str]:
+    if not user:
+        return None
+    if has_request_context() and getattr(g, "auth_user", None) == user:
+        role = getattr(g, "auth_user_role", None)
+        if role:
+            return str(role).strip() or None
+    return user_store.get_role(user)
+
+
+def _forward_proxy_headers(*, include_auth: bool = True, include_cookie: bool = True) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    for key in ("Accept", "Content-Type", "User-Agent", "X-Requested-With", "Origin"):
+        value = request.headers.get(key)
+        if value:
+            headers[key] = value
+    if include_auth:
+        auth = request.headers.get("Authorization") or request.headers.get("authorization")
+        if auth:
+            headers["Authorization"] = auth
+    if include_cookie:
+        cookie_header = request.headers.get("Cookie")
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        headers["X-Forwarded-For"] = forwarded_for
+    elif request.remote_addr:
+        headers["X-Forwarded-For"] = request.remote_addr
+    headers["X-Forwarded-Host"] = request.host
+    headers["X-Forwarded-Proto"] = request.headers.get("X-Forwarded-Proto") or ("https" if _is_secure_request() else "http")
+    return headers
+
+
+def _proxy_service_request(base_url: str, timeout: float, *, path: Optional[str] = None) -> Response:
+    target_path = path if path is not None else request.path
+    url = base_url.rstrip("/") + target_path
+    try:
+        upstream = requests.request(
+            method=request.method,
+            url=url,
+            params=request.args,
+            data=request.get_data(cache=True) if request.method not in {"GET", "HEAD"} else None,
+            headers=_forward_proxy_headers(),
+            allow_redirects=False,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        logger.warning("upstream proxy request failed for %s: %s", url, exc)
+        return jsonify({"error": "upstream_unavailable", "details": str(exc)}), 503
+
+    response = Response(upstream.content, status=upstream.status_code)
+    excluded = {
+        "connection",
+        "content-encoding",
+        "content-length",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+    for header, value in upstream.headers.items():
+        if header.lower() in excluded:
+            continue
+        response.headers.add(header, value)
+    return response
+
+
 def _chain_request_id(prefix: str, *parts: Any) -> str:
     values = [str(prefix).strip()]
     for part in parts:
@@ -7337,6 +7428,11 @@ def _chain_account_summary(scope: str, account_id: str) -> Dict[str, Any]:
 
 
 def _account_summary(scope: str, account_id: str) -> Dict[str, Any]:
+    if _billing_enabled():
+        try:
+            return BILLING_SERVICE.account_snapshot(scope, account_id)
+        except Exception as exc:
+            logger.warning("billing summary fetch failed for %s/%s: %s", scope, account_id, exc)
     if CENTRAL_STORE is not None:
         return _local_account_summary(scope, account_id)
     if _chain_enabled():
@@ -7349,6 +7445,14 @@ def _account_summary(scope: str, account_id: str) -> Dict[str, Any]:
 
 def _account_entries(scope: str, account_id: str, limit: int = 50) -> List[Dict[str, Any]]:
     limit_val = max(1, min(int(limit), 500))
+    if _billing_enabled():
+        try:
+            payload = BILLING_SERVICE.ledger_entries(scope, account_id, limit=limit_val)
+            entries = payload.get("entries")
+            if isinstance(entries, list):
+                return entries
+        except Exception as exc:
+            logger.warning("billing ledger fetch failed for %s/%s: %s", scope, account_id, exc)
     if CENTRAL_STORE is not None:
         ledger = team_token_ledger if scope == "team" else token_ledger
         return ledger.list_entries(account_id, limit=limit_val)
@@ -7374,6 +7478,31 @@ def _record_token_event(
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     meta_dict = dict(meta or {})
+    if _billing_enabled():
+        try:
+            result = BILLING_SERVICE.apply_token(
+                scope,
+                account_id,
+                entry_type=entry_type,
+                delta=int(delta),
+                request_id=request_id,
+                meta=meta_dict,
+            )
+            entry = result.get("entry")
+            if isinstance(entry, dict):
+                return entry
+            snapshot = result.get("snapshot") if isinstance(result.get("snapshot"), dict) else {}
+            return {
+                "ts": _now_iso(),
+                "type": entry_type,
+                "user": account_id,
+                "delta": int(delta),
+                "balance_after": int(snapshot.get("balance") or 0),
+                "meta": meta_dict,
+                "shortfall": 0,
+            }
+        except Exception as exc:
+            logger.warning("billing token event failed for %s/%s: %s", scope, account_id, exc)
     if CENTRAL_STORE is not None:
         ledger = team_token_ledger if scope == "team" else token_ledger
         return ledger.record(account_id, entry_type, int(delta), meta_dict, request_id=request_id)
@@ -7411,6 +7540,34 @@ def _capture_payment_event(
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     meta_dict = dict(meta or {})
+    if _billing_enabled():
+        try:
+            result = BILLING_SERVICE.capture_payment(
+                user,
+                tokens=int(tokens),
+                amount_minor=_safe_int(meta_dict.get("amount_minor")),
+                currency=str(meta_dict.get("currency") or "").strip() or None,
+                provider=str(meta_dict.get("payment_provider") or meta_dict.get("provider") or "").strip() or None,
+                payment_id=str(meta_dict.get("payment_id") or meta_dict.get("btc_txid") or "").strip() or None,
+                checkout_flow=str(meta_dict.get("checkout_flow") or "").strip() or None,
+                request_id=request_id,
+                meta=meta_dict,
+            )
+            entry = result.get("entry")
+            if isinstance(entry, dict):
+                return entry
+            snapshot = result.get("snapshot") if isinstance(result.get("snapshot"), dict) else {}
+            return {
+                "ts": _now_iso(),
+                "type": "topup",
+                "user": user,
+                "delta": int(tokens),
+                "balance_after": int(snapshot.get("balance") or 0),
+                "meta": meta_dict,
+                "shortfall": 0,
+            }
+        except Exception as exc:
+            logger.warning("billing payment capture failed for %s: %s", user, exc)
     if CENTRAL_STORE is not None:
         return token_ledger.record(user, "topup", int(tokens), meta_dict, request_id=request_id)
     if _chain_enabled():
@@ -7926,7 +8083,7 @@ def _append_global_requirements_summary(summary: Dict[str, Any], redact: bool = 
 
 
 def _is_admin_user(user: Optional[str]) -> bool:
-    return bool(user) and user_store.get_role(user) == "admin"
+    return bool(user) and _user_role(user) == "admin"
 
 
 def _job_project_id(job: "Job") -> Optional[str]:
@@ -8296,12 +8453,21 @@ def _extract_voice_tokens(payload: Optional[Dict[str, Any]] = None) -> List[str]
 
 def _voice_user_from_request(payload: Optional[Dict[str, Any]] = None) -> Optional[str]:
     for token in _extract_voice_tokens(payload):
-        user = voice_token_store.verify(token) or VOICE_ENV_TOKEN_MAP.get(token)
+        user = None
+        if _customers_enabled():
+            try:
+                identity = CUSTOMERS_SERVICE.resolve_voice_token(token)
+                if identity.get("authenticated"):
+                    user = identity.get("user")
+            except Exception as exc:
+                logger.warning("customers voice token resolve failed: %s", exc)
+        if not user:
+            user = voice_token_store.verify(token) or VOICE_ENV_TOKEN_MAP.get(token)
         if user:
             user = str(user).strip()
             if not user:
                 continue
-            if user_store.has_users() and not user_store.get_role(user):
+            if user_store.has_users() and not _user_role(user):
                 continue
             return user
     return None
@@ -8313,7 +8479,7 @@ def _validate_voice_user(user: Optional[str]) -> Optional[str]:
     user = str(user).strip()
     if not user:
         return None
-    if user_store.has_users() and not user_store.get_role(user):
+    if user_store.has_users() and not _user_role(user):
         return None
     return user
 
@@ -10064,6 +10230,20 @@ def _current_user() -> Optional[str]:
         return session_user
     auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
     token = _extract_bearer_token(auth_header)
+    if _customers_enabled() and (auth_header or request.headers.get("Cookie")):
+        try:
+            payload = CUSTOMERS_SERVICE.session_from_headers(
+                authorization=auth_header,
+                cookie_header=request.headers.get("Cookie"),
+            )
+        except Exception as exc:
+            logger.warning("customers session lookup failed: %s", exc)
+            payload = {}
+        if isinstance(payload, dict) and payload.get("authenticated") and payload.get("user"):
+            g.auth_user = str(payload.get("user")).strip()
+            g.auth_user_role = payload.get("role")
+            g.auth_user_resolved = True
+            return g.auth_user
     if token and CENTRAL_STORE is not None:
         try:
             identity = CENTRAL_STORE.access_tokens.verify(token)
@@ -10496,7 +10676,7 @@ def index() -> str:
     return render_template(
         "index.html",
         current_user=user,
-        user_role=user_store.get_role(user) if user else None,
+        user_role=_user_role(user) if user else None,
         api_base=API_BASE,
         site_base=SITE_BASE,
     )
@@ -10508,7 +10688,7 @@ def playground() -> str:
     return render_template(
         "playground.html",
         current_user=user,
-        user_role=user_store.get_role(user) if user else None,
+        user_role=_user_role(user) if user else None,
         api_base=API_BASE,
         site_base=SITE_BASE,
     )
@@ -10517,7 +10697,7 @@ def playground() -> str:
 def admin_dashboard() -> Response:
     """Render the admin dashboard page."""
     user = _current_user()
-    role = user_store.get_role(user) if user else None
+    role = _user_role(user) if user else None
     if role != "admin":
         return Response("forbidden", status=403)
     return render_template(
@@ -10569,6 +10749,8 @@ def metrics() -> Response:
 
 def login() -> Response:
     """Render or serve the login route."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     next_path = _safe_next_path(request.args.get("next") or session.get("login_next"))
     if AUTH_MODE == "oidc":
         session["login_next"] = next_path
@@ -10631,6 +10813,8 @@ def _parse_kv_params(raw: str) -> Dict[str, str]:
 
 def oidc_login() -> Response:
     """Handle the oidc login route."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     if not OIDC_ENABLED:
         return jsonify({"error": "oidc_not_enabled"}), 404
     next_path = _safe_next_path(request.args.get("next") or session.get("login_next"))
@@ -10666,6 +10850,8 @@ def oidc_login() -> Response:
 
 def oidc_callback() -> Response:
     """Handle the oidc callback route."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     if not OIDC_ENABLED:
         return jsonify({"error": "oidc_not_enabled"}), 404
     error = (request.args.get("error") or "").strip()
@@ -10750,6 +10936,8 @@ def oidc_callback() -> Response:
 
 def api_oidc_exchange() -> Response:
     """API endpoint for oidc exchange."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     if not OIDC_ENABLED or not OIDC_EXCHANGE_ENABLED:
         return jsonify({"error": "oidc_not_enabled"}), 404
     payload = request.get_json(force=True, silent=True)
@@ -10850,6 +11038,8 @@ def api_oidc_exchange() -> Response:
 
 def sso_login() -> Response:
     """Handle the sso login route."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     token = (request.args.get("token") or "").strip()
     next_path = _safe_next_path(request.args.get("next"))
     user = _consume_sso_token(token)
@@ -10859,7 +11049,7 @@ def sso_login() -> Response:
     session["user"] = user
     _record_identity_event(
         user,
-        role=user_store.get_role(user),
+        role=_user_role(user),
         email=user_store.get_email(user),
         provider="sso",
         meta={"source": "sso_login"},
@@ -10871,6 +11061,8 @@ def sso_login() -> Response:
 
 def external_login() -> Response:
     """Bridge Refiner login back to sibling protected services."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     target = _safe_external_redirect(request.args.get("rd"))
     user = _current_user()
     if user:
@@ -10885,6 +11077,8 @@ def external_login() -> Response:
 
 def logout() -> Response:
     """Render or serve the logout route."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     user = _current_user()
     _clear_user_activity(user)
     session.pop("login_next", None)
@@ -10895,6 +11089,8 @@ def logout() -> Response:
 
 def api_login() -> Response:
     """API endpoint for login."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     if not user_store.has_users():
         return jsonify({"error": "setup_required"}), 400
     if AUTH_MODE == "oidc":
@@ -10941,6 +11137,8 @@ def api_login() -> Response:
 
 def api_setup() -> Response:
     """API endpoint for setup."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     if AUTH_MODE == "oidc":
         return jsonify({"error": "oidc_required"}), 403
     if user_store.has_users():
@@ -11000,6 +11198,8 @@ def api_setup() -> Response:
 
 def api_sso_issue() -> Response:
     """API endpoint for sso issue."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11010,13 +11210,15 @@ def api_sso_issue() -> Response:
             "token": sso_token,
             "expires_in": SSO_TTL_SECONDS,
             "user": user,
-            "role": user_store.get_role(user),
+            "role": _user_role(user),
         }
     )
 
 
 def api_logout() -> Response:
     """API endpoint for logout."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     user = _current_user()
     _clear_user_activity(user)
     session.pop("login_next", None)
@@ -11027,20 +11229,24 @@ def api_logout() -> Response:
 
 def api_session() -> Response:
     """API endpoint for session."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     user = _current_user()
     if not user:
         return jsonify({"authenticated": False, "user": None}), 200
-    return jsonify({"authenticated": True, "user": user, "role": user_store.get_role(user)})
+    return jsonify({"authenticated": True, "user": user, "role": _user_role(user)})
 
 
 def api_authz_nginx() -> Response:
     """Nginx auth_request-compatible session probe."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     user = _current_user()
     if not user:
         response = make_response("", 401)
         response.headers["Cache-Control"] = "no-store"
         return response
-    role = getattr(g, "auth_user_role", None) or user_store.get_role(user)
+    role = getattr(g, "auth_user_role", None) or _user_role(user)
     response = make_response("", 204)
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Auth-Request-User"] = user
@@ -11051,6 +11257,8 @@ def api_authz_nginx() -> Response:
 
 def api_profile() -> Response:
     """API endpoint for profile."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11058,7 +11266,7 @@ def api_profile() -> Response:
         return jsonify(
             {
                 "user": user,
-                "role": user_store.get_role(user),
+                "role": _user_role(user),
                 "email": user_store.get_email(user),
             }
         )
@@ -11069,7 +11277,7 @@ def api_profile() -> Response:
     user_store.set_email(user, email or None)
     _record_identity_event(
         user,
-        role=user_store.get_role(user),
+        role=_user_role(user),
         email=user_store.get_email(user),
         provider="profile",
         meta={"source": "api_profile"},
@@ -11417,6 +11625,8 @@ def api_subtask_cancel(task_id: str) -> Response:
 
 def api_voice_tokens() -> Response:
     """API endpoint for voice tokens."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -11460,6 +11670,12 @@ def api_voice_tokens() -> Response:
 
 def api_voice_token_delete(token_id: str) -> Response:
     """API endpoint for voice token delete."""
+    if _customers_enabled():
+        return _proxy_service_request(
+            CUSTOMERS_API_BASE,
+            CUSTOMERS_TIMEOUT,
+            path=f"/api/voice/tokens/{quote(token_id)}",
+        )
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -12302,6 +12518,8 @@ def api_sessions_history() -> Response:
 
 def setup() -> Response:
     """Render or serve the setup route."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     next_path = _safe_next_path(request.args.get("next") or session.get("login_next"))
     if AUTH_MODE == "oidc":
         session["login_next"] = next_path
@@ -12378,6 +12596,17 @@ def health() -> Response:
             "workers_summary": autoscaler_status.get("workers") if isinstance(autoscaler_status, dict) else {},
             "sso": _sso_store_health(),
             "stt_learning": learning,
+            "service_integrations": {
+                "nmchain": {"enabled": _chain_enabled(), "base_url": NMCHAIN.base_url if _chain_enabled() else None},
+                "customers": {
+                    "enabled": _customers_enabled(),
+                    "base_url": CUSTOMERS_SERVICE.base_url if _customers_enabled() else None,
+                },
+                "billing": {
+                    "enabled": _billing_enabled(),
+                    "base_url": BILLING_SERVICE.base_url if _billing_enabled() else None,
+                },
+            },
         }
     )
 
@@ -12403,7 +12632,7 @@ def admin_stats() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if user_store.get_role(user) != "admin":
+    if _user_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
     total_users = user_store.count_users()
     jobs_snapshot = manager.list_jobs()
@@ -12474,7 +12703,7 @@ def api_audit() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if user_store.get_role(user) != "admin":
+    if _user_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
     limit = request.args.get("limit")
     try:
@@ -12693,7 +12922,7 @@ def assistant_rag_mcp() -> Response:
     mcp_cfg = payload.get("mcp") if isinstance(payload.get("mcp"), dict) else {}
     mcp_result = None
     if mcp_cfg:
-        if user_store.get_role(user) != "admin":
+        if _user_role(user) != "admin":
             return jsonify({"error": "mcp_forbidden"}), 403
         server_name = str(mcp_cfg.get("server") or "").strip()
         tool_name = str(mcp_cfg.get("tool") or "").strip()
@@ -12781,7 +13010,7 @@ def mcp_servers() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if user_store.get_role(user) != "admin":
+    if _user_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
     if request.method == "GET":
         servers = [server.masked() for server in mcp_store.list_servers(user)]
@@ -12817,7 +13046,7 @@ def mcp_server_delete(name: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if user_store.get_role(user) != "admin":
+    if _user_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
     deleted = mcp_store.delete_server(user, name)
     if not deleted:
@@ -12830,7 +13059,7 @@ def mcp_server_tools(name: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if user_store.get_role(user) != "admin":
+    if _user_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
     server = mcp_store.get_server(user, name)
     if not server:
@@ -12849,7 +13078,7 @@ def mcp_server_call(name: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if user_store.get_role(user) != "admin":
+    if _user_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
     server = mcp_store.get_server(user, name)
     if not server:
@@ -12875,7 +13104,7 @@ def mcp_server_resources(name: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if user_store.get_role(user) != "admin":
+    if _user_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
     server = mcp_store.get_server(user, name)
     if not server:
@@ -12894,7 +13123,7 @@ def mcp_server_resource(name: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if user_store.get_role(user) != "admin":
+    if _user_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
     server = mcp_store.get_server(user, name)
     if not server:
@@ -12972,7 +13201,7 @@ def list_refunds() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if user_store.get_role(user) != "admin":
+    if _user_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
     requests: List[Dict[str, Any]] = []
     for job in manager.list_jobs():
@@ -13005,7 +13234,7 @@ def screen_refund(job_id: str, request_id: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if user_store.get_role(user) != "admin":
+    if _user_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
     job = manager.get_job(job_id)
     if not job:
@@ -13072,7 +13301,7 @@ def decide_refund(job_id: str, request_id: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if user_store.get_role(user) != "admin":
+    if _user_role(user) != "admin":
         return jsonify({"error": "forbidden"}), 403
     job = manager.get_job(job_id)
     if not job:
@@ -13144,7 +13373,7 @@ def refund_file(job_id: str, request_id: str, filename: str) -> Response:
     job = manager.get_job(job_id)
     if not job:
         return jsonify({"error": "job not found"}), 404
-    if user_store.get_role(user) != "admin" and job.owner != user:
+    if _user_role(user) != "admin" and job.owner != user:
         return jsonify({"error": "forbidden"}), 403
     refund = _find_refund_request(job, request_id)
     if not refund:
@@ -14489,6 +14718,11 @@ def jobs_bulk_delete() -> Response:
 
 def tokens() -> Response:
     """Token-balance management endpoint."""
+    if _billing_enabled():
+        project_id = (request.args.get("project_id") or request.args.get("project") or "").strip()
+        team_id = (request.args.get("team_id") or "").strip()
+        if not project_id and not team_id:
+            return _proxy_service_request(BILLING_API_BASE, BILLING_TIMEOUT)
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -14592,7 +14826,7 @@ def tokens() -> Response:
         return jsonify({"message": "Cashout recorded.", **snapshot})
 
     if action == "grant":
-        if user_store.get_role(user) != "admin":
+        if _user_role(user) != "admin":
             return jsonify({"error": "forbidden", "details": "Admin role required."}), 403
         target_user = (payload.get("target_user") or payload.get("recipient") or payload.get("username") or "").strip()
         if not target_user:
@@ -14766,12 +15000,14 @@ def tokens() -> Response:
 
 def tokens_ledger() -> Response:
     """Return token ledger history entries."""
+    if _billing_enabled():
+        return _proxy_service_request(BILLING_API_BASE, BILLING_TIMEOUT)
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
     target = (request.args.get("user") or "").strip()
     if target:
-        if user_store.get_role(user) != "admin":
+        if _user_role(user) != "admin":
             return jsonify({"error": "forbidden"}), 403
         user = target
     limit = request.args.get("limit")
@@ -14781,6 +15017,42 @@ def tokens_ledger() -> Response:
         limit_val = 50
     entries = _account_entries("user", user, limit=limit_val)
     return jsonify({"entries": entries})
+
+
+def billing_dashboard() -> Response:
+    """Proxy the customer billing dashboard through the public Refiner origin."""
+    if not _billing_enabled():
+        return make_response("Billing dashboard unavailable.", 503)
+    return _proxy_service_request(BILLING_API_BASE, BILLING_TIMEOUT)
+
+
+def billing_dashboard_admin() -> Response:
+    """Proxy the admin billing dashboard through the public Refiner origin."""
+    if not _billing_enabled():
+        return make_response("Billing dashboard unavailable.", 503)
+    return _proxy_service_request(BILLING_API_BASE, BILLING_TIMEOUT)
+
+
+def billing_dashboard_asset(filename: str) -> Response:
+    """Proxy Billing dashboard assets so the browser stays on the public API host."""
+    _ = filename
+    if not _billing_enabled():
+        return make_response("Billing dashboard unavailable.", 503)
+    return _proxy_service_request(BILLING_API_BASE, BILLING_TIMEOUT)
+
+
+def billing_dashboard_customer() -> Response:
+    """Proxy customer dashboard JSON so the website uses a single backend origin."""
+    if not _billing_enabled():
+        return jsonify({"error": "billing_unavailable"}), 503
+    return _proxy_service_request(BILLING_API_BASE, BILLING_TIMEOUT)
+
+
+def billing_dashboard_admin_data() -> Response:
+    """Proxy admin dashboard JSON so billing telemetry stays under the public API host."""
+    if not _billing_enabled():
+        return jsonify({"error": "billing_unavailable"}), 503
+    return _proxy_service_request(BILLING_API_BASE, BILLING_TIMEOUT)
 
 
 def secrets() -> Response:
@@ -15644,6 +15916,11 @@ if hasattr(app, "add_url_rule"):
             "job_transfer": job_transfer,
             "job_archive": job_archive,
             "jobs_bulk_delete": jobs_bulk_delete,
+            "billing_dashboard": billing_dashboard,
+            "billing_dashboard_admin": billing_dashboard_admin,
+            "billing_dashboard_asset": billing_dashboard_asset,
+            "billing_dashboard_customer": billing_dashboard_customer,
+            "billing_dashboard_admin_data": billing_dashboard_admin_data,
             "tokens": tokens,
             "tokens_ledger": tokens_ledger,
             "secrets": secrets,
