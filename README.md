@@ -15,6 +15,25 @@ Key aspects:
 - Privacy for reuse: reusable modules must be scrubbed of user/company-identifying information to prevent cross-project leakage.
 - Codebase intent/workflow reference: see [CODEBASE_INTENT_AND_WORKFLOW.md](CODEBASE_INTENT_AND_WORKFLOW.md).
 
+## Platform split
+Refiner is now the orchestration and public-API gateway layer in a split multi-service platform.
+The public frontend still talks only to `https://api.neuralmimicry.ai`, but Refiner now delegates specific responsibilities to dedicated sibling projects:
+
+- Authentication, registration, sessions, profile management, and voice-token ownership: [`../customers`](../customers/README.md)
+- Token balances, payment capture, and ledger/account APIs: [`../billing`](../billing/README.md)
+- Speech-to-text and gesture planning: [`../nmstt`](../nmstt/README.md)
+- Auditable identity/payment/token event ledger: [`../nmchain`](../nmchain)
+
+Internal routing still follows the same edge path:
+
+- public site: `https://neuralmimicry.ai`
+- API host: `https://api.neuralmimicry.ai`
+- first internal hop: `vega.neuralmimicry.ai`
+- onward service routing: `spirit.neuralmimicry.ai` and the Continuum tenant workloads
+
+Detailed service boundaries and interaction flows are documented in [SERVICE_SPLIT_ARCHITECTURE.md](SERVICE_SPLIT_ARCHITECTURE.md).
+In the Continuum deployment, Customers defaults to the shared Postgres tenant service for identity records, Refiner job/workspace data is expected on the NFS-backed `continuum-shared` storage class, and `nmstt` model assets are likewise expected on shared NFS-backed storage.
+
 
 ## Quickstart
 1) Install dependencies
@@ -36,7 +55,9 @@ Key aspects:
 - CLI workflows: `run_refiner.py` / `refiner`
 - Backend UI + JSON API: `python refiner_web.py` (defaults to `127.0.0.1:5001`)
 - Frontend-only helper server: `python frontend_server.py` (defaults to `0.0.0.0:8080`)
-- Native STT sidecar: [`stt_rust/`](stt_rust/README.md) (defaults to `127.0.0.1:7079`)
+- Customers identity service: [`../customers`](../customers/README.md) (defaults to `127.0.0.1:5010`)
+- Billing service: [`../billing`](../billing/README.md) (defaults to `127.0.0.1:5020`)
+- Native STT service: [`../nmstt`](../nmstt/README.md) (defaults to `127.0.0.1:7079`)
 
 Useful local URLs after starting `refiner_web.py`:
 - Swagger UI: `http://127.0.0.1:5001/api/docs`
@@ -70,6 +91,8 @@ The web UI is backed by the same Flask server (`refiner_web.py`). It uses sessio
 - Admin + operations: `/api/health`, `/api/version`, `/api/capabilities`, `/api/admin/stats`, `/api/workers/telemetry`, `/api/audit`, `/api/secrets`, `/api/github/tree`
 
 For the detailed route inventory and example payloads, see [API_DOCS_README.md](API_DOCS_README.md) and [`openapi_refiner.yaml`](openapi_refiner.yaml).
+
+When `REFINER_CUSTOMERS_API_BASE` is configured, the auth/profile/voice-token routes above are proxied to Customers so the public contract remains stable while the identity implementation lives in the separate service.
 
 ## RAG + MCP integrations
 Refiner now includes lightweight RAG indexing (for unstructured documents) and MCP connectivity (for structured, action-oriented external systems).
@@ -150,7 +173,7 @@ On the frontend, set the API base:
 4) Bootstrap the first user with `POST /api/setup`, then log in with `POST /api/login`.
 
 ### Voice STT (native arm64, on-prem)
-Refiner supports an on-prem speech-to-text path for `/api/voice/stt` using the Rust service in [`stt_rust/`](stt_rust/README.md), so browser audio can be transcribed locally without cloud STT vendors.
+Refiner supports an on-prem speech-to-text path for `/api/voice/stt` using the standalone Rust service in [`../nmstt`](../nmstt/README.md), so browser audio can be transcribed locally without cloud STT vendors.
 
 Recommended backend env:
 - `REFINER_STT_BACKEND=server`
@@ -158,6 +181,9 @@ Recommended backend env:
 - `REFINER_STT_SERVER_TIMEOUT=25`
 - `REFINER_STT_SERVER_PREPROCESS=0` (skip ffmpeg-style preprocess in server mode)
 - `REFINER_STT_SERVER_SEND_PROMPT=0` (default `0`, keep prompt hints local unless explicitly required)
+
+For the split Continuum deployment, point `REFINER_STT_SERVER_URL` at the tenant service:
+`http://nmstt.nmstt.svc.cluster.local:7079`.
 
 Privacy-safe STT learning (optional, enabled by default):
 - `REFINER_STT_LEARNING_ENABLED=1`
@@ -170,12 +196,12 @@ seeded site content. By default these hints are used locally (not retransmitted 
 Set `REFINER_STT_SERVER_SEND_PROMPT=1` only when remote prompt hints are required.
 For command backend parity, include `{prompt}` in `REFINER_STT_ARGS` if your STT CLI supports prompt hints.
 
-For a native `arm64` Ubuntu systemd deployment, use:
-- `stt_rust/refiner-stt.service`
-- `stt_rust/native_arm64_46core.env` (preset tuned for 46 cores)
+For a native `arm64` Ubuntu systemd deployment, use the artifacts in `../nmstt`:
+- `nmstt.service`
+- `native_arm64_46core.env` (preset tuned for 46 cores)
 
 User-level systemd unit (repo-local paths, no root user required):
-- `stt_rust/refiner-stt-user.service`
+- `nmstt-user.service`
 
 Robust local launcher (STT + `refiner_web.py` with health checks and restart loop):
 - `./scripts/start_refiner_stack.sh`
@@ -216,9 +242,14 @@ User email configuration:
 - API jobs can provide `notify_email` in the job payload to override per job.
 
 ### Token ledger & billing integration
-Refiner exposes a token ledger used by the commercial portal.
+Refiner exposes the same token ledger contract used by the commercial portal, but the implementation can now be delegated to Billing.
 
 Key endpoints:
+- `GET /billing` — customer billing dashboard HTML proxied to Billing.
+- `GET /billing/admin` — admin billing dashboard HTML proxied to Billing.
+- `GET /billing/assets/<filename>` — Billing dashboard assets proxied through the public API host.
+- `GET /api/billing/dashboard/customer` — customer dashboard JSON sourced from Billing and nmchain.
+- `GET /api/billing/dashboard/admin` — admin portfolio/anomaly dashboard JSON sourced from Billing and nmchain.
 - `GET /api/tokens` — current balance, reserved, in‑use, capacity, and low threshold.
 - `POST /api/tokens` — actions: `review`, `add`, `cashout`, `sync` (balance reconciliation).
 - `GET /api/tokens/ledger` — recent ledger entries for audit.
@@ -235,6 +266,7 @@ Notes:
   - `REFINER_CHAIN_API_TOKEN=<refiner-app-token>`
   - `REFINER_CHAIN_APP_ID=refiner`
 - When `REFINER_CHAIN_API_BASE` is configured, Refiner mirrors successful local/OIDC/SSO logins to `nmchain` and routes token top-up, grant, cashout, refund, reservation, release, debit, and sync writes through the chain-backed ledger.
+- When `REFINER_BILLING_API_BASE` is configured, Refiner proxies browser token routes and Billing Intelligence dashboard routes to Billing and uses Billing's internal account/event/payment APIs for service-side accounting.
 
 ### Container build and deployment (Podman + Kubernetes)
 The `Containerfile` is now aligned for both local container runtime use and Kubernetes:
