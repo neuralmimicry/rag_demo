@@ -2288,7 +2288,7 @@ class AccessStore:
         viewers: Optional[List[str]] = None,
         permissions: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        if team_id and not self.get_team(team_id):
+        if team_id and not _team_display_record(team_id):
             raise ValueError("Unknown team_id")
         project_id = uuid.uuid4().hex
         entry = {
@@ -2325,7 +2325,7 @@ class AccessStore:
             if name is not None:
                 project["name"] = str(name).strip() or project.get("name")
             if team_id is not None:
-                if team_id and not self.get_team(team_id):
+                if team_id and not _team_display_record(team_id):
                     raise ValueError("Unknown team_id")
                 project["team_id"] = team_id or None
             if leaders is not None:
@@ -2368,7 +2368,7 @@ class AccessStore:
         if not project:
             return None
         team_id = project.get("team_id")
-        return self.get_team(team_id) if team_id else None
+        return _team_display_record(team_id) if team_id else None
 
     def _team_role(self, user: str, team_id: Optional[str]) -> Optional[str]:
         if not user or not team_id:
@@ -2405,7 +2405,7 @@ class AccessStore:
             return {"read": True, "write": True, "grant": False}
         if user in (project.get("viewers") or []):
             return {"read": True, "write": False, "grant": False}
-        team_role = self._team_role(user, project.get("team_id"))
+        team_role = _team_role_for_user(user, project.get("team_id"))
         if team_role == "leader":
             return {"read": True, "write": True, "grant": True}
         if team_role == "member":
@@ -2415,7 +2415,7 @@ class AccessStore:
     def can_create_project(self, user: str, team_id: Optional[str]) -> bool:
         if not user or not team_id:
             return False
-        if self._team_role(user, team_id) == "leader":
+        if _team_role_for_user(user, team_id) == "leader":
             return True
         for project in self.list_projects():
             if project.get("team_id") != team_id:
@@ -2446,7 +2446,7 @@ class AccessStore:
             return "writer"
         if user in (permissions.get("read") or []):
             return "reader"
-        team_role = self._team_role(user, project.get("team_id"))
+        team_role = _team_role_for_user(user, project.get("team_id"))
         if team_role == "leader":
             return "leader"
         if team_role == "member":
@@ -2478,7 +2478,7 @@ class AccessStore:
             entry = dict(project)
             entry["role"] = role
             entry["capabilities"] = caps
-            team = self.get_team(project.get("team_id")) if project.get("team_id") else None
+            team = _team_display_record(project.get("team_id")) if project.get("team_id") else None
             if team:
                 entry["team_name"] = team.get("name")
             visible.append(entry)
@@ -7319,13 +7319,198 @@ def _billing_enabled() -> bool:
     return bool(BILLING_SERVICE and BILLING_SERVICE.base_url)
 
 
+def _current_request_auth_headers() -> Tuple[Optional[str], Optional[str]]:
+    if not has_request_context():
+        return None, None
+    return (
+        request.headers.get("Authorization") or request.headers.get("authorization"),
+        request.headers.get("Cookie"),
+    )
+
+
+def _normalize_identity_groups(value: Any) -> List[str]:
+    if isinstance(value, str):
+        raw_values = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        raw_values = []
+    normalized: List[str] = []
+    seen = set()
+    for item in raw_values:
+        lowered = item.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        normalized.append(lowered)
+    return normalized
+
+
+def _normalize_identity_active_team(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        payload = dict(value)
+        team_id = str(payload.get("team_id") or payload.get("id") or "").strip()
+        if not team_id:
+            return None
+        payload["team_id"] = team_id
+        return payload
+    if isinstance(value, str):
+        team_id = value.strip()
+        if team_id:
+            return {"team_id": team_id}
+    return None
+
+
+def _normalize_auth_identity(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    user = str(payload.get("user") or "").strip()
+    if not user:
+        return None
+    role = str(payload.get("role") or user_store.get_role(user) or "user").strip().lower() or "user"
+    groups = _normalize_identity_groups(payload.get("groups"))
+    if role and role not in groups:
+        groups.insert(0, role)
+    active_team = _normalize_identity_active_team(payload.get("active_team"))
+    team_tree = payload.get("team_tree") if isinstance(payload.get("team_tree"), list) else []
+    try:
+        team_count = int(payload.get("team_count") or (1 if active_team else 0))
+    except Exception:
+        team_count = 1 if active_team else 0
+    try:
+        pending_invitation_count = int(payload.get("pending_invitation_count") or 0)
+    except Exception:
+        pending_invitation_count = 0
+    return {
+        **payload,
+        "authenticated": bool(payload.get("authenticated", True)),
+        "user": user,
+        "role": role,
+        "groups": groups,
+        "active_team": active_team,
+        "team_count": max(0, team_count),
+        "pending_invitation_count": max(0, pending_invitation_count),
+        "team_tree": team_tree,
+        "is_admin": role == "admin" or "admin" in groups,
+    }
+
+
+def _set_request_identity(identity: Optional[Dict[str, Any]], *, resolved: bool = False) -> None:
+    if not has_request_context():
+        return
+    if not identity:
+        g.auth_identity = None
+        g.auth_user = None
+        g.auth_user_role = None
+        g.auth_user_groups = []
+        g.auth_active_team = None
+        if resolved:
+            g.auth_user_resolved = True
+        return
+    g.auth_identity = identity
+    g.auth_user = identity.get("user")
+    g.auth_user_role = identity.get("role")
+    g.auth_user_groups = identity.get("groups") if isinstance(identity.get("groups"), list) else []
+    g.auth_active_team = identity.get("active_team")
+    if resolved:
+        g.auth_user_resolved = True
+
+
+def _current_auth_identity() -> Optional[Dict[str, Any]]:
+    if not has_request_context():
+        return None
+    identity = getattr(g, "auth_identity", None)
+    return identity if isinstance(identity, dict) else None
+
+
+def _current_auth_profile() -> Optional[Dict[str, Any]]:
+    if not has_request_context():
+        return None
+    if getattr(g, "auth_profile_resolved", False):
+        profile = getattr(g, "auth_profile", None)
+        return profile if isinstance(profile, dict) else None
+    identity = _current_auth_identity()
+    if not identity and _current_user():
+        identity = _current_auth_identity()
+    if not _customers_enabled() or not identity or not identity.get("user"):
+        g.auth_profile = identity
+        g.auth_profile_resolved = True
+        return identity
+    authorization, cookie_header = _current_request_auth_headers()
+    try:
+        payload = CUSTOMERS_SERVICE.profile_from_headers(
+            authorization=authorization,
+            cookie_header=cookie_header,
+        )
+    except Exception as exc:
+        logger.warning("customers profile lookup failed: %s", exc)
+        payload = {}
+    profile = _normalize_auth_identity(payload) or identity
+    g.auth_profile = profile
+    g.auth_profile_resolved = True
+    if profile:
+        _set_request_identity(profile, resolved=False)
+    return profile
+
+
+def _local_identity_payload(user: str, *, include_directory: bool = False) -> Dict[str, Any]:
+    role = str(user_store.get_role(user) or "user").strip().lower() or "user"
+    payload: Dict[str, Any] = {
+        "authenticated": True,
+        "user": user,
+        "role": role,
+        "groups": [role] if role else [],
+        "email": user_store.get_email(user),
+        "active_team": None,
+        "team_count": 0,
+        "pending_invitation_count": 0,
+        "is_admin": role == "admin",
+    }
+    if include_directory:
+        payload["team_tree"] = access_store.tree_all() if payload["is_admin"] else access_store.tree_for_user(user)
+    return payload
+
+
+def _team_tree_role(team_id: Optional[str], nodes: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    cleaned_team_id = str(team_id or "").strip()
+    if not cleaned_team_id or not isinstance(nodes, list):
+        return None
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("id") or "").strip() == cleaned_team_id:
+            membership_role = str(node.get("membership_role") or "").strip().lower()
+            if membership_role == "owner":
+                return "leader"
+            if membership_role == "member":
+                return "member"
+        nested = _team_tree_role(cleaned_team_id, node.get("children") if isinstance(node.get("children"), list) else [])
+        if nested:
+            return nested
+    return None
+
+
+def _team_role_for_user(user: Optional[str], team_id: Optional[str]) -> Optional[str]:
+    cleaned_user = str(user or "").strip()
+    cleaned_team_id = str(team_id or "").strip()
+    if not cleaned_user or not cleaned_team_id:
+        return None
+    profile = _current_auth_profile()
+    if isinstance(profile, dict) and str(profile.get("user") or "").strip() == cleaned_user:
+        membership_role = _team_tree_role(cleaned_team_id, profile.get("team_tree"))
+        if membership_role:
+            return membership_role
+    return access_store._team_role(cleaned_user, cleaned_team_id)
+
+
 def _user_role(user: Optional[str]) -> Optional[str]:
     if not user:
         return None
-    if has_request_context() and getattr(g, "auth_user", None) == user:
-        role = getattr(g, "auth_user_role", None)
+    identity = _current_auth_profile() or _current_auth_identity()
+    if isinstance(identity, dict) and str(identity.get("user") or "").strip() == user:
+        role = identity.get("role")
         if role:
-            return str(role).strip() or None
+            return str(role).strip().lower() or None
     return user_store.get_role(user)
 
 
@@ -7388,6 +7573,114 @@ def _proxy_service_request(base_url: str, timeout: float, *, path: Optional[str]
             continue
         response.headers.add(header, value)
     return response
+
+
+def _customer_team_member_lists(detail_payload: Dict[str, Any]) -> Dict[str, List[str]]:
+    members = detail_payload.get("members") if isinstance(detail_payload.get("members"), list) else []
+    leaders: List[str] = []
+    contributors: List[str] = []
+    for membership in members:
+        if not isinstance(membership, dict):
+            continue
+        username = str(membership.get("username") or "").strip()
+        if not username:
+            continue
+        membership_role = str(membership.get("membership_role") or "").strip().lower()
+        if membership_role == "owner":
+            leaders.append(username)
+        else:
+            contributors.append(username)
+    return {
+        "leaders": sorted(set(leaders)),
+        "members": sorted(set(contributors)),
+    }
+
+
+def _enrich_customer_team_tree(nodes: List[Dict[str, Any]], detail_map: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    enriched: List[Dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        entry = dict(node)
+        team_id = str(entry.get("id") or "").strip()
+        details = detail_map.get(team_id, {})
+        if details:
+            entry["leaders"] = details.get("leaders") or []
+            entry["members"] = details.get("members") or []
+        children = entry.get("children") if isinstance(entry.get("children"), list) else []
+        entry["children"] = _enrich_customer_team_tree(children, detail_map)
+        enriched.append(entry)
+    return enriched
+
+
+def _customer_access_tree() -> List[Dict[str, Any]]:
+    if not has_request_context():
+        return []
+    if getattr(g, "customers_access_tree_resolved", False):
+        tree = getattr(g, "customers_access_tree", None)
+        return tree if isinstance(tree, list) else []
+    if not _customers_enabled():
+        g.customers_access_tree = []
+        g.customers_access_tree_resolved = True
+        return []
+    authorization, cookie_header = _current_request_auth_headers()
+    try:
+        payload = CUSTOMERS_SERVICE.teams_from_headers(
+            authorization=authorization,
+            cookie_header=cookie_header,
+        )
+    except Exception as exc:
+        logger.warning("customers teams lookup failed: %s", exc)
+        payload = {}
+    tree = payload.get("tree") if isinstance(payload.get("tree"), list) else []
+    teams = payload.get("teams") if isinstance(payload.get("teams"), list) else []
+    detail_map: Dict[str, Dict[str, Any]] = {}
+    for team in teams:
+        if not isinstance(team, dict):
+            continue
+        team_id = str(team.get("id") or "").strip()
+        if not team_id:
+            continue
+        try:
+            detail_payload = CUSTOMERS_SERVICE.team_detail_from_headers(
+                team_id,
+                authorization=authorization,
+                cookie_header=cookie_header,
+            )
+        except Exception as exc:
+            logger.warning("customers team detail lookup failed for %s: %s", team_id, exc)
+            detail_payload = {}
+        detail_map[team_id] = _customer_team_member_lists(detail_payload)
+    enriched_tree = _enrich_customer_team_tree(tree, detail_map)
+    g.customers_access_tree = enriched_tree
+    g.customers_access_tree_resolved = True
+    return enriched_tree
+
+
+def _find_team_in_tree(team_id: Optional[str], nodes: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    cleaned_team_id = str(team_id or "").strip()
+    if not cleaned_team_id or not isinstance(nodes, list):
+        return None
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("id") or "").strip() == cleaned_team_id:
+            return node
+        nested = _find_team_in_tree(cleaned_team_id, node.get("children") if isinstance(node.get("children"), list) else [])
+        if nested:
+            return nested
+    return None
+
+
+def _customer_team_record(team_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    return _find_team_in_tree(team_id, _customer_access_tree())
+
+
+def _team_display_record(team_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    cleaned_team_id = str(team_id or "").strip()
+    if not cleaned_team_id:
+        return None
+    return access_store.get_team(cleaned_team_id) or _customer_team_record(cleaned_team_id)
 
 
 def _chain_request_id(prefix: str, *parts: Any) -> str:
@@ -7610,6 +7903,14 @@ def _record_identity_event(
 ) -> None:
     if not _chain_enabled():
         return
+    details = dict(meta or {})
+    identity = _current_auth_profile() or _current_auth_identity()
+    if isinstance(identity, dict) and str(identity.get("user") or "").strip() == str(user or "").strip():
+        for key in ("groups", "active_team", "team_count", "pending_invitation_count"):
+            if key not in details and key in identity:
+                details[key] = identity.get(key)
+    elif role and "groups" not in details:
+        details["groups"] = [str(role).strip().lower()]
     try:
         NMCHAIN.upsert_identity(
             user,
@@ -7618,7 +7919,7 @@ def _record_identity_event(
             provider=provider,
             subject=subject,
             request_id=request_id,
-            meta=meta or {},
+            meta=details,
         )
     except Exception as exc:
         logger.warning("nmchain identity upsert failed for %s: %s", user, exc)
@@ -8083,7 +8384,12 @@ def _append_global_requirements_summary(summary: Dict[str, Any], redact: bool = 
 
 
 def _is_admin_user(user: Optional[str]) -> bool:
-    return bool(user) and _user_role(user) == "admin"
+    if not user:
+        return False
+    identity = _current_auth_profile() or _current_auth_identity()
+    if isinstance(identity, dict) and str(identity.get("user") or "").strip() == user:
+        return bool(identity.get("is_admin"))
+    return _user_role(user) == "admin"
 
 
 def _job_project_id(job: "Job") -> Optional[str]:
@@ -8109,7 +8415,7 @@ def _job_role_for_user(user: Optional[str], job: "Job") -> Optional[str]:
     if not project_id:
         team_id = _job_team_id(job)
         if team_id:
-            team_role = access_store._team_role(user, team_id)
+            team_role = _team_role_for_user(user, team_id)
             if team_role == "leader":
                 return "leader"
             if team_role == "member":
@@ -8130,7 +8436,7 @@ def _job_capabilities_for_user(user: Optional[str], job: "Job") -> Dict[str, boo
         return access_store.project_capabilities(user, project_id)
     team_id = _job_team_id(job)
     if team_id:
-        team_role = access_store._team_role(user, team_id)
+        team_role = _team_role_for_user(user, team_id)
         if team_role == "leader":
             return {"read": True, "write": True, "grant": True}
         if team_role == "member":
@@ -8145,7 +8451,7 @@ def _can_view_job(user: Optional[str], job: "Job") -> bool:
     transfer = getattr(job, "transfer_request", None)
     if isinstance(transfer, dict) and transfer.get("status") == "pending":
         team_id = transfer.get("team_id")
-        if _is_admin_user(user) or access_store._team_role(user, team_id) == "leader":
+        if _is_admin_user(user) or _team_role_for_user(user, team_id) == "leader":
             return True
     return False
 
@@ -8170,7 +8476,7 @@ def _augment_job_dict_for_user(data: Dict[str, Any], user: Optional[str], job: "
         project = access_store.get_project(project_id)
         if project:
             data["project_name"] = project.get("name") or data.get("project_name")
-            team = access_store.get_team(project.get("team_id")) if project.get("team_id") else None
+            team = _team_display_record(project.get("team_id")) if project.get("team_id") else None
             if team:
                 data["team_name"] = team.get("name")
     elif team_id:
@@ -10225,9 +10531,11 @@ def _current_user() -> Optional[str]:
         return getattr(g, "auth_user", None)
     session_user = session.get("user")
     if session_user:
-        g.auth_user = session_user
-        g.auth_user_resolved = True
-        return session_user
+        identity = _normalize_auth_identity(_local_identity_payload(str(session_user).strip(), include_directory=True))
+        _set_request_identity(identity, resolved=True)
+        g.auth_profile = identity
+        g.auth_profile_resolved = True
+        return str(session_user).strip()
     auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
     token = _extract_bearer_token(auth_header)
     if _customers_enabled() and (auth_header or request.headers.get("Cookie")):
@@ -10239,24 +10547,21 @@ def _current_user() -> Optional[str]:
         except Exception as exc:
             logger.warning("customers session lookup failed: %s", exc)
             payload = {}
-        if isinstance(payload, dict) and payload.get("authenticated") and payload.get("user"):
-            g.auth_user = str(payload.get("user")).strip()
-            g.auth_user_role = payload.get("role")
-            g.auth_user_resolved = True
-            return g.auth_user
+        identity = _normalize_auth_identity(payload)
+        if identity and identity.get("authenticated") and identity.get("user"):
+            _set_request_identity(identity, resolved=True)
+            return str(identity.get("user") or "").strip() or None
     if token and CENTRAL_STORE is not None:
         try:
             identity = CENTRAL_STORE.access_tokens.verify(token)
         except Exception as exc:
             logger.warning("central access token verification failed: %s", exc)
             identity = None
-        if identity and identity.get("user"):
-            g.auth_user = str(identity.get("user")).strip()
-            g.auth_user_role = identity.get("role")
-            g.auth_user_resolved = True
-            return g.auth_user
-    g.auth_user = None
-    g.auth_user_resolved = True
+        normalized_identity = _normalize_auth_identity(identity)
+        if normalized_identity and normalized_identity.get("user"):
+            _set_request_identity(normalized_identity, resolved=True)
+            return str(normalized_identity.get("user") or "").strip() or None
+    _set_request_identity(None, resolved=True)
     return None
 
 
@@ -10470,7 +10775,7 @@ def _can_access_team_tokens(user: Optional[str], team_id: Optional[str]) -> bool
         return False
     if _is_admin_user(user):
         return True
-    if access_store._team_role(user, team_id):
+    if _team_role_for_user(user, team_id):
         return True
     for project in access_store.list_projects():
         if project.get("team_id") != team_id:
@@ -10486,7 +10791,7 @@ def _is_team_leader(user: Optional[str], team_id: Optional[str]) -> bool:
         return False
     if _is_admin_user(user):
         return True
-    return access_store._team_role(user, team_id) == "leader"
+    return _team_role_for_user(user, team_id) == "leader"
 
 
 def _is_secure_request() -> bool:
@@ -10698,7 +11003,7 @@ def admin_dashboard() -> Response:
     """Render the admin dashboard page."""
     user = _current_user()
     role = _user_role(user) if user else None
-    if role != "admin":
+    if not _is_admin_user(user):
         return Response("forbidden", status=403)
     return render_template(
         "admin.html",
@@ -11126,8 +11431,7 @@ def api_login() -> Response:
     return jsonify(
         {
             "status": "ok",
-            "user": username,
-            "role": user_store.get_role(username),
+            **_local_identity_payload(username, include_directory=False),
             "sso_token": sso_token,
             "sso_expires_in": SSO_TTL_SECONDS,
             **access_token_payload,
@@ -11185,8 +11489,7 @@ def api_setup() -> Response:
         jsonify(
             {
                 "status": "ok",
-                "user": username,
-                "role": user_store.get_role(username),
+                **_local_identity_payload(username, include_directory=False),
                 "sso_token": sso_token,
                 "sso_expires_in": SSO_TTL_SECONDS,
                 **access_token_payload,
@@ -11209,8 +11512,7 @@ def api_sso_issue() -> Response:
             "status": "ok",
             "token": sso_token,
             "expires_in": SSO_TTL_SECONDS,
-            "user": user,
-            "role": _user_role(user),
+            **_local_identity_payload(user, include_directory=False),
         }
     )
 
@@ -11234,7 +11536,7 @@ def api_session() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"authenticated": False, "user": None}), 200
-    return jsonify({"authenticated": True, "user": user, "role": _user_role(user)})
+    return jsonify(_local_identity_payload(user, include_directory=False))
 
 
 def api_authz_nginx() -> Response:
@@ -11252,6 +11554,9 @@ def api_authz_nginx() -> Response:
     response.headers["X-Auth-Request-User"] = user
     if role:
         response.headers["X-Auth-Request-Role"] = str(role)
+    active_team = getattr(g, "auth_active_team", None)
+    if isinstance(active_team, dict) and active_team.get("team_id"):
+        response.headers["X-Auth-Request-Team"] = str(active_team.get("team_id") or "")
     return response
 
 
@@ -11263,13 +11568,7 @@ def api_profile() -> Response:
     if not user:
         return jsonify({"error": "unauthorized"}), 401
     if request.method == "GET":
-        return jsonify(
-            {
-                "user": user,
-                "role": _user_role(user),
-                "email": user_store.get_email(user),
-            }
-        )
+        return jsonify(_local_identity_payload(user, include_directory=True))
     payload = request.get_json(force=True, silent=True) or {}
     email = str(payload.get("email") or "").strip()
     if email and not EMAIL_RE.match(email):
@@ -11282,7 +11581,56 @@ def api_profile() -> Response:
         provider="profile",
         meta={"source": "api_profile"},
     )
-    return jsonify({"status": "ok", "email": user_store.get_email(user)})
+    return jsonify({"status": "ok", **_local_identity_payload(user, include_directory=True)})
+
+
+def api_profile_password() -> Response:
+    """API endpoint for profile password changes."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_users() -> Response:
+    """API endpoint for centralized user management."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_user_password(username: str) -> Response:
+    """API endpoint for centralized user password management."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_team_invite(team_id: str) -> Response:
+    """API endpoint for centralized team invitations."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_team_invitation_accept(membership_id: str) -> Response:
+    """API endpoint for accepting centralized team invitations."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_team_invitation_reject(membership_id: str) -> Response:
+    """API endpoint for rejecting centralized team invitations."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_team_leave(team_id: str) -> Response:
+    """API endpoint for leaving a centralized team."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
 
 
 def _todo_meta_from_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -12046,7 +12394,7 @@ def api_projects() -> Response:
                 entry = dict(project)
                 entry["role"] = "admin"
                 entry["capabilities"] = {"read": True, "write": True, "grant": True}
-                team = access_store.get_team(project.get("team_id")) if project.get("team_id") else None
+                team = _team_display_record(project.get("team_id")) if project.get("team_id") else None
                 if team:
                     entry["team_name"] = team.get("name")
                 projects.append(entry)
@@ -12175,6 +12523,8 @@ def api_project_detail(project_id: str) -> Response:
 
 def api_teams() -> Response:
     """API endpoint for teams."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -12208,6 +12558,8 @@ def api_teams() -> Response:
 
 def api_team_detail(team_id: str) -> Response:
     """API endpoint for team detail."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -12358,6 +12710,8 @@ def api_access_tree() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
+    if _customers_enabled():
+        return jsonify({"tree": _customer_access_tree()})
     if _is_admin_user(user):
         tree = access_store.tree_all()
     else:
@@ -12632,7 +12986,7 @@ def admin_stats() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if _user_role(user) != "admin":
+    if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     total_users = user_store.count_users()
     jobs_snapshot = manager.list_jobs()
@@ -12703,7 +13057,7 @@ def api_audit() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if _user_role(user) != "admin":
+    if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     limit = request.args.get("limit")
     try:
@@ -12922,7 +13276,7 @@ def assistant_rag_mcp() -> Response:
     mcp_cfg = payload.get("mcp") if isinstance(payload.get("mcp"), dict) else {}
     mcp_result = None
     if mcp_cfg:
-        if _user_role(user) != "admin":
+        if not _is_admin_user(user):
             return jsonify({"error": "mcp_forbidden"}), 403
         server_name = str(mcp_cfg.get("server") or "").strip()
         tool_name = str(mcp_cfg.get("tool") or "").strip()
@@ -13010,7 +13364,7 @@ def mcp_servers() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if _user_role(user) != "admin":
+    if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     if request.method == "GET":
         servers = [server.masked() for server in mcp_store.list_servers(user)]
@@ -13046,7 +13400,7 @@ def mcp_server_delete(name: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if _user_role(user) != "admin":
+    if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     deleted = mcp_store.delete_server(user, name)
     if not deleted:
@@ -13059,7 +13413,7 @@ def mcp_server_tools(name: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if _user_role(user) != "admin":
+    if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     server = mcp_store.get_server(user, name)
     if not server:
@@ -13078,7 +13432,7 @@ def mcp_server_call(name: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if _user_role(user) != "admin":
+    if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     server = mcp_store.get_server(user, name)
     if not server:
@@ -13104,7 +13458,7 @@ def mcp_server_resources(name: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if _user_role(user) != "admin":
+    if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     server = mcp_store.get_server(user, name)
     if not server:
@@ -13123,7 +13477,7 @@ def mcp_server_resource(name: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if _user_role(user) != "admin":
+    if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     server = mcp_store.get_server(user, name)
     if not server:
@@ -13201,7 +13555,7 @@ def list_refunds() -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if _user_role(user) != "admin":
+    if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     requests: List[Dict[str, Any]] = []
     for job in manager.list_jobs():
@@ -13234,7 +13588,7 @@ def screen_refund(job_id: str, request_id: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if _user_role(user) != "admin":
+    if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     job = manager.get_job(job_id)
     if not job:
@@ -13301,7 +13655,7 @@ def decide_refund(job_id: str, request_id: str) -> Response:
     user = _current_user()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
-    if _user_role(user) != "admin":
+    if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     job = manager.get_job(job_id)
     if not job:
@@ -13373,7 +13727,7 @@ def refund_file(job_id: str, request_id: str, filename: str) -> Response:
     job = manager.get_job(job_id)
     if not job:
         return jsonify({"error": "job not found"}), 404
-    if _user_role(user) != "admin" and job.owner != user:
+    if not _is_admin_user(user) and job.owner != user:
         return jsonify({"error": "forbidden"}), 403
     refund = _find_refund_request(job, request_id)
     if not refund:
@@ -14826,7 +15180,7 @@ def tokens() -> Response:
         return jsonify({"message": "Cashout recorded.", **snapshot})
 
     if action == "grant":
-        if _user_role(user) != "admin":
+        if not _is_admin_user(user):
             return jsonify({"error": "forbidden", "details": "Admin role required."}), 403
         target_user = (payload.get("target_user") or payload.get("recipient") or payload.get("username") or "").strip()
         if not target_user:
@@ -15007,7 +15361,7 @@ def tokens_ledger() -> Response:
         return jsonify({"error": "unauthorized"}), 401
     target = (request.args.get("user") or "").strip()
     if target:
-        if _user_role(user) != "admin":
+        if not _is_admin_user(user):
             return jsonify({"error": "forbidden"}), 403
         user = target
     limit = request.args.get("limit")
@@ -15835,6 +16189,9 @@ if hasattr(app, "add_url_rule"):
         api_session=api_session,
         api_authz_nginx=api_authz_nginx,
         api_profile=api_profile,
+        api_profile_password=api_profile_password,
+        api_users=api_users,
+        api_user_password=api_user_password,
     )
     register_voice_routes(
         app,
@@ -15871,6 +16228,10 @@ if hasattr(app, "add_url_rule"):
             "api_project_detail": api_project_detail,
             "api_teams": api_teams,
             "api_team_detail": api_team_detail,
+            "api_team_invite": api_team_invite,
+            "api_team_invitation_accept": api_team_invitation_accept,
+            "api_team_invitation_reject": api_team_invitation_reject,
+            "api_team_leave": api_team_leave,
             "api_team_tokens": api_team_tokens,
             "api_access_tree": api_access_tree,
             "api_sessions": api_sessions,

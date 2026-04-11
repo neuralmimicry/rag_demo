@@ -172,6 +172,9 @@ cython_debug/
 # Delivery pipeline outputs
 delivery_pipeline_output/
 job_data/
+refiner.log
+.confluence_cache/
+.agent/
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
@@ -214,6 +217,10 @@ __marimo__/
 *.csv
 .discovery_cache.json
 .research_cache/
+.env.*
+*.sqlite3
+*.db
+*.db-journal
 
 .idea/
 .*.jsonl
