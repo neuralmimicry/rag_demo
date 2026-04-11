@@ -20,6 +20,9 @@ def register_auth_routes(
     api_session: Callable,
     api_authz_nginx: Callable,
     api_profile: Callable,
+    api_profile_password: Callable,
+    api_users: Callable,
+    api_user_password: Callable,
 ) -> None:
     """Register authentication/session/profile routes."""
     app.add_url_rule("/login", view_func=login, methods=["GET", "POST"])
@@ -36,3 +39,6 @@ def register_auth_routes(
     app.add_url_rule("/api/session", view_func=api_session)
     app.add_url_rule("/api/authz/nginx", view_func=api_authz_nginx)
     app.add_url_rule("/api/profile", view_func=api_profile, methods=["GET", "POST"])
+    app.add_url_rule("/api/profile/password", view_func=api_profile_password, methods=["POST"])
+    app.add_url_rule("/api/users", view_func=api_users, methods=["GET", "POST"])
+    app.add_url_rule("/api/users/<username>/password", view_func=api_user_password, methods=["POST"])

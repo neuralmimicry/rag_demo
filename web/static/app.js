@@ -2699,9 +2699,7 @@ function openTransferModal(mode, job) {
     if (transferTeamSelectEl) transferTeamSelectEl.disabled = true;
     if (transferUserRowEl) transferUserRowEl.hidden = false;
     const team = accessTeamIndex[teamId];
-    const candidates = team
-      ? [...new Set([...(team.leaders || []), ...(team.members || [])])]
-      : [];
+    const candidates = team ? teamUsernames(team) : [];
     const userOptions = candidates.map((user) => ({ value: user, label: user }));
     populateSelect(transferUserSelectEl, userOptions, 'Select a user');
     if (!userOptions.length && transferModalConfirmBtn) {
@@ -2904,22 +2902,82 @@ function buildTeamIndex(tree) {
   return { list, index };
 }
 
+function normalizedIdentityGroups(profile = currentProfile) {
+  const normalized = [];
+  const seen = new Set();
+  const pushGroup = (value) => {
+    if (typeof value !== 'string') return;
+    const cleaned = value.trim().toLowerCase();
+    if (!cleaned || seen.has(cleaned)) return;
+    seen.add(cleaned);
+    normalized.push(cleaned);
+  };
+  if (Array.isArray(profile?.groups)) {
+    profile.groups.forEach(pushGroup);
+  }
+  pushGroup(profile?.role);
+  return normalized;
+}
+
+function isAdminIdentity(profile = currentProfile) {
+  if (profile?.is_admin === true) return true;
+  return normalizedIdentityGroups(profile).includes('admin');
+}
+
+function normalizeMembershipRole(value) {
+  const cleaned = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!cleaned) return null;
+  if (cleaned === 'owner' || cleaned === 'leader' || cleaned === 'admin') return 'leader';
+  if (cleaned === 'member' || cleaned === 'user') return 'member';
+  return null;
+}
+
+function teamMembershipRole(teamId, username = currentProfile?.user) {
+  if (!teamId) return null;
+  const cleanedUser = typeof username === 'string' ? username.trim() : '';
+  if (!cleanedUser) return null;
+  const team = accessTeamIndex[teamId];
+  if (!team) return null;
+  const leaders = Array.isArray(team.leaders) ? team.leaders : [];
+  if (leaders.includes(cleanedUser)) return 'leader';
+  const members = Array.isArray(team.members) ? team.members : [];
+  if (members.includes(cleanedUser)) return 'member';
+  if (cleanedUser === currentProfile?.user) {
+    return normalizeMembershipRole(team.membership_role);
+  }
+  return null;
+}
+
+function teamUsernames(team) {
+  const usernames = new Set();
+  const addUser = (entry) => {
+    if (typeof entry === 'string') {
+      const cleaned = entry.trim();
+      if (cleaned) usernames.add(cleaned);
+      return;
+    }
+    if (!entry || typeof entry !== 'object') return;
+    const candidate = typeof entry.username === 'string'
+      ? entry.username
+      : (typeof entry.user === 'string' ? entry.user : '');
+    const cleaned = candidate.trim();
+    if (cleaned) usernames.add(cleaned);
+  };
+  if (Array.isArray(team?.leaders)) team.leaders.forEach(addUser);
+  if (Array.isArray(team?.members)) team.members.forEach(addUser);
+  return [...usernames];
+}
+
 function isTeamLeader(teamId) {
   if (!teamId) return false;
-  if (currentProfile?.role === 'admin') return true;
-  const team = accessTeamIndex[teamId];
-  if (!team || !currentProfile?.user) return false;
-  return Array.isArray(team.leaders) && team.leaders.includes(currentProfile.user);
+  if (isAdminIdentity()) return true;
+  return teamMembershipRole(teamId) === 'leader';
 }
 
 function isTeamMember(teamId) {
   if (!teamId) return false;
-  if (currentProfile?.role === 'admin') return true;
-  const team = accessTeamIndex[teamId];
-  if (!team || !currentProfile?.user) return false;
-  const leaders = Array.isArray(team.leaders) ? team.leaders : [];
-  const members = Array.isArray(team.members) ? team.members : [];
-  return leaders.includes(currentProfile.user) || members.includes(currentProfile.user);
+  if (isAdminIdentity()) return true;
+  return teamMembershipRole(teamId) !== null;
 }
 
 function teamName(teamId) {
@@ -4074,7 +4132,7 @@ function renderJobDetail(job, options = {}) {
     : '';
   const transfer = job.transfer_request;
   const isOwner = currentProfile?.user && job.owner === currentProfile.user;
-  const isAdmin = currentProfile?.role === 'admin';
+  const isAdmin = isAdminIdentity();
   const pendingTransfer = transfer?.status === 'pending';
   const transferTeamId = transfer?.team_id;
   const canAcceptTransfer = pendingTransfer && (isAdmin || isTeamLeader(transferTeamId));

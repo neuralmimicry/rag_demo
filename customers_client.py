@@ -36,12 +36,45 @@ class CustomersClient:
         )
 
     def session_from_headers(self, *, authorization: Optional[str], cookie_header: Optional[str]) -> Dict[str, Any]:
-        headers = {"Accept": "application/json"}
-        if authorization:
-            headers["Authorization"] = authorization
-        if cookie_header:
-            headers["Cookie"] = cookie_header
-        return self._request("GET", "/api/session", headers=headers, require_app_auth=False)
+        return self._request(
+            "GET",
+            "/api/session",
+            headers=self._browser_headers(authorization=authorization, cookie_header=cookie_header),
+            require_app_auth=False,
+        )
+
+    def profile_from_headers(self, *, authorization: Optional[str], cookie_header: Optional[str]) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            "/api/profile",
+            headers=self._browser_headers(authorization=authorization, cookie_header=cookie_header),
+            require_app_auth=False,
+        )
+
+    def teams_from_headers(self, *, authorization: Optional[str], cookie_header: Optional[str]) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            "/api/teams",
+            headers=self._browser_headers(authorization=authorization, cookie_header=cookie_header),
+            require_app_auth=False,
+        )
+
+    def team_detail_from_headers(
+        self,
+        team_id: str,
+        *,
+        authorization: Optional[str],
+        cookie_header: Optional[str],
+    ) -> Dict[str, Any]:
+        cleaned_team_id = str(team_id or "").strip()
+        if not cleaned_team_id:
+            raise CustomersServiceError("team_id_required")
+        return self._request(
+            "GET",
+            f"/api/teams/{cleaned_team_id}",
+            headers=self._browser_headers(authorization=authorization, cookie_header=cookie_header),
+            require_app_auth=False,
+        )
 
     def resolve_voice_token(self, token: str) -> Dict[str, Any]:
         return self._request(
@@ -50,6 +83,15 @@ class CustomersClient:
             json_body={"token": token},
             require_app_auth=True,
         )
+
+    @staticmethod
+    def _browser_headers(*, authorization: Optional[str], cookie_header: Optional[str]) -> Dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if authorization:
+            headers["Authorization"] = authorization
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        return headers
 
     def _request(
         self,

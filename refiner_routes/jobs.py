@@ -58,6 +58,26 @@ def register_jobs_routes(app, handlers: Dict[str, Callable]) -> None:
         methods=["PATCH", "DELETE"],
     )
     app.add_url_rule(
+        "/api/teams/<team_id>/invite",
+        view_func=handlers["api_team_invite"],
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/api/team-invitations/<membership_id>/accept",
+        view_func=handlers["api_team_invitation_accept"],
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/api/team-invitations/<membership_id>/reject",
+        view_func=handlers["api_team_invitation_reject"],
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/api/teams/<team_id>/leave",
+        view_func=handlers["api_team_leave"],
+        methods=["POST"],
+    )
+    app.add_url_rule(
         "/api/teams/<team_id>/tokens",
         view_func=handlers["api_team_tokens"],
         methods=["GET", "POST"],
