@@ -144,7 +144,7 @@ Set these environment variables on the backend:
 - `REFINER_TRUST_PROXY`: set to `1` if TLS is terminated by a proxy/load balancer.
 - `REFINER_HOST`: set to `0.0.0.0` for public bind.
 
-Cookies default to `SameSite=None` + `Secure` when CORS is enabled. Use `REFINER_COOKIE_SAMESITE` / `REFINER_SECURE_COOKIES` to override.
+Cookies default to `SameSite=None` + `Secure` when CORS is enabled, and the session cookie name defaults to `nm_refiner_session`. Use `REFINER_SESSION_COOKIE_NAME`, `REFINER_COOKIE_SAMESITE`, or `REFINER_SECURE_COOKIES` to override.
 
 For OIDC SPA flows, add the frontend callback URL to `REFINER_OIDC_ALLOWED_REDIRECT_URIS` so `/api/oidc/exchange` can reuse the same redirect URI used during authorisation.
 
@@ -167,7 +167,7 @@ On the frontend, set the API base:
    - `REFINER_ENFORCE_HTTPS=1`
    - `REFINER_TRUST_PROXY=1` (if TLS terminates upstream)
    - `REFINER_CORS_ORIGINS=https://your-frontend.example,https://your-amplify-branch.amplifyapp.com`
-   - `REFINER_COOKIE_SAMESITE=None` and `REFINER_SECURE_COOKIES=1`
+   - `REFINER_SESSION_COOKIE_NAME=nm_refiner_session`, `REFINER_COOKIE_SAMESITE=None`, and `REFINER_SECURE_COOKIES=1`
    - Serve the API host with a publicly trusted TLS certificate (for example via cert-manager + `letsencrypt-prod`). Browsers reject self-signed certs with `ERR_CERT_AUTHORITY_INVALID`.
 3) Point the frontend at the backend origin using `rag-api-base` or `window.__RAG_API_BASE` (for this website: `https://api.neuralmimicry.ai`, not `/auth`).
 4) Bootstrap the first user with `POST /api/setup`, then log in with `POST /api/login`.

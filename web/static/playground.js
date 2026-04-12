@@ -34,6 +34,12 @@ const apiFetch = (path, options = {}) => {
   return fetch(apiUrl(path), { ...options, credentials: 'include' });
 };
 
+function formatNumber(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '';
+  return numeric.toLocaleString('en-GB');
+}
+
 function escapeHtml(value) {
   const div = document.createElement('div');
   div.textContent = value ?? '';
@@ -70,8 +76,14 @@ function renderPlan(data) {
       </div>
     `)
     .join('');
-  const name = data?.project_name ? `Project: ${data.project_name}` : '';
-  metaEl.textContent = name || 'Ready to build.';
+  const metaParts = [];
+  if (data?.project_name) {
+    metaParts.push(`Project: ${data.project_name}`);
+  }
+  if (Number.isFinite(Number(data?.token_estimate))) {
+    metaParts.push(`Estimated reserve: ${formatNumber(data.token_estimate)} tokens`);
+  }
+  metaEl.textContent = metaParts.join(' | ') || 'Ready to build.';
 }
 
 async function requestPlan() {
@@ -131,6 +143,15 @@ async function startBuild() {
     }
     const data = await res.json();
     if (!res.ok) {
+      if (res.status === 402 && data?.error === 'insufficient_tokens') {
+        const estimate = formatNumber(data?.estimate);
+        const available = formatNumber(data?.available);
+        if (estimate && available) {
+          showStatus(`Insufficient tokens to submit this job. Need ${estimate}, available ${available}.`, true);
+          buildBtn.disabled = false;
+          return;
+        }
+      }
       showStatus(data.details || data.error || 'Unable to queue job.', true);
       buildBtn.disabled = false;
       return;

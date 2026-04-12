@@ -387,6 +387,16 @@ ESTIMATE_REPO_MAX_FILE_BYTES = int(os.getenv("REFINER_ESTIMATE_REPO_MAX_FILE_BYT
 ESTIMATE_REPO_SAMPLE_MULTIPLIER = float(os.getenv("REFINER_ESTIMATE_REPO_SAMPLE_MULTIPLIER", "1.6"))
 ESTIMATE_CALIBRATION_TTL_SEC = int(os.getenv("REFINER_ESTIMATE_CALIBRATION_TTL", "90"))
 DEFAULT_LLM_MAX_TOKENS = int(os.getenv("REFINER_DEFAULT_LLM_MAX_TOKENS", "48000"))
+PLAYGROUND_LLM_MAX_TOKENS = max(
+    1000,
+    int(os.getenv("REFINER_PLAYGROUND_LLM_MAX_TOKENS", str(min(DEFAULT_LLM_MAX_TOKENS, 12000)))),
+)
+PLAYGROUND_PROJECT_MAX_STEPS = max(25, int(os.getenv("REFINER_PLAYGROUND_PROJECT_MAX_STEPS", "120")))
+PLAYGROUND_PROJECT_MIN_ITERATIONS = max(1, int(os.getenv("REFINER_PLAYGROUND_PROJECT_MIN_ITERATIONS", "6")))
+PLAYGROUND_PROJECT_MAX_ITERATIONS = max(
+    PLAYGROUND_PROJECT_MIN_ITERATIONS,
+    int(os.getenv("REFINER_PLAYGROUND_PROJECT_MAX_ITERATIONS", "12")),
+)
 RESUME_LLM_MAX_TOKENS_CAP = int(os.getenv("REFINER_RESUME_LLM_MAX_TOKENS_CAP", "96000"))
 JOB_RETENTION_DAYS = int(os.getenv("REFINER_JOB_RETENTION_DAYS", "0"))
 SESSION_TTL_SEC = int(os.getenv("REFINER_SESSION_TTL_SEC", "14400"))
@@ -1063,6 +1073,7 @@ CORS_ALLOW_METHODS = ["GET", "POST", "DELETE", "OPTIONS"]
 CORS_MAX_AGE = int(os.getenv("REFINER_CORS_MAX_AGE", "600"))
 API_BASE = os.getenv("REFINER_API_BASE", "").strip().rstrip("/")
 COOKIE_DOMAIN = (os.getenv("REFINER_COOKIE_DOMAIN") or "").strip() or None
+SESSION_COOKIE_NAME = _env_first("REFINER_SESSION_COOKIE_NAME", default="nm_refiner_session").strip() or "nm_refiner_session"
 EXTERNAL_REDIRECT_HOSTS = _env_list("REFINER_EXTERNAL_REDIRECT_HOSTS")
 
 COOKIE_SAMESITE = _normalize_samesite(os.getenv("REFINER_COOKIE_SAMESITE"))
@@ -1118,6 +1129,7 @@ LOGIN_MAX_ATTEMPTS = int(os.getenv("REFINER_LOGIN_MAX_ATTEMPTS", "10"))
 _LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
 
 app.config.update(
+    SESSION_COOKIE_NAME=SESSION_COOKIE_NAME,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE=COOKIE_SAMESITE,
     SESSION_COOKIE_SECURE=SECURE_COOKIES,
@@ -16112,18 +16124,22 @@ def playground_plan() -> Response:
     if not global_detected:
         req_count += _global_requirements_count()
 
+    playground_iterations = min(
+        PLAYGROUND_PROJECT_MAX_ITERATIONS,
+        max(PLAYGROUND_PROJECT_MIN_ITERATIONS, req_count),
+    )
     job_payload = {
         "workflow": "project_solver",
         "project_name": project_name,
         "requirements_text": requirements_text,
         "project_run": True,
-        "project_max_steps": 250,
-        "project_iterations": min(50, max(req_count, 10)),
+        "project_max_steps": PLAYGROUND_PROJECT_MAX_STEPS,
+        "project_iterations": playground_iterations,
         "llm_provider": settings.get("provider") or provider_hint,
         "llm_model": settings.get("model") or model_hint,
         "llm_reasoning_effort": reasoning_effort,
         "llm_temperature": 0.2,
-        "llm_max_tokens": DEFAULT_LLM_MAX_TOKENS,
+        "llm_max_tokens": PLAYGROUND_LLM_MAX_TOKENS,
         "disable_jira": True,
         "disable_confluence": True,
         "action_plan": False,
@@ -16136,6 +16152,7 @@ def playground_plan() -> Response:
         job_payload["codingagent"] = codingagent
     elif _opencode_available_for_playground():
         job_payload["codingagent"] = "opencode"
+    token_estimate = _estimate_job_tokens(job_payload)
 
     return jsonify(
         {
@@ -16144,6 +16161,7 @@ def playground_plan() -> Response:
             "project_name": project_name,
             "requirements_text": requirements_text,
             "job_payload": job_payload,
+            "token_estimate": token_estimate,
             "provider": response.provider or settings.get("provider"),
             "model": response.model or settings.get("model"),
         }
