@@ -13310,7 +13310,7 @@ def assistant_rag_mcp() -> Response:
             return jsonify({"error": "mcp_request_failed", "details": str(exc)}), 400
 
     provider_hint = payload.get("provider") or payload.get("llm_provider") or "openai"
-    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.1"
+    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.4"
     settings = _resolve_llm_settings(user=user, provider_hint=provider_hint, model_hint=model_hint)
     try:
         provider = get_provider(
@@ -15754,7 +15754,7 @@ def assistant_requirements() -> Response:
             return jsonify({"error": "guardrail_blocked", "details": reason}), 400
 
     provider_hint = payload.get("provider") or payload.get("llm_provider") or "openai"
-    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.1"
+    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.4"
     reasoning_effort = payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or "medium"
 
     if mode == "ask" and is_marketing_assistant and _is_simple_greeting(prompt):
@@ -15916,7 +15916,7 @@ def assistant_form_fill() -> Response:
         return jsonify({"error": "guardrail_blocked", "details": reason}), 400
 
     provider_hint = payload.get("provider") or payload.get("llm_provider") or "openai"
-    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.1"
+    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.4"
     reasoning_effort = payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or "medium"
 
     settings = _resolve_llm_settings(
@@ -16034,7 +16034,7 @@ def playground_plan() -> Response:
         return jsonify({"error": "guardrail_blocked", "details": reason}), 400
 
     provider_hint = payload.get("provider") or payload.get("llm_provider") or "openai"
-    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.1"
+    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.4"
     reasoning_effort = payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or "medium"
 
     settings = _resolve_llm_settings(
