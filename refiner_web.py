@@ -73,6 +73,7 @@ from nmchain_client import NmChainClient, NmChainError
 from customers_client import CustomersClient, CustomersServiceError
 from billing_client import BillingClient, BillingServiceError
 from capabilities import get_capabilities, capability_summary, select_skills, format_skill_brief
+from runtime_env import apply_managed_ollama_defaults, build_effective_llm_env
 from thought_inbox import (
     build_fingerprint as inbox_build_fingerprint,
     build_route_suggestion,
@@ -5863,6 +5864,7 @@ class JobManager:
             use_defaults = job.payload.get("use_default_secrets", True)
             if use_defaults and job.owner:
                 env.update(_get_secret_store(job.owner).get_env())
+                apply_managed_ollama_defaults(env, process_env=os.environ)
             job_secrets = job.payload.get("job_secrets") or {}
             if isinstance(job_secrets, list):
                 for entry in job_secrets:
@@ -8016,7 +8018,7 @@ def _resolve_llm_settings(
     provider_hint: Optional[str] = None,
     model_hint: Optional[str] = None,
 ) -> Dict[str, Any]:
-    env = _get_secret_store(user).get_env()
+    env = build_effective_llm_env(_get_secret_store(user).get_env(), process_env=os.environ)
     cfg = _load_llm_config()
     providers = cfg.get("llm_providers") if isinstance(cfg.get("llm_providers"), list) else []
 
