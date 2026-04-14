@@ -9,6 +9,7 @@ def _episode(
     outcome: str,
     summary: str,
     requirement_ids=None,
+    metadata=None,
 ):
     return SolverEpisode(
         episode_id=episode_id,
@@ -21,6 +22,7 @@ def _episode(
         modified_files=[f"{source_path}.py"],
         commands=["python -m pytest"],
         verification_failures=["assertion failed"] if outcome == "failure" else [],
+        metadata=dict(metadata or {}),
     )
 
 
@@ -107,3 +109,37 @@ def test_solver_episode_store_compacts_and_formats_prompt_context(tmp_path):
     assert all(item.episode_id in {"ep-2", "ep-3"} for item in recent)
     assert "Relevant solver memory" in prompt
     assert "REQ-003" in prompt or "Third attempt succeeded." in prompt
+
+
+def test_solver_episode_store_round_trips_bounded_metadata(tmp_path):
+    path = tmp_path / "episodes.jsonl"
+    store = SolverEpisodeStore(str(path), max_entries=4, compact_every=1)
+    store.record(
+        _episode(
+            episode_id="ep-meta",
+            source_path="req/replay.md",
+            iteration=1,
+            outcome="failure",
+            summary="Replay metadata should persist.",
+            requirement_ids=["REQ-001"],
+            metadata={
+                "prompt_budget": {
+                    "used_chars": 1024,
+                    "omitted_sections": ["repo_context", "research"],
+                },
+                "command_results": [
+                    {
+                        "shape": "python -m pytest",
+                        "success": False,
+                    }
+                ],
+            },
+        )
+    )
+
+    reloaded = SolverEpisodeStore(str(path), max_entries=4, compact_every=1)
+    episode = reloaded.snapshot(limit=1)[0]
+
+    assert episode.metadata["prompt_budget"]["used_chars"] == 1024
+    assert episode.metadata["prompt_budget"]["omitted_sections"] == ["repo_context", "research"]
+    assert episode.metadata["command_results"][0]["shape"] == "python -m pytest"

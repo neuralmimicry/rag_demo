@@ -38,12 +38,14 @@ from language_detector import detect_languages
 from llm_providers import get_provider, LLMQuotaError, LLMError, request_category
 from repo_context import RepoIndex
 from solver_command_policy import evaluate_command_policy
+from solver_command_trust import CommandTrustStore
 from solver_context import (
     PromptSection,
     assemble_prompt_sections,
     estimate_prompt_budget_chars,
 )
 from solver_memory import SolverEpisode, SolverEpisodeStore
+from solver_replay import build_solver_replay_analysis
 from web_research import (
     WebResearchCache,
     GoogleSearchEngine,
@@ -1962,6 +1964,13 @@ def _solver_episode_store(project_root: str) -> SolverEpisodeStore:
     )
 
 
+def _solver_command_trust_store(project_root: str) -> CommandTrustStore:
+    return CommandTrustStore(
+        os.path.join(_solver_state_root(project_root), "command_trust.json"),
+        max_shapes=_env_int("SOLVER_COMMAND_TRUST_MAX_SHAPES", 300),
+    )
+
+
 def _solver_memory_query_text(source: "RequirementSource", source_actions_log: List[str]) -> str:
     parts = [
         source.path,
@@ -3035,12 +3044,31 @@ def _execute_shell_command(
     dataset_summary: Optional[Dict[str, object]],
     eval_info: Optional[Dict[str, object]],
     executed_commands: Optional[List[str]] = None,
+    command_trust_store: Optional[CommandTrustStore] = None,
+    command_results: Optional[List[Dict[str, object]]] = None,
 ) -> bool:
     policy = evaluate_command_policy(command)
+    trust = None
     if not policy.allowed:
         message = f"Blocked command by solver policy: {command} ({policy.reason})"
         actions_log.append(message)
         logger.info(message)
+        if command_results is not None:
+            command_results.append(
+                {
+                    "command": command,
+                    "shape": "",
+                    "category": policy.category,
+                    "policy_allowed": False,
+                    "policy_risk": policy.risk,
+                    "effective_risk": policy.risk,
+                    "trust_level": "blocked",
+                    "trust_score": 0.0,
+                    "success": False,
+                    "exit_code": None,
+                    "verification_issue": "blocked by solver policy",
+                }
+            )
         if failure_log is not None:
             failure_log.append(
                 {
@@ -3057,6 +3085,13 @@ def _execute_shell_command(
     actions_log.append(
         f"Command policy approved: {policy.category} ({policy.risk}) - {policy.reason}"
     )
+    if command_trust_store is not None:
+        trust = command_trust_store.assess(policy)
+        actions_log.append(
+            "Command trust assessment: "
+            f"{trust.level} score={trust.score:.2f} shape={trust.shape or '(unknown)'} "
+            f"effective_risk={trust.effective_risk}. {trust.note}"
+        )
     run_env = os.environ.copy()
     if policy.env:
         run_env.update(policy.env)
@@ -3073,8 +3108,29 @@ def _execute_shell_command(
             env=run_env,
         )
     except Exception as exc:
+        if command_trust_store is not None:
+            try:
+                trust = command_trust_store.record(policy, success=False, exit_code=None)
+            except Exception:
+                pass
         actions_log.append(f"Command failed: {command} ({exc})")
         logger.info(f"Command failed: {command} ({exc})")
+        if command_results is not None:
+            command_results.append(
+                {
+                    "command": command,
+                    "shape": trust.shape if trust else "",
+                    "category": policy.category,
+                    "policy_allowed": True,
+                    "policy_risk": policy.risk,
+                    "effective_risk": trust.effective_risk if trust else policy.risk,
+                    "trust_level": trust.level if trust else "",
+                    "trust_score": round(float(trust.score), 4) if trust is not None else None,
+                    "success": False,
+                    "exit_code": None,
+                    "verification_issue": str(exc),
+                }
+            )
         if failure_log is not None:
             failure_log.append(
                 {
@@ -3103,7 +3159,33 @@ def _execute_shell_command(
             actions_log.append(
                 f"Verification output issue detected ({verification_issue}); treating as failure."
             )
-    if result.returncode == 0 and not verification_issue:
+    success = result.returncode == 0 and not verification_issue
+    if command_trust_store is not None:
+        try:
+            trust = command_trust_store.record(
+                policy,
+                success=success,
+                exit_code=result.returncode,
+            )
+        except Exception:
+            pass
+    if command_results is not None:
+        command_results.append(
+            {
+                "command": command,
+                "shape": trust.shape if trust else "",
+                "category": policy.category,
+                "policy_allowed": True,
+                "policy_risk": policy.risk,
+                "effective_risk": trust.effective_risk if trust else policy.risk,
+                "trust_level": trust.level if trust else "",
+                "trust_score": round(float(trust.score), 4) if trust is not None else None,
+                "success": success,
+                "exit_code": result.returncode,
+                "verification_issue": verification_issue,
+            }
+        )
+    if success:
         actions_log.append(f"Command succeeded: {command}")
         if executed_commands is not None:
             executed_commands.append(command)
@@ -7433,6 +7515,8 @@ def _apply_step(
     dataset_summary: Optional[Dict[str, object]] = None,
     eval_info: Optional[Dict[str, object]] = None,
     executed_commands: Optional[List[str]] = None,
+    command_trust_store: Optional[CommandTrustStore] = None,
+    command_results: Optional[List[Dict[str, object]]] = None,
 ) -> None:
     step_requirement_ids = _extract_requirement_refs_from_step(step)
     step_type = _normalize_step_type(step.get("type"))
@@ -7858,6 +7942,8 @@ def _apply_step(
                     dataset_summary=dataset_summary,
                     eval_info=eval_info,
                     executed_commands=executed_commands,
+                    command_trust_store=command_trust_store,
+                    command_results=command_results,
                 )
                 if server_proc:
                     server_proc.terminate()
@@ -7880,6 +7966,8 @@ def _apply_step(
                     dataset_summary=dataset_summary,
                     eval_info=eval_info,
                     executed_commands=executed_commands,
+                    command_trust_store=command_trust_store,
+                    command_results=command_results,
                 )
                 actions_log.append(
                     "Skipped localhost probe because no dev/start/preview script was found."
@@ -7894,6 +7982,8 @@ def _apply_step(
             dataset_summary=dataset_summary,
             eval_info=eval_info,
             executed_commands=executed_commands,
+            command_trust_store=command_trust_store,
+            command_results=command_results,
         )
         return
 
@@ -8103,6 +8193,7 @@ def run_project_solver(
     solver_workspace: Optional[str] = None
     extra_ignored: List[str] = [".refiner"]
     solver_episode_store = _solver_episode_store(project_root)
+    command_trust_store = _solver_command_trust_store(project_root)
     output_dir_explicit = False
     output_dir_implied = False
     solver_workspace_within_project = False
@@ -9043,6 +9134,21 @@ def run_project_solver(
             prompt_result = assemble_prompt_sections(prompt_sections, prompt_budget_chars)
             user_prompt = prompt_result.text
             omitted_sections = prompt_result.omitted_sections
+            prompt_budget_metadata = {
+                "budget_chars": prompt_result.budget_chars,
+                "used_chars": prompt_result.used_chars,
+                "omitted_sections": omitted_sections,
+                "sections": [
+                    {
+                        "name": usage.name,
+                        "included": usage.included,
+                        "final_chars": usage.final_chars,
+                        "reason": usage.reason,
+                    }
+                    for usage in prompt_result.sections
+                    if not usage.included or usage.reason in {"trimmed", "capped"}
+                ],
+            }
             if omitted_sections:
                 omitted_preview = ", ".join(omitted_sections[:6])
                 if len(omitted_sections) > 6:
@@ -9472,6 +9578,12 @@ def run_project_solver(
                             summary=_safe_str(payload.get("summary")) or "solver marked source complete",
                             requirement_ids=sorted(source_required_ids),
                             notes=["source completed without further action"],
+                            metadata={
+                                "completion_mode": "done_without_plan",
+                                "provider": payload.get("provider") or llm_provider,
+                                "done": True,
+                                "prompt_budget": prompt_budget_metadata,
+                            },
                         )
                     )
                     break
@@ -9687,6 +9799,7 @@ def run_project_solver(
             verification_steps_executed = 0
             iteration_applied_start = len(source_applied_steps)
             iteration_executed_commands: List[str] = []
+            iteration_command_results: List[Dict[str, object]] = []
             current_venv = _find_workspace_venv(solver_workspace)
             replan_due_to_hallucination = False
             execution_steps = plan_steps
@@ -9729,6 +9842,8 @@ def run_project_solver(
                     dataset_summary=dataset_summary,
                     eval_info=eval_info,
                     executed_commands=iteration_executed_commands,
+                    command_trust_store=command_trust_store,
+                    command_results=iteration_command_results,
                 )
                 if len(actions_log) > before_len:
                     source_actions_log.extend(actions_log[before_len:])
@@ -9825,6 +9940,8 @@ def run_project_solver(
                                 dataset_summary=dataset_summary,
                                 eval_info=eval_info,
                                 executed_commands=iteration_executed_commands,
+                                command_trust_store=command_trust_store,
+                                command_results=iteration_command_results,
                             )
                             if len(actions_log) > before_rec_len:
                                 source_actions_log.extend(actions_log[before_rec_len:])
@@ -10047,9 +10164,19 @@ def run_project_solver(
                 iteration_summary
                 or iteration_modified_files
                 or iteration_executed_commands
+                or iteration_command_results
                 or iteration_failure_notes
                 or payload.get("done") is True
             ):
+                iteration_replan_reasons: List[str] = []
+                if replan_due_to_hallucination:
+                    iteration_replan_reasons.append("hallucination")
+                if replan_due_to_verification:
+                    iteration_replan_reasons.append("verification")
+                if replan_due_to_replace:
+                    iteration_replan_reasons.append("replace_in_file")
+                if defer_source:
+                    iteration_replan_reasons.append("deferred")
                 solver_episode_store.record(
                     SolverEpisode(
                         episode_id=uuid.uuid4().hex,
@@ -10063,6 +10190,15 @@ def run_project_solver(
                         commands=iteration_executed_commands,
                         verification_failures=iteration_failure_notes,
                         notes=episode_notes,
+                        metadata={
+                            "done": payload.get("done") is True,
+                            "plan_step_count": len(plan_steps),
+                            "steps_applied": iteration_steps_applied,
+                            "command_results": iteration_command_results,
+                            "prompt_budget": prompt_budget_metadata,
+                            "replan_reasons": iteration_replan_reasons,
+                            "verification_failure_count": len(iteration_failure_notes),
+                        },
                     )
                 )
             if replan_due_to_hallucination:
@@ -10417,6 +10553,19 @@ def run_project_solver(
     )
 
     _ensure_gitignore(project_root, actions_log)
+    solver_replay_analysis = build_solver_replay_analysis(
+        solver_episode_store,
+        command_trust_store=command_trust_store,
+        limit=_env_int("SOLVER_REPLAY_EPISODE_LIMIT", 60),
+    )
+    top_attention = solver_replay_analysis.get("sources_needing_attention") or []
+    if top_attention:
+        top_source = top_attention[0]
+        actions_log.append(
+            "Replay analysis spotlight: "
+            f"{top_source.get('source_path')} "
+            f"({top_source.get('recent_non_successes')} recent non-success episodes)."
+        )
 
     output_data = {
         "summary": all_plans[-1].get("summary") if all_plans else None,
@@ -10487,6 +10636,7 @@ def run_project_solver(
             "enabled": repo_rag_enabled,
             "stats": repo_index.stats() if repo_index else {},
         },
+        "solver_replay_analysis": solver_replay_analysis,
         "codex_preflight": codex_preflight,
         "completion_summary": completion_summary,
         "run_config": {

@@ -25,7 +25,7 @@ import re
 import tempfile
 import time
 import uuid
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from security_utils import ensure_dir_permissions, ensure_file_permissions
 
@@ -58,6 +58,48 @@ def _safe_list(values: Iterable[object], *, max_items: int = 8, max_chars: int =
     return items
 
 
+def _safe_metadata(value: object, *, depth: int = 0) -> Any:
+    """Bound nested metadata so replay analysis stays compact and auditable."""
+
+    if depth >= 3:
+        return _safe_text(value, max_chars=240)
+
+    if isinstance(value, dict):
+        cleaned: Dict[str, Any] = {}
+        for idx, (key, item) in enumerate(value.items()):
+            if idx >= 16:
+                break
+            safe_key = _safe_text(key, max_chars=64)
+            if not safe_key:
+                continue
+            normalized = _safe_metadata(item, depth=depth + 1)
+            if normalized in ("", None, [], {}):
+                continue
+            cleaned[safe_key] = normalized
+        return cleaned
+
+    if isinstance(value, (list, tuple, set)):
+        cleaned_items: List[Any] = []
+        for idx, item in enumerate(value):
+            if idx >= 16:
+                break
+            normalized = _safe_metadata(item, depth=depth + 1)
+            if normalized in ("", None, [], {}):
+                continue
+            cleaned_items.append(normalized)
+        return cleaned_items
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return round(value, 4)
+        return 0.0
+    return _safe_text(value, max_chars=240)
+
+
 def _tokenize(text: str) -> List[str]:
     if not text:
         return []
@@ -86,6 +128,7 @@ class SolverEpisode:
     commands: List[str] = field(default_factory=list)
     verification_failures: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_record(self) -> Dict[str, object]:
         return {
@@ -100,6 +143,7 @@ class SolverEpisode:
             "commands": list(self.commands),
             "verification_failures": list(self.verification_failures),
             "notes": list(self.notes),
+            "metadata": _safe_metadata(self.metadata),
         }
 
     @classmethod
@@ -129,6 +173,7 @@ class SolverEpisode:
                 record.get("verification_failures") or [], max_items=6, max_chars=280
             ),
             notes=_safe_list(record.get("notes") or [], max_items=8, max_chars=280),
+            metadata=_safe_metadata(record.get("metadata") or {}),
         )
 
     def search_blob(self) -> str:
@@ -232,10 +277,21 @@ class SolverEpisodeStore:
             self._append_count = 0
             self._compact()
 
-    def recent(self, *, source_path: Optional[str] = None, limit: int = 3) -> List[SolverEpisode]:
+    def snapshot(
+        self,
+        *,
+        source_path: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[SolverEpisode]:
         selected = self._entries
         if source_path:
             selected = [entry for entry in selected if entry.source_path == source_path]
+        if limit is None or limit <= 0:
+            return list(selected)
+        return list(selected[-int(limit) :])
+
+    def recent(self, *, source_path: Optional[str] = None, limit: int = 3) -> List[SolverEpisode]:
+        selected = self.snapshot(source_path=source_path)
         if not selected:
             return []
         limit = max(1, min(limit, _MAX_SEARCH_RESULTS))
@@ -299,6 +355,7 @@ class SolverEpisodeStore:
         requirement_ids: Optional[Sequence[str]] = None,
         limit: int = 3,
         max_chars: int = 2400,
+        header: str = "Relevant solver memory from earlier runs (reuse wins and avoid repeated failures):",
     ) -> str:
         entries = self.search(
             query_text,
@@ -308,7 +365,7 @@ class SolverEpisodeStore:
         )
         if not entries:
             return ""
-        lines = ["Relevant solver memory from earlier runs (reuse wins and avoid repeated failures):"]
+        lines = [header]
         for entry in entries:
             lines.append(f"- {entry.prompt_line()}")
         text = "\n".join(lines).strip()
