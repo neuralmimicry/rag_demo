@@ -74,6 +74,7 @@ from customers_client import CustomersClient, CustomersServiceError
 from billing_client import BillingClient, BillingServiceError
 from capabilities import get_capabilities, capability_summary, select_skills, format_skill_brief
 from runtime_env import apply_managed_ollama_defaults, build_effective_llm_env
+from solver_memory import SolverEpisode, SolverEpisodeStore
 from thought_inbox import (
     build_fingerprint as inbox_build_fingerprint,
     build_route_suggestion,
@@ -181,6 +182,7 @@ PUBLIC_DIR = os.path.join(BASE_DIR, "web", "public")
 JOB_ROOT = os.getenv("REFINER_JOB_DIR", os.path.join(BASE_DIR, "job_data"))
 PROJECTS_ROOT = os.path.join(JOB_ROOT, "projects")
 SECRET_STORE_ROOT = os.path.join(JOB_ROOT, "secrets")
+ASSISTANT_MEMORY_ROOT = os.path.join(JOB_ROOT, "assistant_memory")
 USERS_PATH = os.path.join(JOB_ROOT, "users.json")
 WORKSPACE_ROOT = os.path.join(JOB_ROOT, "workspaces")
 AUDIT_LOG_PATH = os.getenv("REFINER_AUDIT_LOG_PATH", os.path.join(JOB_ROOT, "audit.log"))
@@ -499,6 +501,7 @@ EDITOR_SKIP_DIRS = {
 ensure_dir_permissions(JOB_ROOT, mode=0o700)
 ensure_dir_permissions(PROJECTS_ROOT, mode=0o700)
 ensure_dir_permissions(SECRET_STORE_ROOT, mode=0o700)
+ensure_dir_permissions(ASSISTANT_MEMORY_ROOT, mode=0o700)
 ensure_dir_permissions(WORKSPACE_ROOT, mode=0o700)
 ensure_dir_permissions(TEAM_LEDGER_ROOT, mode=0o700)
 audit_logger = AuditLogger(AUDIT_LOG_PATH)
@@ -980,6 +983,8 @@ REFUND_ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _estimate_repo_cache: Dict[str, Dict[str, Any]] = {}
 _estimate_repo_cache_lock = threading.Lock()
 _estimate_calibration_cache: Dict[str, Any] = {"ts": 0.0, "data": {}, "job_count": 0}
+_job_output_insights_cache: Dict[str, Dict[str, Any]] = {}
+_job_output_insights_cache_lock = threading.Lock()
 
 app = Flask(__name__, static_folder="web/static", template_folder="web/templates")
 SECRET_KEY_REQUIRED = _env_flag("REFINER_REQUIRE_SECRET_KEY", False)
@@ -1616,6 +1621,7 @@ def _ensure_dirs() -> None:
     ensure_dir_permissions(JOB_ROOT, mode=0o700)
     ensure_dir_permissions(PROJECTS_ROOT, mode=0o700)
     ensure_dir_permissions(SECRET_STORE_ROOT, mode=0o700)
+    ensure_dir_permissions(ASSISTANT_MEMORY_ROOT, mode=0o700)
     ensure_dir_permissions(WORKSPACE_ROOT, mode=0o700)
     ensure_dir_permissions(TODO_ROOT, mode=0o700)
     ensure_dir_permissions(SCHEDULE_ROOT, mode=0o700)
@@ -8303,6 +8309,37 @@ def _completion_summary_from_output(output_path: Optional[str]) -> Optional[Dict
     return None
 
 
+def _job_output_insights_from_output(output_path: Optional[str]) -> Dict[str, Any]:
+    """Return cached solver detail fields extracted from a job output JSON file."""
+
+    if not output_path or not os.path.exists(output_path):
+        return {}
+    try:
+        mtime = os.path.getmtime(output_path)
+    except Exception:
+        return {}
+
+    with _job_output_insights_cache_lock:
+        cached = _job_output_insights_cache.get(output_path)
+        if cached and cached.get("mtime") == mtime:
+            payload = cached.get("data")
+            return dict(payload) if isinstance(payload, dict) else {}
+
+    payload: Dict[str, Any] = {}
+    data = _read_json_file(output_path)
+    if isinstance(data, dict):
+        completion_summary = data.get("completion_summary")
+        if isinstance(completion_summary, dict):
+            payload["completion_summary"] = completion_summary
+        solver_replay_analysis = data.get("solver_replay_analysis")
+        if isinstance(solver_replay_analysis, dict):
+            payload["solver_replay_analysis"] = solver_replay_analysis
+
+    with _job_output_insights_cache_lock:
+        _job_output_insights_cache[output_path] = {"mtime": mtime, "data": dict(payload)}
+    return payload
+
+
 _GLOBAL_REQUIREMENTS_CACHE: Optional[List[Dict[str, str]]] = None
 _GLOBAL_REQUIREMENTS_TITLES: Optional[List[str]] = None
 
@@ -13842,6 +13879,8 @@ def job_detail(job_id: str) -> Response:
         return jsonify({"status": "deleted", "job_id": job_id})
     data = job.to_dict(include_logs=True, log_tail=DEFAULT_TAIL)
     data["logs"] = _redact_log_entries(data.get("logs", []), is_admin)
+    if isinstance(job.output_paths, dict):
+        data.update(_job_output_insights_from_output(job.output_paths.get("primary")))
     return jsonify(_augment_job_dict_for_user(data, user, job))
 
 
@@ -15673,6 +15712,278 @@ def _is_marketing_assistant_request(payload: Dict[str, Any], requirements_text: 
     return False
 
 
+def _assistant_memory_store(user: str) -> SolverEpisodeStore:
+    """Return the per-user episodic memory store for assistant-style routes."""
+
+    ensure_dir_permissions(ASSISTANT_MEMORY_ROOT, mode=0o700)
+    try:
+        max_entries = max(20, min(int(os.getenv("REFINER_ASSISTANT_MEMORY_MAX_ENTRIES", "240")), 1000))
+    except Exception:
+        max_entries = 240
+    try:
+        compact_every = max(1, min(int(os.getenv("REFINER_ASSISTANT_MEMORY_COMPACT_EVERY", "20")), 200))
+    except Exception:
+        compact_every = 20
+    user_key = hash_identifier(user or "") or "anonymous"
+    return SolverEpisodeStore(
+        os.path.join(ASSISTANT_MEMORY_ROOT, f"{user_key}.jsonl"),
+        max_entries=max_entries,
+        compact_every=compact_every,
+    )
+
+
+def _assistant_memory_scope(route: str, *, mode: str = "", profile: str = "") -> str:
+    parts = [str(route or "").strip().lower()]
+    if mode:
+        parts.append(str(mode).strip().lower())
+    if profile:
+        parts.append(str(profile).strip().lower())
+    return ":".join(part for part in parts if part)
+
+
+def _assistant_memory_query_text(
+    *,
+    prompt: str = "",
+    requirements_text: str = "",
+    messages: Optional[List[Dict[str, Any]]] = None,
+    extra_parts: Optional[List[str]] = None,
+) -> str:
+    """Build a compact lexical query over the current assistant request."""
+
+    blocks: List[str] = []
+    for part in [prompt, requirements_text] + list(extra_parts or []):
+        cleaned = str(part or "").strip()
+        if cleaned:
+            blocks.append(cleaned)
+    for msg in (messages or [])[-6:]:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        content = str(msg.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            blocks.append(f"{role}: {content}")
+    return "\n\n".join(blocks).strip()
+
+
+def _assistant_memory_matches(
+    user: str,
+    *,
+    scope: str,
+    query_text: str,
+    limit: int,
+) -> List[SolverEpisode]:
+    """Prefer same-scope memories, then fall back to the user's wider history."""
+
+    store = _assistant_memory_store(user)
+    if query_text:
+        matches = store.search(query_text, source_path=scope, limit=limit)
+        if matches:
+            return matches
+        return store.search(query_text, limit=limit)
+    matches = store.recent(source_path=scope, limit=limit)
+    if matches:
+        return matches
+    return store.recent(limit=limit)
+
+
+def _assistant_memory_entry_line(entry: SolverEpisode) -> str:
+    bits: List[str] = []
+    summary = str(entry.summary or "").strip()
+    if summary:
+        bits.append(summary)
+    if entry.requirement_ids:
+        bits.append("requirements=" + ", ".join(entry.requirement_ids[:4]))
+    context_notes = [note for note in entry.notes[:2] if isinstance(note, str) and note.strip()]
+    if context_notes:
+        bits.append("context=" + "; ".join(context_notes))
+    return ". ".join(bit for bit in bits if bit).strip()
+
+
+def _assistant_memory_prompt_block(
+    user: str,
+    *,
+    scope: str,
+    query_text: str,
+    header: str,
+    limit: int = 3,
+    max_chars: int = 1400,
+) -> str:
+    try:
+        matches = _assistant_memory_matches(user, scope=scope, query_text=query_text, limit=limit)
+    except Exception as exc:
+        logger.debug("Assistant memory lookup failed: %s", exc)
+        return ""
+    if not matches:
+        return ""
+    lines = [header]
+    for entry in matches:
+        line = _assistant_memory_entry_line(entry)
+        if line:
+            lines.append(f"- {line}")
+    text = "\n".join(lines).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 15].rstrip() + "...(truncated)"
+
+
+def _assistant_memory_reference_payload(
+    user: str,
+    *,
+    scope: str,
+    query_text: str,
+    limit: int = 3,
+) -> List[Dict[str, Any]]:
+    try:
+        matches = _assistant_memory_matches(user, scope=scope, query_text=query_text, limit=limit)
+    except Exception as exc:
+        logger.debug("Assistant memory lookup failed: %s", exc)
+        return []
+    payload: List[Dict[str, Any]] = []
+    for entry in matches:
+        item: Dict[str, Any] = {
+            "summary": str(entry.summary or "").strip(),
+        }
+        if entry.requirement_ids:
+            item["requirement_ids"] = list(entry.requirement_ids[:6])
+        if entry.notes:
+            item["notes"] = [str(note).strip() for note in entry.notes[:2] if str(note).strip()]
+        metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
+        project_name = str(metadata.get("project_name") or "").strip()
+        if project_name:
+            item["project_name"] = project_name
+        workflow = str(metadata.get("workflow") or "").strip()
+        if workflow:
+            item["workflow"] = workflow
+        scope_name = str(metadata.get("scope") or "").strip()
+        if scope_name:
+            item["scope"] = scope_name
+        field_ids = metadata.get("field_ids")
+        if isinstance(field_ids, list):
+            item["field_ids"] = [str(field_id).strip() for field_id in field_ids[:8] if str(field_id).strip()]
+        steps = metadata.get("steps")
+        if isinstance(steps, list):
+            item["steps"] = [str(step).strip() for step in steps[:4] if str(step).strip()]
+        suggestions = metadata.get("suggestions")
+        if isinstance(suggestions, list):
+            cleaned_suggestions: List[Dict[str, Any]] = []
+            for suggestion in suggestions[:4]:
+                if not isinstance(suggestion, dict):
+                    continue
+                field_id = str(suggestion.get("field_id") or suggestion.get("id") or "").strip()
+                value = suggestion.get("value")
+                rationale = str(suggestion.get("rationale") or "").strip()
+                if not field_id:
+                    continue
+                entry_payload: Dict[str, Any] = {"field_id": field_id}
+                if value not in (None, ""):
+                    entry_payload["value"] = value
+                if rationale:
+                    entry_payload["rationale"] = rationale[:160]
+                cleaned_suggestions.append(entry_payload)
+            if cleaned_suggestions:
+                item["suggestions"] = cleaned_suggestions
+        if item.get("summary") or item.get("notes") or item.get("steps") or item.get("suggestions"):
+            payload.append(item)
+    return payload
+
+
+def _assistant_memory_requirement_ids(text: str, limit: int = 12) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for match in re.finditer(r"\bREQ-\d{3,}\b", text or "", re.I):
+        req_id = match.group(0).upper()
+        if req_id in seen:
+            continue
+        seen.add(req_id)
+        result.append(req_id)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _assistant_memory_summary(text: str, *, fallback: str = "", max_chars: int = 260) -> str:
+    source = text or fallback
+    cleaned = re.sub(r"\s+", " ", str(source or "")).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 15].rstrip() + "...(truncated)"
+
+
+def _record_assistant_memory(
+    user: str,
+    *,
+    scope: str,
+    prompt_text: str,
+    requirements_text: str,
+    reply_text: str,
+    project_name: str = "",
+    steps: Optional[List[str]] = None,
+    extra_notes: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist a compact assistant episode without affecting request success."""
+
+    if not user:
+        return
+    try:
+        store = _assistant_memory_store(user)
+        recent = store.snapshot(source_path=scope, limit=1)
+        iteration = (recent[-1].iteration if recent else 0) + 1
+        notes: List[str] = []
+        for raw in [
+            f"prompt: {_assistant_memory_summary(prompt_text, max_chars=180)}" if prompt_text else "",
+            f"context: {_assistant_memory_summary(requirements_text, max_chars=180)}" if requirements_text else "",
+        ] + list(extra_notes or []):
+            cleaned = str(raw or "").strip()
+            if cleaned and cleaned not in notes:
+                notes.append(cleaned)
+        episode_metadata: Dict[str, Any] = {
+            "project_name": _assistant_memory_summary(project_name, max_chars=80) if project_name else "",
+            "steps": [str(step).strip() for step in (steps or [])[:6] if str(step).strip()],
+            "reply_chars": len(reply_text or ""),
+        }
+        if isinstance(metadata, dict):
+            for key, value in metadata.items():
+                cleaned_key = str(key or "").strip()
+                if not cleaned_key:
+                    continue
+                if value in ("", None, [], {}):
+                    continue
+                episode_metadata[cleaned_key] = value
+        store.record(
+            SolverEpisode(
+                episode_id=uuid.uuid4().hex,
+                source_path=scope,
+                iteration=iteration,
+                created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                outcome="success",
+                summary=_assistant_memory_summary(reply_text, fallback=prompt_text),
+                requirement_ids=_assistant_memory_requirement_ids(reply_text),
+                notes=notes[:6],
+                metadata=episode_metadata,
+            )
+        )
+    except Exception as exc:
+        logger.debug("Assistant episodic memory skipped: %s", exc)
+
+
+def _should_use_assistant_ask_memory(
+    prompt: str,
+    *,
+    requirements_text: str,
+    messages: Optional[List[Dict[str, Any]]],
+    is_marketing_assistant: bool,
+) -> bool:
+    """Only add memory to ask flows when the request has enough reusable context."""
+
+    if is_marketing_assistant:
+        return False
+    prompt_len = len((prompt or "").strip())
+    context_len = len((requirements_text or "").strip())
+    message_count = len(messages or [])
+    return bool(prompt_len >= 80 or context_len >= 80 or message_count >= 3)
+
+
 def _assistant_reply_payload(
     reply_text: str,
     provider: str,
@@ -15749,6 +16060,11 @@ def assistant_requirements() -> Response:
     requirements_text = (payload.get("requirements_text") or "").strip()
     messages = payload.get("messages") or []
     is_marketing_assistant = _is_marketing_assistant_request(payload, requirements_text)
+    assistant_memory_scope = _assistant_memory_scope(
+        "assistant_requirements",
+        mode=mode,
+        profile="marketing" if is_marketing_assistant else "requirements",
+    )
     marketing_context = ""
     marketing_vocab_hint = ""
 
@@ -15851,24 +16167,75 @@ def assistant_requirements() -> Response:
         if role in {"user", "assistant"} and isinstance(content, str):
             chat_messages.append({"role": role, "content": content})
 
+    assistant_memory_context = ""
+    use_assistant_ask_memory = False
+    if mode == "draft":
+        assistant_memory_query = _assistant_memory_query_text(
+            prompt=prompt,
+            requirements_text=requirements_text,
+            messages=chat_messages,
+            extra_parts=[marketing_context] if marketing_context else None,
+        )
+        assistant_memory_context = _assistant_memory_prompt_block(
+            user,
+            scope=assistant_memory_scope,
+            query_text=assistant_memory_query,
+            header=(
+                "Relevant patterns from this user's earlier successful drafts "
+                "(adapt useful structure, but do not copy stale details blindly):"
+            ),
+        )
+    else:
+        use_assistant_ask_memory = _should_use_assistant_ask_memory(
+            prompt,
+            requirements_text=requirements_text,
+            messages=chat_messages,
+            is_marketing_assistant=is_marketing_assistant,
+        )
+        if use_assistant_ask_memory:
+            assistant_memory_query = _assistant_memory_query_text(
+                prompt=prompt,
+                requirements_text=requirements_text,
+                messages=chat_messages,
+            )
+            assistant_memory_context = _assistant_memory_prompt_block(
+                user,
+                scope=assistant_memory_scope,
+                query_text=assistant_memory_query,
+                header=(
+                    "Relevant prior successful guidance for similar requirements questions "
+                    "(reuse useful reasoning, but resolve conflicts using the current notes first):"
+                ),
+                max_chars=1200,
+            )
+
     if mode == "draft":
         user_text = "Draft a complete requirements document."
         if requirements_text:
             user_text += f"\n\nCurrent notes:\n{requirements_text}"
         if marketing_context:
             user_text += f"\n\nNeuralMimicry context:\n{marketing_context}"
+        if assistant_memory_context:
+            user_text += f"\n\n{assistant_memory_context}"
         chat_messages.append({"role": "user", "content": user_text})
     else:
         if not prompt:
             return jsonify({"error": "prompt_required"}), 400
+        prompt_blocks: List[str] = []
         if requirements_text:
             if is_marketing_assistant:
-                prompt = f"Assistant context:\\n{requirements_text}\\n\\nUser message: {prompt}"
+                prompt_blocks.append(f"Assistant context:\\n{requirements_text}")
             else:
-                prompt = f"Current requirements notes:\\n{requirements_text}\\n\\nUser question: {prompt}"
+                prompt_blocks.append(f"Current requirements notes:\\n{requirements_text}")
         if marketing_context:
-            prompt = f"{prompt}\\n\\nRetrieved NeuralMimicry knowledge:\\n{marketing_context}"
-        chat_messages.append({"role": "user", "content": prompt})
+            prompt_blocks.append(f"Retrieved NeuralMimicry knowledge:\\n{marketing_context}")
+        if assistant_memory_context:
+            prompt_blocks.append(assistant_memory_context)
+        if is_marketing_assistant:
+            prompt_blocks.append(f"User message: {prompt}")
+        else:
+            prompt_blocks.append(f"User question: {prompt}")
+        chat_messages.append({"role": "user", "content": "\\n\\n".join(prompt_blocks)})
 
     temperature = payload.get("temperature", 0.2)
     max_tokens = payload.get("max_tokens")
@@ -15892,6 +16259,26 @@ def assistant_requirements() -> Response:
     reply_text = response.text if isinstance(response.text, str) else str(response.text)
     if mode == "draft":
         reply_text = _ensure_req_register_in_draft(reply_text)
+        _record_assistant_memory(
+            user,
+            scope=assistant_memory_scope,
+            prompt_text=raw_prompt or "Draft a complete requirements document.",
+            requirements_text=requirements_text,
+            reply_text=reply_text,
+            extra_notes=[
+                "assistant_profile: marketing" if is_marketing_assistant else "assistant_profile: requirements"
+            ],
+        )
+    elif use_assistant_ask_memory:
+        _record_assistant_memory(
+            user,
+            scope=assistant_memory_scope,
+            prompt_text=raw_prompt,
+            requirements_text=requirements_text,
+            reply_text=reply_text,
+            extra_notes=["assistant_profile: requirements", "mode: ask"],
+            metadata={"mode": "ask"},
+        )
     if is_marketing_assistant:
         _stt_record_learning(raw_prompt, source="assistant_marketing_user")
         _stt_record_learning(reply_text, source="assistant_marketing_reply")
@@ -15969,6 +16356,30 @@ def assistant_form_fill() -> Response:
         }
         field_descriptions.append(entry)
 
+    assistant_memory_scope = _assistant_memory_scope("assistant_form_fill")
+    field_context_lines: List[str] = []
+    for entry in field_descriptions[:10]:
+        field_id = str(entry.get("id") or "").strip()
+        label = str(entry.get("label") or "").strip()
+        description = str(entry.get("description") or "").strip()
+        options = entry.get("options")
+        option_preview = ""
+        if isinstance(options, list):
+            preview_items = [str(item).strip() for item in options[:4] if str(item).strip()]
+            if preview_items:
+                option_preview = " options=" + ", ".join(preview_items)
+        summary_bits = [bit for bit in [field_id, label, description] if bit]
+        if summary_bits:
+            field_context_lines.append(" | ".join(summary_bits) + option_preview)
+    form_memory_references = _assistant_memory_reference_payload(
+        user,
+        scope=assistant_memory_scope,
+        query_text=_assistant_memory_query_text(
+            prompt=prompt,
+            extra_parts=[workflow, scope, " ".join(allowed_ids)] + field_context_lines,
+        ),
+    )
+
     system = (
         "You are a form assistant. Return ONLY valid JSON. "
         "Output an array of objects with keys: field_id, value, rationale (optional). "
@@ -15986,6 +16397,8 @@ def assistant_form_fill() -> Response:
         "allowed_fields": allowed_ids,
         "fields": field_descriptions,
     }
+    if form_memory_references:
+        user_text["reference_suggestions"] = form_memory_references
 
     capacity_acquired = _acquire_request_capacity(_ASSISTANT_REQUEST_CAPACITY, ASSISTANT_CAPACITY_WAIT_SEC)
     if not capacity_acquired:
@@ -16023,6 +16436,28 @@ def assistant_form_fill() -> Response:
 
     if not cleaned:
         return jsonify({"error": "no_suggestions"}), 400
+
+    _record_assistant_memory(
+        user,
+        scope=assistant_memory_scope,
+        prompt_text=prompt,
+        requirements_text=json.dumps({"workflow": workflow, "scope": scope, "fields": allowed_ids[:12]}),
+        reply_text=(
+            f"Suggested {len(cleaned)} field value(s) for workflow '{workflow or 'unknown'}' "
+            f"in scope '{scope or 'workflow'}'."
+        ),
+        extra_notes=[
+            f"workflow: {workflow}" if workflow else "",
+            f"scope: {scope}" if scope else "",
+            ("fields: " + ", ".join(allowed_ids[:10])) if allowed_ids else "",
+        ],
+        metadata={
+            "workflow": workflow,
+            "scope": scope,
+            "field_ids": allowed_ids[:12],
+            "suggestions": cleaned[:6],
+        },
+    )
 
     return jsonify({"suggestions": cleaned})
 
@@ -16076,6 +16511,12 @@ def playground_plan() -> Response:
         "levels, and rewards similar to a child-friendly dashboard."
     )
 
+    assistant_memory_scope = _assistant_memory_scope("playground_plan")
+    memory_references = _assistant_memory_reference_payload(
+        user,
+        scope=assistant_memory_scope,
+        query_text=_assistant_memory_query_text(prompt=prompt),
+    )
     user_text = {
         "prompt": prompt,
         "constraints": {
@@ -16083,6 +16524,10 @@ def playground_plan() -> Response:
             "scope": "small",
         },
     }
+    if memory_references:
+        # Feed prior successful playground outputs back as compact reference
+        # examples so the assistant can reuse working patterns without copying.
+        user_text["reference_patterns"] = memory_references
 
     capacity_acquired = _acquire_request_capacity(_ASSISTANT_REQUEST_CAPACITY, ASSISTANT_CAPACITY_WAIT_SEC)
     if not capacity_acquired:
@@ -16163,6 +16608,16 @@ def playground_plan() -> Response:
     elif _opencode_available_for_playground():
         job_payload["codingagent"] = "opencode"
     token_estimate = _estimate_job_tokens(job_payload)
+    _record_assistant_memory(
+        user,
+        scope=assistant_memory_scope,
+        prompt_text=prompt,
+        requirements_text=requirements_text,
+        reply_text=f"{summary}\n\n{requirements_text}".strip(),
+        project_name=project_name,
+        steps=steps,
+        extra_notes=[f"project_name: {project_name}"] if project_name else None,
+    )
 
     return jsonify(
         {

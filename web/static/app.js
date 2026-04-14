@@ -4106,6 +4106,177 @@ async function refreshSelectedJob(options = {}) {
   renderSessionPanel(sessionSnapshot);
 }
 
+function renderReplayList(items, renderItem, emptyMessage) {
+  if (!Array.isArray(items) || !items.length) {
+    return `<p class="subtitle">${escapeHtml(emptyMessage)}</p>`;
+  }
+  return `<div class="replay-list">${items.map((item, idx) => renderItem(item, idx)).join('')}</div>`;
+}
+
+function renderSolverReplayPanel(job) {
+  const replay = job?.solver_replay_analysis;
+  const completion = job?.completion_summary;
+  const isSolverJob = job?.workflow === 'project_solver' || Boolean(replay);
+  if (!isSolverJob) return '';
+
+  const panelHeader = `
+    <div class="card-header">
+      <h3>Solver Replay</h3>
+      <p>Recent solver history, repeated loops, and unstable command patterns from the structured run output.</p>
+    </div>
+  `;
+  if (!replay || typeof replay !== 'object' || !replay.window) {
+    return `
+      <div class="replay-panel">
+        ${panelHeader}
+        <p class="subtitle">Replay analysis will appear after the solver writes a completed structured output.</p>
+      </div>
+    `;
+  }
+
+  const windowInfo = replay.window || {};
+  const outcomes = Object.entries(replay.outcomes || {});
+  const recommendations = Array.isArray(replay.recommendations) ? replay.recommendations : [];
+  const attention = Array.isArray(replay.sources_needing_attention) ? replay.sources_needing_attention : [];
+  const verification = Array.isArray(replay.top_verification_failures) ? replay.top_verification_failures : [];
+  const commandPatterns = Array.isArray(replay.command_patterns) ? replay.command_patterns : [];
+  const promptBudget = replay.prompt_budget && typeof replay.prompt_budget === 'object' ? replay.prompt_budget : {};
+  const omittedSections = Array.isArray(promptBudget.top_omitted_sections) ? promptBudget.top_omitted_sections : [];
+  const metaPills = [
+    Number.isFinite(Number(windowInfo.episodes_analyzed)) ? `${windowInfo.episodes_analyzed} episodes` : '',
+    Number.isFinite(Number(windowInfo.sources_analyzed)) ? `${windowInfo.sources_analyzed} sources` : '',
+    Number.isFinite(Number(promptBudget.episodes_with_omissions)) ? `${promptBudget.episodes_with_omissions} omission-hit episodes` : '',
+    completion ? (completion.needs_more_iterations ? 'Needs more iterations' : 'Completion stable') : '',
+  ].filter(Boolean);
+
+  const outcomeHtml = outcomes.length
+    ? `<div class="replay-pills">${outcomes.map(([label, count]) => `
+        <span class="replay-pill">${escapeHtml(label)}: ${escapeHtml(String(count))}</span>
+      `).join('')}</div>`
+    : '<p class="subtitle">No recent solver outcomes recorded.</p>';
+
+  const recommendationsHtml = renderReplayList(
+    recommendations,
+    (item, idx) => `
+      <div class="replay-item">
+        <span class="replay-index">${idx + 1}</span>
+        <div class="replay-body">${escapeHtml(String(item || ''))}</div>
+      </div>
+    `,
+    'No replay recommendations yet.'
+  );
+
+  const attentionHtml = renderReplayList(
+    attention,
+    (item) => {
+      const sourcePath = escapeHtml(item?.source_path || '--');
+      const recent = Number(item?.recent_non_successes ?? 0);
+      const lastOutcome = escapeHtml(item?.last_outcome || 'unknown');
+      const lastIteration = Number(item?.last_iteration ?? 0);
+      const summary = escapeHtml(item?.last_summary || '');
+      const meta = [
+        recent ? `${recent} recent non-successes` : '',
+        lastOutcome ? `last ${lastOutcome}` : '',
+        lastIteration ? `iter ${lastIteration}` : '',
+      ].filter(Boolean).join(' • ');
+      return `
+        <div class="replay-item">
+          <div class="replay-body">
+            <strong>${sourcePath}</strong>
+            ${meta ? `<div class="subtitle">${meta}</div>` : ''}
+            ${summary ? `<div class="replay-note">${summary}</div>` : ''}
+          </div>
+        </div>
+      `;
+    },
+    'No repeated source-level loops detected.'
+  );
+
+  const verificationHtml = renderReplayList(
+    verification,
+    (item) => `
+      <div class="replay-item">
+        <div class="replay-body">
+          <strong>${escapeHtml(item?.issue || '--')}</strong>
+          <div class="subtitle">${escapeHtml(String(item?.count ?? 0))} occurrence(s)</div>
+        </div>
+      </div>
+    `,
+    'No recurring verification failures recorded.'
+  );
+
+  const promptBudgetHtml = renderReplayList(
+    omittedSections,
+    (item) => `
+      <div class="replay-item">
+        <div class="replay-body">
+          <strong>${escapeHtml(item?.section || '--')}</strong>
+          <div class="subtitle">
+            omitted ${escapeHtml(String(item?.count ?? 0))} time(s)
+            ${Number(item?.failure_related ?? 0) ? ` • ${escapeHtml(String(item.failure_related))} near failures` : ''}
+          </div>
+        </div>
+      </div>
+    `,
+    'Prompt budget omissions have not been significant in the replay window.'
+  );
+
+  const commandHtml = renderReplayList(
+    commandPatterns,
+    (item) => {
+      const shape = escapeHtml(item?.shape || '--');
+      const runs = Number(item?.runs ?? 0);
+      const failures = Number(item?.failures ?? 0);
+      const trust = escapeHtml(item?.trust_level || 'unknown');
+      const risk = escapeHtml(item?.effective_risk || item?.policy_risk || '--');
+      return `
+        <div class="replay-item">
+          <div class="replay-body">
+            <code class="replay-code">${shape}</code>
+            <div class="subtitle">
+              ${failures}/${runs} failures • trust ${trust} • risk ${risk}
+            </div>
+          </div>
+        </div>
+      `;
+    },
+    'No unstable command patterns were recorded.'
+  );
+
+  return `
+    <div class="replay-panel">
+      ${panelHeader}
+      ${metaPills.length ? `<div class="replay-pills">${metaPills.map((item) => `<span class="replay-pill">${escapeHtml(item)}</span>`).join('')}</div>` : ''}
+      <div class="replay-card replay-recommendations">
+        <div class="label">Recommendations</div>
+        ${recommendationsHtml}
+      </div>
+      <div class="replay-grid">
+        <div class="replay-card">
+          <div class="label">Outcomes</div>
+          ${outcomeHtml}
+        </div>
+        <div class="replay-card">
+          <div class="label">Sources Needing Attention</div>
+          ${attentionHtml}
+        </div>
+        <div class="replay-card">
+          <div class="label">Verification Failures</div>
+          ${verificationHtml}
+        </div>
+        <div class="replay-card">
+          <div class="label">Prompt Budget Pressure</div>
+          ${promptBudgetHtml}
+        </div>
+        <div class="replay-card">
+          <div class="label">Command Patterns</div>
+          ${commandHtml}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderJobDetail(job, options = {}) {
   if (!job) {
     jobDetailEl.innerHTML = '';
@@ -4385,6 +4556,7 @@ function renderJobDetail(job, options = {}) {
         <div class="req-summary-list" id="reqSummaryList"></div>
         <div class="req-status" id="reqSummaryStatus" hidden></div>
       </div>
+      ${renderSolverReplayPanel(job)}
       <div class="stage-list">${stageHtml}</div>
     </div>
     ${refundHtml}
