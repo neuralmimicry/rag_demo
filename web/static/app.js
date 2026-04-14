@@ -57,6 +57,18 @@ const notifyEmailEl = document.getElementById('notifyEmail');
 const saveNotifyEmailBtn = document.getElementById('saveNotifyEmail');
 const clearNotifyEmailBtn = document.getElementById('clearNotifyEmail');
 const notifyStatusEl = document.getElementById('notifyStatus');
+const profileSettingsFormEl = document.getElementById('profileSettingsForm');
+const defaultLlmProviderEl = document.getElementById('defaultLlmProvider');
+const defaultLlmModelEl = document.getElementById('defaultLlmModel');
+const defaultReasoningEffortEl = document.getElementById('defaultReasoningEffort');
+const defaultAssistantProfileEl = document.getElementById('defaultAssistantProfile');
+const solverPolicyModeEl = document.getElementById('solverPolicyMode');
+const assistantUseMemoryEl = document.getElementById('assistantUseMemory');
+const showSolverReplayEl = document.getElementById('showSolverReplay');
+const saveProfileSettingsBtn = document.getElementById('saveProfileSettings');
+const revertProfileSettingsBtn = document.getElementById('revertProfileSettings');
+const profileSettingsStatusEl = document.getElementById('profileSettingsStatus');
+const llmDefaultsSummaryEl = document.getElementById('llmDefaultsSummary');
 const jobSecretListEl = document.getElementById('jobSecretList');
 const jobSecretNameEl = document.getElementById('jobSecretName');
 const jobSecretValueEl = document.getElementById('jobSecretValue');
@@ -801,13 +813,135 @@ async function deleteSecret(name) {
   }
 }
 
+function normalizeProfileSettings(settings) {
+  const llm = settings?.llm && typeof settings.llm === 'object' ? settings.llm : {};
+  const assistant = settings?.assistant && typeof settings.assistant === 'object' ? settings.assistant : {};
+  const solver = settings?.solver && typeof settings.solver === 'object' ? settings.solver : {};
+  const ui = settings?.ui && typeof settings.ui === 'object' ? settings.ui : {};
+  return {
+    llm: {
+      default_provider: typeof llm.default_provider === 'string' ? llm.default_provider : '',
+      default_model: typeof llm.default_model === 'string' ? llm.default_model : '',
+      default_reasoning_effort: typeof llm.default_reasoning_effort === 'string' ? llm.default_reasoning_effort : 'medium',
+    },
+    assistant: {
+      default_profile: typeof assistant.default_profile === 'string' ? assistant.default_profile : 'requirements',
+      use_memory: assistant.use_memory !== false,
+    },
+    solver: {
+      command_policy_mode: typeof solver.command_policy_mode === 'string' ? solver.command_policy_mode : 'standard',
+    },
+    ui: {
+      show_solver_replay: ui.show_solver_replay !== false,
+    },
+  };
+}
+
+function profileSettingsSupported(profile = currentProfile) {
+  return Boolean(profile?.settings && typeof profile.settings === 'object');
+}
+
+function showProfileSettingsStatus(message, isError = false) {
+  if (!profileSettingsStatusEl) return;
+  profileSettingsStatusEl.textContent = message;
+  profileSettingsStatusEl.hidden = false;
+  profileSettingsStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function clearProfileSettingsStatus() {
+  if (!profileSettingsStatusEl) return;
+  profileSettingsStatusEl.hidden = true;
+  profileSettingsStatusEl.textContent = '';
+  profileSettingsStatusEl.classList.remove('error');
+}
+
+function setProfileSettingsEnabled(enabled) {
+  [
+    defaultLlmProviderEl,
+    defaultLlmModelEl,
+    defaultReasoningEffortEl,
+    defaultAssistantProfileEl,
+    solverPolicyModeEl,
+    assistantUseMemoryEl,
+    showSolverReplayEl,
+    saveProfileSettingsBtn,
+    revertProfileSettingsBtn,
+  ].forEach((el) => {
+    if (el) el.disabled = !enabled;
+  });
+}
+
+function updateLlmDefaultsSummary(settings, supported = true) {
+  if (!llmDefaultsSummaryEl) return;
+  if (!supported) {
+    llmDefaultsSummaryEl.textContent = 'Profile-backed defaults are unavailable from the current identity backend.';
+    return;
+  }
+  const parts = [
+    settings?.llm?.default_provider || 'config provider',
+    settings?.llm?.default_model || 'config model',
+    `reasoning ${settings?.llm?.default_reasoning_effort || 'medium'}`,
+    `assistant ${settings?.assistant?.default_profile || 'requirements'}`,
+    settings?.assistant?.use_memory === false ? 'assistant memory off' : 'assistant memory on',
+    `solver ${settings?.solver?.command_policy_mode || 'standard'}`,
+  ];
+  llmDefaultsSummaryEl.textContent = `Leaving workflow overrides blank uses: ${parts.join(' • ')}.`;
+}
+
+function applyProfileSettingsToForm(settings) {
+  const normalized = normalizeProfileSettings(settings);
+  if (defaultLlmProviderEl) defaultLlmProviderEl.value = normalized.llm.default_provider || '';
+  if (defaultLlmModelEl) defaultLlmModelEl.value = normalized.llm.default_model || '';
+  if (defaultReasoningEffortEl) defaultReasoningEffortEl.value = normalized.llm.default_reasoning_effort || 'medium';
+  if (defaultAssistantProfileEl) defaultAssistantProfileEl.value = normalized.assistant.default_profile || 'requirements';
+  if (solverPolicyModeEl) solverPolicyModeEl.value = normalized.solver.command_policy_mode || 'standard';
+  if (assistantUseMemoryEl) assistantUseMemoryEl.checked = normalized.assistant.use_memory !== false;
+  if (showSolverReplayEl) showSolverReplayEl.checked = normalized.ui.show_solver_replay !== false;
+  updateLlmDefaultsSummary(normalized, true);
+}
+
+function applyProfileToUi(profile) {
+  currentProfile = profile;
+  if (notifyEmailEl) notifyEmailEl.value = profile?.email || '';
+  const supported = profileSettingsSupported(profile);
+  setProfileSettingsEnabled(supported);
+  if (supported) {
+    clearProfileSettingsStatus();
+    applyProfileSettingsToForm(profile?.settings || {});
+  } else {
+    applyProfileSettingsToForm({});
+    updateLlmDefaultsSummary({}, false);
+    if (profileSettingsFormEl) {
+      showProfileSettingsStatus('This profile backend does not currently expose settings defaults.');
+    }
+  }
+}
+
+async function saveProfilePatch(patch) {
+  const res = await apiFetch('/api/profile', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch || {}),
+  });
+  let data = {};
+  try {
+    data = await res.json();
+  } catch (err) {
+    data = {};
+  }
+  if (!res.ok) {
+    return { ok: false, data };
+  }
+  applyProfileToUi(data);
+  return { ok: true, data };
+}
+
 async function fetchProfile() {
   try {
     const res = await apiFetch('/api/profile');
     if (!res.ok) return;
     const data = await res.json();
-    currentProfile = data;
-    if (notifyEmailEl) notifyEmailEl.value = data.email || '';
+    applyProfileToUi(data);
     await fetchAccessTree();
   } catch (err) {
     console.error('Failed to fetch profile', err);
@@ -818,22 +952,67 @@ async function updateNotifyEmail(email) {
   if (!notifyEmailEl) return;
   clearNotifyStatus();
   try {
-    const res = await apiFetch('/api/profile', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      showNotifyStatus(data.details || 'Failed to save notification email.', true);
+    const result = await saveProfilePatch({ email });
+    if (!result.ok) {
+      showNotifyStatus(result.data?.details || 'Failed to save notification email.', true);
       return;
     }
-    notifyEmailEl.value = data.email || '';
     showNotifyStatus('Notification email saved.');
     setTimeout(clearNotifyStatus, 3000);
   } catch (err) {
     showNotifyStatus('Failed to save notification email.', true);
   }
+}
+
+function readProfileSettingsForm() {
+  return {
+    llm: {
+      default_provider: defaultLlmProviderEl?.value || null,
+      default_model: defaultLlmModelEl?.value.trim() || null,
+      default_reasoning_effort: defaultReasoningEffortEl?.value || 'medium',
+    },
+    assistant: {
+      default_profile: defaultAssistantProfileEl?.value || 'requirements',
+      use_memory: assistantUseMemoryEl ? assistantUseMemoryEl.checked : true,
+    },
+    solver: {
+      command_policy_mode: solverPolicyModeEl?.value || 'standard',
+    },
+    ui: {
+      show_solver_replay: showSolverReplayEl ? showSolverReplayEl.checked : true,
+    },
+  };
+}
+
+async function updateProfileSettings() {
+  if (!profileSettingsSupported()) {
+    showProfileSettingsStatus('This profile backend does not currently expose settings defaults.', true);
+    return;
+  }
+  clearProfileSettingsStatus();
+  try {
+    const result = await saveProfilePatch({ settings: readProfileSettingsForm() });
+    if (!result.ok) {
+      const details = Array.isArray(result.data?.details)
+        ? result.data.details.join(' ')
+        : (result.data?.details || result.data?.error || 'Failed to save profile defaults.');
+      showProfileSettingsStatus(details, true);
+      return;
+    }
+    showProfileSettingsStatus('Profile defaults saved.');
+    setTimeout(clearProfileSettingsStatus, 3000);
+    if (selectedJobId) {
+      refreshSelectedJob().catch((err) => console.error('Failed to refresh selected job after settings update', err));
+    }
+  } catch (err) {
+    showProfileSettingsStatus('Failed to save profile defaults.', true);
+  }
+}
+
+function revertProfileSettingsForm() {
+  clearProfileSettingsStatus();
+  if (!profileSettingsSupported()) return;
+  applyProfileSettingsToForm(currentProfile?.settings || {});
 }
 
 function initFilters() {
@@ -3226,7 +3405,7 @@ function scheduleRequirementProgressUpdates(job) {
 function formatTokens(metrics) {
   if (!metrics || !metrics.token_usage) return '--';
   const total = metrics.token_usage.total;
-  return total ? total.toString() : '--';
+  return total === null || total === undefined ? '--' : total.toString();
 }
 
 function formatAmount(value) {
@@ -3234,6 +3413,15 @@ function formatAmount(value) {
   const num = Number(value);
   if (Number.isNaN(num)) return '--';
   return Math.round(num).toString();
+}
+
+function formatTokenCost(cost) {
+  if (!cost || typeof cost !== 'object') return '--';
+  const amount = Number(cost.amount);
+  if (Number.isNaN(amount)) return '--';
+  const currency = cost.currency || 'USD';
+  const digits = amount >= 1 ? 2 : 4;
+  return `${currency} ${amount.toFixed(digits)}`;
 }
 
 function getLatestRefund(job) {
@@ -4113,6 +4301,81 @@ function renderReplayList(items, renderItem, emptyMessage) {
   return `<div class="replay-list">${items.map((item, idx) => renderItem(item, idx)).join('')}</div>`;
 }
 
+function renderTokenUsagePanel(job) {
+  const usage = job?.metrics?.token_usage;
+  if (!usage || typeof usage !== 'object') return '';
+
+  const summaryPills = [
+    `Total ${formatAmount(usage.total)}`,
+    `Prompt ${formatAmount(usage.prompt)}`,
+    `Completion ${formatAmount(usage.completion)}`,
+    usage.cached !== null && usage.cached !== undefined ? `Cached ${formatAmount(usage.cached)}` : '',
+    usage.events ? `${formatAmount(usage.events)} event(s)` : '',
+    usage.cost ? `Cost ${formatTokenCost(usage.cost)}` : '',
+    usage.last_event_at ? `Last ${formatAbsoluteTime(usage.last_event_at)}` : '',
+  ].filter(Boolean);
+
+  const categoryEntries = Object.entries(usage.by_category || {})
+    .sort((a, b) => (Number(b?.[1]?.total) || 0) - (Number(a?.[1]?.total) || 0));
+  const modelEntries = Object.entries(usage.by_model || {})
+    .sort((a, b) => (Number(b?.[1]?.total) || 0) - (Number(a?.[1]?.total) || 0));
+
+  const renderUsageList = (entries, emptyMessage, labelForEntry) => renderReplayList(
+    entries,
+    ([key, bucket]) => {
+      const title = labelForEntry(key, bucket || {});
+      const detailBits = [
+        `total ${formatAmount(bucket?.total)}`,
+        `prompt ${formatAmount(bucket?.prompt)}`,
+        `completion ${formatAmount(bucket?.completion)}`,
+        bucket?.cached !== null && bucket?.cached !== undefined ? `cached ${formatAmount(bucket.cached)}` : '',
+        bucket?.events ? `${formatAmount(bucket.events)} event(s)` : '',
+        bucket?.cost ? formatTokenCost(bucket.cost) : '',
+      ].filter(Boolean);
+      return `
+        <div class="replay-item">
+          <div class="replay-body">
+            <strong>${escapeHtml(title)}</strong>
+            <div class="subtitle">${escapeHtml(detailBits.join(' • '))}</div>
+          </div>
+        </div>
+      `;
+    },
+    emptyMessage
+  );
+
+  const categoryHtml = renderUsageList(
+    categoryEntries,
+    'No structured usage events were captured for this job yet.',
+    (key) => key
+  );
+  const modelHtml = renderUsageList(
+    modelEntries,
+    'No model-level usage breakdown is available yet.',
+    (_key, bucket) => bucket?.model ? `${bucket.provider || 'provider'} / ${bucket.model}` : _key
+  );
+
+  return `
+    <div class="replay-panel token-usage-panel">
+      <div class="card-header">
+        <h3>Token Usage</h3>
+        <p>Structured provider usage events captured during execution, including category and model breakdowns.</p>
+      </div>
+      ${summaryPills.length ? `<div class="replay-pills">${summaryPills.map((item) => `<span class="replay-pill">${escapeHtml(item)}</span>`).join('')}</div>` : '<p class="subtitle">No token usage recorded yet.</p>'}
+      <div class="replay-grid">
+        <div class="replay-card">
+          <div class="label">By Category</div>
+          ${categoryHtml}
+        </div>
+        <div class="replay-card">
+          <div class="label">By Model</div>
+          ${modelHtml}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderSolverReplayPanel(job) {
   const replay = job?.solver_replay_analysis;
   const completion = job?.completion_summary;
@@ -4481,6 +4744,7 @@ function renderJobDetail(job, options = {}) {
       .filter(Boolean)
       .join('/') || '--'
     : '--';
+  const showReplay = currentProfile?.settings?.ui?.show_solver_replay !== false;
   const detailHtml = `
     <div class="detail-grid">
       <div class="detail-card"><span class="label">Status</span><div class="value">${job.status}</div></div>
@@ -4556,7 +4820,8 @@ function renderJobDetail(job, options = {}) {
         <div class="req-summary-list" id="reqSummaryList"></div>
         <div class="req-status" id="reqSummaryStatus" hidden></div>
       </div>
-      ${renderSolverReplayPanel(job)}
+      ${renderTokenUsagePanel(job)}
+      ${showReplay ? renderSolverReplayPanel(job) : ''}
       <div class="stage-list">${stageHtml}</div>
     </div>
     ${refundHtml}
@@ -5878,6 +6143,16 @@ if (saveNotifyEmailBtn) {
 if (clearNotifyEmailBtn) {
   clearNotifyEmailBtn.addEventListener('click', () => updateNotifyEmail(''));
 }
+if (saveProfileSettingsBtn) {
+  saveProfileSettingsBtn.addEventListener('click', () => {
+    updateProfileSettings();
+  });
+}
+if (revertProfileSettingsBtn) {
+  revertProfileSettingsBtn.addEventListener('click', () => {
+    revertProfileSettingsForm();
+  });
+}
 if (reqExtractBtn) {
   reqExtractBtn.addEventListener('click', () => {
     clearReqGridStatus();
@@ -6114,6 +6389,10 @@ if (cliBubblesEl) {
 renderJobSecrets();
 renderAssistantMessages();
 renderFormSuggestions();
+if (profileSettingsFormEl) {
+  setProfileSettingsEnabled(false);
+  updateLlmDefaultsSummary({}, false);
+}
 fetchSecrets();
 fetchProfile();
 fetchProjects();

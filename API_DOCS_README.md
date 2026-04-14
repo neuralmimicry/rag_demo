@@ -33,7 +33,7 @@ Primary backend auth is session-cookie based:
 - `POST /api/login` starts a session and also returns a short-lived SSO token.
 - `POST /api/logout` clears the current session.
 - `GET /api/session` reports whether the caller is authenticated.
-- `GET/POST /api/profile` reads or updates the current user's email.
+- `GET/POST /api/profile` reads or updates the current user's email plus profile-backed settings defaults for LLM, assistant, solver, and replay UI behaviour.
 
 Optional auth paths:
 - `POST /api/sso/issue` issues a one-time SSO token for the current session.

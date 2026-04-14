@@ -45,7 +45,7 @@ from solver_context import (
     estimate_prompt_budget_chars,
 )
 from solver_memory import SolverEpisode, SolverEpisodeStore
-from solver_replay import build_solver_replay_analysis
+from solver_replay import build_solver_feedback_prompt, build_solver_replay_analysis
 from web_research import (
     WebResearchCache,
     GoogleSearchEngine,
@@ -8904,6 +8904,15 @@ def run_project_solver(
                 limit=_env_int("SOLVER_EPISODIC_MEMORY_LIMIT", 3),
                 max_chars=_env_int("SOLVER_EPISODIC_MEMORY_MAX_CHARS", 2400),
             )
+            solver_feedback_section = build_solver_feedback_prompt(
+                solver_episode_store,
+                command_trust_store=command_trust_store,
+                query_text=_solver_memory_query_text(source, source_actions_log),
+                source_path=source.path,
+                requirement_ids=sorted(source_required_ids),
+                limit=_env_int("SOLVER_FEEDBACK_MEMORY_LIMIT", 4),
+                max_chars=_env_int("SOLVER_FEEDBACK_MAX_CHARS", 1800),
+            )
             schema_section = (
                 "Respond with JSON only. Schema:\n"
                 "{\n"
@@ -9052,6 +9061,13 @@ def run_project_solver(
                     content=episodic_memory_section,
                     priority=84,
                     max_chars=2400,
+                    trim_mode="tail",
+                ),
+                PromptSection(
+                    name="solver_feedback",
+                    content=solver_feedback_section,
+                    priority=89,
+                    max_chars=1800,
                     trim_mode="tail",
                 ),
                 PromptSection(

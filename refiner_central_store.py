@@ -101,6 +101,27 @@ SCHEMA_STATEMENTS: Sequence[str] = (
     CREATE INDEX IF NOT EXISTS nm_token_ledger_lookup_idx
         ON nm_token_ledger_entries (scope, account_id, ts DESC, id DESC)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS nm_mcp_servers (
+        owner TEXT NOT NULL REFERENCES nm_users(username) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        auth_type TEXT NOT NULL DEFAULT 'bearer',
+        auth_secret_ref TEXT,
+        headers_secret_ref TEXT,
+        headers JSONB NOT NULL DEFAULT '{}'::jsonb,
+        timeout INTEGER NOT NULL DEFAULT 20,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        runtime JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (owner, name)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_mcp_servers_owner_updated_idx
+        ON nm_mcp_servers (owner, updated_at DESC)
+    """,
 )
 
 
@@ -407,6 +428,36 @@ class PostgresUserStore:
             ).fetchone()
         value = (row or {}).get("role")
         return str(value).strip() if value else None
+
+    def get_metadata(self, username: str) -> Dict[str, Any]:
+        username = str(username or "").strip()
+        if not username:
+            return {}
+        with self.store.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT metadata FROM nm_users WHERE username = %s",
+                (username,),
+            ).fetchone()
+        metadata = (row or {}).get("metadata")
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def set_metadata(self, username: str, metadata: Optional[Dict[str, Any]]) -> bool:
+        username = str(username or "").strip()
+        if not username:
+            return False
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    UPDATE nm_users
+                    SET metadata = %s,
+                        updated_at = NOW()
+                    WHERE username = %s
+                    RETURNING username
+                    """,
+                    (_jsonb(dict(metadata or {})), username),
+                ).fetchone()
+        return bool(row)
 
 
 class PostgresAccessTokenStore:

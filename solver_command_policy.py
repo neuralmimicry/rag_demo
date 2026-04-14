@@ -56,6 +56,7 @@ _BLOCKED_EXECUTABLES = {
 }
 _READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "branch", "rev-parse"}
 _PACKAGE_MANAGERS = {"pip", "pip3", "npm", "pnpm", "yarn", "cargo", "go", "uv"}
+_STRICT_ALLOWED_CATEGORIES = {"verification", "vcs_readonly"}
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,13 @@ def _risk_for_category(category: str) -> str:
     if category == "vcs_mutation":
         return "high"
     return "medium"
+
+
+def _policy_mode() -> str:
+    cleaned = str(os.getenv("REFINER_SOLVER_COMMAND_POLICY_MODE") or "standard").strip().lower()
+    if cleaned in {"standard", "strict"}:
+        return cleaned
+    return "standard"
 
 
 def evaluate_command_policy(command: str) -> CommandPolicyDecision:
@@ -225,6 +233,16 @@ def evaluate_command_policy(command: str) -> CommandPolicyDecision:
         return CommandPolicyDecision(
             allowed=False,
             reason="mutating git commands are blocked in solver execution",
+            category=category,
+            risk="blocked",
+            command=cleaned,
+        )
+
+    policy_mode = _policy_mode()
+    if policy_mode == "strict" and category not in _STRICT_ALLOWED_CATEGORIES:
+        return CommandPolicyDecision(
+            allowed=False,
+            reason=f"{category} commands are disabled when REFINER_SOLVER_COMMAND_POLICY_MODE=strict",
             category=category,
             risk="blocked",
             command=cleaned,

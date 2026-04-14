@@ -675,6 +675,75 @@
             </form>
           </div>
 
+          <div class="credential-panel settings-panel">
+            <div class="card-header">
+              <h3 class="has-tip" data-tooltip="Profile-backed defaults applied by assistant flows and job submission when workflow fields are left blank.">Execution Defaults</h3>
+              <p>Control your default LLM settings, assistant behaviour, and solver safety mode without editing raw API payloads.</p>
+            </div>
+            <p id="llmDefaultsSummary" class="subtitle settings-summary">Loading profile-backed defaults...</p>
+            <form id="profileSettingsForm" class="secret-form settings-form" autocomplete="off">
+              <div class="field grid-2">
+                <div>
+                  <label for="defaultLlmProvider">Default LLM Provider</label>
+                  <select id="defaultLlmProvider">
+                    <option value="">Use config default</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="gemini">Gemini</option>
+                    <option value="ollama">Ollama</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="defaultLlmModel">Default LLM Model</label>
+                  <input id="defaultLlmModel" type="text" placeholder="gpt-5.2-codex">
+                </div>
+              </div>
+              <div class="field grid-2">
+                <div>
+                  <label for="defaultReasoningEffort">Default Reasoning Effort</label>
+                  <select id="defaultReasoningEffort">
+                    <option value="none">None</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="xhigh">XHigh</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="defaultAssistantProfile">Assistant Default Profile</label>
+                  <select id="defaultAssistantProfile">
+                    <option value="requirements">Requirements</option>
+                    <option value="marketing">Marketing</option>
+                  </select>
+                </div>
+              </div>
+              <div class="field grid-2">
+                <div>
+                  <label for="solverPolicyMode">Solver Command Policy</label>
+                  <select id="solverPolicyMode">
+                    <option value="standard">Standard</option>
+                    <option value="strict">Strict</option>
+                  </select>
+                  <p class="subtitle settings-note">Strict mode blocks all non-verification and non-read-only VCS solver commands.</p>
+                </div>
+                <div class="settings-checks">
+                  <label class="check">
+                    <input id="assistantUseMemory" type="checkbox" checked>
+                    Use assistant memory by default
+                  </label>
+                  <label class="check">
+                    <input id="showSolverReplay" type="checkbox" checked>
+                    Show solver replay panels in job detail
+                  </label>
+                </div>
+              </div>
+              <div id="profileSettingsStatus" class="status-banner" hidden></div>
+              <div class="actions">
+                <button type="button" id="saveProfileSettings" class="primary">Save Defaults</button>
+                <button type="button" id="revertProfileSettings" class="ghost">Revert</button>
+              </div>
+            </form>
+          </div>
+
           <div class="cli-builder">
             <div class="card-header">
               <h3 class="has-tip" data-tooltip="Click a bubble to open a pop-up with choices. Your selections build a CLI args string you can apply below.">CLI Args Builder</h3>
