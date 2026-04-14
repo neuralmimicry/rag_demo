@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -36,6 +37,13 @@ from file_converter import FileConverter
 from language_detector import detect_languages
 from llm_providers import get_provider, LLMQuotaError, LLMError, request_category
 from repo_context import RepoIndex
+from solver_command_policy import evaluate_command_policy
+from solver_context import (
+    PromptSection,
+    assemble_prompt_sections,
+    estimate_prompt_budget_chars,
+)
+from solver_memory import SolverEpisode, SolverEpisodeStore
 from web_research import (
     WebResearchCache,
     GoogleSearchEngine,
@@ -55,6 +63,7 @@ IGNORED_DIRS = {
     ".hg",
     ".svn",
     ".venv",
+    ".refiner",
     "venv",
     ".research_cache",
     "__pypackages__",
@@ -78,6 +87,7 @@ IGNORED_DIRS = {
 DEFAULT_SOLVER_OUTPUT_DIR = "project_solver_output"
 
 GITIGNORE_ALWAYS = (
+    ".refiner/",
     ".research_cache/",
     ".venv/",
     "project_solver_output/",
@@ -1936,6 +1946,79 @@ def _trim_actions_log(log: List[str], limit: int = 20) -> str:
     return "\n".join(log[-limit:])
 
 
+def _utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _solver_state_root(project_root: str) -> str:
+    return os.path.join(project_root, ".refiner")
+
+
+def _solver_episode_store(project_root: str) -> SolverEpisodeStore:
+    return SolverEpisodeStore(
+        os.path.join(_solver_state_root(project_root), "solver_episodes.jsonl"),
+        max_entries=_env_int("SOLVER_EPISODE_MAX_ENTRIES", 300),
+        compact_every=_env_int("SOLVER_EPISODE_COMPACT_EVERY", 25),
+    )
+
+
+def _solver_memory_query_text(source: "RequirementSource", source_actions_log: List[str]) -> str:
+    parts = [
+        source.path,
+        source.requirements_text or "",
+        source.context_excerpt or "",
+        _trim_actions_log(source_actions_log, limit=12),
+    ]
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _summarize_iteration_outcome(
+    payload: Dict[str, object],
+    *,
+    iteration_steps_applied: int,
+    modified_files: List[str],
+    executed_commands: List[str],
+    verification_failures: List[str],
+    replan_due_to_hallucination: bool,
+    replan_due_to_verification: bool,
+    replan_due_to_replace: bool,
+    defer_source: bool,
+) -> str:
+    parts: List[str] = []
+    summary = _safe_str(payload.get("summary"))
+    if summary:
+        parts.append(summary)
+    if iteration_steps_applied:
+        parts.append(f"Applied {iteration_steps_applied} step(s).")
+    if modified_files:
+        parts.append(
+            "Modified files: "
+            + ", ".join(modified_files[:6])
+            + (" ...(truncated)" if len(modified_files) > 6 else "")
+        )
+    if executed_commands:
+        parts.append(
+            "Executed commands: "
+            + "; ".join(executed_commands[:3])
+            + (" ...(truncated)" if len(executed_commands) > 3 else "")
+        )
+    if verification_failures:
+        parts.append(
+            "Verification failures: "
+            + "; ".join(verification_failures[:2])
+            + (" ...(truncated)" if len(verification_failures) > 2 else "")
+        )
+    if replan_due_to_hallucination:
+        parts.append("Replanned after hallucinated dependency or requirement detection.")
+    if replan_due_to_verification:
+        parts.append("Replanned after verification failure.")
+    if replan_due_to_replace:
+        parts.append("Replanned after replace-in-file mismatch.")
+    if defer_source:
+        parts.append("Deferred source after unresolved execution failures.")
+    return " ".join(part.strip() for part in parts if part).strip()
+
+
 def _scan_requirements_root(
     root: str,
     *,
@@ -2951,16 +3034,43 @@ def _execute_shell_command(
     failure_log: Optional[List[Dict[str, object]]],
     dataset_summary: Optional[Dict[str, object]],
     eval_info: Optional[Dict[str, object]],
+    executed_commands: Optional[List[str]] = None,
 ) -> bool:
+    policy = evaluate_command_policy(command)
+    if not policy.allowed:
+        message = f"Blocked command by solver policy: {command} ({policy.reason})"
+        actions_log.append(message)
+        logger.info(message)
+        if failure_log is not None:
+            failure_log.append(
+                {
+                    "command": command,
+                    "workdir": workdir,
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": policy.reason,
+                    "verification_issue": "blocked by solver policy",
+                }
+            )
+        return False
+
+    actions_log.append(
+        f"Command policy approved: {policy.category} ({policy.risk}) - {policy.reason}"
+    )
+    run_env = os.environ.copy()
+    if policy.env:
+        run_env.update(policy.env)
+
     try:
         logger.info(f"Executing command: {command} (workdir={workdir})")
         result = subprocess.run(
-            command,
+            policy.argv,
             cwd=workdir,
-            shell=True,
+            shell=False,
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=run_env,
         )
     except Exception as exc:
         actions_log.append(f"Command failed: {command} ({exc})")
@@ -2995,8 +3105,12 @@ def _execute_shell_command(
             )
     if result.returncode == 0 and not verification_issue:
         actions_log.append(f"Command succeeded: {command}")
+        if executed_commands is not None:
+            executed_commands.append(command)
         return True
     actions_log.append(f"Command failed (exit {result.returncode}): {command}")
+    if executed_commands is not None:
+        executed_commands.append(command)
     if failure_log is not None:
         failure_log.append(
             {
@@ -7318,6 +7432,7 @@ def _apply_step(
     applied_steps: Optional[List[Dict[str, object]]] = None,
     dataset_summary: Optional[Dict[str, object]] = None,
     eval_info: Optional[Dict[str, object]] = None,
+    executed_commands: Optional[List[str]] = None,
 ) -> None:
     step_requirement_ids = _extract_requirement_refs_from_step(step)
     step_type = _normalize_step_type(step.get("type"))
@@ -7664,16 +7779,39 @@ def _apply_step(
                     actions_log.append(
                         f"Starting dev server for localhost probe: {server_command} (port {port})"
                     )
+                    server_policy = evaluate_command_policy(server_command)
+                    if not server_policy.allowed:
+                        actions_log.append(
+                            f"Blocked dev server command by solver policy: {server_command} ({server_policy.reason})"
+                        )
+                        if failure_log is not None:
+                            failure_log.append(
+                                {
+                                    "command": server_command,
+                                    "workdir": abs_workdir,
+                                    "exit_code": None,
+                                    "stdout": "",
+                                    "stderr": server_policy.reason,
+                                    "verification_issue": "blocked by solver policy",
+                                }
+                            )
+                        return
+                    server_env = os.environ.copy()
+                    if server_policy.env:
+                        server_env.update(server_policy.env)
                     try:
                         server_proc = subprocess.Popen(
-                            server_command,
+                            server_policy.argv,
                             cwd=abs_workdir,
-                            shell=True,
+                            shell=False,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             text=True,
                             bufsize=1,
+                            env=server_env,
                         )
+                        if executed_commands is not None:
+                            executed_commands.append(server_command)
                     except Exception as exc:
                         actions_log.append(f"Failed to start dev server: {exc}")
                         if failure_log is not None:
@@ -7719,6 +7857,7 @@ def _apply_step(
                     failure_log=failure_log,
                     dataset_summary=dataset_summary,
                     eval_info=eval_info,
+                    executed_commands=executed_commands,
                 )
                 if server_proc:
                     server_proc.terminate()
@@ -7740,6 +7879,7 @@ def _apply_step(
                     failure_log=failure_log,
                     dataset_summary=dataset_summary,
                     eval_info=eval_info,
+                    executed_commands=executed_commands,
                 )
                 actions_log.append(
                     "Skipped localhost probe because no dev/start/preview script was found."
@@ -7753,6 +7893,7 @@ def _apply_step(
             failure_log=failure_log,
             dataset_summary=dataset_summary,
             eval_info=eval_info,
+            executed_commands=executed_commands,
         )
         return
 
@@ -7896,6 +8037,14 @@ def run_project_solver(
     planner_params = _role_params("planner")
     reviewer_params = _role_params("reviewer")
     researcher_params = _role_params("researcher")
+    prompt_budget_chars = estimate_prompt_budget_chars(
+        planner_provider,
+        planner_params.get("max_tokens"),
+    )
+    prompt_budget_override = _env_int("SOLVER_PROMPT_MAX_CHARS", prompt_budget_chars)
+    if prompt_budget_override > 0:
+        prompt_budget_chars = max(12_000, min(prompt_budget_chars, prompt_budget_override))
+    actions_log.append(f"Solver prompt budget set to {prompt_budget_chars} chars.")
     local_planner_provider = None
     if _env_bool("SOLVER_TRY_OLLAMA_FIRST", True) and llm_provider != "ollama":
         try:
@@ -7952,7 +8101,8 @@ def run_project_solver(
         codingagent_fallback=codingagent_fallback_norm,
     )
     solver_workspace: Optional[str] = None
-    extra_ignored: List[str] = []
+    extra_ignored: List[str] = [".refiner"]
+    solver_episode_store = _solver_episode_store(project_root)
     output_dir_explicit = False
     output_dir_implied = False
     solver_workspace_within_project = False
@@ -8656,33 +8806,14 @@ def run_project_solver(
                 include_skills=True,
             )
             skills_section = f"Skill directives:\n{skills_directives}\n\n" if skills_directives else ""
-            user_prompt = (
-                "Project tree (partial):\n"
-                f"{tree_summary}\n\n"
-                f"{requirements_register_section}"
-                f"{eval_section}"
-                f"{helper_section}"
-                f"{repo_section}"
-                f"{sample_section}"
-                f"{test_section}"
-                f"{explicit_section}"
-                f"{replace_section}"
-                f"{requirements_page_note}"
-                f"{requirements_label}:\n{paged_requirements}\n\n"
-                f"{skills_section}"
-                "Source context excerpt:\n"
-                f"{source_context}\n\n"
-                f"{research_section}"
-                f"{audit_section}"
-                f"{verification_section}"
-                f"{other_sources_note}\n\n"
-                f"{workspace_note}\n"
-                f"{workspace_context_note}\n\n"
-                f"{hallucination_note}"
-                f"Iteration {iteration} of {max_iterations} for this source.\n"
-                "Previous actions log (most recent):\n"
-                f"{_trim_actions_log(source_actions_log) if source_actions_log else 'None yet.'}\n\n"
-                f"{progress_memory}"
+            episodic_memory_section = solver_episode_store.format_for_prompt(
+                _solver_memory_query_text(source, source_actions_log),
+                source_path=source.path,
+                requirement_ids=sorted(source_required_ids),
+                limit=_env_int("SOLVER_EPISODIC_MEMORY_LIMIT", 3),
+                max_chars=_env_int("SOLVER_EPISODIC_MEMORY_MAX_CHARS", 2400),
+            )
+            schema_section = (
                 "Respond with JSON only. Schema:\n"
                 "{\n"
                 '  "summary": "short overview of intent",\n'
@@ -8712,44 +8843,219 @@ def run_project_solver(
                 '      "timeout": 600\n'
                 "    }\n"
                 "  ]\n"
-                "}\n"
-        "Notes:\n"
-        "- Treat ONLY the current requirement source. Do not merge requirements from other files unless explicitly requested.\n"
-        "- Reference requirement IDs (REQ-###) from the formal register in every plan step and in any code comments you add.\n"
-        "- Ensure at least one global requirement ID is referenced in the plan steps.\n"
-        "- Prefer write_file for new files, replace_in_file for edits, and run_command only when necessary.\n"
-        "- Keep changes within the project root, or within the solver workspace if provided outside the project root. Do not delete files.\n"
-        "- Ignore virtual environments and third-party packages; do not propose edits inside site-packages or venv folders.\n"
-        "- If you write or modify code, ensure it is robust, secure, resilient, modular, scalable, and follows best practices. "
-        "Include brief inline documentation for non-obvious logic.\n"
-        "- If audit findings are provided, include at least one plan step prefixed with 'AUDIT:' that explicitly addresses them.\n"
-        "- Use exact filenames from requirements and the project tree; do not invent similarly named variants (pluralized/renumbered). If a target file exists, edit it rather than creating a new one.\n"
-        "- Avoid placeholder implementations (constant defaults, empty returns). Implement a deterministic baseline and layer optional improvements as needed.\n"
-        "- When accuracy/quality targets are mentioned, implement a baseline and an optional advanced mode (feature flag/CLI) plus caching or staged heuristics before LLM calls.\n"
-        "- Normalise outputs to canonical labels/units expected by eval data/tests; add parsing and validation.\n"
-        "- If eval_data schema is shown, treat records as dicts with those keys; do not assume dataclass/attribute access (e.g., use data['filepath'] not data.filepath).\n"
-        "- When eval_data includes list-valued keys (e.g., latlong), treat them as positional lists (index 0 = lat, index 1 = lon).\n"
-        "- If PDFDocument (or similar helper) exposes a load() constructor, use it instead of calling the BaseModel constructor with positional args.\n"
-        "- If the task text hints at starter code (e.g., 'colleague has written some code to get started'), build on that file rather than replacing it.\n"
-        "- Prefer shared utilities across related files to reduce duplication and keep behaviour consistent.\n"
-        "- For solution files, include a module-level docstring that summarises the formal requirements and the workflow implemented.\n"
-        "- Ensure generated Python files are syntactically valid and do not contain duplicate/conflicting implementations.\n"
-        "- When code is created or changed, include pytest (or equivalent) coverage and a run_command step to execute tests "
-        "or run the code to validate outputs. If results are not as expected, add follow-up steps to address gaps.\n"
-        "- If your code relies on environment variables, add explicit checks (prompt or clear error) for missing values and "
-        "include tests/verification for the missing-value path.\n"
-        "- If verification output shows a FutureWarning, treat it as a failure and apply the suggested fix before retrying.\n"
-        "- If you need to run commands in the solver workspace, set workdir to the absolute workspace path explicitly.\n"
-        "- If you create or modify Python code or install Python dependencies, include steps to create a venv in the solver workspace (or specified output location) and install dependencies there unless requirements say otherwise (e.g., python -m venv <workspace>/venv).\n"
-        "- When installing Python packages, use <venv>/bin/python -m pip or <venv>/bin/pip to ensure the venv is used; do not rely on activation across steps.\n"
-        "- Do not chain shell commands with quoted '&&'. Prefer separate run_command steps; if you must chain, use plain && without quotes.\n"
-        "- When creating a venv, use system python (python3 -m venv <path>) rather than a python executable inside the target venv.\n"
-        "- Do not invent package names; if a dependency is unclear, call it out and prefer standard-library alternatives.\n"
-        "- Do not create or overwrite venv activation scripts directly; use python -m venv to create them.\n"
-        "- If eval_data.json or load_eval_data() is present, use it for evaluation and do not hardcode single-file runs.\n"
-        "- When using replace_in_file, copy the exact text from provided excerpts or the file content; avoid guessing snippets.\n"
-        "- If all requirements for this source are satisfied, set done=true and plan=[]\n"
-    )
+                "}"
+            )
+            notes_section = (
+                "Notes:\n"
+                "- Treat ONLY the current requirement source. Do not merge requirements from other files unless explicitly requested.\n"
+                "- Reference requirement IDs (REQ-###) from the formal register in every plan step and in any code comments you add.\n"
+                "- Ensure at least one global requirement ID is referenced in the plan steps.\n"
+                "- Prefer write_file for new files, replace_in_file for edits, and run_command only when necessary.\n"
+                "- Keep changes within the project root, or within the solver workspace if provided outside the project root. Do not delete files.\n"
+                "- Ignore virtual environments and third-party packages; do not propose edits inside site-packages or venv folders.\n"
+                "- If you write or modify code, ensure it is robust, secure, resilient, modular, scalable, and follows best practices. Include brief inline documentation for non-obvious logic.\n"
+                "- If audit findings are provided, include at least one plan step prefixed with 'AUDIT:' that explicitly addresses them.\n"
+                "- Use exact filenames from requirements and the project tree; do not invent similarly named variants (pluralized/renumbered). If a target file exists, edit it rather than creating a new one.\n"
+                "- Avoid placeholder implementations (constant defaults, empty returns). Implement a deterministic baseline and layer optional improvements as needed.\n"
+                "- When accuracy or quality targets are mentioned, implement a baseline and an optional advanced mode (feature flag or CLI) plus caching or staged heuristics before LLM calls.\n"
+                "- Normalise outputs to canonical labels or units expected by eval data or tests; add parsing and validation.\n"
+                "- If eval_data schema is shown, treat records as dicts with those keys; do not assume dataclass or attribute access (e.g. use data['filepath'] not data.filepath).\n"
+                "- When eval_data includes list-valued keys (e.g. latlong), treat them as positional lists (index 0 = lat, index 1 = lon).\n"
+                "- If PDFDocument (or similar helper) exposes a load() constructor, use it instead of calling the BaseModel constructor with positional args.\n"
+                "- If the task text hints at starter code, build on that file rather than replacing it.\n"
+                "- Prefer shared utilities across related files to reduce duplication and keep behaviour consistent.\n"
+                "- For solution files, include a module-level docstring that summarises the formal requirements and the workflow implemented.\n"
+                "- Ensure generated Python files are syntactically valid and do not contain duplicate or conflicting implementations.\n"
+                "- When code is created or changed, include pytest (or equivalent) coverage and a run_command step to execute tests or run the code to validate outputs. If results are not as expected, add follow-up steps to address gaps.\n"
+                "- If your code relies on environment variables, add explicit checks (prompt or clear error) for missing values and include tests or verification for the missing-value path.\n"
+                "- If verification output shows a FutureWarning, treat it as a failure and apply the suggested fix before retrying.\n"
+                "- If you need to run commands in the solver workspace, set workdir to the absolute workspace path explicitly.\n"
+                "- If you create or modify Python code or install Python dependencies, include steps to create a venv in the solver workspace (or specified output location) and install dependencies there unless requirements say otherwise (e.g. python -m venv <workspace>/venv).\n"
+                "- When installing Python packages, use <venv>/bin/python -m pip or <venv>/bin/pip to ensure the venv is used; do not rely on activation across steps.\n"
+                "- Do not chain shell commands with quoted '&&'. Prefer separate run_command steps; if you must chain, use plain && without quotes.\n"
+                "- When creating a venv, use system python (python3 -m venv <path>) rather than a python executable inside the target venv.\n"
+                "- Do not invent package names; if a dependency is unclear, call it out and prefer standard-library alternatives.\n"
+                "- Do not create or overwrite venv activation scripts directly; use python -m venv to create them.\n"
+                "- If eval_data.json or load_eval_data() is present, use it for evaluation and do not hardcode single-file runs.\n"
+                "- When using replace_in_file, copy the exact text from provided excerpts or the file content; avoid guessing snippets.\n"
+                "- If all requirements for this source are satisfied, set done=true and plan=[]."
+            )
+            prompt_sections = [
+                PromptSection(
+                    name="tree",
+                    content=f"Project tree (partial):\n{tree_summary}",
+                    priority=55,
+                    max_chars=5000,
+                ),
+                PromptSection(
+                    name="requirements_register",
+                    content=requirements_register_section,
+                    priority=98,
+                    required=True,
+                    max_chars=14_000,
+                ),
+                PromptSection(
+                    name="eval_data",
+                    content=eval_section,
+                    priority=60,
+                    max_chars=2500,
+                ),
+                PromptSection(
+                    name="helper_modules",
+                    content=helper_section,
+                    priority=66,
+                    max_chars=2400,
+                ),
+                PromptSection(
+                    name="repo_context",
+                    content=repo_section,
+                    priority=72,
+                    max_chars=3200,
+                ),
+                PromptSection(
+                    name="sample_code",
+                    content=sample_section,
+                    priority=63,
+                    max_chars=2600,
+                ),
+                PromptSection(
+                    name="related_tests",
+                    content=test_section,
+                    priority=76,
+                    max_chars=3200,
+                ),
+                PromptSection(
+                    name="explicit_excerpts",
+                    content=explicit_section,
+                    priority=82,
+                    max_chars=3600,
+                ),
+                PromptSection(
+                    name="replace_failures",
+                    content=replace_section,
+                    priority=88,
+                    max_chars=2600,
+                ),
+                PromptSection(
+                    name="current_requirements",
+                    content=f"{requirements_page_note}{requirements_label}:\n{paged_requirements}",
+                    priority=100,
+                    required=True,
+                    max_chars=10_000,
+                ),
+                PromptSection(
+                    name="skill_directives",
+                    content=skills_section,
+                    priority=70,
+                    max_chars=2600,
+                ),
+                PromptSection(
+                    name="source_context",
+                    content=f"Source context excerpt:\n{source_context}",
+                    priority=96,
+                    required=True,
+                    max_chars=4200,
+                ),
+                PromptSection(
+                    name="episodic_memory",
+                    content=episodic_memory_section,
+                    priority=84,
+                    max_chars=2400,
+                    trim_mode="tail",
+                ),
+                PromptSection(
+                    name="research",
+                    content=research_section,
+                    priority=80,
+                    max_chars=3000,
+                ),
+                PromptSection(
+                    name="audit",
+                    content=audit_section,
+                    priority=90,
+                    max_chars=3200,
+                ),
+                PromptSection(
+                    name="verification",
+                    content=verification_section,
+                    priority=92,
+                    max_chars=3200,
+                ),
+                PromptSection(
+                    name="other_sources",
+                    content=other_sources_note,
+                    priority=35,
+                    max_chars=1200,
+                ),
+                PromptSection(
+                    name="workspace",
+                    content=f"{workspace_note}\n{workspace_context_note}".strip(),
+                    priority=58,
+                    max_chars=1400,
+                ),
+                PromptSection(
+                    name="hallucination",
+                    content=hallucination_note,
+                    priority=85,
+                    max_chars=1600,
+                ),
+                PromptSection(
+                    name="iteration",
+                    content=f"Iteration {iteration} of {max_iterations} for this source.",
+                    priority=94,
+                    required=True,
+                    max_chars=240,
+                ),
+                PromptSection(
+                    name="actions_log",
+                    content=(
+                        "Previous actions log (most recent):\n"
+                        + (_trim_actions_log(source_actions_log) if source_actions_log else "None yet.")
+                    ),
+                    priority=83,
+                    max_chars=2600,
+                    trim_mode="tail",
+                ),
+                PromptSection(
+                    name="progress_memory",
+                    content=progress_memory,
+                    priority=82,
+                    max_chars=1800,
+                    trim_mode="tail",
+                ),
+                PromptSection(
+                    name="schema",
+                    content=schema_section,
+                    priority=100,
+                    required=True,
+                    min_chars=1200,
+                    max_chars=3200,
+                ),
+                PromptSection(
+                    name="instructions",
+                    content=notes_section,
+                    priority=99,
+                    required=True,
+                    min_chars=3000,
+                    max_chars=11_000,
+                ),
+            ]
+            prompt_result = assemble_prompt_sections(prompt_sections, prompt_budget_chars)
+            user_prompt = prompt_result.text
+            omitted_sections = prompt_result.omitted_sections
+            if omitted_sections:
+                omitted_preview = ", ".join(omitted_sections[:6])
+                if len(omitted_sections) > 6:
+                    omitted_preview += ", ..."
+                _record_action(
+                    f"Prompt budget for {source.path}: {prompt_result.used_chars}/{prompt_result.budget_chars} chars; omitted {omitted_preview}.",
+                    source_actions_log,
+                )
+            else:
+                _record_action(
+                    f"Prompt budget for {source.path}: {prompt_result.used_chars}/{prompt_result.budget_chars} chars; all sections retained.",
+                    source_actions_log,
+                )
 
             payload = None
             codingagent_used = None
@@ -9156,6 +9462,18 @@ def run_project_solver(
                     )
                     progress_last_id_by_source[source.path] = done_entry_id
                     progress_checkpoint_by_source[source.path] = done_entry_id
+                    solver_episode_store.record(
+                        SolverEpisode(
+                            episode_id=uuid.uuid4().hex,
+                            source_path=source.path,
+                            iteration=iteration,
+                            created_at=_utc_now_iso(),
+                            outcome="success",
+                            summary=_safe_str(payload.get("summary")) or "solver marked source complete",
+                            requirement_ids=sorted(source_required_ids),
+                            notes=["source completed without further action"],
+                        )
+                    )
                     break
 
             plan_has_code_changes = _plan_has_code_changes(plan_steps)
@@ -9367,6 +9685,8 @@ def run_project_solver(
             replan_due_to_verification = False
             replan_due_to_replace = False
             verification_steps_executed = 0
+            iteration_applied_start = len(source_applied_steps)
+            iteration_executed_commands: List[str] = []
             current_venv = _find_workspace_venv(solver_workspace)
             replan_due_to_hallucination = False
             execution_steps = plan_steps
@@ -9408,6 +9728,7 @@ def run_project_solver(
                     applied_steps=source_applied_steps,
                     dataset_summary=dataset_summary,
                     eval_info=eval_info,
+                    executed_commands=iteration_executed_commands,
                 )
                 if len(actions_log) > before_len:
                     source_actions_log.extend(actions_log[before_len:])
@@ -9503,6 +9824,7 @@ def run_project_solver(
                                 applied_steps=source_applied_steps,
                                 dataset_summary=dataset_summary,
                                 eval_info=eval_info,
+                                executed_commands=iteration_executed_commands,
                             )
                             if len(actions_log) > before_rec_len:
                                 source_actions_log.extend(actions_log[before_rec_len:])
@@ -9662,6 +9984,87 @@ def run_project_solver(
                 verification_failures_by_source.pop(source.path, None)
             if not replan_due_to_replace:
                 replace_failures_by_source.pop(source.path, None)
+            iteration_modified_files: List[str] = []
+            for applied_step in source_applied_steps[iteration_applied_start:]:
+                if not isinstance(applied_step, dict):
+                    continue
+                rel_path = _safe_str(applied_step.get("path"))
+                if rel_path and rel_path not in iteration_modified_files:
+                    iteration_modified_files.append(rel_path)
+            iteration_failure_notes: List[str] = []
+            if replan_due_to_verification:
+                for failure in verification_failures_by_source.get(source.path, []):
+                    if not isinstance(failure, dict):
+                        continue
+                    issue = _safe_str(failure.get("verification_issue") or failure.get("stderr"))
+                    if issue:
+                        iteration_failure_notes.append(issue)
+            if replan_due_to_replace:
+                for failure in replace_failures_by_source.get(source.path, []):
+                    if not isinstance(failure, dict):
+                        continue
+                    issue = _safe_str(failure.get("issue") or "replace-in-file mismatch")
+                    rel_path = _safe_str(failure.get("path"))
+                    iteration_failure_notes.append(
+                        f"{issue}: {rel_path}" if rel_path else issue
+                    )
+            for failure in unresolved_failures[iteration_unresolved_start:]:
+                if not isinstance(failure, dict):
+                    continue
+                issue = _safe_str(
+                    failure.get("verification_issue")
+                    or failure.get("stderr")
+                    or failure.get("command")
+                )
+                if issue:
+                    iteration_failure_notes.append(issue)
+            episode_notes: List[str] = []
+            if audit_required:
+                episode_notes.append("audit findings were active for this source")
+            if research_section:
+                episode_notes.append("external research context was attached")
+            if defer_source:
+                episode_notes.append("source deferred after unresolved execution failures")
+            iteration_summary = _summarize_iteration_outcome(
+                payload,
+                iteration_steps_applied=iteration_steps_applied,
+                modified_files=iteration_modified_files,
+                executed_commands=iteration_executed_commands,
+                verification_failures=iteration_failure_notes,
+                replan_due_to_hallucination=replan_due_to_hallucination,
+                replan_due_to_verification=replan_due_to_verification,
+                replan_due_to_replace=replan_due_to_replace,
+                defer_source=defer_source,
+            )
+            episode_outcome = "partial"
+            if replan_due_to_hallucination or replan_due_to_verification or replan_due_to_replace:
+                episode_outcome = "failure"
+            elif defer_source:
+                episode_outcome = "deferred"
+            elif payload.get("done") is True:
+                episode_outcome = "success"
+            if (
+                iteration_summary
+                or iteration_modified_files
+                or iteration_executed_commands
+                or iteration_failure_notes
+                or payload.get("done") is True
+            ):
+                solver_episode_store.record(
+                    SolverEpisode(
+                        episode_id=uuid.uuid4().hex,
+                        source_path=source.path,
+                        iteration=iteration,
+                        created_at=_utc_now_iso(),
+                        outcome=episode_outcome,
+                        summary=iteration_summary or "solver iteration completed",
+                        requirement_ids=sorted(source_required_ids),
+                        modified_files=iteration_modified_files,
+                        commands=iteration_executed_commands,
+                        verification_failures=iteration_failure_notes,
+                        notes=episode_notes,
+                    )
+                )
             if replan_due_to_hallucination:
                 cycle.record(
                     "reflect",
