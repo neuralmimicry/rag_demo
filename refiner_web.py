@@ -7585,7 +7585,10 @@ def _proxy_service_request(base_url: str, timeout: float, *, path: Optional[str]
     for header, value in upstream.headers.items():
         if header.lower() in excluded:
             continue
-        response.headers.add(header, value)
+        if header.lower() == "set-cookie":
+            response.headers.add(header, value)
+        else:
+            response.headers[header] = value
     return response
 
 
@@ -10909,7 +10912,12 @@ def _metrics_path_label() -> str:
 
 def _require_login() -> Optional[Response]:
     path = request.path or ""
-    if path.startswith("/static/") or path.startswith("/public/") or path.startswith("/favicon"):
+    if (
+        path.startswith("/static/")
+        or path.startswith("/public/")
+        or path.startswith("/favicon")
+        or path.startswith("/billing/assets/")
+    ):
         return None
     if path == METRICS_PATH:
         return None
