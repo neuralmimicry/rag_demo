@@ -1590,7 +1590,6 @@ def _build_rag_documents(
                 continue
             merged_meta = dict(metadata)
             merged_meta.setdefault("source_url", url)
-            source_label = source_label or url
             if is_youtube_url(url):
                 try:
                     text, transcript_meta = fetch_youtube_transcript(url, timeout=20)
@@ -1598,6 +1597,7 @@ def _build_rag_documents(
                     continue
                 for key, value in transcript_meta.items():
                     merged_meta.setdefault(key, value)
+                source_label = source_label or str(transcript_meta.get("title") or url).strip()
             else:
                 text = fetch_url_content(
                     url,
@@ -1608,6 +1608,7 @@ def _build_rag_documents(
                 )
                 if not text:
                     continue
+                source_label = source_label or url
             try:
                 if max_doc_bytes and len(text.encode("utf-8")) > max_doc_bytes:
                     continue

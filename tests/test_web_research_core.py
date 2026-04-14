@@ -69,8 +69,39 @@ def test_parse_youtube_json3_transcript_flattens_segments():
     assert wr.parse_youtube_json3_transcript(payload) == "Hello world\nAnother line"
 
 
-def test_fetch_youtube_transcript_parses_json3_payload():
-    payload = {"events": [{"segs": [{"utf8": "Transcript"}, {"utf8": " text"}]}]}
+def test_parse_youtube_xml_transcript_flattens_text_nodes():
+    xml = "<transcript><text start='0'>Hello &amp; welcome</text><text start='1'>Second line</text></transcript>"
+    assert wr.parse_youtube_xml_transcript(xml) == "Hello & welcome\nSecond line"
+
+
+def test_fetch_youtube_transcript_collects_metadata_and_uses_translated_fallback():
+    payload = {"events": [{"segs": [{"utf8": "Translated"}, {"utf8": " transcript"}]}]}
+    player_response = {
+        "captions": {
+            "playerCaptionsTracklistRenderer": {
+                "captionTracks": [
+                    {
+                        "baseUrl": "https://captions.example/transcript?lang=es",
+                        "name": {"simpleText": "Spanish"},
+                        "languageCode": "es",
+                        "isTranslatable": True,
+                    }
+                ]
+            }
+        },
+        "videoDetails": {
+            "title": "Watch Title",
+            "author": "Watch Channel",
+            "channelId": "channel-123",
+            "thumbnail": {"thumbnails": [{"url": "https://img.example/watch.jpg"}]},
+        },
+        "microformat": {
+            "playerMicroformatRenderer": {
+                "ownerProfileUrl": "https://www.youtube.com/@watchchannel",
+            }
+        },
+    }
+    watch_html = f"<html><script>var ytInitialPlayerResponse = {json.dumps(player_response)};</script></html>"
 
     class _Session:
         def __init__(self):
@@ -78,13 +109,37 @@ def test_fetch_youtube_transcript_parses_json3_payload():
 
         def get(self, url, **kwargs):
             self.calls.append((url, kwargs))
-            raw = json.dumps(payload)
-            return _Response(
-                status_code=200,
-                text=raw,
-                content=raw.encode("utf-8"),
-                headers={"content-type": "application/json"},
-            )
+            if "oembed" in url:
+                raw = json.dumps(
+                    {
+                        "title": "OEmbed Title",
+                        "author_name": "Digital Leaders",
+                        "author_url": "https://www.youtube.com/@digileaderscom",
+                        "thumbnail_url": "https://img.example/oembed.jpg",
+                    }
+                )
+                return _Response(
+                    status_code=200,
+                    text=raw,
+                    content=raw.encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                )
+            if "watch?v=" in url:
+                return _Response(
+                    status_code=200,
+                    text=watch_html,
+                    content=watch_html.encode("utf-8"),
+                    headers={"content-type": "text/html"},
+                )
+            if "captions.example" in url and "tlang=en" in url:
+                raw = json.dumps(payload)
+                return _Response(
+                    status_code=200,
+                    text=raw,
+                    content=raw.encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                )
+            return _Response(status_code=200, text="", content=b"", headers={"content-type": "text/html"})
 
     session = _Session()
     transcript, metadata = wr.fetch_youtube_transcript(
@@ -93,10 +148,19 @@ def test_fetch_youtube_transcript_parses_json3_payload():
         session=session,
     )
 
-    assert transcript == "Transcript text"
+    assert transcript == "Translated transcript"
     assert metadata["video_id"] == "VTtC8tAzsOo"
     assert metadata["caption_lang"] == "en"
-    assert session.calls[0][0] == "https://www.youtube.com/api/timedtext"
+    assert metadata["caption_source_language"] == "es"
+    assert metadata["caption_translated_to"] == "en"
+    assert metadata["title"] == "OEmbed Title"
+    assert metadata["channel_name"] == "Digital Leaders"
+    assert metadata["channel_url"] == "https://www.youtube.com/@digileaderscom"
+    assert metadata["thumbnail_url"] == "https://img.example/oembed.jpg"
+    assert metadata["available_caption_languages"] == ["es"]
+    assert any("oembed" in call[0] for call in session.calls)
+    assert any("watch?v=VTtC8tAzsOo" in call[0] for call in session.calls)
+    assert any("tlang=en" in call[0] for call in session.calls)
 
 
 def test_fetch_url_content_uses_youtube_transcript(monkeypatch):

@@ -1411,11 +1411,13 @@ class TopicResearcher:
                             timeout=self.llm_params.get("timeout", 30) or 30,
                         )
                         caption_lang = str(transcript_meta.get("caption_lang") or "").strip()
+                        display_title = str(transcript_meta.get("title") or path_or_url).strip()
+                        channel_name = str(transcript_meta.get("channel_name") or "").strip()
                         locator = f"YouTube transcript ({caption_lang})" if caption_lang else "YouTube transcript"
                         locator_meta = {"locator": locator, "locators": [locator]}
                         self._record_web_contribution(
                             path_or_url,
-                            path_or_url,
+                            display_title,
                             locator=locator_meta.get("locator"),
                             locators=locator_meta.get("locators"),
                         )
@@ -1455,6 +1457,14 @@ class TopicResearcher:
                     # or the caller (e.g. _execute_queries) will record it.
                     # However, if context_sources contains a URL, we should record it here.
                     metadata = {"type": "Web", "title": path_or_url}
+                    if is_youtube_url(path_or_url):
+                        metadata["title"] = str(transcript_meta.get("title") or path_or_url).strip()
+                        if channel_name:
+                            metadata["channel_name"] = channel_name
+                        if transcript_meta.get("channel_url"):
+                            metadata["channel_url"] = transcript_meta.get("channel_url")
+                        if transcript_meta.get("video_id"):
+                            metadata["video_id"] = transcript_meta.get("video_id")
                     if locator_meta:
                         metadata.update(locator_meta)
                 

@@ -34,18 +34,21 @@ def test_build_rag_documents_supports_youtube_sources(monkeypatch):
                 "source_type": "youtube_transcript",
                 "video_id": "VTtC8tAzsOo",
                 "caption_lang": "en",
+                "title": "Conference Talk",
+                "channel_name": "Digital Leaders",
             },
         ),
     )
 
     docs = refiner_web._build_rag_documents(
-        [{"url": "https://youtu.be/VTtC8tAzsOo", "title": "Conference talk"}],
+        [{"url": "https://youtu.be/VTtC8tAzsOo"}],
         max_docs=5,
         max_doc_bytes=5000,
     )
 
     assert len(docs) == 1
-    assert docs[0].source == "Conference talk"
+    assert docs[0].source == "Conference Talk"
     assert docs[0].text == "Transcript body"
     assert docs[0].metadata["source_url"] == "https://youtu.be/VTtC8tAzsOo"
     assert docs[0].metadata["video_id"] == "VTtC8tAzsOo"
+    assert docs[0].metadata["channel_name"] == "Digital Leaders"
