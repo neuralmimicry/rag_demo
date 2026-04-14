@@ -96,6 +96,31 @@ const schedulerStateEl = document.getElementById('schedulerState');
 const schedulerPollEl = document.getElementById('schedulerPoll');
 const subtaskQueueDepthEl = document.getElementById('subtaskQueueDepth');
 const subtaskInflightEl = document.getElementById('subtaskInflight');
+const llmTelemetrySummaryEl = document.getElementById('llmTelemetrySummary');
+const llmTelemetryOpenBtn = document.getElementById('llmTelemetryOpen');
+const llmTelemetryRequestsEl = document.getElementById('llmTelemetryRequests');
+const llmTelemetryWindowEl = document.getElementById('llmTelemetryWindow');
+const llmTelemetryRetentionEl = document.getElementById('llmTelemetryRetention');
+const llmTelemetrySuccessRateEl = document.getElementById('llmTelemetrySuccessRate');
+const llmTelemetryQuotaErrorsEl = document.getElementById('llmTelemetryQuotaErrors');
+const llmTelemetryLatencyEl = document.getElementById('llmTelemetryLatency');
+const llmTelemetryJanitorEl = document.getElementById('llmTelemetryJanitor');
+const llmTelemetryInlineStatusEl = document.getElementById('llmTelemetryInlineStatus');
+const llmTelemetryModalEl = document.getElementById('llmTelemetryModal');
+const llmTelemetryModalCloseBtn = document.getElementById('llmTelemetryModalClose');
+const llmTelemetryModalRefreshBtn = document.getElementById('llmTelemetryModalRefresh');
+const llmTelemetryModalApplyBtn = document.getElementById('llmTelemetryModalApply');
+const llmTelemetryModalSubtitleEl = document.getElementById('llmTelemetryModalSubtitle');
+const llmTelemetryModalStatsEl = document.getElementById('llmTelemetryModalStats');
+const llmTelemetryGroupsBodyEl = document.getElementById('llmTelemetryGroupsBody');
+const llmTelemetrySubjectsBodyEl = document.getElementById('llmTelemetrySubjectsBody');
+const llmTelemetryModalStatusEl = document.getElementById('llmTelemetryModalStatus');
+const llmTelemetryScopeFilterEl = document.getElementById('llmTelemetryScopeFilter');
+const llmTelemetrySubjectFilterEl = document.getElementById('llmTelemetrySubjectFilter');
+const llmTelemetryHoursFilterEl = document.getElementById('llmTelemetryHoursFilter');
+const llmTelemetryProviderFilterEl = document.getElementById('llmTelemetryProviderFilter');
+const llmTelemetryModelFilterEl = document.getElementById('llmTelemetryModelFilter');
+const llmTelemetryCategoryFilterEl = document.getElementById('llmTelemetryCategoryFilter');
 const subtaskPanelEl = document.getElementById('subtaskPanel');
 const subtaskRefreshBtn = document.getElementById('subtaskRefresh');
 const subtaskStatusEl = document.getElementById('subtaskStatus');
@@ -192,6 +217,8 @@ let sessionSnapshot = null;
 let workspaceSnapshot = null;
 let workspaceCapabilities = null;
 let workersTelemetrySnapshot = null;
+let adminStatsSnapshot = null;
+let llmTelemetrySnapshot = null;
 let jobsPollTimer = null;
 let todoFilterStatus = 'todo';
 let todoDeferOnly = false;
@@ -915,6 +942,7 @@ function applyProfileToUi(profile) {
       showProfileSettingsStatus('This profile backend does not currently expose settings defaults.');
     }
   }
+  syncAdminTelemetryUi(profile);
 }
 
 async function saveProfilePatch(patch) {
@@ -3967,6 +3995,225 @@ function formatWorkersCount(value) {
   return String(Math.max(0, Math.round(parsed)));
 }
 
+function formatInteger(value) {
+  const parsed = toSafeNumber(value, 0);
+  return Math.max(0, Math.round(parsed)).toLocaleString('en-GB');
+}
+
+function formatPercent(value, digits = 1) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return '--';
+  return `${(parsed * 100).toFixed(digits)}%`;
+}
+
+function formatLatencyValue(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return '--';
+  if (parsed >= 1000) {
+    const seconds = parsed / 1000;
+    return `${seconds.toFixed(seconds >= 10 ? 1 : 2)}s`;
+  }
+  return `${Math.round(parsed)}ms`;
+}
+
+function formatRetentionHours(value) {
+  const hours = Math.max(0, Math.round(toSafeNumber(value, 0)));
+  if (!hours) return '--';
+  if (hours % 24 === 0) {
+    const days = Math.round(hours / 24);
+    return `${days} day${days === 1 ? '' : 's'}`;
+  }
+  return `${hours} hour${hours === 1 ? '' : 's'}`;
+}
+
+function llmTelemetryJanitorState(retention = {}) {
+  if (!retention?.enabled) return 'Off';
+  if (retention?.last_error) return 'Error';
+  if (retention?.running) return 'Running';
+  if (retention?.available) return 'Idle';
+  return 'Waiting';
+}
+
+function llmTelemetryLastEventHtml(item = {}) {
+  const parts = [];
+  if (item?.last_event_at) {
+    parts.push(escapeHtml(formatRelativeTime(item.last_event_at)));
+  }
+  const outcome = item?.last_outcome || item?.last_error_class || '';
+  if (outcome) {
+    parts.push(escapeHtml(normaliseUiLabel(outcome)));
+  }
+  return parts.length ? parts.join('<span class="telemetry-cell-sep"> • </span>') : '--';
+}
+
+function setLlmTelemetrySummaryVisible(isVisible) {
+  if (!llmTelemetrySummaryEl) return;
+  llmTelemetrySummaryEl.hidden = !isVisible;
+}
+
+function setLlmTelemetryCardDegraded(isDegraded) {
+  if (!llmTelemetrySummaryEl) return;
+  llmTelemetrySummaryEl.classList.toggle('degraded', Boolean(isDegraded));
+}
+
+function clearLlmTelemetryInlineStatus() {
+  if (!llmTelemetryInlineStatusEl) return;
+  llmTelemetryInlineStatusEl.textContent = '';
+  llmTelemetryInlineStatusEl.hidden = true;
+  llmTelemetryInlineStatusEl.classList.remove('error');
+}
+
+function showLlmTelemetryInlineStatus(message, isError = false) {
+  if (!llmTelemetryInlineStatusEl) return;
+  llmTelemetryInlineStatusEl.textContent = message;
+  llmTelemetryInlineStatusEl.hidden = !message;
+  llmTelemetryInlineStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function setLlmTelemetryModalOpen(isOpen) {
+  if (!llmTelemetryModalEl) return;
+  llmTelemetryModalEl.hidden = !isOpen;
+  llmTelemetryModalEl.dataset.open = isOpen ? 'true' : 'false';
+  llmTelemetryModalEl.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
+}
+
+function clearLlmTelemetryModalStatus() {
+  if (!llmTelemetryModalStatusEl) return;
+  llmTelemetryModalStatusEl.textContent = '';
+  llmTelemetryModalStatusEl.hidden = true;
+  llmTelemetryModalStatusEl.classList.remove('error');
+}
+
+function showLlmTelemetryModalStatus(message, isError = false) {
+  if (!llmTelemetryModalStatusEl) return;
+  llmTelemetryModalStatusEl.textContent = message;
+  llmTelemetryModalStatusEl.hidden = !message;
+  llmTelemetryModalStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function emptyTelemetryTableRow(colspan, message) {
+  return `<tr><td colspan="${colspan}" class="telemetry-empty">${escapeHtml(message)}</td></tr>`;
+}
+
+function renderLlmTelemetryOverview(payload = {}) {
+  const totals = payload?.totals || {};
+  const retention = payload?.retention || {};
+  const enabled = Boolean(payload?.enabled);
+
+  if (llmTelemetryRequestsEl) {
+    llmTelemetryRequestsEl.textContent = enabled ? `${formatInteger(totals.requests)} req` : '--';
+  }
+  if (llmTelemetryWindowEl) {
+    llmTelemetryWindowEl.textContent = `Window: ${formatRetentionHours(payload?.window_hours || 72)}`;
+  }
+  if (llmTelemetryRetentionEl) {
+    llmTelemetryRetentionEl.textContent = `Retention: ${formatRetentionHours(retention?.retention_hours)}`;
+  }
+  if (llmTelemetrySuccessRateEl) {
+    llmTelemetrySuccessRateEl.textContent = enabled ? formatPercent(totals.success_rate) : '--';
+  }
+  if (llmTelemetryQuotaErrorsEl) {
+    llmTelemetryQuotaErrorsEl.textContent = enabled ? formatInteger(totals.quota_errors) : '--';
+  }
+  if (llmTelemetryLatencyEl) {
+    llmTelemetryLatencyEl.textContent = enabled ? formatLatencyValue(totals.avg_latency_ms) : '--';
+  }
+  if (llmTelemetryJanitorEl) {
+    llmTelemetryJanitorEl.textContent = llmTelemetryJanitorState(retention);
+  }
+
+  const statusMessage = enabled
+    ? (retention?.last_error ? `Prune issue: ${retention.last_error}` : (payload?.degraded ? 'Telemetry summary is degraded.' : ''))
+    : (retention?.available ? 'Telemetry summary is unavailable.' : 'Postgres telemetry is not configured.');
+  if (statusMessage) {
+    showLlmTelemetryInlineStatus(statusMessage, Boolean(payload?.degraded || retention?.last_error || !retention?.available));
+  } else {
+    clearLlmTelemetryInlineStatus();
+  }
+  setLlmTelemetryCardDegraded(Boolean(payload?.degraded || retention?.last_error));
+}
+
+function renderLlmTelemetryModal(payload = {}) {
+  const totals = payload?.totals || {};
+  const retention = payload?.retention || {};
+  const groups = Array.isArray(payload?.groups) ? payload.groups : [];
+  const subjects = Array.isArray(payload?.subjects) ? payload.subjects : [];
+  const generatedAt = payload?.generated_at ? formatAbsoluteTime(payload.generated_at) : '--';
+  const windowLabel = formatRetentionHours(payload?.window_hours || 72);
+  if (llmTelemetryModalSubtitleEl) {
+    llmTelemetryModalSubtitleEl.textContent = `Window ${windowLabel} • Generated ${generatedAt} • Aggregated in ${retention?.aggregate_store || 'storage'} with raw events preserved in per-job events.jsonl files.`;
+  }
+  if (llmTelemetryModalStatsEl) {
+    llmTelemetryModalStatsEl.innerHTML = `
+      <div class="admin-status-card"><span>Total requests</span><strong>${escapeHtml(formatInteger(totals.requests))}</strong></div>
+      <div class="admin-status-card"><span>Success rate</span><strong>${escapeHtml(formatPercent(totals.success_rate))}</strong></div>
+      <div class="admin-status-card"><span>Quota errors</span><strong>${escapeHtml(formatInteger(totals.quota_errors))}</strong></div>
+      <div class="admin-status-card"><span>Avg latency</span><strong>${escapeHtml(formatLatencyValue(totals.avg_latency_ms))}</strong></div>
+      <div class="admin-status-card"><span>Input chars</span><strong>${escapeHtml(formatInteger(totals.input_chars_total))}</strong></div>
+      <div class="admin-status-card"><span>Estimated tokens</span><strong>${escapeHtml(formatInteger(totals.estimated_input_tokens_total))}</strong></div>
+      <div class="admin-status-card"><span>Retention</span><strong>${escapeHtml(formatRetentionHours(retention?.retention_hours))}</strong></div>
+      <div class="admin-status-card"><span>Last prune</span><strong>${escapeHtml(retention?.last_run_at ? `${formatRelativeTime(retention.last_run_at)} (${formatInteger(retention.last_removed)} removed)` : 'Never')}</strong></div>
+    `;
+  }
+  if (llmTelemetryGroupsBodyEl) {
+    llmTelemetryGroupsBodyEl.innerHTML = groups.length
+      ? groups.map((item) => `
+        <tr>
+          <td>${escapeHtml(item?.provider || '--')}</td>
+          <td>${escapeHtml(item?.model || '--')}</td>
+          <td>${escapeHtml(item?.category || '--')}</td>
+          <td>${escapeHtml(formatInteger(item?.requests))}</td>
+          <td>${escapeHtml(formatPercent(item?.success_rate))}</td>
+          <td>${escapeHtml(formatInteger(item?.quota_errors))}</td>
+          <td>${escapeHtml(formatLatencyValue(item?.avg_latency_ms))}</td>
+          <td>${llmTelemetryLastEventHtml(item)}</td>
+        </tr>
+      `).join('')
+      : emptyTelemetryTableRow(8, 'No provider/model groups match the current filters.');
+  }
+  if (llmTelemetrySubjectsBodyEl) {
+    llmTelemetrySubjectsBodyEl.innerHTML = subjects.length
+      ? subjects.map((item) => `
+        <tr>
+          <td>${escapeHtml(normaliseUiLabel(item?.scope || '--'))}</td>
+          <td>${escapeHtml(item?.subject || '--')}</td>
+          <td>${escapeHtml(formatInteger(item?.requests))}</td>
+          <td>${escapeHtml(formatPercent(item?.success_rate))}</td>
+          <td>${escapeHtml(formatInteger(toSafeNumber(item?.errors, 0) + toSafeNumber(item?.quota_errors, 0)))}</td>
+          <td>${item?.last_event_at ? escapeHtml(formatAbsoluteTime(item.last_event_at)) : '--'}</td>
+        </tr>
+      `).join('')
+      : emptyTelemetryTableRow(6, 'No matching user or team subjects in the selected window.');
+  }
+}
+
+function readLlmTelemetryFilters() {
+  return {
+    scope: llmTelemetryScopeFilterEl?.value || '',
+    subject: llmTelemetrySubjectFilterEl?.value.trim() || '',
+    hours: llmTelemetryHoursFilterEl?.value || '72',
+    provider: llmTelemetryProviderFilterEl?.value.trim() || '',
+    model: llmTelemetryModelFilterEl?.value.trim() || '',
+    category: llmTelemetryCategoryFilterEl?.value.trim() || '',
+  };
+}
+
+function syncAdminTelemetryUi(profile = currentProfile) {
+  const isAdmin = isAdminIdentity(profile);
+  setLlmTelemetrySummaryVisible(isAdmin);
+  if (!isAdmin) {
+    adminStatsSnapshot = null;
+    llmTelemetrySnapshot = null;
+    clearLlmTelemetryInlineStatus();
+    setLlmTelemetryCardDegraded(false);
+    if (llmTelemetryModalEl && !llmTelemetryModalEl.hidden) {
+      closeLlmTelemetryModal();
+    }
+    return;
+  }
+  void fetchAdminStats({ silent: true });
+}
+
 function setWorkersModalOpen(isOpen) {
   if (!workersModalEl) return;
   workersModalEl.hidden = !isOpen;
@@ -4162,6 +4409,98 @@ function openWorkersModal() {
 function closeWorkersModal() {
   setWorkersModalOpen(false);
   clearWorkersModalStatus();
+}
+
+async function fetchAdminStats({ silent = true } = {}) {
+  if (!isAdminIdentity()) return null;
+  try {
+    const res = await apiFetch('/api/admin/stats', { cache: 'no-store' });
+    if (res.status === 401 || res.status === 403) {
+      setLlmTelemetrySummaryVisible(false);
+      if (!llmTelemetryModalEl?.hidden) {
+        closeLlmTelemetryModal();
+      }
+      return null;
+    }
+    if (!res.ok) {
+      if (!silent) showLlmTelemetryInlineStatus('Unable to load admin telemetry.', true);
+      setLlmTelemetryCardDegraded(true);
+      return null;
+    }
+    const data = await res.json();
+    adminStatsSnapshot = data;
+    // Keep the card lightweight: it always shows the unfiltered admin summary.
+    renderLlmTelemetryOverview(data?.llm_request_telemetry || {});
+    return data;
+  } catch (err) {
+    if (!silent) showLlmTelemetryInlineStatus('Admin telemetry request failed.', true);
+    setLlmTelemetryCardDegraded(true);
+    return null;
+  }
+}
+
+async function loadLlmTelemetry({ silent = true } = {}) {
+  if (!isAdminIdentity()) return null;
+  // The modal does the heavier filtered drill-down against the dedicated admin endpoint.
+  const filters = readLlmTelemetryFilters();
+  const params = new URLSearchParams();
+  params.set('hours', filters.hours || '72');
+  params.set('limit', '20');
+  params.set('include_subjects', '1');
+  params.set('subject_limit', '12');
+  if (filters.scope) params.set('scope', filters.scope);
+  if (filters.subject) params.set('subject', filters.subject);
+  if (filters.provider) params.set('provider', filters.provider);
+  if (filters.model) params.set('model', filters.model);
+  if (filters.category) params.set('category', filters.category);
+  try {
+    const res = await apiFetch(`/api/admin/llm-telemetry?${params.toString()}`, { cache: 'no-store' });
+    if (res.status === 401 || res.status === 403) {
+      setLlmTelemetrySummaryVisible(false);
+      if (!llmTelemetryModalEl?.hidden) {
+        closeLlmTelemetryModal();
+      }
+      return null;
+    }
+    if (!res.ok) {
+      if (!silent) showLlmTelemetryModalStatus('Unable to load LLM telemetry.', true);
+      return null;
+    }
+    const payload = await res.json();
+    llmTelemetrySnapshot = payload;
+    if (!llmTelemetryModalEl?.hidden) {
+      renderLlmTelemetryModal(payload);
+    }
+    const statusMessage = payload?.retention?.last_error
+      ? `Prune issue: ${payload.retention.last_error}`
+      : (payload?.message || '');
+    if (statusMessage) {
+      showLlmTelemetryModalStatus(statusMessage, Boolean(payload?.degraded || payload?.retention?.last_error));
+    } else {
+      clearLlmTelemetryModalStatus();
+    }
+    return payload;
+  } catch (err) {
+    if (!silent) showLlmTelemetryModalStatus('LLM telemetry request failed.', true);
+    return null;
+  }
+}
+
+function openLlmTelemetryModal() {
+  if (!llmTelemetryModalEl || !isAdminIdentity()) return;
+  setLlmTelemetryModalOpen(true);
+  clearLlmTelemetryModalStatus();
+  if (llmTelemetrySnapshot) {
+    renderLlmTelemetryModal(llmTelemetrySnapshot);
+  } else if (adminStatsSnapshot?.llm_request_telemetry) {
+    renderLlmTelemetryModal(adminStatsSnapshot.llm_request_telemetry);
+  }
+  void loadLlmTelemetry({ silent: false });
+}
+
+function closeLlmTelemetryModal() {
+  setLlmTelemetryModalOpen(false);
+  clearLlmTelemetryModalStatus();
 }
 
 async function fetchHealth() {
@@ -6360,6 +6699,49 @@ if (transferModalConfirmBtn) {
 if (workersDetailOpenBtn) {
   workersDetailOpenBtn.addEventListener('click', openWorkersModal);
 }
+if (llmTelemetryOpenBtn) {
+  llmTelemetryOpenBtn.addEventListener('click', openLlmTelemetryModal);
+}
+if (llmTelemetryModalCloseBtn) {
+  llmTelemetryModalCloseBtn.addEventListener('click', closeLlmTelemetryModal);
+}
+if (llmTelemetryModalApplyBtn) {
+  llmTelemetryModalApplyBtn.addEventListener('click', () => {
+    showLlmTelemetryModalStatus('Applying filters...');
+    void loadLlmTelemetry({ silent: false });
+  });
+}
+if (llmTelemetryModalRefreshBtn) {
+  llmTelemetryModalRefreshBtn.addEventListener('click', () => {
+    showLlmTelemetryModalStatus('Refreshing LLM telemetry...');
+    void loadLlmTelemetry({ silent: false });
+  });
+}
+[
+  llmTelemetrySubjectFilterEl,
+  llmTelemetryProviderFilterEl,
+  llmTelemetryModelFilterEl,
+  llmTelemetryCategoryFilterEl,
+].forEach((el) => {
+  if (!el) return;
+  el.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void loadLlmTelemetry({ silent: false });
+    }
+  });
+});
+[
+  llmTelemetryScopeFilterEl,
+  llmTelemetryHoursFilterEl,
+].forEach((el) => {
+  if (!el) return;
+  el.addEventListener('change', () => {
+    if (llmTelemetryModalEl && !llmTelemetryModalEl.hidden) {
+      void loadLlmTelemetry({ silent: true });
+    }
+  });
+});
 if (workersModalCloseBtn) {
   workersModalCloseBtn.addEventListener('click', closeWorkersModal);
 }
@@ -6373,6 +6755,13 @@ if (workersModalEl) {
   workersModalEl.addEventListener('click', (event) => {
     if (event.target === workersModalEl) {
       closeWorkersModal();
+    }
+  });
+}
+if (llmTelemetryModalEl) {
+  llmTelemetryModalEl.addEventListener('click', (event) => {
+    if (event.target === llmTelemetryModalEl) {
+      closeLlmTelemetryModal();
     }
   });
 }
@@ -6404,6 +6793,14 @@ fetchCapabilities();
 fetchTokens();
 setInterval(fetchHealth, 15000);
 setInterval(fetchTokens, 12000);
+setInterval(() => {
+  if (isAdminIdentity()) {
+    void fetchAdminStats({ silent: true });
+    if (llmTelemetryModalEl && !llmTelemetryModalEl.hidden) {
+      void loadLlmTelemetry({ silent: true });
+    }
+  }
+}, 30000);
 setInterval(() => {
   if (workersModalEl && !workersModalEl.hidden) {
     void loadWorkersTelemetry({ refresh: false, includeCluster: false, limit: 240, silent: true });

@@ -51,7 +51,7 @@ Voice and STT routes support additional auth patterns:
 - `GET /api/health` - backend health summary with workers, queue depth, scheduler, SSO store state, and STT learning status
 - `GET /api/version` - public version payload
 - `GET /api/capabilities` - current capability inventory for authenticated users
-- `GET /api/admin/stats` - admin-only usage and worker summary
+- `GET /api/admin/stats` - admin-only usage and worker summary, including recent `llm_request_telemetry` rollups when the shared Postgres control-plane store is enabled
 - `GET /api/workers/telemetry` - worker/autoscaler telemetry for the Control Room
 - `GET /api/audit` - admin-only audit trail
 

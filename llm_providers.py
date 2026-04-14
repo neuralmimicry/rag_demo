@@ -26,10 +26,10 @@ Public factory:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Callable, Dict, Any, Optional, List, Tuple
 import os
 import time
 import hashlib
@@ -138,6 +138,8 @@ _REQUEST_CATEGORY: ContextVar[str] = ContextVar("llm_request_category", default=
 _TOKEN_TOTALS: Dict[str, Dict[str, int]] = {}
 _TOKEN_TOTALS_LOCK = threading.Lock()
 _USAGE_EVENT_FILE_LOCK = threading.Lock()
+_EVENT_CALLBACKS: List[Callable[[Dict[str, Any]], None]] = []
+_EVENT_CALLBACKS_LOCK = threading.Lock()
 _PRICING_CACHE_LOCK = threading.Lock()
 _PRICING_CACHE_RAW = None
 _PRICING_CACHE_VALUE: Dict[str, Any] = {}
@@ -311,6 +313,53 @@ def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def register_event_callback(callback: Callable[[Dict[str, Any]], None]) -> None:
+    """Register a process-local callback for structured LLM events."""
+    if not callable(callback):
+        raise TypeError("callback must be callable")
+    with _EVENT_CALLBACKS_LOCK:
+        if callback not in _EVENT_CALLBACKS:
+            _EVENT_CALLBACKS.append(callback)
+
+
+def unregister_event_callback(callback: Callable[[Dict[str, Any]], None]) -> None:
+    """Remove a previously registered structured event callback."""
+    with _EVENT_CALLBACKS_LOCK:
+        try:
+            _EVENT_CALLBACKS.remove(callback)
+        except ValueError:
+            return
+
+
+def _emit_structured_event(event: Dict[str, Any]) -> None:
+    if _usage_event_enabled():
+        try:
+            print("__RAG_EVENT__ " + json.dumps(event, ensure_ascii=True, sort_keys=True), flush=True)
+        except Exception:
+            pass
+    events_file = _usage_events_file()
+    if events_file:
+        # Keep a job-local JSONL copy so shared-storage artifacts still show
+        # provider activity even when stdout is truncated or unavailable.
+        try:
+            os.makedirs(os.path.dirname(events_file), exist_ok=True)
+        except Exception:
+            pass
+        with _USAGE_EVENT_FILE_LOCK:
+            try:
+                with open(events_file, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
+            except Exception:
+                logger.debug("Failed to append usage event to %s", events_file)
+    with _EVENT_CALLBACKS_LOCK:
+        callbacks = list(_EVENT_CALLBACKS)
+    for callback in callbacks:
+        try:
+            callback(dict(event))
+        except Exception:
+            logger.debug("Structured event callback failed for %s", event.get("type"))
+
+
 def _load_pricing_config() -> Dict[str, Any]:
     global _PRICING_CACHE_RAW, _PRICING_CACHE_VALUE
     raw = os.getenv("REFINER_LLM_PRICING") or ""
@@ -389,26 +438,91 @@ def _compute_usage_cost(provider: str, model: Optional[str], usage: Dict[str, Op
 
 
 def _emit_usage_event(event: Dict[str, Any]) -> None:
-    if _usage_event_enabled():
-        try:
-            print("__RAG_EVENT__ " + json.dumps(event, ensure_ascii=True, sort_keys=True), flush=True)
-        except Exception:
-            pass
-    events_file = _usage_events_file()
-    if not events_file:
-        return
-    # Mirror the same structured event into the job JSONL artifact so operators
-    # can inspect usage even if stdout has been truncated or rotated away.
-    try:
-        os.makedirs(os.path.dirname(events_file), exist_ok=True)
-    except Exception:
-        pass
-    with _USAGE_EVENT_FILE_LOCK:
-        try:
-            with open(events_file, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
-        except Exception:
-            logger.debug("Failed to append usage event to %s", events_file)
+    _emit_structured_event(event)
+
+
+def _sanitize_error_detail(value: Any, *, max_length: int = 240) -> Optional[str]:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return None
+    if len(text) > max_length:
+        return text[: max_length - 3].rstrip() + "..."
+    return text
+
+
+@dataclass
+class _LLMRequestObserver:
+    provider: str
+    category: str
+    input_chars: int
+    estimated_input_tokens: int
+    max_tokens: Optional[int]
+    reasoning_effort: Optional[str]
+    started_at: float = field(default_factory=time.time)
+    emitted: bool = False
+
+    @classmethod
+    def begin(
+        cls,
+        provider: str,
+        messages: List[Dict[str, Any]],
+        system: Optional[str],
+        *,
+        max_tokens: Optional[int],
+        reasoning_effort: Optional[str],
+    ) -> "_LLMRequestObserver":
+        input_chars = _total_input_chars(messages, system)
+        return cls(
+            provider=provider,
+            category=_current_request_category(),
+            input_chars=input_chars,
+            estimated_input_tokens=_estimate_tokens_from_chars(input_chars),
+            max_tokens=_coerce_int(max_tokens),
+            reasoning_effort=_normalize_reasoning_effort(reasoning_effort),
+        )
+
+    def _emit(
+        self,
+        *,
+        model: Optional[str],
+        outcome: str,
+        error_class: Optional[str] = None,
+        error_detail: Optional[str] = None,
+    ) -> None:
+        if self.emitted:
+            return
+        self.emitted = True
+        event = {
+            "type": "llm_request",
+            "ts": time.time(),
+            "at": _iso_now(),
+            "provider": self.provider,
+            "model": str(model or "unknown").strip() or "unknown",
+            "category": self.category,
+            "outcome": outcome,
+            "latency_ms": max(0, int((time.time() - self.started_at) * 1000)),
+            "input_chars": self.input_chars,
+            "estimated_input_tokens": self.estimated_input_tokens,
+            "max_tokens": self.max_tokens,
+            "reasoning_effort": self.reasoning_effort,
+        }
+        if error_class:
+            event["error_class"] = error_class
+        if error_detail:
+            event["error_detail"] = error_detail
+        _emit_structured_event(event)
+
+    def success(self, *, model: Optional[str]) -> None:
+        self._emit(model=model, outcome="success")
+
+    def failure(self, *, model: Optional[str], exc: Exception) -> None:
+        outcome = "quota_error" if isinstance(exc, LLMQuotaError) else "error"
+        self._emit(
+            model=model,
+            outcome=outcome,
+            error_class=exc.__class__.__name__,
+            error_detail=_sanitize_error_detail(exc),
+        )
 
 
 def _log_token_usage(provider: str, model: Optional[str], usage: Optional[Dict[str, Optional[int]]]) -> None:
@@ -693,6 +807,46 @@ class LLMProvider:
             self._last_request_time = time.time()
 
     def predict(
+        self,
+        messages: List[Dict[str, Any]],
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.2,
+        system: Optional[str] = None,
+        timeout: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+    ) -> LLMResponse:
+        self._wait_for_gap()
+        observer = _LLMRequestObserver.begin(
+            self.name,
+            messages,
+            system,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+        )
+        try:
+            response = self._predict_impl(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system,
+                timeout=timeout,
+                reasoning_effort=reasoning_effort,
+            )
+        except Exception as exc:
+            observer.failure(model=getattr(self, "model", None), exc=exc)
+            raise
+        if not isinstance(response, LLMResponse):
+            exc = LLMError("provider returned an invalid response object")
+            observer.failure(model=getattr(self, "model", None), exc=exc)
+            raise exc
+        if not response.provider:
+            response.provider = self.name
+        if not response.model:
+            response.model = getattr(self, "model", None)
+        observer.success(model=response.model or getattr(self, "model", None))
+        return response
+
+    def _predict_impl(
         self,
         messages: List[Dict[str, Any]],
         max_tokens: Optional[int] = None,
@@ -994,7 +1148,7 @@ class OpenAIProvider(LLMProvider):
             raise LLMError("OPENAI_API_KEY not set")
         self._session = requests.Session()
 
-    def predict(
+    def _predict_impl(
         self,
         messages: List[Dict[str, Any]],
         max_tokens: Optional[int] = None,
@@ -1003,7 +1157,6 @@ class OpenAIProvider(LLMProvider):
         timeout: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> LLMResponse:
-        self._wait_for_gap()
         effort = _normalize_reasoning_effort(reasoning_effort)
         use_responses = bool(effort) or os.getenv("OPENAI_USE_RESPONSES", "").strip().lower() in ("1", "true", "yes")
         service_tier = _openai_service_tier("responses" if use_responses else "chat")
@@ -1713,7 +1866,7 @@ class GeminiProvider(LLMProvider):
                 continue
         self._created_cached_contents = []
 
-    def predict(
+    def _predict_impl(
         self,
         messages: List[Dict[str, Any]],
         max_tokens: Optional[int] = None,
@@ -1722,7 +1875,6 @@ class GeminiProvider(LLMProvider):
         timeout: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> LLMResponse:
-        self._wait_for_gap()
         # Gemini generateContent expects a contents list of role/parts
         # We use v1beta as it supports newer models and reasoning features
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
@@ -1886,7 +2038,7 @@ class OllamaProvider(LLMProvider):
         self.model = model or os.getenv("OLLAMA_MODEL", self.default_model)
         self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/")
 
-    def predict(
+    def _predict_impl(
         self,
         messages: List[Dict[str, Any]],
         max_tokens: Optional[int] = None,
@@ -1895,7 +2047,6 @@ class OllamaProvider(LLMProvider):
         timeout: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> LLMResponse:
-        self._wait_for_gap()
         # Collapse messages into a single prompt for /api/generate
         # Note: Ollama /api/chat is better for multimodal, but we are using /api/generate here
         # For simplicity, we'll keep generate but ideally it should use chat

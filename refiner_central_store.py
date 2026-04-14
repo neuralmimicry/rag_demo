@@ -122,6 +122,41 @@ SCHEMA_STATEMENTS: Sequence[str] = (
     CREATE INDEX IF NOT EXISTS nm_mcp_servers_owner_updated_idx
         ON nm_mcp_servers (owner, updated_at DESC)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS nm_llm_request_telemetry (
+        scope TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        bucket_hour TIMESTAMPTZ NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        category TEXT NOT NULL,
+        requests INTEGER NOT NULL DEFAULT 0,
+        successes INTEGER NOT NULL DEFAULT 0,
+        quota_errors INTEGER NOT NULL DEFAULT 0,
+        errors INTEGER NOT NULL DEFAULT 0,
+        latency_ms_total BIGINT NOT NULL DEFAULT 0,
+        latency_ms_min INTEGER,
+        latency_ms_max INTEGER,
+        input_chars_total BIGINT NOT NULL DEFAULT 0,
+        estimated_input_tokens_total BIGINT NOT NULL DEFAULT 0,
+        last_outcome TEXT,
+        last_error_class TEXT,
+        last_error_detail TEXT,
+        last_event_at TIMESTAMPTZ,
+        last_max_tokens INTEGER,
+        last_reasoning_effort TEXT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (scope, subject, bucket_hour, provider, model, category)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_llm_request_telemetry_scope_subject_bucket_idx
+        ON nm_llm_request_telemetry (scope, subject, bucket_hour DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_llm_request_telemetry_bucket_idx
+        ON nm_llm_request_telemetry (bucket_hour DESC)
+    """,
 )
 
 
@@ -148,6 +183,63 @@ def _token_hint(token: str) -> Optional[str]:
 
 def _jsonb(value: Optional[Dict[str, Any]] = None) -> Jsonb:
     return Jsonb(value or {})
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _clean_dimension(value: Any, *, default: str = "", max_length: int = 128) -> str:
+    cleaned = " ".join(str(value or "").split())
+    if not cleaned:
+        cleaned = default
+    if len(cleaned) > max_length:
+        cleaned = cleaned[:max_length]
+    return cleaned
+
+
+def _clean_optional_text(value: Any, *, max_length: int = 240) -> Optional[str]:
+    cleaned = " ".join(str(value or "").split())
+    if not cleaned:
+        return None
+    if len(cleaned) > max_length:
+        return cleaned[:max_length]
+    return cleaned
+
+
+def _coerce_event_datetime(value: Any) -> dt.datetime:
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    if isinstance(value, (int, float)):
+        try:
+            return dt.datetime.fromtimestamp(float(value), UTC)
+        except Exception:
+            return dt.datetime.now(UTC)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned:
+            try:
+                parsed = dt.datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    return parsed.replace(tzinfo=UTC)
+                return parsed.astimezone(UTC)
+            except Exception:
+                pass
+            try:
+                return dt.datetime.fromtimestamp(float(cleaned), UTC)
+            except Exception:
+                pass
+    return dt.datetime.now(UTC)
+
+
+def _hour_bucket(value: dt.datetime) -> dt.datetime:
+    moment = _coerce_event_datetime(value)
+    return moment.replace(minute=0, second=0, microsecond=0)
 
 
 def _default_account_summary() -> Dict[str, Any]:
@@ -212,6 +304,7 @@ class PostgresCentralStore:
         self.sso_tokens = PostgresSsoStore(self)
         self.user_ledger = PostgresTokenLedger(self, "user")
         self.team_ledger = PostgresTokenLedger(self, "team")
+        self.llm_request_telemetry = PostgresLLMRequestTelemetry(self)
 
     def close(self) -> None:
         self.pool.close()
@@ -1046,6 +1139,370 @@ class PostgresTokenLedger:
             "meta": entry_meta,
             "shortfall": int((entry_meta or {}).get("shortfall") or 0),
         }
+
+
+class PostgresLLMRequestTelemetry:
+    """Hourly rollups for provider latency and success telemetry."""
+
+    def __init__(self, store: PostgresCentralStore):
+        self.store = store
+
+    def record(self, scope: str, subject: str, event: Optional[Dict[str, Any]]) -> None:
+        scope_value = _clean_dimension(scope, default="user", max_length=32).lower() or "user"
+        subject_value = _clean_dimension(subject, default="", max_length=120)
+        if not subject_value:
+            raise ValueError("subject is required")
+        payload = dict(event or {})
+        provider = _clean_dimension(payload.get("provider"), default="unknown", max_length=64)
+        model = _clean_dimension(payload.get("model"), default="unknown", max_length=128)
+        category = _clean_dimension(payload.get("category"), default="llm", max_length=64) or "llm"
+        outcome = _clean_dimension(payload.get("outcome"), default="error", max_length=32).lower() or "error"
+        if outcome not in {"success", "quota_error", "error"}:
+            outcome = "error"
+        latency_ms = max(0, _coerce_int(payload.get("latency_ms"), 0))
+        input_chars = max(0, _coerce_int(payload.get("input_chars"), 0))
+        estimated_input_tokens = max(0, _coerce_int(payload.get("estimated_input_tokens"), 0))
+        event_at = _coerce_event_datetime(payload.get("at") or payload.get("ts"))
+        bucket_hour = _hour_bucket(event_at)
+        error_class = _clean_optional_text(payload.get("error_class"), max_length=96)
+        error_detail = _clean_optional_text(payload.get("error_detail"), max_length=240)
+        max_tokens = _coerce_int(payload.get("max_tokens"), 0)
+        max_tokens_value = max_tokens if max_tokens > 0 else None
+        reasoning_effort = _clean_optional_text(payload.get("reasoning_effort"), max_length=32)
+        success_count = 1 if outcome == "success" else 0
+        quota_count = 1 if outcome == "quota_error" else 0
+        error_count = 1 if outcome == "error" else 0
+
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    INSERT INTO nm_llm_request_telemetry (
+                        scope,
+                        subject,
+                        bucket_hour,
+                        provider,
+                        model,
+                        category,
+                        requests,
+                        successes,
+                        quota_errors,
+                        errors,
+                        latency_ms_total,
+                        latency_ms_min,
+                        latency_ms_max,
+                        input_chars_total,
+                        estimated_input_tokens_total,
+                        last_outcome,
+                        last_error_class,
+                        last_error_detail,
+                        last_event_at,
+                        last_max_tokens,
+                        last_reasoning_effort,
+                        updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        1, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s,
+                        NOW()
+                    )
+                    ON CONFLICT (scope, subject, bucket_hour, provider, model, category) DO UPDATE
+                    SET requests = nm_llm_request_telemetry.requests + 1,
+                        successes = nm_llm_request_telemetry.successes + EXCLUDED.successes,
+                        quota_errors = nm_llm_request_telemetry.quota_errors + EXCLUDED.quota_errors,
+                        errors = nm_llm_request_telemetry.errors + EXCLUDED.errors,
+                        latency_ms_total = nm_llm_request_telemetry.latency_ms_total + EXCLUDED.latency_ms_total,
+                        latency_ms_min = CASE
+                            WHEN nm_llm_request_telemetry.latency_ms_min IS NULL THEN EXCLUDED.latency_ms_min
+                            WHEN EXCLUDED.latency_ms_min IS NULL THEN nm_llm_request_telemetry.latency_ms_min
+                            ELSE LEAST(nm_llm_request_telemetry.latency_ms_min, EXCLUDED.latency_ms_min)
+                        END,
+                        latency_ms_max = CASE
+                            WHEN nm_llm_request_telemetry.latency_ms_max IS NULL THEN EXCLUDED.latency_ms_max
+                            WHEN EXCLUDED.latency_ms_max IS NULL THEN nm_llm_request_telemetry.latency_ms_max
+                            ELSE GREATEST(nm_llm_request_telemetry.latency_ms_max, EXCLUDED.latency_ms_max)
+                        END,
+                        input_chars_total = nm_llm_request_telemetry.input_chars_total + EXCLUDED.input_chars_total,
+                        estimated_input_tokens_total = nm_llm_request_telemetry.estimated_input_tokens_total + EXCLUDED.estimated_input_tokens_total,
+                        last_outcome = CASE
+                            WHEN nm_llm_request_telemetry.last_event_at IS NULL
+                              OR EXCLUDED.last_event_at IS NULL
+                              OR EXCLUDED.last_event_at >= nm_llm_request_telemetry.last_event_at
+                            THEN EXCLUDED.last_outcome
+                            ELSE nm_llm_request_telemetry.last_outcome
+                        END,
+                        last_error_class = CASE
+                            WHEN nm_llm_request_telemetry.last_event_at IS NULL
+                              OR EXCLUDED.last_event_at IS NULL
+                              OR EXCLUDED.last_event_at >= nm_llm_request_telemetry.last_event_at
+                            THEN COALESCE(EXCLUDED.last_error_class, nm_llm_request_telemetry.last_error_class)
+                            ELSE nm_llm_request_telemetry.last_error_class
+                        END,
+                        last_error_detail = CASE
+                            WHEN nm_llm_request_telemetry.last_event_at IS NULL
+                              OR EXCLUDED.last_event_at IS NULL
+                              OR EXCLUDED.last_event_at >= nm_llm_request_telemetry.last_event_at
+                            THEN COALESCE(EXCLUDED.last_error_detail, nm_llm_request_telemetry.last_error_detail)
+                            ELSE nm_llm_request_telemetry.last_error_detail
+                        END,
+                        last_event_at = CASE
+                            WHEN nm_llm_request_telemetry.last_event_at IS NULL THEN EXCLUDED.last_event_at
+                            WHEN EXCLUDED.last_event_at IS NULL THEN nm_llm_request_telemetry.last_event_at
+                            ELSE GREATEST(nm_llm_request_telemetry.last_event_at, EXCLUDED.last_event_at)
+                        END,
+                        last_max_tokens = CASE
+                            WHEN nm_llm_request_telemetry.last_event_at IS NULL
+                              OR EXCLUDED.last_event_at IS NULL
+                              OR EXCLUDED.last_event_at >= nm_llm_request_telemetry.last_event_at
+                            THEN COALESCE(EXCLUDED.last_max_tokens, nm_llm_request_telemetry.last_max_tokens)
+                            ELSE nm_llm_request_telemetry.last_max_tokens
+                        END,
+                        last_reasoning_effort = CASE
+                            WHEN nm_llm_request_telemetry.last_event_at IS NULL
+                              OR EXCLUDED.last_event_at IS NULL
+                              OR EXCLUDED.last_event_at >= nm_llm_request_telemetry.last_event_at
+                            THEN COALESCE(EXCLUDED.last_reasoning_effort, nm_llm_request_telemetry.last_reasoning_effort)
+                            ELSE nm_llm_request_telemetry.last_reasoning_effort
+                        END,
+                        updated_at = NOW()
+                    """,
+                    (
+                        scope_value,
+                        subject_value,
+                        bucket_hour,
+                        provider,
+                        model,
+                        category,
+                        success_count,
+                        quota_count,
+                        error_count,
+                        latency_ms,
+                        latency_ms,
+                        latency_ms,
+                        input_chars,
+                        estimated_input_tokens,
+                        outcome,
+                        error_class,
+                        error_detail,
+                        event_at,
+                        max_tokens_value,
+                        reasoning_effort,
+                    ),
+                )
+
+    def summary(
+        self,
+        *,
+        scope: Optional[str] = None,
+        subject: Optional[str] = None,
+        hours: int = 72,
+        limit: int = 20,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        category: Optional[str] = None,
+        include_subjects: bool = False,
+        subject_limit: int = 12,
+    ) -> Dict[str, Any]:
+        scope_value = _clean_dimension(scope, default="", max_length=32).lower() if scope is not None else None
+        subject_value = _clean_dimension(subject, default="", max_length=120) if subject is not None else None
+        provider_value = _clean_dimension(provider, default="", max_length=64) if provider is not None else None
+        model_value = _clean_dimension(model, default="", max_length=128) if model is not None else None
+        category_value = _clean_dimension(category, default="", max_length=64) if category is not None else None
+        hours_value = max(1, _coerce_int(hours, 72))
+        limit_value = max(1, min(_coerce_int(limit, 20), 100))
+        subject_limit_value = max(1, min(_coerce_int(subject_limit, 12), 100))
+        now = dt.datetime.now(UTC)
+        window_start = now - dt.timedelta(hours=hours_value)
+        filters = (
+            window_start,
+            scope_value,
+            scope_value,
+            subject_value,
+            subject_value,
+            provider_value,
+            provider_value,
+            model_value,
+            model_value,
+            category_value,
+            category_value,
+        )
+
+        def _summary_payload(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            payload = {
+                "requests": _coerce_int((row or {}).get("requests"), 0),
+                "successes": _coerce_int((row or {}).get("successes"), 0),
+                "quota_errors": _coerce_int((row or {}).get("quota_errors"), 0),
+                "errors": _coerce_int((row or {}).get("errors"), 0),
+                "latency_ms_total": _coerce_int((row or {}).get("latency_ms_total"), 0),
+                "latency_ms_min": _coerce_int((row or {}).get("latency_ms_min"), 0) if (row or {}).get("latency_ms_min") is not None else None,
+                "latency_ms_max": _coerce_int((row or {}).get("latency_ms_max"), 0) if (row or {}).get("latency_ms_max") is not None else None,
+                "input_chars_total": _coerce_int((row or {}).get("input_chars_total"), 0),
+                "estimated_input_tokens_total": _coerce_int((row or {}).get("estimated_input_tokens_total"), 0),
+                "last_outcome": (row or {}).get("last_outcome"),
+                "last_error_class": (row or {}).get("last_error_class"),
+                "last_error_detail": (row or {}).get("last_error_detail"),
+                "last_event_at": _timestamp((row or {}).get("last_event_at")),
+                "last_max_tokens": _coerce_int((row or {}).get("last_max_tokens"), 0) if (row or {}).get("last_max_tokens") is not None else None,
+                "last_reasoning_effort": (row or {}).get("last_reasoning_effort"),
+            }
+            requests = payload["requests"]
+            payload["avg_latency_ms"] = round(payload["latency_ms_total"] / requests, 2) if requests else None
+            payload["success_rate"] = round(payload["successes"] / requests, 4) if requests else None
+            return payload
+
+        with self.store.pool.connection() as conn:
+            totals_row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(requests), 0) AS requests,
+                    COALESCE(SUM(successes), 0) AS successes,
+                    COALESCE(SUM(quota_errors), 0) AS quota_errors,
+                    COALESCE(SUM(errors), 0) AS errors,
+                    COALESCE(SUM(latency_ms_total), 0) AS latency_ms_total,
+                    MIN(latency_ms_min) AS latency_ms_min,
+                    MAX(latency_ms_max) AS latency_ms_max,
+                    COALESCE(SUM(input_chars_total), 0) AS input_chars_total,
+                    COALESCE(SUM(estimated_input_tokens_total), 0) AS estimated_input_tokens_total
+                FROM nm_llm_request_telemetry
+                WHERE bucket_hour >= %s
+                  AND (%s IS NULL OR scope = %s)
+                  AND (%s IS NULL OR subject = %s)
+                  AND (%s IS NULL OR provider = %s)
+                  AND (%s IS NULL OR model = %s)
+                  AND (%s IS NULL OR category = %s)
+                """,
+                filters,
+            ).fetchone()
+            rows = conn.execute(
+                """
+                WITH filtered AS (
+                    SELECT *
+                    FROM nm_llm_request_telemetry
+                    WHERE bucket_hour >= %s
+                      AND (%s IS NULL OR scope = %s)
+                      AND (%s IS NULL OR subject = %s)
+                      AND (%s IS NULL OR provider = %s)
+                      AND (%s IS NULL OR model = %s)
+                      AND (%s IS NULL OR category = %s)
+                ),
+                aggregated AS (
+                    SELECT
+                        provider,
+                        model,
+                        category,
+                        SUM(requests) AS requests,
+                        SUM(successes) AS successes,
+                        SUM(quota_errors) AS quota_errors,
+                        SUM(errors) AS errors,
+                        SUM(latency_ms_total) AS latency_ms_total,
+                        MIN(latency_ms_min) AS latency_ms_min,
+                        MAX(latency_ms_max) AS latency_ms_max,
+                        SUM(input_chars_total) AS input_chars_total,
+                        SUM(estimated_input_tokens_total) AS estimated_input_tokens_total
+                    FROM filtered
+                    GROUP BY provider, model, category
+                ),
+                latest AS (
+                    SELECT DISTINCT ON (provider, model, category)
+                        provider,
+                        model,
+                        category,
+                        last_outcome,
+                        last_error_class,
+                        last_error_detail,
+                        last_event_at,
+                        last_max_tokens,
+                        last_reasoning_effort
+                    FROM filtered
+                    ORDER BY provider, model, category, last_event_at DESC NULLS LAST, updated_at DESC
+                )
+                SELECT
+                    aggregated.*,
+                    latest.last_outcome,
+                    latest.last_error_class,
+                    latest.last_error_detail,
+                    latest.last_event_at,
+                    latest.last_max_tokens,
+                    latest.last_reasoning_effort
+                FROM aggregated
+                LEFT JOIN latest USING (provider, model, category)
+                ORDER BY aggregated.requests DESC, aggregated.latency_ms_total DESC, aggregated.provider ASC, aggregated.model ASC
+                LIMIT %s
+                """,
+                (*filters, limit_value),
+            ).fetchall()
+            subject_rows: List[Dict[str, Any]] = []
+            if include_subjects:
+                subject_rows = conn.execute(
+                    """
+                    SELECT
+                        subject,
+                        scope,
+                        SUM(requests) AS requests,
+                        SUM(successes) AS successes,
+                        SUM(quota_errors) AS quota_errors,
+                        SUM(errors) AS errors,
+                        SUM(latency_ms_total) AS latency_ms_total,
+                        MIN(latency_ms_min) AS latency_ms_min,
+                        MAX(latency_ms_max) AS latency_ms_max,
+                        MAX(last_event_at) AS last_event_at
+                    FROM nm_llm_request_telemetry
+                    WHERE bucket_hour >= %s
+                      AND (%s IS NULL OR scope = %s)
+                      AND (%s IS NULL OR subject = %s)
+                      AND (%s IS NULL OR provider = %s)
+                      AND (%s IS NULL OR model = %s)
+                      AND (%s IS NULL OR category = %s)
+                    GROUP BY subject, scope
+                    ORDER BY SUM(requests) DESC, MAX(last_event_at) DESC NULLS LAST, subject ASC
+                    LIMIT %s
+                    """,
+                    (*filters, subject_limit_value),
+                ).fetchall()
+
+        groups: List[Dict[str, Any]] = []
+        for row in rows or []:
+            item = _summary_payload(row)
+            item["provider"] = row.get("provider")
+            item["model"] = row.get("model")
+            item["category"] = row.get("category")
+            groups.append(item)
+        subjects: List[Dict[str, Any]] = []
+        for row in subject_rows or []:
+            item = _summary_payload(row)
+            item["subject"] = row.get("subject")
+            item["scope"] = row.get("scope")
+            subjects.append(item)
+        return {
+            "enabled": True,
+            "scope": scope_value,
+            "subject": subject_value,
+            "provider": provider_value,
+            "model": model_value,
+            "category": category_value,
+            "window_hours": hours_value,
+            "window_start": _timestamp(window_start),
+            "generated_at": _timestamp(now),
+            "totals": _summary_payload(totals_row),
+            "groups": groups,
+            "subjects": subjects,
+        }
+
+    def prune_older_than(self, hours: int, *, now: Optional[dt.datetime] = None) -> int:
+        hours_value = max(0, _coerce_int(hours, 0))
+        if hours_value <= 0:
+            return 0
+        cutoff = _coerce_event_datetime(now) - dt.timedelta(hours=hours_value)
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                result = conn.execute(
+                    "DELETE FROM nm_llm_request_telemetry WHERE bucket_hour < %s",
+                    (cutoff,),
+                )
+        return max(0, int(result.rowcount or 0))
 
 
 def create_central_store_from_env() -> Optional[PostgresCentralStore]:

@@ -132,6 +132,26 @@
         <div><span>Subtasks active</span><strong id="subtaskInflight">--</strong></div>
       </div>
     </div>
+    <div class="status-card llm-telemetry-summary" id="llmTelemetrySummary" hidden>
+      <div class="llm-telemetry-head">
+        <div class="workers-head">
+          <span class="label">LLM Telemetry</span>
+          <button type="button" class="ghost workers-detail-btn" id="llmTelemetryOpen">Drill Down</button>
+        </div>
+        <span class="value" id="llmTelemetryRequests">--</span>
+        <div class="llm-telemetry-meta">
+          <span id="llmTelemetryWindow">Window: --</span>
+          <span id="llmTelemetryRetention">Retention: --</span>
+        </div>
+      </div>
+      <div class="llm-telemetry-grid">
+        <div><span>Success rate</span><strong id="llmTelemetrySuccessRate">--</strong></div>
+        <div><span>Quota errors</span><strong id="llmTelemetryQuotaErrors">--</strong></div>
+        <div><span>Avg latency</span><strong id="llmTelemetryLatency">--</strong></div>
+        <div><span>Janitor</span><strong id="llmTelemetryJanitor">--</strong></div>
+      </div>
+      <div id="llmTelemetryInlineStatus" class="status-banner" hidden></div>
+    </div>
   </section>
 
   <main class="control-grid">
@@ -885,6 +905,95 @@
         <button type="button" class="ghost" id="transferModalCancel">Cancel</button>
         <button type="button" class="primary" id="transferModalConfirm">Confirm</button>
       </div>
+    </div>
+  </div>
+
+  <div id="llmTelemetryModal" class="modal" data-open="false" aria-hidden="true" hidden>
+    <div class="modal-content llm-telemetry-modal-content">
+      <div class="modal-header">
+        <h3>LLM Request Telemetry</h3>
+        <button type="button" id="llmTelemetryModalClose" class="ghost">Close</button>
+      </div>
+      <p class="subtitle" id="llmTelemetryModalSubtitle">Aggregated request telemetry from Postgres. Raw event lines remain in per-job <code>events.jsonl</code> files on shared job storage.</p>
+      <div class="telemetry-filter-grid">
+        <div class="field">
+          <label for="llmTelemetryScopeFilter">Scope</label>
+          <select id="llmTelemetryScopeFilter">
+            <option value="">All scopes</option>
+            <option value="team">Team</option>
+            <option value="user">User</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="llmTelemetrySubjectFilter">Subject</label>
+          <input id="llmTelemetrySubjectFilter" type="text" placeholder="team-123 or alice">
+        </div>
+        <div class="field">
+          <label for="llmTelemetryHoursFilter">Window</label>
+          <select id="llmTelemetryHoursFilter">
+            <option value="24">24 hours</option>
+            <option value="72" selected>72 hours</option>
+            <option value="168">7 days</option>
+            <option value="720">30 days</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="llmTelemetryProviderFilter">Provider</label>
+          <input id="llmTelemetryProviderFilter" type="text" placeholder="openai">
+        </div>
+        <div class="field">
+          <label for="llmTelemetryModelFilter">Model</label>
+          <input id="llmTelemetryModelFilter" type="text" placeholder="gpt-5.4">
+        </div>
+        <div class="field">
+          <label for="llmTelemetryCategoryFilter">Category</label>
+          <input id="llmTelemetryCategoryFilter" type="text" placeholder="codingagent">
+        </div>
+      </div>
+      <div class="assistant-actions">
+        <button type="button" class="ghost" id="llmTelemetryModalApply">Apply Filters</button>
+        <button type="button" class="ghost" id="llmTelemetryModalRefresh">Refresh</button>
+      </div>
+      <div class="admin-status-grid llm-telemetry-stats" id="llmTelemetryModalStats"></div>
+      <div class="llm-telemetry-section">
+        <div class="section-title">Top Provider / Model Groups</div>
+        <div class="telemetry-table-wrap">
+          <table class="telemetry-table">
+            <thead>
+              <tr>
+                <th>Provider</th>
+                <th>Model</th>
+                <th>Category</th>
+                <th>Requests</th>
+                <th>Success</th>
+                <th>Quota</th>
+                <th>Avg Latency</th>
+                <th>Last Event</th>
+              </tr>
+            </thead>
+            <tbody id="llmTelemetryGroupsBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="llm-telemetry-section">
+        <div class="section-title">Top Subjects</div>
+        <div class="telemetry-table-wrap">
+          <table class="telemetry-table">
+            <thead>
+              <tr>
+                <th>Scope</th>
+                <th>Subject</th>
+                <th>Requests</th>
+                <th>Success</th>
+                <th>Errors</th>
+                <th>Last Event</th>
+              </tr>
+            </thead>
+            <tbody id="llmTelemetrySubjectsBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div id="llmTelemetryModalStatus" class="status-banner" hidden></div>
     </div>
   </div>
 

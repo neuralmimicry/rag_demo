@@ -36,7 +36,7 @@ import datetime as dt
 from collections import deque
 from dataclasses import dataclass, field
 from email.message import EmailMessage
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlencode, quote
 from zoneinfo import ZoneInfo
 
@@ -61,7 +61,7 @@ from flask import (
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from llm_providers import get_provider, LLMError
+from llm_providers import get_provider, LLMError, register_event_callback
 from document_schema import coerce_document_elements
 from file_converter import FileConverter
 from rag_engine import RagDocument, RagIndex, RagStore
@@ -209,6 +209,8 @@ TODO_SCHEDULE_EXECUTION_TIMEOUT_SEC = max(
     5.0,
     float(os.getenv("REFINER_TODO_SCHEDULE_EXECUTION_TIMEOUT_SEC", "90")),
 )
+LLM_TELEMETRY_RETENTION_HOURS = max(0, int(os.getenv("REFINER_LLM_TELEMETRY_RETENTION_HOURS", "2160")))
+LLM_TELEMETRY_PRUNE_POLL_SEC = max(300.0, float(os.getenv("REFINER_LLM_TELEMETRY_PRUNE_POLL_SEC", "3600")))
 VOICE_TOKEN_PATH = os.path.join(JOB_ROOT, "voice_tokens.json")
 VOICE_DEFAULT_USER = (os.getenv("REFINER_VOICE_DEFAULT_USER") or "").strip()
 VOICE_ENV_TOKEN = (os.getenv("REFINER_VOICE_TOKEN") or "").strip()
@@ -2028,6 +2030,7 @@ class SecretStore:
     def _write(self) -> None:
         tmp = f"{self.path}.tmp"
         try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as handle:
                 json.dump(self.data, handle, indent=2)
             os.replace(tmp, self.path)
@@ -4430,6 +4433,61 @@ def _merge_token_usage_event(job: "Job", data: Dict[str, Any]) -> None:
     job.token_actual = int(token_usage.get("total") or 0)
 
 
+def _llm_request_telemetry_store() -> Optional[Any]:
+    if CENTRAL_STORE is None:
+        return None
+    return getattr(CENTRAL_STORE, "llm_request_telemetry", None)
+
+
+def _record_llm_request_telemetry_subject(subject: Optional[str], data: Dict[str, Any], *, scope: str = "user") -> bool:
+    cleaned_subject = str(subject or "").strip()
+    store = _llm_request_telemetry_store()
+    if not cleaned_subject or store is None or not isinstance(data, dict):
+        return False
+    try:
+        store.record(scope, cleaned_subject, data)
+        return True
+    except Exception as exc:
+        logger.debug("llm request telemetry persistence failed for %s/%s: %s", scope, cleaned_subject, exc)
+        return False
+
+
+def _record_llm_request_telemetry(
+    user: Optional[str],
+    data: Dict[str, Any],
+    *,
+    scope: str = "user",
+    team_id: Optional[str] = None,
+) -> bool:
+    # Persist a user-scoped record plus an optional team roll-up so operators can
+    # inspect either personal or shared usage without duplicating raw job logs.
+    recorded = _record_llm_request_telemetry_subject(user, data, scope=scope)
+    cleaned_team_id = str(team_id or "").strip()
+    if cleaned_team_id:
+        recorded = _record_llm_request_telemetry_subject(cleaned_team_id, data, scope="team") or recorded
+    return recorded
+
+
+def _current_team_telemetry_subject() -> Optional[str]:
+    profile = _current_auth_profile()
+    active_team = profile.get("active_team") if isinstance(profile, dict) else None
+    if isinstance(active_team, dict):
+        cleaned = str(active_team.get("team_id") or active_team.get("id") or "").strip()
+        return cleaned or None
+    return None
+
+
+def _handle_inprocess_llm_provider_event(event: Dict[str, Any]) -> None:
+    if not isinstance(event, dict) or event.get("type") != "llm_request":
+        return
+    # Assistant/playground requests run inside the web process, so they do not
+    # pass through the job stdout event reader. Persist those here instead.
+    _record_llm_request_telemetry(_current_user(), event, team_id=_current_team_telemetry_subject())
+
+
+register_event_callback(_handle_inprocess_llm_provider_event)
+
+
 @dataclass
 class Stage:
     """One lifecycle stage entry for a background job."""
@@ -5573,6 +5631,95 @@ class TodoScheduler:
                 _audit_event("todo_schedule_complete", actor=user, status="failed", details={"schedule_id": schedule_id, "todo_id": todo_id, "subtask_id": subtask_id, "error": task.error or "subtask_failed"})
 
 
+class LLMTelemetryJanitor:
+    """Background janitor that trims old Postgres LLM telemetry buckets."""
+
+    def __init__(
+        self,
+        *,
+        telemetry_store_factory: Callable[[], Optional[Any]],
+        retention_hours: int = LLM_TELEMETRY_RETENTION_HOURS,
+        poll_sec: float = LLM_TELEMETRY_PRUNE_POLL_SEC,
+    ):
+        self.telemetry_store_factory = telemetry_store_factory
+        self.retention_hours = max(0, int(retention_hours))
+        self.poll_sec = max(60.0, float(poll_sec))
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._last_run_at: Optional[str] = None
+        self._last_removed = 0
+        self._last_error: Optional[str] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        if not self.retention_hours or self.telemetry_store_factory() is None:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, name="llm-telemetry-janitor", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=max(0.1, float(timeout)))
+
+    def status(self) -> Dict[str, Any]:
+        store = self.telemetry_store_factory()
+        thread = self._thread
+        with self._lock:
+            last_run_at = self._last_run_at
+            last_removed = self._last_removed
+            last_error = self._last_error
+        return {
+            "enabled": bool(self.retention_hours > 0),
+            "available": bool(store is not None),
+            "running": bool(thread and thread.is_alive()),
+            "retention_hours": self.retention_hours,
+            "poll_sec": self.poll_sec,
+            "last_run_at": last_run_at,
+            "last_removed": last_removed,
+            "last_error": last_error,
+            "aggregate_store": "postgres" if store is not None else "disabled",
+            # Raw event lines remain in per-job events.jsonl under shared job storage.
+            "raw_event_stream": "job_events_jsonl",
+        }
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.run_once()
+            except Exception:
+                logger.exception("LLM telemetry janitor cycle failed")
+            self._stop_event.wait(self.poll_sec)
+
+    def run_once(self) -> int:
+        store = self.telemetry_store_factory()
+        if store is None or self.retention_hours <= 0:
+            with self._lock:
+                self._last_run_at = _now_iso()
+                self._last_removed = 0
+                self._last_error = None if self.retention_hours <= 0 else "telemetry_store_unavailable"
+            return 0
+        removed = 0
+        error: Optional[str] = None
+        try:
+            removed = max(0, int(store.prune_older_than(self.retention_hours)))
+        except Exception as exc:
+            error = str(exc)
+            with self._lock:
+                self._last_run_at = _now_iso()
+                self._last_removed = 0
+                self._last_error = error
+            raise
+        with self._lock:
+            self._last_run_at = _now_iso()
+            self._last_removed = removed
+            self._last_error = error
+        return removed
+
+
 class JobManager:
     """Background job queue manager for workflow execution processes."""
 
@@ -6222,6 +6369,8 @@ class JobManager:
             status = data.get("status")
             if status and job.status == "running":
                 job.update_stage("finalize", status)
+        elif event_type == "llm_request":
+            _record_llm_request_telemetry(job.owner, data, team_id=self._effective_team_id(job))
         elif event_type == "token_usage":
             _merge_token_usage_event(job, data)
             job.persist()
@@ -7566,6 +7715,11 @@ todo_scheduler = TodoScheduler(
     todo_store=todo_store,
     subtask_manager=subtask_manager,
 )
+llm_telemetry_janitor = LLMTelemetryJanitor(telemetry_store_factory=_llm_request_telemetry_store)
+
+
+def _llm_telemetry_retention_status() -> Dict[str, Any]:
+    return llm_telemetry_janitor.status()
 
 
 def _chain_enabled() -> bool:
@@ -13702,6 +13856,24 @@ def admin_stats() -> Response:
         status = job.status or "unknown"
         jobs_by_status[status] = jobs_by_status.get(status, 0) + 1
     active_users = _active_users_snapshot()
+    retention_status = _llm_telemetry_retention_status()
+    llm_request_telemetry: Dict[str, Any] = {
+        "enabled": False,
+        "retention": retention_status,
+    }
+    telemetry_store = _llm_request_telemetry_store()
+    if telemetry_store is not None:
+        try:
+            llm_request_telemetry = telemetry_store.summary(hours=72, limit=12)
+            llm_request_telemetry["retention"] = retention_status
+        except Exception as exc:
+            logger.warning("llm request telemetry summary failed: %s", exc)
+            llm_request_telemetry = {
+                "enabled": True,
+                "degraded": True,
+                "error": "telemetry_summary_unavailable",
+                "retention": retention_status,
+            }
     return jsonify(
         {
             "active_users": active_users,
@@ -13725,10 +13897,77 @@ def admin_stats() -> Response:
             "jobs_completed": jobs_by_status.get("completed", 0),
             "jobs_paused": jobs_by_status.get("paused", 0),
             "jobs_by_status": jobs_by_status,
+            "llm_request_telemetry": llm_request_telemetry,
             "continuum_autoscaler": _continuum_autoscaler_status(),
             "uptime_sec": int(time.time() - APP_START_TIME),
         }
     )
+
+
+def admin_llm_telemetry() -> Response:
+    """Return filtered LLM request telemetry for admin drill-down views."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if not _is_admin_user(user):
+        return jsonify({"error": "forbidden"}), 403
+
+    scope_raw = str(request.args.get("scope") or "").strip().lower()
+    if scope_raw not in {"", "user", "team"}:
+        return jsonify({"error": "invalid_scope"}), 400
+    hours = max(1, min(_safe_int(request.args.get("hours"), 72), 24 * 365))
+    limit = max(1, min(_safe_int(request.args.get("limit"), 20), 100))
+    include_subjects = _is_truthy(request.args.get("include_subjects"))
+    subject_limit = max(1, min(_safe_int(request.args.get("subject_limit"), 12), 100))
+    filters = {
+        "scope": scope_raw or None,
+        "subject": str(request.args.get("subject") or "").strip() or None,
+        "provider": str(request.args.get("provider") or "").strip() or None,
+        "model": str(request.args.get("model") or "").strip() or None,
+        "category": str(request.args.get("category") or "").strip() or None,
+    }
+    retention_status = _llm_telemetry_retention_status()
+    telemetry_store = _llm_request_telemetry_store()
+    if telemetry_store is None:
+        return jsonify(
+            {
+                "enabled": False,
+                "window_hours": hours,
+                "retention": retention_status,
+                "filters": filters,
+            }
+        )
+    try:
+        payload = telemetry_store.summary(
+            scope=filters["scope"],
+            subject=filters["subject"],
+            hours=hours,
+            limit=limit,
+            provider=filters["provider"],
+            model=filters["model"],
+            category=filters["category"],
+            include_subjects=include_subjects,
+            subject_limit=subject_limit,
+        )
+    except Exception as exc:
+        logger.warning("admin llm telemetry summary failed: %s", exc)
+        return jsonify(
+            {
+                "enabled": True,
+                "degraded": True,
+                "error": "telemetry_summary_unavailable",
+                "message": "Failed to load LLM telemetry summary.",
+                "retention": retention_status,
+                "filters": filters,
+            }
+        )
+
+    payload["retention"] = retention_status
+    payload["filters"] = filters
+    payload["limit"] = limit
+    payload["include_subjects"] = include_subjects
+    payload["subject_limit"] = subject_limit
+    return jsonify(payload)
 
 
 def workers_telemetry() -> Response:
@@ -17355,6 +17594,7 @@ if hasattr(app, "add_url_rule"):
         api_version=api_version,
         capabilities_report=capabilities_report,
         admin_stats=admin_stats,
+        admin_llm_telemetry=admin_llm_telemetry,
         workers_telemetry=workers_telemetry,
         api_audit=api_audit,
     )
@@ -17476,6 +17716,8 @@ if hasattr(app, "add_url_rule"):
     )
     if TODO_SCHEDULER_ENABLED:
         todo_scheduler.start()
+    if LLM_TELEMETRY_RETENTION_HOURS > 0:
+        llm_telemetry_janitor.start()
 
 
 if __name__ == "__main__":

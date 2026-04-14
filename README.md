@@ -102,6 +102,8 @@ When `REFINER_CUSTOMERS_API_BASE` is configured, the auth/profile/voice-token ro
 
 `POST /api/profile` can update either the email, the settings block, or both in one request. In local/Postgres-backed mode these settings are stored under the user's metadata record; the Control Room Global Settings tab now exposes them directly.
 
+When Refiner is running on the shared Continuum stack, job-scoped `token_usage` and `llm_request` events are still mirrored into each job's `events.jsonl` artifact under the NFS-backed job workspace, while aggregated provider latency/success telemetry is rolled up hourly in the shared Postgres control-plane store. Admin operators can inspect the recent aggregate through `GET /api/admin/stats` under the `llm_request_telemetry` field.
+
 ## RAG + MCP integrations
 Refiner now includes lightweight RAG indexing (for unstructured documents) and MCP connectivity (for structured, action-oriented external systems).
 
