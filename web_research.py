@@ -17,8 +17,9 @@ import os
 import re
 import tempfile
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, unquote, urlparse
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse, urlsplit, urlunsplit
+from xml.etree import ElementTree as ET
 
 import requests
 
@@ -29,6 +30,12 @@ from security_utils import url_allowed
 logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_ROOT = ".research_cache"
+YOUTUBE_DEFAULT_LANGS = ("en", "en-US", "en-GB", "en-CA", "en-AU", "en-IN")
+YOUTUBE_PLAYER_RESPONSE_MARKERS = (
+    "var ytInitialPlayerResponse = ",
+    "ytInitialPlayerResponse = ",
+    "window['ytInitialPlayerResponse'] = ",
+)
 
 
 def normalize_query(query: str, *, max_chars: int = 512, drop_todo_fixme: bool = False) -> str:
@@ -750,6 +757,199 @@ def is_youtube_url(url: str) -> bool:
     return bool(extract_youtube_video_id(url))
 
 
+def _youtube_watch_url(video_id: str) -> str:
+    """Return the canonical watch URL for a YouTube video id."""
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _youtube_primary_lang(lang: str) -> str:
+    """Normalize a caption language code to its primary language subtag."""
+    return str(lang or "").strip().lower().split("-", 1)[0]
+
+
+def _youtube_dedup_langs(languages: Optional[List[str]] = None) -> List[str]:
+    """Deduplicate explicit and default language preferences while preserving order."""
+    ordered: List[str] = []
+    for candidate in list(languages or []) + list(YOUTUBE_DEFAULT_LANGS):
+        lang = str(candidate or "").strip()
+        if lang and lang not in ordered:
+            ordered.append(lang)
+    return ordered
+
+
+def _youtube_track_name(track: Dict[str, Any]) -> str:
+    """Extract a readable caption track name from a YouTube caption track object."""
+    name = track.get("name")
+    if isinstance(name, dict):
+        simple_text = str(name.get("simpleText") or "").strip()
+        if simple_text:
+            return simple_text
+        runs = name.get("runs")
+        if isinstance(runs, list):
+            pieces = [str(run.get("text") or "") for run in runs if isinstance(run, dict)]
+            joined = "".join(pieces).strip()
+            if joined:
+                return joined
+    return str(track.get("trackName") or "").strip()
+
+
+def _youtube_set_query_param(url: str, key: str, value: str) -> str:
+    """Replace or append one query parameter on a URL."""
+    parts = urlsplit(str(url or "").strip())
+    pairs = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != key]
+    if value != "":
+        pairs.append((key, value))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(pairs), parts.fragment))
+
+
+def _extract_json_object_after_marker(body: str, marker: str) -> Optional[Dict[str, Any]]:
+    """Extract and parse one JSON object embedded after a fixed marker string."""
+    if not body or not marker:
+        return None
+    marker_index = body.find(marker)
+    if marker_index < 0:
+        return None
+    start = body.find("{", marker_index + len(marker))
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(body)):
+        char = body[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    payload = json.loads(body[start : index + 1])
+                except Exception:
+                    return None
+                return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _extract_youtube_player_response(body: str) -> Dict[str, Any]:
+    """Parse the embedded ytInitialPlayerResponse object from a watch page."""
+    for marker in YOUTUBE_PLAYER_RESPONSE_MARKERS:
+        payload = _extract_json_object_after_marker(body, marker)
+        if payload:
+            return payload
+    return {}
+
+
+def _fetch_youtube_oembed_metadata(
+    url: str,
+    video_id: str,
+    *,
+    timeout: int,
+    session: requests.Session,
+) -> Dict[str, Any]:
+    """Fetch lightweight YouTube video metadata via oEmbed when available."""
+    endpoint = "https://www.youtube.com/oembed"
+    if not url_allowed(endpoint):
+        return {}
+    try:
+        response = session.get(
+            endpoint,
+            params={"url": _youtube_watch_url(video_id), "format": "json"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://www.youtube.com/",
+            },
+            timeout=timeout,
+        )
+        if int(getattr(response, "status_code", 0) or 0) >= 400:
+            return {}
+        data = response.json()
+        if not isinstance(data, dict):
+            return {}
+        return {
+            "title": str(data.get("title") or "").strip(),
+            "channel_name": str(data.get("author_name") or "").strip(),
+            "channel_url": str(data.get("author_url") or "").strip(),
+            "thumbnail_url": str(data.get("thumbnail_url") or "").strip(),
+        }
+    except Exception:
+        return {}
+
+
+def _fetch_youtube_watch_context(
+    video_id: str,
+    *,
+    timeout: int,
+    session: requests.Session,
+) -> Dict[str, Any]:
+    """Fetch watch-page context so caption tracks and fallback metadata are available."""
+    watch_url = _youtube_watch_url(video_id)
+    if not url_allowed(watch_url):
+        return {}
+    try:
+        response = session.get(
+            watch_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                "Accept-Language": "en-GB,en;q=0.9,en-US;q=0.8",
+                "Referer": "https://www.youtube.com/",
+            },
+            timeout=timeout,
+        )
+        if int(getattr(response, "status_code", 0) or 0) >= 400:
+            return {}
+    except Exception:
+        return {}
+
+    player_response = _extract_youtube_player_response(getattr(response, "text", "") or "")
+    if not player_response:
+        return {}
+
+    tracklist = (
+        player_response.get("captions", {})
+        .get("playerCaptionsTracklistRenderer", {})
+        .get("captionTracks")
+        or []
+    )
+    tracks = [track for track in tracklist if isinstance(track, dict)]
+    video_details = player_response.get("videoDetails") if isinstance(player_response.get("videoDetails"), dict) else {}
+    microformat = (
+        player_response.get("microformat", {})
+        .get("playerMicroformatRenderer", {})
+        if isinstance(player_response.get("microformat"), dict)
+        else {}
+    )
+    thumbnails = []
+    if isinstance(video_details.get("thumbnail"), dict):
+        thumbnails = video_details.get("thumbnail", {}).get("thumbnails") or []
+    thumbnail_url = ""
+    if isinstance(thumbnails, list) and thumbnails:
+        last = thumbnails[-1]
+        if isinstance(last, dict):
+            thumbnail_url = str(last.get("url") or "").strip()
+    owner_profile_url = str(microformat.get("ownerProfileUrl") or "").strip()
+    if owner_profile_url.startswith("/"):
+        owner_profile_url = f"https://www.youtube.com{owner_profile_url}"
+    return {
+        "tracks": tracks,
+        "title": str(video_details.get("title") or "").strip(),
+        "channel_name": str(video_details.get("author") or "").strip(),
+        "channel_id": str(video_details.get("channelId") or "").strip(),
+        "channel_url": owner_profile_url,
+        "thumbnail_url": thumbnail_url,
+    }
+
+
 def parse_youtube_json3_transcript(payload: Dict[str, Any]) -> str:
     """Flatten a YouTube JSON3 transcript payload into plain text."""
     if not isinstance(payload, dict):
@@ -775,6 +975,149 @@ def parse_youtube_json3_transcript(payload: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def parse_youtube_xml_transcript(payload_text: str) -> str:
+    """Flatten a YouTube XML transcript payload into plain text."""
+    raw = str(payload_text or "").strip()
+    if not raw:
+        return ""
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return ""
+    lines: List[str] = []
+    for node in root.findall(".//text"):
+        fragments = [fragment for fragment in node.itertext()]
+        line = html_lib.unescape("".join(fragments)).replace("\n", " ")
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _parse_youtube_transcript_response(response: requests.Response) -> str:
+    """Parse either JSON3 or XML caption responses into plain text."""
+    body = getattr(response, "text", "") or ""
+    if not body and getattr(response, "content", None):
+        try:
+            body = response.content.decode(getattr(response, "encoding", None) or "utf-8", errors="ignore")
+        except Exception:
+            body = ""
+    stripped = body.strip()
+    if not stripped:
+        return ""
+    payload = None
+    if stripped.startswith("{"):
+        try:
+            payload = response.json()
+        except Exception:
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = None
+    if isinstance(payload, dict):
+        transcript = parse_youtube_json3_transcript(payload)
+        if transcript:
+            return transcript
+    return parse_youtube_xml_transcript(body)
+
+
+def _build_youtube_caption_attempts(tracks: List[Dict[str, Any]], preferred_langs: List[str]) -> List[Dict[str, Any]]:
+    """Order caption fetch attempts from strongest fit to broadest fallback."""
+    attempts: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str]] = set()
+    preferred_exact = {lang.lower() for lang in preferred_langs if lang}
+    preferred_primary = {_youtube_primary_lang(lang) for lang in preferred_langs if lang}
+
+    def add_attempt(track: Dict[str, Any], *, translated_to: str = "") -> None:
+        base_url = html_lib.unescape(str(track.get("baseUrl") or "").strip())
+        if not base_url:
+            return
+        seen_key = (base_url, translated_to)
+        if seen_key in seen:
+            return
+        seen.add(seen_key)
+        caption_name = _youtube_track_name(track)
+        source_lang = str(track.get("languageCode") or "").strip()
+        transcript_lang = translated_to or source_lang
+        candidate_urls = []
+        for candidate in (_youtube_set_query_param(base_url, "fmt", "json3"), base_url):
+            final_url = _youtube_set_query_param(candidate, "tlang", translated_to) if translated_to else candidate
+            if final_url not in candidate_urls:
+                candidate_urls.append(final_url)
+        attempts.append(
+            {
+                "urls": candidate_urls,
+                "caption_lang": transcript_lang,
+                "caption_kind": "asr" if str(track.get("kind") or "").strip().lower() == "asr" else "standard",
+                "caption_name": caption_name,
+                "caption_source_language": source_lang,
+                "caption_translated_to": translated_to,
+            }
+        )
+
+    def ordered(predicate: Callable[[Dict[str, Any]], bool]) -> List[Dict[str, Any]]:
+        return [track for track in tracks if predicate(track)]
+
+    def is_manual(track: Dict[str, Any]) -> bool:
+        return str(track.get("kind") or "").strip().lower() != "asr"
+
+    def is_asr(track: Dict[str, Any]) -> bool:
+        return not is_manual(track)
+
+    def lang_exact(track: Dict[str, Any]) -> bool:
+        return str(track.get("languageCode") or "").strip().lower() in preferred_exact
+
+    def lang_primary(track: Dict[str, Any]) -> bool:
+        return _youtube_primary_lang(track.get("languageCode") or "") in preferred_primary
+
+    def is_english(track: Dict[str, Any]) -> bool:
+        return _youtube_primary_lang(track.get("languageCode") or "") == "en"
+
+    for track in ordered(lambda track: is_manual(track) and lang_exact(track)):
+        add_attempt(track)
+    for track in ordered(lambda track: is_asr(track) and lang_exact(track)):
+        add_attempt(track)
+    for track in ordered(lambda track: is_manual(track) and lang_primary(track)):
+        add_attempt(track)
+    for track in ordered(lambda track: is_asr(track) and lang_primary(track)):
+        add_attempt(track)
+    for track in ordered(lambda track: is_manual(track) and is_english(track)):
+        add_attempt(track)
+    for track in ordered(lambda track: is_asr(track) and is_english(track)):
+        add_attempt(track)
+    for track in ordered(
+        lambda track: bool(track.get("isTranslatable")) and _youtube_primary_lang(track.get("languageCode") or "") != "en"
+    ):
+        add_attempt(track, translated_to="en")
+    for track in ordered(is_manual):
+        add_attempt(track)
+    for track in ordered(is_asr):
+        add_attempt(track)
+    return attempts
+
+
+def _build_direct_youtube_attempts(video_id: str, preferred_langs: List[str]) -> List[Dict[str, Any]]:
+    """Fallback caption requests when watch-page caption tracks are unavailable."""
+    attempts: List[Dict[str, Any]] = []
+    for lang in preferred_langs:
+        for kind in ("standard", "asr"):
+            params = {"v": video_id, "lang": lang}
+            if kind == "asr":
+                params["kind"] = "asr"
+            direct_url = "https://www.youtube.com/api/timedtext?" + urlencode(params)
+            attempts.append(
+                {
+                    "urls": [_youtube_set_query_param(direct_url, "fmt", "json3"), direct_url],
+                    "caption_lang": lang,
+                    "caption_kind": kind,
+                    "caption_name": "",
+                    "caption_source_language": lang,
+                    "caption_translated_to": "",
+                }
+            )
+    return attempts
+
+
 def fetch_youtube_transcript(
     url: str,
     *,
@@ -786,68 +1129,66 @@ def fetch_youtube_transcript(
     video_id = extract_youtube_video_id(url)
     if not video_id:
         raise requests.exceptions.RequestException("URL is not a supported YouTube video link.")
-    timedtext_url = "https://www.youtube.com/api/timedtext"
-    if not url_allowed(timedtext_url):
+    if not url_allowed("https://www.youtube.com/api/timedtext"):
         raise requests.exceptions.RequestException("YouTube transcript endpoint blocked by policy")
 
-    preferred_langs: List[str] = []
-    for candidate in (languages or ["en", "en-US", "en-GB"]):
-        lang = str(candidate or "").strip()
-        if lang and lang not in preferred_langs:
-            preferred_langs.append(lang)
-    if not preferred_langs:
-        preferred_langs = ["en"]
-
+    preferred_langs = _youtube_dedup_langs(languages)
     session = session or requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "Accept": "application/json,text/plain,*/*",
         "Referer": "https://www.youtube.com/",
     }
-    attempts = []
-    for lang in preferred_langs:
-        attempts.append({"v": video_id, "lang": lang, "fmt": "json3"})
-        attempts.append({"v": video_id, "lang": lang, "fmt": "json3", "kind": "asr"})
+    watch_context = _fetch_youtube_watch_context(video_id, timeout=timeout, session=session)
+    oembed_metadata = _fetch_youtube_oembed_metadata(url, video_id, timeout=timeout, session=session)
+    available_languages = []
+    for track in watch_context.get("tracks") or []:
+        language_code = str(track.get("languageCode") or "").strip()
+        if language_code and language_code not in available_languages:
+            available_languages.append(language_code)
+
+    base_metadata = {
+        "source_type": "youtube_transcript",
+        "source_url": url,
+        "video_id": video_id,
+        "video_url": _youtube_watch_url(video_id),
+        "title": str(oembed_metadata.get("title") or watch_context.get("title") or "").strip(),
+        "channel_name": str(oembed_metadata.get("channel_name") or watch_context.get("channel_name") or "").strip(),
+        "channel_url": str(oembed_metadata.get("channel_url") or watch_context.get("channel_url") or "").strip(),
+        "thumbnail_url": str(oembed_metadata.get("thumbnail_url") or watch_context.get("thumbnail_url") or "").strip(),
+    }
+    if available_languages:
+        base_metadata["available_caption_languages"] = available_languages
+
+    attempts = _build_youtube_caption_attempts(watch_context.get("tracks") or [], preferred_langs)
+    attempts.extend(_build_direct_youtube_attempts(video_id, preferred_langs))
 
     last_error = "Transcript unavailable."
-    for params in attempts:
-        try:
-            resp = session.get(timedtext_url, params=params, headers=headers, timeout=timeout)
-        except Exception as exc:
-            last_error = str(exc)
-            continue
-        status_code = int(getattr(resp, "status_code", 0) or 0)
-        if status_code >= 400:
-            last_error = f"HTTP {status_code}"
-            continue
-        raw_text = getattr(resp, "text", "") or ""
-        if not raw_text and getattr(resp, "content", None):
+    for attempt in attempts:
+        for transcript_url in attempt.get("urls") or []:
             try:
-                raw_text = resp.content.decode("utf-8", errors="ignore")
-            except Exception:
-                raw_text = ""
-        if not raw_text.strip():
-            last_error = "Transcript response was empty."
-            continue
-        payload = None
-        try:
-            payload = resp.json()
-        except Exception:
-            try:
-                payload = json.loads(raw_text)
-            except Exception:
-                payload = None
-        transcript = parse_youtube_json3_transcript(payload if isinstance(payload, dict) else {})
-        if transcript:
-            metadata = {
-                "source_type": "youtube_transcript",
-                "source_url": url,
-                "video_id": video_id,
-                "caption_lang": str(params.get("lang") or ""),
-                "caption_kind": str(params.get("kind") or "standard"),
-            }
-            return transcript, metadata
-        last_error = "Transcript payload did not contain caption events."
+                resp = session.get(transcript_url, headers=headers, timeout=timeout)
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+            status_code = int(getattr(resp, "status_code", 0) or 0)
+            if status_code >= 400:
+                last_error = f"HTTP {status_code}"
+                continue
+            transcript = _parse_youtube_transcript_response(resp)
+            if transcript:
+                metadata = dict(base_metadata)
+                metadata.update(
+                    {
+                        "caption_lang": str(attempt.get("caption_lang") or ""),
+                        "caption_kind": str(attempt.get("caption_kind") or "standard"),
+                        "caption_name": str(attempt.get("caption_name") or "").strip(),
+                        "caption_source_language": str(attempt.get("caption_source_language") or ""),
+                        "caption_translated_to": str(attempt.get("caption_translated_to") or ""),
+                    }
+                )
+                return transcript, metadata
+            last_error = "Transcript payload did not contain caption text."
     raise requests.exceptions.RequestException(last_error)
 
 
