@@ -94,6 +94,14 @@ For the detailed route inventory and example payloads, see [API_DOCS_README.md](
 
 When `REFINER_CUSTOMERS_API_BASE` is configured, the auth/profile/voice-token routes above are proxied to Customers so the public contract remains stable while the identity implementation lives in the separate service.
 
+`GET /api/profile` now returns the current user's notification email plus validated profile-backed defaults for:
+- LLM provider/model/reasoning effort,
+- assistant profile + assistant memory,
+- solver command policy mode, and
+- UI replay visibility.
+
+`POST /api/profile` can update either the email, the settings block, or both in one request. In local/Postgres-backed mode these settings are stored under the user's metadata record; the Control Room Global Settings tab now exposes them directly.
+
 ## RAG + MCP integrations
 Refiner now includes lightweight RAG indexing (for unstructured documents) and MCP connectivity (for structured, action-oriented external systems).
 
@@ -121,6 +129,7 @@ RAG indexes are stored per user under `job_data/rag/` and only accept file paths
 - `POST /api/mcp/servers/<name>/resource` — read a resource by URI.
 
 MCP endpoints are admin-only because they can execute actions in external systems. Store OAuth/Bearer tokens when registering the server; responses mask secrets.
+Raw MCP tokens and custom headers are moved into the encrypted Refiner secret store; the shared Postgres/file registry persists secret references and runtime metadata, not the plaintext secret material.
 
 ### Capability inventory
 - `GET /api/capabilities` — returns a snapshot of detected workflows, features, and API groups.
@@ -1191,6 +1200,7 @@ Inputs
 - If the solver workspace exists (explicit or implied), its files are scanned as their own requirement sources and TODO/FIXME notes there are treated as requirements.
 - If a previous solver output JSON exists, the solver resumes from the last incomplete requirement source instead of restarting; completed sources are skipped and prior action logs are reused.
 - Failed commands trigger an automatic debug/retry cycle with a recovery plan.
+- Recent replay data now feeds compact operational guidance back into prompt construction so repeated verification failures, unstable command shapes, and prompt-budget omissions are surfaced before the next iteration.
 - Optional web research augments planning with external guidance when search credentials are available; results are injected into prompts and recorded in the output.
 
 #### Output
@@ -1232,6 +1242,8 @@ Inputs
 - The solver passes through existing `OPENAI_API_KEY`/`GEMINI_API_KEY` values to OpenCode when available.
 - If `OPENCODE_COMMAND_TEMPLATE` is not set, the solver defaults to `opencode run --format json --file <prompt>`, and you can set `OPENCODE_MODEL` to choose a provider/model.
 - `OPENCODE_MODEL` should be in `provider/model` form (e.g., `openai/gpt-4o`, `anthropic/claude-sonnet-4-5`).
+- `SOLVER_EPISODIC_MEMORY_LIMIT` / `SOLVER_EPISODIC_MEMORY_MAX_CHARS` tune how much durable solver-memory context is injected per requirement source.
+- `SOLVER_FEEDBACK_MEMORY_LIMIT` / `SOLVER_FEEDBACK_MAX_CHARS` tune how much replay-derived operational guidance is injected alongside that memory.
 - Configure providers with `opencode auth login` and verify with `opencode auth list` (see `opencode.txt` or opencode.ai/docs).
 
 #### Settings

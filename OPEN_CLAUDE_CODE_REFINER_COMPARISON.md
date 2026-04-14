@@ -211,6 +211,21 @@ The same episodic pattern could later be extended to:
 For now, the solver is the highest-value target because it already has the
 strongest requirement traceability and verification model.
 
+## Additional refinements after the second comparison pass
+
+The next best matches from the external repository were not more agent types or
+terminal UX. The useful additions were smaller and operational:
+
+- adaptive feedback from recent solver replay data, so prompt construction can
+  warn about recurring verification failures, prompt-budget omissions, and
+  unstable command shapes before the next iteration runs,
+- operator-facing controls for the new profile-backed defaults, so the web UI
+  exposes assistant memory, solver safety, and LLM defaults directly instead of
+  leaving them hidden behind `POST /api/profile`,
+- deferring automatic model-routing until Refiner has broader persisted
+  provider latency/cost telemetry, because premature routing heuristics would
+  add policy complexity without enough signal.
+
 ## Components intentionally not recommended
 
 - UI bridge, React terminal UX, and remote desktop handoff

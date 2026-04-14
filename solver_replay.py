@@ -15,7 +15,7 @@ the final solver result without overwhelming downstream tooling.
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from solver_command_trust import CommandTrustStore
 from solver_memory import SolverEpisodeStore
@@ -257,3 +257,162 @@ def build_solver_replay_analysis(
         "command_patterns": command_patterns[:6],
         "recommendations": recommendations[:5],
     }
+
+
+def build_solver_feedback_prompt(
+    episode_store: SolverEpisodeStore,
+    *,
+    command_trust_store: Optional[CommandTrustStore] = None,
+    query_text: str = "",
+    source_path: Optional[str] = None,
+    requirement_ids: Optional[Sequence[str]] = None,
+    limit: int = 4,
+    max_chars: int = 1800,
+    header: str = "Recent solver feedback for similar work (use this to avoid repeating unstable patterns):",
+) -> str:
+    """Format compact operational guidance for the next solver iteration.
+
+    This complements episodic memory instead of replacing it. Episodic memory
+    captures *what* changed and why; this helper highlights *how* similar work
+    has recently gone wrong so the next prompt can steer away from known traps.
+    """
+
+    episodes = episode_store.search(
+        query_text,
+        source_path=source_path,
+        requirement_ids=requirement_ids,
+        limit=max(1, int(limit)),
+    )
+    if not episodes:
+        return ""
+
+    ordered = sorted(
+        episodes,
+        key=lambda item: (_safe_text(getattr(item, "created_at", ""), max_chars=40), int(item.iteration or 0)),
+        reverse=True,
+    )
+    recent_window = ordered[:3]
+    verification_counts: Counter[str] = Counter()
+    omitted_counts: Counter[str] = Counter()
+    command_failures: Dict[str, Dict[str, Any]] = {}
+
+    for episode in episodes:
+        for issue in episode.verification_failures:
+            cleaned_issue = _safe_text(issue, max_chars=180)
+            if cleaned_issue:
+                verification_counts[cleaned_issue] += 1
+
+        metadata = _safe_dict(getattr(episode, "metadata", {}) or {})
+        prompt_budget = _safe_dict(metadata.get("prompt_budget") or {})
+        if episode.outcome in {"failure", "deferred"} or episode.verification_failures:
+            for item in _safe_list(prompt_budget.get("omitted_sections") or []):
+                section = _safe_text(item, max_chars=80)
+                if section:
+                    omitted_counts[section] += 1
+
+        for raw in _safe_list(metadata.get("command_results") or []):
+            item = _safe_dict(raw)
+            shape = _safe_text(item.get("shape") or item.get("command"), max_chars=120)
+            if not shape:
+                continue
+            stats = command_failures.setdefault(
+                shape,
+                {
+                    "shape": shape,
+                    "runs": 0,
+                    "failures": 0,
+                    "trust_level": _safe_text(item.get("trust_level"), max_chars=24),
+                    "effective_risk": _safe_text(item.get("effective_risk") or item.get("policy_risk"), max_chars=16),
+                },
+            )
+            stats["runs"] += 1
+            if not bool(item.get("success")):
+                stats["failures"] += 1
+            if item.get("trust_level"):
+                stats["trust_level"] = _safe_text(item.get("trust_level"), max_chars=24)
+            if item.get("effective_risk") or item.get("policy_risk"):
+                stats["effective_risk"] = _safe_text(
+                    item.get("effective_risk") or item.get("policy_risk"),
+                    max_chars=16,
+                )
+
+    trust_snapshot_by_shape: Dict[str, Dict[str, Any]] = {}
+    if command_trust_store is not None:
+        for item in command_trust_store.snapshot(limit=80):
+            shape = _safe_text(item.get("shape"), max_chars=120)
+            if shape:
+                trust_snapshot_by_shape[shape] = item
+
+    lines: List[str] = [header]
+    latest = ordered[0]
+    recent_non_success = sum(
+        1
+        for item in recent_window
+        if item.outcome in {"failure", "deferred"} or item.verification_failures
+    )
+    if recent_non_success:
+        lines.append(
+            f"- {recent_non_success} of the last {len(recent_window)} similar runs ended in failure/deferred or hit verification breakage."
+        )
+
+    if latest.outcome != "success" or latest.verification_failures:
+        summary = _safe_text(latest.summary, max_chars=220)
+        suffix = f" Summary: {summary}" if summary else ""
+        lines.append(
+            f"- Latest similar outcome for '{_safe_text(latest.source_path, max_chars=160)}' was "
+            f"{_safe_text(latest.outcome, max_chars=24)} at iteration {int(latest.iteration or 0)}.{suffix}"
+        )
+
+    if verification_counts:
+        issue, count = verification_counts.most_common(1)[0]
+        lines.append(f"- Recurring verification issue: '{issue}' ({count} recent occurrence(s)).")
+
+    if omitted_counts:
+        section, count = omitted_counts.most_common(1)[0]
+        lines.append(
+            f"- Prompt budget dropped '{section}' before non-success runs {count} time(s); keep that context compact instead of losing it entirely."
+        )
+
+    command_rows: List[Dict[str, Any]] = []
+    for shape, item in command_failures.items():
+        if int(item.get("failures") or 0) <= 0:
+            continue
+        trust_row = trust_snapshot_by_shape.get(shape, {})
+        command_rows.append(
+            {
+                "shape": shape,
+                "runs": int(item.get("runs") or 0),
+                "failures": int(item.get("failures") or 0),
+                "trust_level": _safe_text(
+                    trust_row.get("trust_level") or item.get("trust_level"),
+                    max_chars=24,
+                )
+                or "unknown",
+                "effective_risk": _safe_text(
+                    trust_row.get("effective_risk") or item.get("effective_risk"),
+                    max_chars=16,
+                )
+                or "medium",
+            }
+        )
+    command_rows.sort(
+        key=lambda item: (
+            int(item.get("failures") or 0),
+            int(item.get("runs") or 0),
+        ),
+        reverse=True,
+    )
+    if command_rows:
+        item = command_rows[0]
+        lines.append(
+            f"- Treat command shape '{item['shape']}' carefully: {item['failures']}/{item['runs']} recent failure(s), "
+            f"trust {item['trust_level']}, effective risk {item['effective_risk']}."
+        )
+
+    if len(lines) == 1:
+        return ""
+
+    text = "\n".join(lines).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 15].rstrip() + "...(truncated)"

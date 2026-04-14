@@ -68,7 +68,7 @@ from rag_engine import RagDocument, RagIndex, RagStore
 from stt_learning import SttLearningStore
 from stt_gesture_planner import plan_stt_avatar_motion, sanitize_avatar_mode, sanitize_gesture_mode
 from stt_rust_contracts import RustGesturePlanRequest, sanitize_rust_motion_response
-from mcp_client import MCPClient, MCPServerConfig, MCPServerStore
+from mcp_client import MCPClient, MCPServerConfig, MCPServerStore, PostgresMCPServerStore
 from nmchain_client import NmChainClient, NmChainError
 from customers_client import CustomersClient, CustomersServiceError
 from billing_client import BillingClient, BillingServiceError
@@ -97,8 +97,17 @@ from security_utils import (
     ensure_dir_permissions,
     ensure_file_permissions,
     hash_identifier,
+    url_allowed,
 )
 from refiner_central_store import create_central_store_from_env
+from refiner_settings import (
+    SettingsValidationError,
+    default_settings as default_user_settings,
+    llm_defaults_from_settings,
+    metadata_with_settings,
+    settings_from_metadata,
+    validate_settings_patch,
+)
 from versioning import get_public_version_info, get_version_info
 from web_research import fetch_url_content, fetch_youtube_transcript, is_youtube_url
 
@@ -2043,6 +2052,13 @@ class SecretStore:
                 items.append({"name": name, "masked": masked, "updated_at": updated_at})
             return items
 
+    def get(self, name: str) -> Optional[str]:
+        with self.lock:
+            entry = self.data.get(name)
+            if not isinstance(entry, dict):
+                return None
+            return self._decrypt_entry(entry)
+
     def set(self, name: str, value: str) -> None:
         with self.lock:
             payload = self._encrypt_value(value)
@@ -2202,6 +2218,22 @@ class UserStore:
         with self.lock:
             entry = self.users.get(username) or {}
             return entry.get("role")
+
+    def get_metadata(self, username: str) -> Dict[str, Any]:
+        with self.lock:
+            entry = self.users.get(username) or {}
+            metadata = entry.get("metadata")
+            return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def set_metadata(self, username: str, metadata: Optional[Dict[str, Any]]) -> bool:
+        with self.lock:
+            entry = self.users.get(username)
+            if not entry:
+                return False
+            entry["metadata"] = dict(metadata or {})
+            entry["updated_at"] = _now_iso()
+            self._write()
+            return True
 
 
 class AccessStore:
@@ -4230,12 +4262,172 @@ class TokenLedger:
             return []
 
 
-TOKEN_RE = re.compile(
-    r"Token usage \[(?P<category>[^\]]+)\] (?P<provider>[^/\s]+)/(?P<model>[^:]+): "
-    r"sent=(?P<prompt>\?|\d+) received=(?P<completion>\?|\d+) used=(?P<total>\?|\d+)"
-    r"(?: cached=(?P<cached>\?|\d+))? \| running total \[(?P<cat2>[^\]]+)\]: "
-    r"sent=(?P<run_prompt>\d+) received=(?P<run_completion>\d+) used=(?P<run_total>\d+)"
-)
+def _default_token_usage_bucket() -> Dict[str, Any]:
+    return {
+        "prompt": 0,
+        "completion": 0,
+        "total": 0,
+        "cached": None,
+        "cost": None,
+        "events": 0,
+        "last_event_at": None,
+    }
+
+
+def _default_token_usage_metrics() -> Dict[str, Any]:
+    payload = _default_token_usage_bucket()
+    payload["by_category"] = {}
+    payload["by_model"] = {}
+    return payload
+
+
+def _normalize_token_cost(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    amount = value.get("amount")
+    currency = str(value.get("currency") or "").strip().upper() or None
+    try:
+        amount_value = float(amount)
+    except Exception:
+        amount_value = None
+    if amount_value is None:
+        return {"amount": None, "currency": currency} if currency else None
+    return {"amount": round(amount_value, 8), "currency": currency}
+
+
+def _normalize_token_usage_bucket(value: Any) -> Dict[str, Any]:
+    bucket = _default_token_usage_bucket()
+    if not isinstance(value, dict):
+        return bucket
+    bucket["prompt"] = _safe_int(value.get("prompt"), 0)
+    bucket["completion"] = _safe_int(value.get("completion"), 0)
+    bucket["total"] = _safe_int(value.get("total"), 0)
+    cached = value.get("cached")
+    bucket["cached"] = _safe_int(cached) if cached not in (None, "") else None
+    bucket["cost"] = _normalize_token_cost(value.get("cost"))
+    bucket["events"] = _safe_int(value.get("events"), 0)
+    bucket["last_event_at"] = str(value.get("last_event_at") or "").strip() or None
+    return bucket
+
+
+def _normalize_token_usage_metrics(value: Any) -> Dict[str, Any]:
+    metrics = _normalize_token_usage_bucket(value)
+    metrics["by_category"] = {}
+    metrics["by_model"] = {}
+    if isinstance(value, dict):
+        by_category = value.get("by_category")
+        if isinstance(by_category, dict):
+            for key, item in by_category.items():
+                label = str(key or "").strip()
+                if label:
+                    metrics["by_category"][label] = _normalize_token_usage_bucket(item)
+        by_model = value.get("by_model")
+        if isinstance(by_model, dict):
+            for key, item in by_model.items():
+                label = str(key or "").strip()
+                if label:
+                    bucket = _normalize_token_usage_bucket(item)
+                    if isinstance(item, dict):
+                        provider = str(item.get("provider") or "").strip()
+                        model = str(item.get("model") or "").strip()
+                        if provider:
+                            bucket["provider"] = provider
+                        if model:
+                            bucket["model"] = model
+                    metrics["by_model"][label] = bucket
+    return metrics
+
+
+def _event_ts_to_iso(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    try:
+        ts = float(value)
+    except Exception:
+        return None
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _merge_token_cost(total: Optional[Dict[str, Any]], incoming: Any) -> Optional[Dict[str, Any]]:
+    next_cost = _normalize_token_cost(incoming)
+    if not next_cost:
+        return total
+    if not total:
+        return next_cost
+    current = _normalize_token_cost(total) or {"amount": None, "currency": next_cost.get("currency")}
+    current_currency = current.get("currency")
+    next_currency = next_cost.get("currency")
+    if current_currency and next_currency and current_currency != next_currency:
+        return {"amount": None, "currency": "MIXED"}
+    if current.get("amount") is None or next_cost.get("amount") is None:
+        return {"amount": None, "currency": current_currency or next_currency}
+    return {
+        "amount": round(float(current.get("amount") or 0.0) + float(next_cost.get("amount") or 0.0), 8),
+        "currency": current_currency or next_currency,
+    }
+
+
+def _merge_token_usage_bucket(bucket: Dict[str, Any], usage: Any, *, cost: Any = None, event_at: Optional[str] = None) -> Dict[str, Any]:
+    extras: Dict[str, Any] = {}
+    if isinstance(bucket, dict):
+        for key in ("by_category", "by_model", "provider", "model"):
+            if key in bucket:
+                extras[key] = bucket.get(key)
+    target = _normalize_token_usage_bucket(bucket)
+    payload = usage if isinstance(usage, dict) else {}
+    prompt = _safe_int(payload.get("prompt"), 0)
+    completion = _safe_int(payload.get("completion"), 0)
+    total = payload.get("total")
+    total_value = _safe_int(total) if total not in (None, "") else None
+    if total_value is None and (prompt or completion):
+        total_value = prompt + completion
+    cached = payload.get("cached")
+    cached_value = _safe_int(cached) if cached not in (None, "") else None
+    target["prompt"] = _safe_int(target.get("prompt"), 0) + prompt
+    target["completion"] = _safe_int(target.get("completion"), 0) + completion
+    target["total"] = _safe_int(target.get("total"), 0) + int(total_value or 0)
+    if cached_value is not None:
+        target["cached"] = _safe_int(target.get("cached"), 0) + cached_value
+    target["events"] = _safe_int(target.get("events"), 0) + 1
+    target["cost"] = _merge_token_cost(target.get("cost"), cost)
+    if event_at:
+        target["last_event_at"] = event_at
+    target.update(extras)
+    return target
+
+
+def _merge_token_usage_event(job: "Job", data: Dict[str, Any]) -> None:
+    token_usage = _normalize_token_usage_metrics(job.metrics.get("token_usage") if isinstance(job.metrics, dict) else {})
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    event_at = _event_ts_to_iso(data.get("at") or data.get("ts"))
+    cost = data.get("cost")
+    # Keep the flat totals and the grouped breakdowns derived from the exact same
+    # event so UI summaries and token settlement never drift apart.
+    token_usage = _merge_token_usage_bucket(token_usage, usage, cost=cost, event_at=event_at)
+
+    category = str(data.get("category") or "llm").strip() or "llm"
+    token_usage["by_category"][category] = _merge_token_usage_bucket(
+        token_usage["by_category"].get(category),
+        usage,
+        cost=cost,
+        event_at=event_at,
+    )
+
+    provider = str(data.get("provider") or "unknown").strip() or "unknown"
+    model = str(data.get("model") or "unknown").strip() or "unknown"
+    model_key = f"{provider}/{model}"
+    bucket = _merge_token_usage_bucket(
+        token_usage["by_model"].get(model_key),
+        usage,
+        cost=cost,
+        event_at=event_at,
+    )
+    bucket["provider"] = provider
+    bucket["model"] = model
+    token_usage["by_model"][model_key] = bucket
+
+    job.metrics["token_usage"] = token_usage
+    job.token_actual = int(token_usage.get("total") or 0)
 
 
 @dataclass
@@ -4320,7 +4512,7 @@ class Job:
             self.notify_email = candidate or None
         if not self.metrics:
             self.metrics = {
-                "token_usage": {"prompt": 0, "completion": 0, "total": 0, "cached": None},
+                "token_usage": _default_token_usage_metrics(),
                 "errors": 0,
                 "resolved": 0,
                 "warnings": 0,
@@ -4328,7 +4520,7 @@ class Job:
                 "runtime_sec": None,
             }
         else:
-            self.metrics.setdefault("token_usage", {"prompt": 0, "completion": 0, "total": 0, "cached": None})
+            self.metrics["token_usage"] = _normalize_token_usage_metrics(self.metrics.get("token_usage"))
             self.metrics.setdefault("errors", 0)
             self.metrics.setdefault("resolved", 0)
             self.metrics.setdefault("warnings", 0)
@@ -5405,6 +5597,7 @@ class JobManager:
         events_path = os.path.join(job_dir, "events.jsonl")
         project_id = None
         if isinstance(payload, dict):
+            _apply_user_job_defaults(payload, owner)
             project_id = payload.get("project_id") or payload.get("project")
             if project_id:
                 project = access_store.get_project(project_id)
@@ -5849,7 +6042,7 @@ class JobManager:
         if job.token_reserved:
             job.token_status = "reserved"
         job.metrics = {
-            "token_usage": {"prompt": 0, "completion": 0, "total": 0, "cached": None},
+            "token_usage": _default_token_usage_metrics(),
             "errors": 0,
             "resolved": 0,
             "warnings": 0,
@@ -5922,6 +6115,15 @@ class JobManager:
             if use_defaults and job.owner:
                 env.update(_get_secret_store(job.owner).get_env())
                 apply_managed_ollama_defaults(env, process_env=os.environ)
+            env["REFINER_EMIT_USAGE_EVENTS"] = "1"
+            env["REFINER_EVENTS_FILE"] = job.events_path
+            policy_mode = (
+                str(job.payload.get("solver_command_policy_mode") or _settings_defaults_for_user(job.owner).get("command_policy_mode") or "standard")
+                .strip()
+                .lower()
+            )
+            if policy_mode in {"standard", "strict"}:
+                env["REFINER_SOLVER_COMMAND_POLICY_MODE"] = policy_mode
             job_secrets = job.payload.get("job_secrets") or {}
             if isinstance(job_secrets, list):
                 for entry in job_secrets:
@@ -6020,6 +6222,9 @@ class JobManager:
             status = data.get("status")
             if status and job.status == "running":
                 job.update_stage("finalize", status)
+        elif event_type == "token_usage":
+            _merge_token_usage_event(job, data)
+            job.persist()
         return True
 
     def _update_metrics(self, job: Job, line: str) -> None:
@@ -6029,21 +6234,6 @@ class JobManager:
             job.metrics["warnings"] += 1
         if re.search(r"\brecover(?:ed|y)\b|\bretry(?:ing|ed)\b|\bfallback\b", line, re.IGNORECASE):
             job.metrics["resolved"] += 1
-        match = TOKEN_RE.search(line)
-        if match:
-            run_prompt = self._coerce_int(match.group("run_prompt"))
-            run_completion = self._coerce_int(match.group("run_completion"))
-            run_total = self._coerce_int(match.group("run_total"))
-            cached = self._coerce_int(match.group("cached")) if match.group("cached") else None
-            usage = job.metrics.get("token_usage") or {}
-            usage["prompt"] = run_prompt or usage.get("prompt", 0)
-            usage["completion"] = run_completion or usage.get("completion", 0)
-            usage["total"] = run_total or usage.get("total", 0)
-            if cached is not None:
-                usage["cached"] = cached
-            job.metrics["token_usage"] = usage
-            if run_total is not None:
-                job.token_actual = run_total
 
     def _reserve_tokens(self, job: Job, estimate: int) -> None:
         job.token_estimate = int(estimate or 0)
@@ -7364,7 +7554,7 @@ _user_activity_lock = threading.Lock()
 token_ledger = CENTRAL_STORE.user_ledger if CENTRAL_STORE is not None else TokenLedger(LEDGER_ROOT)
 team_token_ledger = CENTRAL_STORE.team_ledger if CENTRAL_STORE is not None else TokenLedger(TEAM_LEDGER_ROOT)
 rag_store = RagStore(RAG_STORE_ROOT)
-mcp_store = MCPServerStore(MCP_STORE_ROOT)
+mcp_store = PostgresMCPServerStore(CENTRAL_STORE.pool) if CENTRAL_STORE is not None else MCPServerStore(MCP_STORE_ROOT)
 session_history = SessionHistoryStore(SESSIONS_ROOT)
 session_store = SessionStore()
 voice_token_store = CENTRAL_STORE.voice_tokens if CENTRAL_STORE is not None else VoiceTokenStore(VOICE_TOKEN_PATH)
@@ -7524,6 +7714,41 @@ def _current_auth_profile() -> Optional[Dict[str, Any]]:
     return profile
 
 
+def _user_metadata(user: Optional[str]) -> Dict[str, Any]:
+    cleaned = str(user or "").strip()
+    if not cleaned:
+        return {}
+    try:
+        metadata = user_store.get_metadata(cleaned)
+    except Exception:
+        metadata = {}
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _user_settings(user: Optional[str]) -> Dict[str, Any]:
+    cleaned = str(user or "").strip()
+    if not cleaned:
+        return default_user_settings()
+    return settings_from_metadata(_user_metadata(cleaned))
+
+
+def _settings_defaults_for_user(user: Optional[str]) -> Dict[str, Optional[str]]:
+    return llm_defaults_from_settings(_user_settings(user))
+
+
+def _update_user_settings(user: str, raw_settings: Any) -> Dict[str, Any]:
+    cleaned = str(user or "").strip()
+    if not cleaned:
+        raise SettingsValidationError(["user is required"])
+    current_metadata = _user_metadata(cleaned)
+    current_settings = settings_from_metadata(current_metadata)
+    merged = validate_settings_patch(raw_settings, current=current_settings)
+    updated_metadata = metadata_with_settings(current_metadata, merged, updated_at=_now_iso())
+    if not user_store.set_metadata(cleaned, updated_metadata):
+        raise KeyError(cleaned)
+    return merged
+
+
 def _local_identity_payload(user: str, *, include_directory: bool = False) -> Dict[str, Any]:
     role = str(user_store.get_role(user) or "user").strip().lower() or "user"
     payload: Dict[str, Any] = {
@@ -7536,6 +7761,7 @@ def _local_identity_payload(user: str, *, include_directory: bool = False) -> Di
         "team_count": 0,
         "pending_invitation_count": 0,
         "is_admin": role == "admin",
+        "settings": _user_settings(user),
     }
     if include_directory:
         payload["team_tree"] = access_store.tree_all() if payload["is_admin"] else access_store.tree_for_user(user)
@@ -8063,6 +8289,341 @@ def _get_github_api_token(user: Optional[str]) -> Optional[str]:
     return None
 
 
+MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+MCP_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+def _mcp_internal_metadata(server: Optional[MCPServerConfig]) -> Dict[str, Any]:
+    if not server or not isinstance(server.metadata, dict):
+        return {}
+    internal = server.metadata.get("_refiner")
+    return dict(internal) if isinstance(internal, dict) else {}
+
+
+def _mcp_secret_ref_name(server_name: str, suffix: str) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", str(server_name or "").upper()).strip("_") or "SERVER"
+    digest = hashlib.sha256(str(server_name or "").encode("utf-8")).hexdigest()[:10].upper()
+    suffix_clean = re.sub(r"[^A-Za-z0-9]+", "_", str(suffix or "").upper()).strip("_") or "SECRET"
+    budget = max(8, 63 - len("MCP__") - len(digest) - len(suffix_clean))
+    return f"MCP_{safe_name[:budget]}_{digest}_{suffix_clean}"
+
+
+def _mcp_secret_value(user: str, secret_ref: Optional[str]) -> Optional[str]:
+    ref = str(secret_ref or "").strip()
+    if not ref:
+        return None
+    if not SECRET_NAME_RE.match(ref):
+        raise ValueError("secret reference must match the secret-name policy")
+    return _get_secret_store(user).get(ref)
+
+
+def _mcp_load_headers_secret(user: str, secret_ref: Optional[str]) -> Dict[str, str]:
+    raw = _mcp_secret_value(user, secret_ref)
+    if raw is None:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:
+        raise ValueError(f"headers secret '{secret_ref}' does not contain valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"headers secret '{secret_ref}' must decode to an object")
+    return _validate_mcp_headers(payload)
+
+
+def _validate_mcp_headers(headers: Any) -> Dict[str, str]:
+    if headers is None:
+        return {}
+    if not isinstance(headers, dict):
+        raise ValueError("headers must be an object")
+    normalized: Dict[str, str] = {}
+    for key, value in headers.items():
+        name = str(key or "").strip()
+        if not MCP_HEADER_NAME_RE.match(name):
+            raise ValueError(f"header name '{name or key}' is invalid")
+        if value is None:
+            continue
+        text = str(value)
+        if "\r" in text or "\n" in text:
+            raise ValueError(f"header '{name}' contains an invalid newline")
+        if len(text) > 4096:
+            raise ValueError(f"header '{name}' exceeds 4096 characters")
+        normalized[name] = text
+    return normalized
+
+
+def _mcp_runtime_patch(action: str, *, status: str, duration_ms: int, error: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
+    patch: Dict[str, Any] = {
+        "last_action": action,
+        "last_status": status,
+        "last_checked_at": _now_iso(),
+        "last_duration_ms": int(max(0, duration_ms)),
+    }
+    if status == "success":
+        patch["last_success_at"] = patch["last_checked_at"]
+        patch["last_error"] = None
+    else:
+        patch["last_failure_at"] = patch["last_checked_at"]
+        patch["last_error"] = error or "mcp_request_failed"
+    for key, value in extra.items():
+        patch[key] = value
+    return patch
+
+
+def _mcp_public_metadata(server: Optional[MCPServerConfig]) -> Dict[str, Any]:
+    if not server or not isinstance(server.metadata, dict):
+        return {}
+    return {key: value for key, value in server.metadata.items() if key != "_refiner"}
+
+
+def _mcp_masked_server(user: str, server: MCPServerConfig) -> Dict[str, Any]:
+    masked = server.masked()
+    if masked.get("headers"):
+        return masked
+    if not server.headers_secret_ref:
+        return masked
+    try:
+        header_keys = sorted(_mcp_load_headers_secret(user, server.headers_secret_ref).keys())
+    except Exception:
+        return masked
+    masked["headers"] = {key: "***" for key in header_keys}
+    return masked
+
+
+def _mcp_resolve_server(user: str, server: MCPServerConfig) -> MCPServerConfig:
+    headers = {}
+    if isinstance(server.headers, dict):
+        headers.update(_validate_mcp_headers(server.headers))
+    if server.headers_secret_ref:
+        headers.update(_mcp_load_headers_secret(user, server.headers_secret_ref))
+    auth_token = server.auth_token
+    if server.auth_type != "none" and server.auth_secret_ref:
+        auth_token = _mcp_secret_value(user, server.auth_secret_ref)
+        if auth_token is None:
+            raise ValueError(f"configured auth secret '{server.auth_secret_ref}' is missing")
+    return MCPServerConfig(
+        name=server.name,
+        base_url=server.base_url,
+        auth_type=server.auth_type,
+        auth_token=auth_token,
+        headers=headers or None,
+        timeout=int(server.timeout or 20),
+        auth_secret_ref=server.auth_secret_ref,
+        headers_secret_ref=server.headers_secret_ref,
+        metadata=dict(server.metadata or {}),
+        runtime=dict(server.runtime or {}),
+        created_at=server.created_at,
+        updated_at=server.updated_at,
+    )
+
+
+def _mcp_cleanup_managed_secrets(user: str, server: Optional[MCPServerConfig]) -> None:
+    internal = _mcp_internal_metadata(server)
+    managed = internal.get("managed_secret_refs") if isinstance(internal.get("managed_secret_refs"), dict) else {}
+    store = _get_secret_store(user)
+    for ref in managed.values():
+        cleaned = str(ref or "").strip()
+        if cleaned and SECRET_NAME_RE.match(cleaned):
+            store.delete(cleaned)
+
+
+def _prepare_mcp_server_config(
+    user: str,
+    payload: Dict[str, Any],
+    *,
+    current: Optional[MCPServerConfig] = None,
+) -> MCPServerConfig:
+    name = str(payload.get("name") or (current.name if current else "")).strip()
+    if not MCP_SERVER_NAME_RE.match(name):
+        raise ValueError("name must use 1-64 characters from A-Z, a-z, 0-9, dot, underscore, colon, or dash")
+
+    base_url = str(payload.get("base_url") or (current.base_url if current else "")).strip()
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("base_url must be a valid http or https URL")
+    if not url_allowed(base_url):
+        raise ValueError("base_url is blocked by the current URL safety policy")
+
+    auth_type = str(payload.get("auth_type") or (current.auth_type if current else "bearer")).strip().lower() or "bearer"
+    if auth_type not in {"bearer", "oauth", "none"}:
+        raise ValueError("auth_type must be bearer, oauth, or none")
+
+    timeout_value = payload.get("timeout", current.timeout if current else 20)
+    timeout = _safe_int(timeout_value, 20) or 20
+    if timeout < 1 or timeout > 120:
+        raise ValueError("timeout must be between 1 and 120 seconds")
+
+    metadata = _mcp_public_metadata(current)
+    if "metadata" in payload:
+        if payload.get("metadata") is None:
+            metadata = {}
+        elif not isinstance(payload.get("metadata"), dict):
+            raise ValueError("metadata must be an object")
+        else:
+            metadata = dict(payload.get("metadata") or {})
+
+    runtime = dict(current.runtime or {}) if current and isinstance(current.runtime, dict) else {}
+    runtime["last_configured_at"] = _now_iso()
+
+    internal = _mcp_internal_metadata(current)
+    # Only refs created by Refiner are tracked here so delete/update can clean
+    # them up safely without removing user-managed shared secret entries.
+    managed_refs = internal.get("managed_secret_refs") if isinstance(internal.get("managed_secret_refs"), dict) else {}
+    managed_refs = dict(managed_refs or {})
+    store = _get_secret_store(user)
+
+    if auth_type == "none":
+        if current and current.auth_secret_ref and managed_refs.get("auth") == current.auth_secret_ref:
+            store.delete(current.auth_secret_ref)
+        auth_secret_ref = None
+        managed_refs.pop("auth", None)
+    else:
+        auth_secret_ref = current.auth_secret_ref if current else None
+        if "auth_token" in payload and "auth_secret_ref" in payload and str(payload.get("auth_token") or "").strip():
+            raise ValueError("provide auth_token or auth_secret_ref, not both")
+        if "auth_token" in payload:
+            raw_token = str(payload.get("auth_token") or "").strip()
+            if raw_token:
+                ref = managed_refs.get("auth") or auth_secret_ref or _mcp_secret_ref_name(name, "AUTH")
+                store.set(ref, raw_token)
+                auth_secret_ref = ref
+                managed_refs["auth"] = ref
+            else:
+                if current and current.auth_secret_ref and managed_refs.get("auth") == current.auth_secret_ref:
+                    store.delete(current.auth_secret_ref)
+                auth_secret_ref = None
+                managed_refs.pop("auth", None)
+        elif "auth_secret_ref" in payload:
+            ref = str(payload.get("auth_secret_ref") or "").strip() or None
+            if ref:
+                if not SECRET_NAME_RE.match(ref):
+                    raise ValueError("auth_secret_ref does not match the secret-name policy")
+                if _mcp_secret_value(user, ref) is None:
+                    raise ValueError(f"auth secret '{ref}' was not found")
+            if current and current.auth_secret_ref and managed_refs.get("auth") == current.auth_secret_ref and current.auth_secret_ref != ref:
+                store.delete(current.auth_secret_ref)
+            auth_secret_ref = ref
+            managed_refs.pop("auth", None)
+
+    raw_headers = payload.get("headers") if "headers" in payload else None
+    if "headers" in payload and raw_headers is not None and not isinstance(raw_headers, dict):
+        raise ValueError("headers must be an object")
+    if "headers" in payload and "headers_secret_ref" in payload and isinstance(raw_headers, dict) and raw_headers:
+        raise ValueError("provide headers or headers_secret_ref, not both")
+    headers_secret_ref = current.headers_secret_ref if current else None
+    header_keys: List[str] = []
+    if "headers" in payload:
+        normalized_headers = _validate_mcp_headers(raw_headers or {})
+        if normalized_headers:
+            ref = managed_refs.get("headers") or headers_secret_ref or _mcp_secret_ref_name(name, "HEADERS")
+            store.set(ref, json.dumps(normalized_headers, sort_keys=True))
+            headers_secret_ref = ref
+            managed_refs["headers"] = ref
+            header_keys = sorted(normalized_headers.keys())
+        else:
+            if current and current.headers_secret_ref and managed_refs.get("headers") == current.headers_secret_ref:
+                store.delete(current.headers_secret_ref)
+            headers_secret_ref = None
+            managed_refs.pop("headers", None)
+    elif "headers_secret_ref" in payload:
+        ref = str(payload.get("headers_secret_ref") or "").strip() or None
+        if ref:
+            if not SECRET_NAME_RE.match(ref):
+                raise ValueError("headers_secret_ref does not match the secret-name policy")
+            header_keys = sorted(_mcp_load_headers_secret(user, ref).keys())
+        if current and current.headers_secret_ref and managed_refs.get("headers") == current.headers_secret_ref and current.headers_secret_ref != ref:
+            store.delete(current.headers_secret_ref)
+        headers_secret_ref = ref
+        managed_refs.pop("headers", None)
+    elif current and current.headers_secret_ref:
+        try:
+            header_keys = sorted(_mcp_load_headers_secret(user, current.headers_secret_ref).keys())
+        except Exception:
+            header_keys = current.header_keys()
+
+    if header_keys:
+        internal["header_keys"] = header_keys
+    else:
+        internal.pop("header_keys", None)
+    if managed_refs:
+        internal["managed_secret_refs"] = managed_refs
+    else:
+        internal.pop("managed_secret_refs", None)
+    if internal:
+        metadata["_refiner"] = internal
+    else:
+        metadata.pop("_refiner", None)
+
+    return MCPServerConfig(
+        name=name,
+        base_url=base_url,
+        auth_type=auth_type,
+        timeout=timeout,
+        auth_secret_ref=auth_secret_ref,
+        headers_secret_ref=headers_secret_ref,
+        metadata=metadata,
+        runtime=runtime,
+        created_at=current.created_at if current else None,
+    )
+
+
+def _mcp_result_items(result: Dict[str, Any], key: str) -> List[Any]:
+    if not isinstance(result, dict):
+        return []
+    for candidate in (result.get("result"), result):
+        if isinstance(candidate, dict):
+            items = candidate.get(key)
+            if isinstance(items, list):
+                return items
+    return []
+
+
+def _mcp_execute(
+    user: str,
+    server_name: str,
+    action: str,
+    operation: Any,
+    *,
+    audit_details: Optional[Dict[str, Any]] = None,
+    runtime_from_result: Optional[Any] = None,
+) -> Dict[str, Any]:
+    server = mcp_store.get_server(user, server_name)
+    if not server:
+        raise KeyError("not_found")
+    resolved = _mcp_resolve_server(user, server)
+    start = time.time()
+    base_details = {
+        "server": server_name,
+        "host": urlparse(server.base_url).hostname or "",
+    }
+    if isinstance(audit_details, dict):
+        base_details.update(audit_details)
+    try:
+        client = MCPClient(resolved)
+        client.initialize({"name": "refiner"})
+        result = operation(client)
+    except Exception as exc:
+        duration_ms = int((time.time() - start) * 1000)
+        mcp_store.update_runtime(
+            user,
+            server_name,
+            _mcp_runtime_patch(action, status="failed", duration_ms=duration_ms, error=str(exc)),
+        )
+        _audit_event(f"mcp_{action}", actor=user, status="failed", details={**base_details, "error": str(exc)})
+        raise
+    duration_ms = int((time.time() - start) * 1000)
+    runtime_patch = _mcp_runtime_patch(action, status="success", duration_ms=duration_ms)
+    if callable(runtime_from_result):
+        try:
+            extra = runtime_from_result(result)
+        except Exception:
+            extra = {}
+        if isinstance(extra, dict):
+            runtime_patch.update(extra)
+    mcp_store.update_runtime(user, server_name, runtime_patch)
+    _audit_event(f"mcp_{action}", actor=user, status="success", details=base_details)
+    return result
+
+
 def _load_llm_config() -> Dict[str, Any]:
     path = os.path.join(BASE_DIR, "config.json")
     try:
@@ -8081,19 +8642,23 @@ def _resolve_llm_settings(
     env = build_effective_llm_env(_get_secret_store(user).get_env(), process_env=os.environ)
     cfg = _load_llm_config()
     providers = cfg.get("llm_providers") if isinstance(cfg.get("llm_providers"), list) else []
+    defaults = _settings_defaults_for_user(user)
 
     provider_type = None
-    model = model_hint
+    cleaned_provider_hint = str(provider_hint or "").strip() or None
+    cleaned_model_hint = str(model_hint or "").strip() or None
+    model = cleaned_model_hint or defaults.get("model")
     base_url = None
 
-    if provider_hint:
-        match = next((p for p in providers if p.get("name") == provider_hint), None)
+    preferred_provider = cleaned_provider_hint or defaults.get("provider")
+    if preferred_provider:
+        match = next((p for p in providers if p.get("name") == preferred_provider), None)
         if match:
-            provider_type = match.get("type") or provider_hint
+            provider_type = match.get("type") or preferred_provider
             model = model or match.get("model")
             base_url = match.get("base_url")
         else:
-            provider_type = provider_hint
+            provider_type = preferred_provider
 
     if not provider_type:
         if env.get("OPENAI_API_KEY"):
@@ -8122,7 +8687,29 @@ def _resolve_llm_settings(
         "model": model,
         "base_url": base_url,
         "api_key": api_key,
+        "reasoning_effort": defaults.get("reasoning_effort"),
+        "assistant_profile": defaults.get("assistant_profile"),
+        "assistant_use_memory": defaults.get("assistant_use_memory"),
+        "command_policy_mode": defaults.get("command_policy_mode"),
+        "show_solver_replay": defaults.get("show_solver_replay"),
+        "settings": _user_settings(user),
     }
+
+
+def _apply_user_job_defaults(payload: Dict[str, Any], owner: str) -> None:
+    if not isinstance(payload, dict):
+        return
+    defaults = _settings_defaults_for_user(owner)
+    if not payload.get("llm_provider") and defaults.get("provider"):
+        payload["llm_provider"] = defaults.get("provider")
+    if not payload.get("llm_model") and defaults.get("model"):
+        payload["llm_model"] = defaults.get("model")
+    if not payload.get("llm_reasoning_effort") and defaults.get("reasoning_effort"):
+        payload["llm_reasoning_effort"] = defaults.get("reasoning_effort")
+    if payload.get("codingagent") and not payload.get("codingagent_reasoning_effort") and defaults.get("reasoning_effort"):
+        payload["codingagent_reasoning_effort"] = defaults.get("reasoning_effort")
+    if not payload.get("solver_command_policy_mode") and defaults.get("command_policy_mode"):
+        payload["solver_command_policy_mode"] = defaults.get("command_policy_mode")
 
 
 def _guardrail_scan(text: str) -> Optional[str]:
@@ -11680,16 +12267,26 @@ def api_profile() -> Response:
     if request.method == "GET":
         return jsonify(_local_identity_payload(user, include_directory=True))
     payload = request.get_json(force=True, silent=True) or {}
-    email = str(payload.get("email") or "").strip()
-    if email and not EMAIL_RE.match(email):
-        return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
-    user_store.set_email(user, email or None)
+    email = None
+    if "email" in payload:
+        email = str(payload.get("email") or "").strip()
+        if email and not EMAIL_RE.match(email):
+            return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
+    if "settings" in payload:
+        try:
+            _update_user_settings(user, payload.get("settings"))
+        except SettingsValidationError as exc:
+            return jsonify({"error": "invalid_settings", "details": exc.issues}), 400
+        except KeyError:
+            return jsonify({"error": "user_not_found"}), 404
+    if "email" in payload:
+        user_store.set_email(user, email or None)
     _record_identity_event(
         user,
         role=_user_role(user),
         email=user_store.get_email(user),
         provider="profile",
-        meta={"source": "api_profile"},
+        meta={"source": "api_profile", "settings_updated": "settings" in payload},
     )
     return jsonify({"status": "ok", **_local_identity_payload(user, include_directory=True)})
 
@@ -13392,21 +13989,25 @@ def assistant_rag_mcp() -> Response:
         tool_name = str(mcp_cfg.get("tool") or "").strip()
         if not server_name or not tool_name:
             return jsonify({"error": "mcp_server_and_tool_required"}), 400
-        server = mcp_store.get_server(user, server_name)
-        if not server:
-            return jsonify({"error": "mcp_server_not_found"}), 404
         arguments = mcp_cfg.get("arguments")
         if arguments is not None and not isinstance(arguments, dict):
             return jsonify({"error": "mcp_invalid_arguments"}), 400
         try:
-            client = MCPClient(server)
-            client.initialize({"name": "refiner"})
-            mcp_result = client.call_tool(tool_name, arguments or {})
+            mcp_result = _mcp_execute(
+                user,
+                server_name,
+                "call",
+                lambda client: client.call_tool(tool_name, arguments or {}),
+                audit_details={"tool": tool_name, "source": "assistant"},
+                runtime_from_result=lambda _result: {"last_tool": tool_name},
+            )
+        except KeyError:
+            return jsonify({"error": "mcp_server_not_found"}), 404
         except Exception as exc:
             return jsonify({"error": "mcp_request_failed", "details": str(exc)}), 400
 
-    provider_hint = payload.get("provider") or payload.get("llm_provider") or "openai"
-    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.4"
+    provider_hint = payload.get("provider") or payload.get("llm_provider")
+    model_hint = payload.get("model") or payload.get("llm_model")
     settings = _resolve_llm_settings(user=user, provider_hint=provider_hint, model_hint=model_hint)
     try:
         provider = get_provider(
@@ -13453,7 +14054,7 @@ def assistant_rag_mcp() -> Response:
             system=system,
             temperature=payload.get("temperature", 0.2),
             max_tokens=payload.get("max_tokens", 1200),
-            reasoning_effort=payload.get("reasoning_effort"),
+            reasoning_effort=payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or settings.get("reasoning_effort"),
         )
     except Exception as exc:
         return jsonify({"error": "llm_request_failed", "details": str(exc)}), 400
@@ -13477,32 +14078,32 @@ def mcp_servers() -> Response:
     if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
     if request.method == "GET":
-        servers = [server.masked() for server in mcp_store.list_servers(user)]
+        servers = [_mcp_masked_server(user, server) for server in mcp_store.list_servers(user)]
+        _audit_event("mcp_list", actor=user, status="success", details={"count": len(servers)})
         return jsonify({"servers": servers})
     payload = request.get_json(force=True, silent=True) or {}
     name = str(payload.get("name") or "").strip()
-    base_url = str(payload.get("base_url") or "").strip()
-    if not name or not base_url:
+    current = mcp_store.get_server(user, name)
+    if not name or (not current and not str(payload.get("base_url") or "").strip()):
         return jsonify({"error": "name_and_base_url_required"}), 400
-    parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return jsonify({"error": "invalid_base_url"}), 400
-    auth_type = str(payload.get("auth_type") or "bearer").strip().lower()
-    if auth_type not in {"bearer", "oauth", "none"}:
-        return jsonify({"error": "invalid_auth_type"}), 400
-    auth_token = payload.get("auth_token") if auth_type != "none" else None
-    headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else None
-    timeout = _safe_int(payload.get("timeout"), 20) or 20
-    config = MCPServerConfig(
-        name=name,
-        base_url=base_url,
-        auth_type=auth_type,
-        auth_token=auth_token,
-        headers=headers,
-        timeout=timeout,
-    )
+    try:
+        config = _prepare_mcp_server_config(user, payload, current=current)
+    except ValueError as exc:
+        return jsonify({"error": "invalid_mcp_server", "details": str(exc)}), 400
+    if hasattr(user_store, "ensure_user"):
+        try:
+            user_store.ensure_user(user, role=_user_role(user) or "user", email=user_store.get_email(user))
+        except Exception:
+            pass
     mcp_store.save_server(user, config)
-    return jsonify({"server": config.masked()})
+    saved = mcp_store.get_server(user, config.name) or config
+    _audit_event(
+        "mcp_save",
+        actor=user,
+        status="success",
+        details={"server": config.name, "host": urlparse(config.base_url).hostname or ""},
+    )
+    return jsonify({"server": _mcp_masked_server(user, saved)})
 
 
 def mcp_server_delete(name: str) -> Response:
@@ -13512,9 +14113,19 @@ def mcp_server_delete(name: str) -> Response:
         return jsonify({"error": "unauthorized"}), 401
     if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
+    server = mcp_store.get_server(user, name)
+    if not server:
+        return jsonify({"error": "not_found"}), 404
     deleted = mcp_store.delete_server(user, name)
     if not deleted:
         return jsonify({"error": "not_found"}), 404
+    _mcp_cleanup_managed_secrets(user, server)
+    _audit_event(
+        "mcp_delete",
+        actor=user,
+        status="success",
+        details={"server": name, "host": urlparse(server.base_url).hostname or ""},
+    )
     return jsonify({"status": "deleted", "name": name})
 
 
@@ -13525,16 +14136,19 @@ def mcp_server_tools(name: str) -> Response:
         return jsonify({"error": "unauthorized"}), 401
     if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
-    server = mcp_store.get_server(user, name)
-    if not server:
-        return jsonify({"error": "not_found"}), 404
     try:
-        client = MCPClient(server)
-        client.initialize({"name": "refiner"})
-        tools = client.list_tools()
-        return jsonify({"tools": tools})
+        tools = _mcp_execute(
+            user,
+            name,
+            "list_tools",
+            lambda client: client.list_tools(),
+            runtime_from_result=lambda result: {"tool_count": len(_mcp_result_items(result, "tools"))},
+        )
+    except KeyError:
+        return jsonify({"error": "not_found"}), 404
     except Exception as exc:
         return jsonify({"error": "mcp_request_failed", "details": str(exc)}), 400
+    return jsonify({"tools": tools})
 
 
 def mcp_server_call(name: str) -> Response:
@@ -13544,9 +14158,6 @@ def mcp_server_call(name: str) -> Response:
         return jsonify({"error": "unauthorized"}), 401
     if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
-    server = mcp_store.get_server(user, name)
-    if not server:
-        return jsonify({"error": "not_found"}), 404
     payload = request.get_json(force=True, silent=True) or {}
     tool = str(payload.get("tool") or "").strip()
     if not tool:
@@ -13555,12 +14166,19 @@ def mcp_server_call(name: str) -> Response:
     if arguments is not None and not isinstance(arguments, dict):
         return jsonify({"error": "invalid_arguments"}), 400
     try:
-        client = MCPClient(server)
-        client.initialize({"name": "refiner"})
-        result = client.call_tool(tool, arguments or {})
-        return jsonify({"result": result})
+        result = _mcp_execute(
+            user,
+            name,
+            "call",
+            lambda client: client.call_tool(tool, arguments or {}),
+            audit_details={"tool": tool},
+            runtime_from_result=lambda _result: {"last_tool": tool},
+        )
+    except KeyError:
+        return jsonify({"error": "not_found"}), 404
     except Exception as exc:
         return jsonify({"error": "mcp_request_failed", "details": str(exc)}), 400
+    return jsonify({"result": result})
 
 
 def mcp_server_resources(name: str) -> Response:
@@ -13570,16 +14188,19 @@ def mcp_server_resources(name: str) -> Response:
         return jsonify({"error": "unauthorized"}), 401
     if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
-    server = mcp_store.get_server(user, name)
-    if not server:
-        return jsonify({"error": "not_found"}), 404
     try:
-        client = MCPClient(server)
-        client.initialize({"name": "refiner"})
-        resources = client.list_resources()
-        return jsonify({"resources": resources})
+        resources = _mcp_execute(
+            user,
+            name,
+            "list_resources",
+            lambda client: client.list_resources(),
+            runtime_from_result=lambda result: {"resource_count": len(_mcp_result_items(result, "resources"))},
+        )
+    except KeyError:
+        return jsonify({"error": "not_found"}), 404
     except Exception as exc:
         return jsonify({"error": "mcp_request_failed", "details": str(exc)}), 400
+    return jsonify({"resources": resources})
 
 
 def mcp_server_resource(name: str) -> Response:
@@ -13589,20 +14210,24 @@ def mcp_server_resource(name: str) -> Response:
         return jsonify({"error": "unauthorized"}), 401
     if not _is_admin_user(user):
         return jsonify({"error": "forbidden"}), 403
-    server = mcp_store.get_server(user, name)
-    if not server:
-        return jsonify({"error": "not_found"}), 404
     payload = request.get_json(force=True, silent=True) or {}
     uri = str(payload.get("uri") or "").strip()
     if not uri:
         return jsonify({"error": "uri_required"}), 400
     try:
-        client = MCPClient(server)
-        client.initialize({"name": "refiner"})
-        resource = client.read_resource(uri)
-        return jsonify({"resource": resource})
+        resource = _mcp_execute(
+            user,
+            name,
+            "read_resource",
+            lambda client: client.read_resource(uri),
+            audit_details={"uri": uri[:256]},
+            runtime_from_result=lambda _result: {"last_resource_uri": uri[:512]},
+        )
+    except KeyError:
+        return jsonify({"error": "not_found"}), 404
     except Exception as exc:
         return jsonify({"error": "mcp_request_failed", "details": str(exc)}), 400
+    return jsonify({"resource": resource})
 
 
 def request_refund(job_id: str) -> Response:
@@ -13857,6 +14482,7 @@ def jobs() -> Response:
     if request.method == "POST":
         payload = request.get_json(force=True, silent=True) or {}
         payload["owner"] = user
+        _apply_user_job_defaults(payload, user)
         project_id = payload.get("project_id") or payload.get("project")
         team_id = payload.get("team_id") if isinstance(payload, dict) else None
         if project_id:
@@ -16110,12 +16736,6 @@ def assistant_requirements() -> Response:
     raw_prompt = prompt
     requirements_text = (payload.get("requirements_text") or "").strip()
     messages = payload.get("messages") or []
-    is_marketing_assistant = _is_marketing_assistant_request(payload, requirements_text)
-    assistant_memory_scope = _assistant_memory_scope(
-        "assistant_requirements",
-        mode=mode,
-        profile="marketing" if is_marketing_assistant else "requirements",
-    )
     marketing_context = ""
     marketing_vocab_hint = ""
 
@@ -16128,9 +16748,28 @@ def assistant_requirements() -> Response:
         if reason:
             return jsonify({"error": "guardrail_blocked", "details": reason}), 400
 
-    provider_hint = payload.get("provider") or payload.get("llm_provider") or "openai"
-    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.4"
-    reasoning_effort = payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or "medium"
+    provider_hint = payload.get("provider") or payload.get("llm_provider")
+    model_hint = payload.get("model") or payload.get("llm_model")
+    settings = _resolve_llm_settings(
+        user=user,
+        provider_hint=provider_hint,
+        model_hint=model_hint,
+    )
+    if not payload.get("assistant_profile") and settings.get("assistant_profile"):
+        payload = dict(payload)
+        payload["assistant_profile"] = settings.get("assistant_profile")
+    reasoning_effort = (
+        str(payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or settings.get("reasoning_effort") or "medium")
+        .strip()
+        .lower()
+    )
+    assistant_memory_enabled = bool(settings.get("assistant_use_memory", True))
+    is_marketing_assistant = _is_marketing_assistant_request(payload, requirements_text)
+    assistant_memory_scope = _assistant_memory_scope(
+        "assistant_requirements",
+        mode=mode,
+        profile="marketing" if is_marketing_assistant else "requirements",
+    )
 
     if mode == "ask" and is_marketing_assistant and _is_simple_greeting(prompt):
         return jsonify(
@@ -16159,12 +16798,6 @@ def assistant_requirements() -> Response:
                 marketing_context = "\\n\\n".join(chunks)
         except Exception as exc:
             logger.debug("Marketing assistant knowledge lookup skipped: %s", exc)
-
-    settings = _resolve_llm_settings(
-        user=user,
-        provider_hint=provider_hint,
-        model_hint=model_hint,
-    )
     try:
         provider = get_provider(
             settings["provider"],
@@ -16220,45 +16853,46 @@ def assistant_requirements() -> Response:
 
     assistant_memory_context = ""
     use_assistant_ask_memory = False
-    if mode == "draft":
-        assistant_memory_query = _assistant_memory_query_text(
-            prompt=prompt,
-            requirements_text=requirements_text,
-            messages=chat_messages,
-            extra_parts=[marketing_context] if marketing_context else None,
-        )
-        assistant_memory_context = _assistant_memory_prompt_block(
-            user,
-            scope=assistant_memory_scope,
-            query_text=assistant_memory_query,
-            header=(
-                "Relevant patterns from this user's earlier successful drafts "
-                "(adapt useful structure, but do not copy stale details blindly):"
-            ),
-        )
-    else:
-        use_assistant_ask_memory = _should_use_assistant_ask_memory(
-            prompt,
-            requirements_text=requirements_text,
-            messages=chat_messages,
-            is_marketing_assistant=is_marketing_assistant,
-        )
-        if use_assistant_ask_memory:
+    if assistant_memory_enabled:
+        if mode == "draft":
             assistant_memory_query = _assistant_memory_query_text(
                 prompt=prompt,
                 requirements_text=requirements_text,
                 messages=chat_messages,
+                extra_parts=[marketing_context] if marketing_context else None,
             )
             assistant_memory_context = _assistant_memory_prompt_block(
                 user,
                 scope=assistant_memory_scope,
                 query_text=assistant_memory_query,
                 header=(
-                    "Relevant prior successful guidance for similar requirements questions "
-                    "(reuse useful reasoning, but resolve conflicts using the current notes first):"
+                    "Relevant patterns from this user's earlier successful drafts "
+                    "(adapt useful structure, but do not copy stale details blindly):"
                 ),
-                max_chars=1200,
             )
+        else:
+            use_assistant_ask_memory = _should_use_assistant_ask_memory(
+                prompt,
+                requirements_text=requirements_text,
+                messages=chat_messages,
+                is_marketing_assistant=is_marketing_assistant,
+            )
+            if use_assistant_ask_memory:
+                assistant_memory_query = _assistant_memory_query_text(
+                    prompt=prompt,
+                    requirements_text=requirements_text,
+                    messages=chat_messages,
+                )
+                assistant_memory_context = _assistant_memory_prompt_block(
+                    user,
+                    scope=assistant_memory_scope,
+                    query_text=assistant_memory_query,
+                    header=(
+                        "Relevant prior successful guidance for similar requirements questions "
+                        "(reuse useful reasoning, but resolve conflicts using the current notes first):"
+                    ),
+                    max_chars=1200,
+                )
 
     if mode == "draft":
         user_text = "Draft a complete requirements document."
@@ -16290,7 +16924,6 @@ def assistant_requirements() -> Response:
 
     temperature = payload.get("temperature", 0.2)
     max_tokens = payload.get("max_tokens")
-    reasoning_effort = payload.get("reasoning_effort")
     capacity_acquired = _acquire_request_capacity(_ASSISTANT_REQUEST_CAPACITY, ASSISTANT_CAPACITY_WAIT_SEC)
     if not capacity_acquired:
         return jsonify({"error": "assistant_capacity_unavailable"}), 503
@@ -16310,6 +16943,7 @@ def assistant_requirements() -> Response:
     reply_text = response.text if isinstance(response.text, str) else str(response.text)
     if mode == "draft":
         reply_text = _ensure_req_register_in_draft(reply_text)
+    if mode == "draft" and assistant_memory_enabled:
         _record_assistant_memory(
             user,
             scope=assistant_memory_scope,
@@ -16320,7 +16954,7 @@ def assistant_requirements() -> Response:
                 "assistant_profile: marketing" if is_marketing_assistant else "assistant_profile: requirements"
             ],
         )
-    elif use_assistant_ask_memory:
+    elif use_assistant_ask_memory and assistant_memory_enabled:
         _record_assistant_memory(
             user,
             scope=assistant_memory_scope,
@@ -16361,15 +16995,20 @@ def assistant_form_fill() -> Response:
     if reason:
         return jsonify({"error": "guardrail_blocked", "details": reason}), 400
 
-    provider_hint = payload.get("provider") or payload.get("llm_provider") or "openai"
-    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.4"
-    reasoning_effort = payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or "medium"
+    provider_hint = payload.get("provider") or payload.get("llm_provider")
+    model_hint = payload.get("model") or payload.get("llm_model")
 
     settings = _resolve_llm_settings(
         user=user,
         provider_hint=provider_hint,
         model_hint=model_hint,
     )
+    reasoning_effort = (
+        str(payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or settings.get("reasoning_effort") or "medium")
+        .strip()
+        .lower()
+    )
+    assistant_memory_enabled = bool(settings.get("assistant_use_memory", True))
     try:
         provider = get_provider(
             settings["provider"],
@@ -16422,14 +17061,16 @@ def assistant_form_fill() -> Response:
         summary_bits = [bit for bit in [field_id, label, description] if bit]
         if summary_bits:
             field_context_lines.append(" | ".join(summary_bits) + option_preview)
-    form_memory_references = _assistant_memory_reference_payload(
-        user,
-        scope=assistant_memory_scope,
-        query_text=_assistant_memory_query_text(
-            prompt=prompt,
-            extra_parts=[workflow, scope, " ".join(allowed_ids)] + field_context_lines,
-        ),
-    )
+    form_memory_references = []
+    if assistant_memory_enabled:
+        form_memory_references = _assistant_memory_reference_payload(
+            user,
+            scope=assistant_memory_scope,
+            query_text=_assistant_memory_query_text(
+                prompt=prompt,
+                extra_parts=[workflow, scope, " ".join(allowed_ids)] + field_context_lines,
+            ),
+        )
 
     system = (
         "You are a form assistant. Return ONLY valid JSON. "
@@ -16460,6 +17101,7 @@ def assistant_form_fill() -> Response:
             system=system,
             temperature=payload.get("temperature", 0.2),
             max_tokens=payload.get("max_tokens"),
+            reasoning_effort=reasoning_effort,
         )
     except Exception as exc:
         return jsonify({"error": "llm_request_failed", "details": str(exc)}), 400
@@ -16488,27 +17130,28 @@ def assistant_form_fill() -> Response:
     if not cleaned:
         return jsonify({"error": "no_suggestions"}), 400
 
-    _record_assistant_memory(
-        user,
-        scope=assistant_memory_scope,
-        prompt_text=prompt,
-        requirements_text=json.dumps({"workflow": workflow, "scope": scope, "fields": allowed_ids[:12]}),
-        reply_text=(
-            f"Suggested {len(cleaned)} field value(s) for workflow '{workflow or 'unknown'}' "
-            f"in scope '{scope or 'workflow'}'."
-        ),
-        extra_notes=[
-            f"workflow: {workflow}" if workflow else "",
-            f"scope: {scope}" if scope else "",
-            ("fields: " + ", ".join(allowed_ids[:10])) if allowed_ids else "",
-        ],
-        metadata={
-            "workflow": workflow,
-            "scope": scope,
-            "field_ids": allowed_ids[:12],
-            "suggestions": cleaned[:6],
-        },
-    )
+    if assistant_memory_enabled:
+        _record_assistant_memory(
+            user,
+            scope=assistant_memory_scope,
+            prompt_text=prompt,
+            requirements_text=json.dumps({"workflow": workflow, "scope": scope, "fields": allowed_ids[:12]}),
+            reply_text=(
+                f"Suggested {len(cleaned)} field value(s) for workflow '{workflow or 'unknown'}' "
+                f"in scope '{scope or 'workflow'}'."
+            ),
+            extra_notes=[
+                f"workflow: {workflow}" if workflow else "",
+                f"scope: {scope}" if scope else "",
+                ("fields: " + ", ".join(allowed_ids[:10])) if allowed_ids else "",
+            ],
+            metadata={
+                "workflow": workflow,
+                "scope": scope,
+                "field_ids": allowed_ids[:12],
+                "suggestions": cleaned[:6],
+            },
+        )
 
     return jsonify({"suggestions": cleaned})
 
@@ -16527,15 +17170,20 @@ def playground_plan() -> Response:
     if reason:
         return jsonify({"error": "guardrail_blocked", "details": reason}), 400
 
-    provider_hint = payload.get("provider") or payload.get("llm_provider") or "openai"
-    model_hint = payload.get("model") or payload.get("llm_model") or "gpt-5.4"
-    reasoning_effort = payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or "medium"
+    provider_hint = payload.get("provider") or payload.get("llm_provider")
+    model_hint = payload.get("model") or payload.get("llm_model")
 
     settings = _resolve_llm_settings(
         user=user,
         provider_hint=provider_hint,
         model_hint=model_hint,
     )
+    reasoning_effort = (
+        str(payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or settings.get("reasoning_effort") or "medium")
+        .strip()
+        .lower()
+    )
+    assistant_memory_enabled = bool(settings.get("assistant_use_memory", True))
     try:
         provider = get_provider(
             settings["provider"],
@@ -16563,11 +17211,13 @@ def playground_plan() -> Response:
     )
 
     assistant_memory_scope = _assistant_memory_scope("playground_plan")
-    memory_references = _assistant_memory_reference_payload(
-        user,
-        scope=assistant_memory_scope,
-        query_text=_assistant_memory_query_text(prompt=prompt),
-    )
+    memory_references = []
+    if assistant_memory_enabled:
+        memory_references = _assistant_memory_reference_payload(
+            user,
+            scope=assistant_memory_scope,
+            query_text=_assistant_memory_query_text(prompt=prompt),
+        )
     user_text = {
         "prompt": prompt,
         "constraints": {
@@ -16659,16 +17309,17 @@ def playground_plan() -> Response:
     elif _opencode_available_for_playground():
         job_payload["codingagent"] = "opencode"
     token_estimate = _estimate_job_tokens(job_payload)
-    _record_assistant_memory(
-        user,
-        scope=assistant_memory_scope,
-        prompt_text=prompt,
-        requirements_text=requirements_text,
-        reply_text=f"{summary}\n\n{requirements_text}".strip(),
-        project_name=project_name,
-        steps=steps,
-        extra_notes=[f"project_name: {project_name}"] if project_name else None,
-    )
+    if assistant_memory_enabled:
+        _record_assistant_memory(
+            user,
+            scope=assistant_memory_scope,
+            prompt_text=prompt,
+            requirements_text=requirements_text,
+            reply_text=f"{summary}\n\n{requirements_text}".strip(),
+            project_name=project_name,
+            steps=steps,
+            extra_notes=[f"project_name: {project_name}"] if project_name else None,
+        )
 
     return jsonify(
         {

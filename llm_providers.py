@@ -137,6 +137,10 @@ def _should_use_background_auto(
 _REQUEST_CATEGORY: ContextVar[str] = ContextVar("llm_request_category", default="llm")
 _TOKEN_TOTALS: Dict[str, Dict[str, int]] = {}
 _TOKEN_TOTALS_LOCK = threading.Lock()
+_USAGE_EVENT_FILE_LOCK = threading.Lock()
+_PRICING_CACHE_LOCK = threading.Lock()
+_PRICING_CACHE_RAW = None
+_PRICING_CACHE_VALUE: Dict[str, Any] = {}
 
 
 @contextmanager
@@ -291,6 +295,122 @@ def _format_token_value(value: Optional[int]) -> str:
     return "?" if value is None else str(value)
 
 
+def _usage_event_enabled() -> bool:
+    return _env_bool("REFINER_EMIT_USAGE_EVENTS", False)
+
+
+def _usage_events_file() -> Optional[str]:
+    value = os.getenv("REFINER_EVENTS_FILE")
+    if not value:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _load_pricing_config() -> Dict[str, Any]:
+    global _PRICING_CACHE_RAW, _PRICING_CACHE_VALUE
+    raw = os.getenv("REFINER_LLM_PRICING") or ""
+    with _PRICING_CACHE_LOCK:
+        if raw == _PRICING_CACHE_RAW:
+            return dict(_PRICING_CACHE_VALUE)
+        try:
+            payload = json.loads(raw) if raw else {}
+        except Exception:
+            payload = {}
+        _PRICING_CACHE_RAW = raw
+        _PRICING_CACHE_VALUE = payload if isinstance(payload, dict) else {}
+        return dict(_PRICING_CACHE_VALUE)
+
+
+def _pricing_entry(provider: str, model: Optional[str]) -> Optional[Dict[str, Any]]:
+    payload = _load_pricing_config()
+    if not payload:
+        return None
+    model_key = str(model or "").strip()
+    provider_key = str(provider or "").strip()
+    candidates = [
+        f"{provider_key}/{model_key}" if provider_key and model_key else "",
+        f"{provider_key}:{model_key}" if provider_key and model_key else "",
+        model_key,
+        f"provider:{provider_key}" if provider_key else "",
+        "default",
+    ]
+    for key in candidates:
+        if key and isinstance(payload.get(key), dict):
+            return dict(payload.get(key) or {})
+    models = payload.get("models")
+    if model_key and isinstance(models, dict) and isinstance(models.get(model_key), dict):
+        return dict(models.get(model_key) or {})
+    providers = payload.get("providers")
+    if provider_key and isinstance(providers, dict) and isinstance(providers.get(provider_key), dict):
+        return dict(providers.get(provider_key) or {})
+    default_entry = payload.get("default")
+    if isinstance(default_entry, dict):
+        return dict(default_entry)
+    return None
+
+
+def _rate_denominator(unit: Optional[str]) -> float:
+    cleaned = str(unit or "per_1m_tokens").strip().lower()
+    if cleaned in {"per_1k_tokens", "per_1k", "1k"}:
+        return 1_000.0
+    return 1_000_000.0
+
+
+def _compute_usage_cost(provider: str, model: Optional[str], usage: Dict[str, Optional[int]]) -> Optional[Dict[str, Any]]:
+    pricing = _pricing_entry(provider, model)
+    if not pricing:
+        return None
+    denominator = _rate_denominator(pricing.get("unit"))
+    try:
+        prompt_rate = float(pricing.get("prompt") or 0.0)
+        completion_rate = float(pricing.get("completion") or 0.0)
+        cached_rate = float(pricing.get("cached") or pricing.get("prompt_cached") or prompt_rate)
+    except Exception:
+        return None
+    prompt = max(_coerce_int(usage.get("prompt")) or 0, 0)
+    completion = max(_coerce_int(usage.get("completion")) or 0, 0)
+    cached = max(_coerce_int(usage.get("cached")) or 0, 0)
+    prompt_non_cached = max(prompt - cached, 0)
+    amount = (
+        (prompt_non_cached * prompt_rate)
+        + (completion * completion_rate)
+        + (cached * cached_rate)
+    ) / denominator
+    currency = str(pricing.get("currency") or "USD").strip().upper() or "USD"
+    return {
+        "amount": round(amount, 8),
+        "currency": currency,
+    }
+
+
+def _emit_usage_event(event: Dict[str, Any]) -> None:
+    if _usage_event_enabled():
+        try:
+            print("__RAG_EVENT__ " + json.dumps(event, ensure_ascii=True, sort_keys=True), flush=True)
+        except Exception:
+            pass
+    events_file = _usage_events_file()
+    if not events_file:
+        return
+    # Mirror the same structured event into the job JSONL artifact so operators
+    # can inspect usage even if stdout has been truncated or rotated away.
+    try:
+        os.makedirs(os.path.dirname(events_file), exist_ok=True)
+    except Exception:
+        pass
+    with _USAGE_EVENT_FILE_LOCK:
+        try:
+            with open(events_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
+        except Exception:
+            logger.debug("Failed to append usage event to %s", events_file)
+
+
 def _log_token_usage(provider: str, model: Optional[str], usage: Optional[Dict[str, Optional[int]]]) -> None:
     if not usage:
         return
@@ -312,6 +432,25 @@ def _log_token_usage(provider: str, model: Optional[str], usage: Optional[Dict[s
         if total_for_add is not None:
             totals["total"] += total_for_add
         running = dict(totals)
+
+    cost = _compute_usage_cost(provider, model, usage)
+    event = {
+        "type": "token_usage",
+        "ts": time.time(),
+        "at": _iso_now(),
+        "provider": provider,
+        "model": model or "unknown",
+        "category": category,
+        "usage": {
+            "prompt": prompt,
+            "completion": completion,
+            "total": total_for_add,
+            "cached": cached,
+        },
+        "running_total": running,
+        "cost": cost,
+    }
+    _emit_usage_event(event)
 
     cached_note = f" cached={_format_token_value(cached)}" if cached is not None else ""
     logger.info(

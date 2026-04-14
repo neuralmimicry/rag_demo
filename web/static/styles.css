@@ -1806,6 +1806,27 @@ button.ghost:hover {
   padding-top: 12px;
 }
 
+.settings-form {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-summary {
+  margin: 6px 0 0;
+}
+
+.settings-note {
+  margin: 8px 0 0;
+}
+
+.settings-checks {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  min-height: 100%;
+  padding-top: 28px;
+}
+
 .todo-panel {
   margin-bottom: 18px;
 }
