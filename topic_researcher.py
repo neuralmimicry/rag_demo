@@ -1348,8 +1348,10 @@ class TopicResearcher:
         if path_or_url.startswith(("http://", "https://")):
             # 1. Try cache first for path-specific resources. For bare domains, prefer a live fetch
             # to avoid stale homepage cache entries masking current content.
+            # YouTube transcripts are fetched live because caption tracks can change independently
+            # from the watch URL and stale cache entries make transcript tests/order brittle.
             parsed_for_cache = urlparse(path_or_url)
-            should_use_cache = parsed_for_cache.path not in ("", "/")
+            should_use_cache = parsed_for_cache.path not in ("", "/") and not is_youtube_url(path_or_url)
             if should_use_cache:
                 cache_data = self._read_cache(path_or_url)
                 if cache_data:

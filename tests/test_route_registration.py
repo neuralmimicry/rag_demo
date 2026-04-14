@@ -26,4 +26,5 @@ def test_voice_and_assistant_routes_are_registered():
     assert "/api/subtasks" in rules
     assert "/api/subtasks/<task_id>" in rules
     assert "/api/subtasks/<task_id>/cancel" in rules
+    assert "/api/admin/llm-telemetry" in rules
     assert "/api/workers/telemetry" in rules
