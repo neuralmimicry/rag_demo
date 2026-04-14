@@ -100,6 +100,7 @@ from security_utils import (
 )
 from refiner_central_store import create_central_store_from_env
 from versioning import get_public_version_info, get_version_info
+from web_research import fetch_url_content, fetch_youtube_transcript, is_youtube_url
 
 logger = logging.getLogger(__name__)
 try:
@@ -1513,12 +1514,29 @@ def _coerce_rag_sources(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     sources = []
     raw_sources = payload.get("sources")
     if isinstance(raw_sources, list):
-        sources.extend([item for item in raw_sources if isinstance(item, dict)])
+        for item in raw_sources:
+            if isinstance(item, dict):
+                sources.append(item)
+            elif isinstance(item, str):
+                cleaned = item.strip()
+                if not cleaned:
+                    continue
+                if cleaned.startswith(("http://", "https://")):
+                    sources.append({"url": cleaned})
+                else:
+                    sources.append({"path": cleaned})
     raw_paths = payload.get("paths")
     if isinstance(raw_paths, list):
         for path in raw_paths:
             if isinstance(path, str):
                 sources.append({"path": path})
+    raw_urls = payload.get("urls")
+    if isinstance(raw_urls, list):
+        for url in raw_urls:
+            if isinstance(url, str):
+                cleaned = url.strip()
+                if cleaned:
+                    sources.append({"url": cleaned})
     return sources
 
 
@@ -1536,6 +1554,7 @@ def _build_rag_documents(
             continue
         text = entry.get("text")
         path = entry.get("path")
+        url = entry.get("url")
         metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
         source_label = entry.get("source") or entry.get("title")
         elements = coerce_document_elements(entry.get("elements") or [])
@@ -1564,6 +1583,37 @@ def _build_rag_documents(
                 merged_meta.setdefault(key, value)
             if path:
                 merged_meta.setdefault("source_path", path)
+            metadata = merged_meta
+        elif url and isinstance(url, str):
+            url = url.strip()
+            if not url:
+                continue
+            merged_meta = dict(metadata)
+            merged_meta.setdefault("source_url", url)
+            source_label = source_label or url
+            if is_youtube_url(url):
+                try:
+                    text, transcript_meta = fetch_youtube_transcript(url, timeout=20)
+                except Exception:
+                    continue
+                for key, value in transcript_meta.items():
+                    merged_meta.setdefault(key, value)
+            else:
+                text = fetch_url_content(
+                    url,
+                    timeout=20,
+                    max_bytes=max_doc_bytes,
+                    file_converter=converter,
+                    raise_on_error=False,
+                )
+                if not text:
+                    continue
+            try:
+                if max_doc_bytes and len(text.encode("utf-8")) > max_doc_bytes:
+                    continue
+            except Exception:
+                if max_doc_bytes and len(text) > max_doc_bytes:
+                    continue
             metadata = merged_meta
         if not text or not isinstance(text, str):
             continue

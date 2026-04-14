@@ -26,7 +26,9 @@ from web_research import (
     TavilySearchEngine,
     build_search_engine,
     fetch_url,
+    fetch_youtube_transcript,
     heuristic_relevance_check,
+    is_youtube_url,
     search_web,
 )
 from skills_engine import build_skill_context, format_skill_directives
@@ -1402,38 +1404,53 @@ class TopicResearcher:
                             metadata = {"type": "Confluence", "identifier": cids[0], "title": title}
 
                 if not content:
-                    # Standard fetch
                     locator_meta = {}
-                    resp = self._fetch_url(path_or_url)
-                    
-                    # Check if it's text-based or binary
-                    content_type = resp.headers.get("Content-Type", "")
-                    is_likely_text = any(t in content_type for t in ["text/", "json", "javascript", "xml"])
-                    
-                    if is_likely_text and not any(ext in path_or_url.lower() for ext in [".pdf", ".docx", ".odf", ".odt", ".jpg", ".png", ".mp3", ".mp4"]):
-                        content = resp.text
+                    if is_youtube_url(path_or_url):
+                        content, transcript_meta = fetch_youtube_transcript(
+                            path_or_url,
+                            timeout=self.llm_params.get("timeout", 30) or 30,
+                        )
+                        caption_lang = str(transcript_meta.get("caption_lang") or "").strip()
+                        locator = f"YouTube transcript ({caption_lang})" if caption_lang else "YouTube transcript"
+                        locator_meta = {"locator": locator, "locators": [locator]}
+                        self._record_web_contribution(
+                            path_or_url,
+                            path_or_url,
+                            locator=locator_meta.get("locator"),
+                            locators=locator_meta.get("locators"),
+                        )
                     else:
-                        # Binary or complex format, save to temp and convert
-                        suffix = os.path.splitext(urlparse(path_or_url).path)[1]
-                        import tempfile
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                            tmp.write(resp.content)
-                            tmp_path = tmp.name
-                        try:
-                            extraction = self.file_converter.extract(tmp_path, mime_type=content_type)
-                            content = extraction.text
-                            locator_meta = self._locator_metadata_from_extraction(extraction)
-                            if locator_meta:
-                                self._record_web_contribution(
-                                    path_or_url,
-                                    path_or_url,
-                                    locator=locator_meta.get("locator"),
-                                    locators=locator_meta.get("locators"),
-                                )
-                        finally:
-                            if os.path.exists(tmp_path):
-                                os.remove(tmp_path)
-                    
+                        # Standard fetch
+                        resp = self._fetch_url(path_or_url)
+
+                        # Check if it's text-based or binary
+                        content_type = resp.headers.get("Content-Type", "")
+                        is_likely_text = any(t in content_type for t in ["text/", "json", "javascript", "xml"])
+
+                        if is_likely_text and not any(ext in path_or_url.lower() for ext in [".pdf", ".docx", ".odf", ".odt", ".jpg", ".png", ".mp3", ".mp4"]):
+                            content = resp.text
+                        else:
+                            # Binary or complex format, save to temp and convert
+                            suffix = os.path.splitext(urlparse(path_or_url).path)[1]
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                                tmp.write(resp.content)
+                                tmp_path = tmp.name
+                            try:
+                                extraction = self.file_converter.extract(tmp_path, mime_type=content_type)
+                                content = extraction.text
+                                locator_meta = self._locator_metadata_from_extraction(extraction)
+                                if locator_meta:
+                                    self._record_web_contribution(
+                                        path_or_url,
+                                        path_or_url,
+                                        locator=locator_meta.get("locator"),
+                                        locators=locator_meta.get("locators"),
+                                    )
+                            finally:
+                                if os.path.exists(tmp_path):
+                                    os.remove(tmp_path)
+
                     # For web content, we don't always have a title here, but we can try to guess it later
                     # or the caller (e.g. _execute_queries) will record it.
                     # However, if context_sources contains a URL, we should record it here.

@@ -716,6 +716,141 @@ def _strip_html_text(content: str) -> str:
     return html_lib.unescape(re.sub(r"\s+", " ", text)).strip()
 
 
+def extract_youtube_video_id(url: str) -> str:
+    """Extract a canonical 11-character YouTube video id from supported URL forms."""
+    cleaned = str(url or "").strip()
+    if not cleaned:
+        return ""
+    parsed = urlparse(cleaned)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").strip("/")
+    candidate = ""
+
+    if host in {"youtu.be", "www.youtu.be"}:
+        candidate = path.split("/", 1)[0]
+    elif host in {
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+        "youtube-nocookie.com",
+        "www.youtube-nocookie.com",
+    }:
+        if path == "watch":
+            candidate = (parse_qs(parsed.query).get("v") or [""])[0]
+        elif path.startswith(("embed/", "shorts/", "live/")):
+            candidate = path.split("/", 1)[1].split("/", 1)[0]
+
+    candidate = (candidate or "").strip()
+    return candidate if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate) else ""
+
+
+def is_youtube_url(url: str) -> bool:
+    """Return True when the supplied URL targets a supported YouTube video path."""
+    return bool(extract_youtube_video_id(url))
+
+
+def parse_youtube_json3_transcript(payload: Dict[str, Any]) -> str:
+    """Flatten a YouTube JSON3 transcript payload into plain text."""
+    if not isinstance(payload, dict):
+        return ""
+    lines: List[str] = []
+    for event in payload.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        segs = event.get("segs")
+        if not isinstance(segs, list):
+            continue
+        fragments = []
+        for seg in segs:
+            if not isinstance(seg, dict):
+                continue
+            fragment = str(seg.get("utf8") or "")
+            if fragment:
+                fragments.append(fragment)
+        line = html_lib.unescape("".join(fragments)).replace("\n", " ")
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def fetch_youtube_transcript(
+    url: str,
+    *,
+    timeout: int,
+    session: Optional[requests.Session] = None,
+    languages: Optional[List[str]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Fetch a plain-text YouTube transcript from the timedtext JSON3 endpoint."""
+    video_id = extract_youtube_video_id(url)
+    if not video_id:
+        raise requests.exceptions.RequestException("URL is not a supported YouTube video link.")
+    timedtext_url = "https://www.youtube.com/api/timedtext"
+    if not url_allowed(timedtext_url):
+        raise requests.exceptions.RequestException("YouTube transcript endpoint blocked by policy")
+
+    preferred_langs: List[str] = []
+    for candidate in (languages or ["en", "en-US", "en-GB"]):
+        lang = str(candidate or "").strip()
+        if lang and lang not in preferred_langs:
+            preferred_langs.append(lang)
+    if not preferred_langs:
+        preferred_langs = ["en"]
+
+    session = session or requests.Session()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://www.youtube.com/",
+    }
+    attempts = []
+    for lang in preferred_langs:
+        attempts.append({"v": video_id, "lang": lang, "fmt": "json3"})
+        attempts.append({"v": video_id, "lang": lang, "fmt": "json3", "kind": "asr"})
+
+    last_error = "Transcript unavailable."
+    for params in attempts:
+        try:
+            resp = session.get(timedtext_url, params=params, headers=headers, timeout=timeout)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        status_code = int(getattr(resp, "status_code", 0) or 0)
+        if status_code >= 400:
+            last_error = f"HTTP {status_code}"
+            continue
+        raw_text = getattr(resp, "text", "") or ""
+        if not raw_text and getattr(resp, "content", None):
+            try:
+                raw_text = resp.content.decode("utf-8", errors="ignore")
+            except Exception:
+                raw_text = ""
+        if not raw_text.strip():
+            last_error = "Transcript response was empty."
+            continue
+        payload = None
+        try:
+            payload = resp.json()
+        except Exception:
+            try:
+                payload = json.loads(raw_text)
+            except Exception:
+                payload = None
+        transcript = parse_youtube_json3_transcript(payload if isinstance(payload, dict) else {})
+        if transcript:
+            metadata = {
+                "source_type": "youtube_transcript",
+                "source_url": url,
+                "video_id": video_id,
+                "caption_lang": str(params.get("lang") or ""),
+                "caption_kind": str(params.get("kind") or "standard"),
+            }
+            return transcript, metadata
+        last_error = "Transcript payload did not contain caption events."
+    raise requests.exceptions.RequestException(last_error)
+
+
 def fetch_url(
     url: str,
     *,
@@ -803,6 +938,17 @@ def fetch_url_content(
         cached = cache.read("fetch", url, cache_ttl_hours)
         if isinstance(cached, str):
             return cached
+    if is_youtube_url(url):
+        try:
+            transcript, _ = fetch_youtube_transcript(url, timeout=timeout)
+        except Exception:
+            if raise_on_error:
+                raise
+            return ""
+        cleaned = transcript.strip()
+        if cache and cleaned:
+            cache.write("fetch", url, cleaned)
+        return cleaned
     try:
         resp = fetch_url(url, timeout=timeout, get_fetch_advice=get_fetch_advice)
     except Exception:
