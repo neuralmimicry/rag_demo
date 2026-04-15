@@ -123,6 +123,100 @@ def test_orchestrator_prefers_valid_json_and_runs_candidates_concurrently(tmp_pa
     assert valid.calls
 
 
+def test_orchestrator_best_mode_returns_early_for_interactive_high_quality_success(tmp_path, monkeypatch):
+    fast = _FakeProvider("fast", "m1", "NeuralMimicry is an adaptive neuromorphic AI platform.", delay=0.02)
+    slow = _FakeProvider("slow", "m2", "A slower but still valid marketing answer.", delay=0.25)
+    metrics_path = tmp_path / "provider_metrics.json"
+    monkeypatch.setenv("REFINER_AI_REGISTRY_PATH", str(metrics_path))
+    monkeypatch.setenv("REFINER_AI_EARLY_SUCCESS_SETTLE_SECONDS", "0.03")
+    monkeypatch.setenv("REFINER_AARNN_ENABLED", "0")
+
+    provider = orchestrate_provider_candidates(
+        [fast, slow],
+        workflow="assistant_requirements",
+        role="assistant",
+        include_configured=False,
+        config_path=str(tmp_path / "missing-config.json"),
+        selection_mode="best",
+        max_candidates=2,
+    )
+    assert provider is not None
+
+    start = time.time()
+    response = provider.predict(
+        messages=[{"role": "user", "content": "What is NeuralMimicry?"}],
+        system="Answer in concise prose.",
+    )
+    elapsed = time.time() - start
+
+    assert response.provider == "fast"
+    assert elapsed < 0.16
+    assert fast.calls[0]["timeout"] == 45
+    assert response.raw["refiner_ai"]["returned_early"] is True
+
+
+def test_orchestrator_best_mode_still_waits_for_slow_valid_json_after_fast_invalid_response(tmp_path, monkeypatch):
+    invalid = _FakeProvider("fast_invalid", "v1", "not json", delay=0.02)
+    valid = _FakeProvider("slow_valid", "v2", '{"summary": "ok"}', delay=0.08)
+    metrics_path = tmp_path / "provider_metrics.json"
+    monkeypatch.setenv("REFINER_AI_REGISTRY_PATH", str(metrics_path))
+    monkeypatch.setenv("REFINER_AI_EARLY_SUCCESS_SETTLE_SECONDS", "0.01")
+    monkeypatch.setenv("REFINER_AARNN_ENABLED", "0")
+
+    provider = orchestrate_provider_candidates(
+        [invalid, valid],
+        workflow="assistant_requirements",
+        role="assistant",
+        include_configured=False,
+        config_path=str(tmp_path / "missing-config.json"),
+        selection_mode="best",
+        max_candidates=2,
+    )
+    assert provider is not None
+
+    start = time.time()
+    response = provider.predict(
+        messages=[{"role": "user", "content": "Build a reading quiz."}],
+        system="Return ONLY valid JSON with keys: summary",
+    )
+    elapsed = time.time() - start
+
+    assert response.provider == "slow_valid"
+    assert json.loads(response.text)["summary"] == "ok"
+    assert elapsed >= 0.07
+    assert elapsed < 0.16
+
+
+def test_orchestrator_fastest_mode_returns_first_acceptable_success(tmp_path, monkeypatch):
+    fast = _FakeProvider("fast", "m1", "A quick acceptable answer.", delay=0.02)
+    slow = _FakeProvider("slow", "m2", "A much slower acceptable answer.", delay=0.25)
+    metrics_path = tmp_path / "provider_metrics.json"
+    monkeypatch.setenv("REFINER_AI_REGISTRY_PATH", str(metrics_path))
+    monkeypatch.setenv("REFINER_AARNN_ENABLED", "0")
+
+    provider = orchestrate_provider_candidates(
+        [fast, slow],
+        workflow="assistant_requirements",
+        role="assistant",
+        include_configured=False,
+        config_path=str(tmp_path / "missing-config.json"),
+        selection_mode="fastest",
+        max_candidates=2,
+    )
+    assert provider is not None
+
+    start = time.time()
+    response = provider.predict(
+        messages=[{"role": "user", "content": "Say hello."}],
+        system="Answer in concise prose.",
+    )
+    elapsed = time.time() - start
+
+    assert response.provider == "fast"
+    assert elapsed < 0.12
+    assert response.raw["refiner_ai"]["returned_early"] is True
+
+
 def test_orchestrator_returns_single_provider_unchanged_when_no_alt_candidates(monkeypatch):
     solo = _FakeProvider("solo", "m1", '{"summary": "ok"}')
     monkeypatch.setenv("REFINER_AARNN_ENABLED", "0")
