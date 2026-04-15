@@ -16,7 +16,7 @@ heavy external dependencies.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 import json
 import logging
@@ -235,6 +235,76 @@ def _include_configured_candidates(config_path: Optional[str] = None) -> bool:
 def _health_ttl_seconds(config_path: Optional[str] = None) -> float:
     ai_cfg = _orchestration_config(config_path)
     return max(30.0, _env_float("REFINER_AI_HEALTH_TTL_SECONDS", float(ai_cfg.get("health_ttl_seconds") or 1800.0)))
+
+
+def _is_interactive_workflow(workflow: str, role: str) -> bool:
+    workflow_key = str(workflow or "").strip().lower()
+    role_key = str(role or "").strip().lower()
+    return workflow_key.startswith("assistant_") or role_key == "assistant"
+
+
+def _early_success_enabled(
+    config_path: Optional[str] = None,
+    *,
+    workflow: str,
+    role: str,
+    selection_mode: str,
+) -> bool:
+    if selection_mode == "fastest":
+        return True
+    ai_cfg = _orchestration_config(config_path)
+    raw = os.getenv("REFINER_AI_EARLY_SUCCESS_ENABLED")
+    if raw is not None:
+        return _env_bool("REFINER_AI_EARLY_SUCCESS_ENABLED", False)
+    if "early_success_enabled" in ai_cfg:
+        return bool(ai_cfg.get("early_success_enabled"))
+    return _is_interactive_workflow(workflow, role)
+
+
+def _early_success_settle_seconds(
+    config_path: Optional[str] = None,
+    *,
+    workflow: str,
+    role: str,
+    selection_mode: str,
+) -> float:
+    ai_cfg = _orchestration_config(config_path)
+    default = 0.0 if selection_mode == "fastest" else (0.75 if _is_interactive_workflow(workflow, role) else 0.0)
+    raw = os.getenv("REFINER_AI_EARLY_SUCCESS_SETTLE_SECONDS")
+    if raw is not None:
+        return max(0.0, _env_float("REFINER_AI_EARLY_SUCCESS_SETTLE_SECONDS", default))
+    if "early_success_settle_seconds" in ai_cfg:
+        return max(0.0, _safe_float(ai_cfg.get("early_success_settle_seconds"), default))
+    return default
+
+
+def _early_success_quality_floor(config_path: Optional[str] = None) -> float:
+    ai_cfg = _orchestration_config(config_path)
+    default = 0.5
+    raw = os.getenv("REFINER_AI_EARLY_SUCCESS_MIN_QUALITY")
+    if raw is not None:
+        return _safe_float(raw, default)
+    if "early_success_min_quality" in ai_cfg:
+        return _safe_float(ai_cfg.get("early_success_min_quality"), default)
+    return default
+
+
+def _candidate_timeout_cap_seconds(
+    config_path: Optional[str] = None,
+    *,
+    workflow: str,
+    role: str,
+) -> Optional[int]:
+    ai_cfg = _orchestration_config(config_path)
+    default = 45 if _is_interactive_workflow(workflow, role) else 0
+    raw = os.getenv("REFINER_AI_CANDIDATE_TIMEOUT_CAP_SECONDS")
+    if raw is not None:
+        value = _env_int("REFINER_AI_CANDIDATE_TIMEOUT_CAP_SECONDS", default)
+    elif "candidate_timeout_cap_seconds" in ai_cfg:
+        value = int(_safe_float(ai_cfg.get("candidate_timeout_cap_seconds"), float(default)))
+    else:
+        value = default
+    return None if value <= 0 else max(1, int(value))
 
 
 def _provider_kwargs(provider_type: Optional[str], api_key: Optional[str]) -> Dict[str, Any]:
@@ -506,6 +576,10 @@ class ConcurrentLLMProvider(LLMProvider):
         selection_mode: str,
         max_candidates: int,
         health_ttl_sec: float,
+        early_success_enabled: bool,
+        early_success_settle_sec: float,
+        early_success_min_quality: float,
+        candidate_timeout_cap_sec: Optional[int],
         specialist_engines: Optional[Sequence[Any]] = None,
         actions_log: Optional[List[str]] = None,
     ) -> None:
@@ -517,6 +591,10 @@ class ConcurrentLLMProvider(LLMProvider):
         self.selection_mode = selection_mode
         self.max_candidates = max(1, int(max_candidates))
         self.health_ttl_sec = max(30.0, float(health_ttl_sec))
+        self.early_success_enabled = bool(early_success_enabled)
+        self.early_success_settle_sec = max(0.0, float(early_success_settle_sec))
+        self.early_success_min_quality = float(early_success_min_quality)
+        self.candidate_timeout_cap_sec = None if candidate_timeout_cap_sec is None else max(1, int(candidate_timeout_cap_sec))
         self.specialist_engines = list(specialist_engines or [])
         self.actions_log = actions_log
         self.name = f"refiner_ai:{self.workflow}:{self.role}"
@@ -600,6 +678,9 @@ class ConcurrentLLMProvider(LLMProvider):
         quota_backoff_base = max(0.1, _env_float("LLM_RATE_LIMIT_BACKOFF_BASE", 1.0))
         timeout_backoff_base = max(0.1, _env_float("LLM_TIMEOUT_BACKOFF_BASE", 1.0))
         empty_retry = _env_bool("REFINER_AI_RETRY_EMPTY_OUTPUT", True)
+        effective_timeout = timeout
+        if effective_timeout is None and self.candidate_timeout_cap_sec is not None:
+            effective_timeout = self.candidate_timeout_cap_sec
         attempts = 0
         quota_attempts = 0
         timeout_attempts = 0
@@ -612,7 +693,7 @@ class ConcurrentLLMProvider(LLMProvider):
                     max_tokens=max_tokens,
                     temperature=temperature,
                     system=system,
-                    timeout=timeout,
+                    timeout=effective_timeout,
                     reasoning_effort=reasoning_effort,
                 )
                 text = response.text if isinstance(response.text, str) else str(response.text)
@@ -646,6 +727,20 @@ class ConcurrentLLMProvider(LLMProvider):
             except Exception as exc:
                 latency_ms = max(0, int((time.time() - started) * 1000))
                 return InvocationResult(candidate=candidate, error=exc, latency_ms=latency_ms)
+
+    def _accepts_early_success(self, result: InvocationResult) -> bool:
+        return bool(result.response is not None and result.quality >= self.early_success_min_quality)
+
+    def _collect_future_result(
+        self,
+        future,
+        future_map: Dict[Any, ProviderCandidate],
+    ) -> InvocationResult:
+        try:
+            return future.result()
+        except Exception as exc:
+            candidate = future_map[future]
+            return InvocationResult(candidate=candidate, error=exc)
 
     def _predict_impl(
         self,
@@ -695,6 +790,7 @@ class ConcurrentLLMProvider(LLMProvider):
 
         expected_json = _expected_json(messages, system_to_send)
         results: List[InvocationResult] = []
+        returned_early = False
         if len(selected) == 1:
             results.append(
                 self._invoke_candidate(
@@ -706,39 +802,59 @@ class ConcurrentLLMProvider(LLMProvider):
                     timeout=timeout,
                     reasoning_effort=reasoning_effort,
                     expected_json=expected_json,
-                )
+                    )
             )
         else:
-            with ThreadPoolExecutor(max_workers=len(selected)) as executor:
-                future_map = {
-                    executor.submit(
-                        self._invoke_candidate,
-                        candidate,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        system=system_to_send,
-                        timeout=timeout,
-                        reasoning_effort=reasoning_effort,
-                        expected_json=expected_json,
-                    ): candidate
-                    for candidate in selected
-                }
-                if self.selection_mode == "fastest":
-                    for future in as_completed(future_map):
-                        result = future.result()
-                        results.append(result)
-                        if result.response and result.quality > -1.0:
+            executor = ThreadPoolExecutor(max_workers=len(selected))
+            future_map = {
+                executor.submit(
+                    self._invoke_candidate,
+                    candidate,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system=system_to_send,
+                    timeout=timeout,
+                    reasoning_effort=reasoning_effort,
+                    expected_json=expected_json,
+                ): candidate
+                for candidate in selected
+            }
+            pending = set(future_map)
+            early_deadline: Optional[float] = None
+            returned_early = False
+            try:
+                while pending:
+                    wait_timeout = None
+                    if early_deadline is not None:
+                        wait_timeout = max(0.0, early_deadline - time.time())
+                    done, pending = wait(
+                        pending,
+                        timeout=wait_timeout,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        if early_deadline is not None:
+                            returned_early = True
                             break
-                for future in as_completed(future_map):
-                    if future.done():
-                        try:
-                            result = future.result()
-                        except Exception as exc:
-                            candidate = future_map[future]
-                            result = InvocationResult(candidate=candidate, error=exc)
-                        if result not in results:
-                            results.append(result)
+                        continue
+                    for future in done:
+                        result = self._collect_future_result(future, future_map)
+                        results.append(result)
+                        if self.early_success_enabled and self._accepts_early_success(result):
+                            if self.selection_mode == "fastest":
+                                returned_early = True
+                                pending.clear()
+                                break
+                            if early_deadline is None:
+                                early_deadline = time.time() + self.early_success_settle_sec
+                    if returned_early:
+                        break
+                    if early_deadline is not None and time.time() >= early_deadline:
+                        returned_early = True
+                        break
+            finally:
+                executor.shutdown(wait=not returned_early, cancel_futures=returned_early)
 
         successful: List[InvocationResult] = []
         failures: List[InvocationResult] = []
@@ -795,6 +911,9 @@ class ConcurrentLLMProvider(LLMProvider):
             "role": self.role,
             "task_tags": sorted(task_tags),
             "selection_mode": self.selection_mode,
+            "returned_early": returned_early if len(selected) > 1 else False,
+            "early_success_enabled": self.early_success_enabled,
+            "early_success_settle_sec": self.early_success_settle_sec,
             "selected": chosen.candidate.summary(),
             "candidates": [
                 {
@@ -1008,6 +1127,24 @@ def orchestrate_provider_candidates(
         selection_mode=selection_mode or _selection_mode(config_path),
         max_candidates=max_candidates or _max_parallel_candidates(config_path),
         health_ttl_sec=_health_ttl_seconds(config_path),
+        early_success_enabled=_early_success_enabled(
+            config_path,
+            workflow=workflow,
+            role=role,
+            selection_mode=selection_mode or _selection_mode(config_path),
+        ),
+        early_success_settle_sec=_early_success_settle_seconds(
+            config_path,
+            workflow=workflow,
+            role=role,
+            selection_mode=selection_mode or _selection_mode(config_path),
+        ),
+        early_success_min_quality=_early_success_quality_floor(config_path),
+        candidate_timeout_cap_sec=_candidate_timeout_cap_seconds(
+            config_path,
+            workflow=workflow,
+            role=role,
+        ),
         specialist_engines=resolved_specialist_engines,
         actions_log=actions_log,
     )
