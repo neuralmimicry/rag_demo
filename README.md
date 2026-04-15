@@ -10,10 +10,13 @@ Key aspects:
 - Multi-workflow CLI: a single entry point drives Jira statistics, Jira quality analysis, Confluence space analysis, topic research, and project solving.
 - Project solver: scan a local folder for requirement signals, derive a plan with an LLM, and optionally apply file edits/run commands.
 - Agentic workflows: explicit plan → act → verify → reflect loops, verification-first execution, and role-based LLM overrides for planning/review.
+- Concurrent AI orchestration: LLM-backed workflows can now fan out across multiple provider/model candidates per role, score the responses, and retain rolling health/quality telemetry for future routing decisions.
+- Neuromorphic specialist support: Refiner can attach multiple concurrent SNN/AER specialist engines for neuromorphic tasks, keep an AARNN path available by default, and use offline AER translation when a live runtime is not present.
 - Refinement principle: every run should improve the solution in a measurable, qualitative, and quantifiable way, with attention to efficiency and performance where applicable. This principle is core to the Refiner name.
 - Reuse & traceability: generated/updated modules are intended to be modular, tracked against requirement IDs, and paired with tests/examples to aid cross-project reuse.
 - Privacy for reuse: reusable modules must be scrubbed of user/company-identifying information to prevent cross-project leakage.
 - Codebase intent/workflow reference: see [CODEBASE_INTENT_AND_WORKFLOW.md](CODEBASE_INTENT_AND_WORKFLOW.md).
+- AI orchestration details: see [REFINER_AI_ORCHESTRATION.md](REFINER_AI_ORCHESTRATION.md).
 
 ## Platform split
 Refiner is now the orchestration and public-API gateway layer in a split multi-service platform.
@@ -88,7 +91,7 @@ The web UI is backed by the same Flask server (`refiner_web.py`). It uses sessio
 - Jobs + workspaces: `/api/jobs`, `/api/jobs/estimate`, `/api/jobs/<job_id>/workspace`, `/api/jobs/<job_id>/editor/*`, `/api/jobs/<job_id>/logs`, `/api/jobs/<job_id>/actions`, `/api/jobs/<job_id>/transfer`, `/api/jobs/<job_id>/archive`
 - Inbox automation: `/api/todos`, `/api/todos/next`, `/api/todos/<todo_id>/route`, `/api/todos/<todo_id>/schedule`, `/api/schedules`, `/api/subtasks`
 - Access + collaboration: `/api/projects`, `/api/teams`, `/api/teams/<team_id>/tokens`, `/api/access/tree`, `/api/sessions`, `/api/sessions/<session_id>/stream`
-- Admin + operations: `/api/health`, `/api/version`, `/api/capabilities`, `/api/admin/stats`, `/api/workers/telemetry`, `/api/audit`, `/api/secrets`, `/api/github/tree`
+- Admin + operations: `/api/health`, `/api/version`, `/api/capabilities`, `/api/admin/stats`, `/api/admin/ai-orchestration`, `/api/workers/telemetry`, `/api/audit`, `/api/secrets`, `/api/github/tree`
 
 For the detailed route inventory and example payloads, see [API_DOCS_README.md](API_DOCS_README.md) and [`openapi_refiner.yaml`](openapi_refiner.yaml).
 
@@ -136,6 +139,23 @@ Raw MCP tokens and custom headers are moved into the encrypted Refiner secret st
 ### Capability inventory
 - `GET /api/capabilities` — returns a snapshot of detected workflows, features, and API groups.
 - Add `?refresh=1` to rescan the codebase.
+
+## AI orchestration
+
+Refiner now includes a shared orchestration layer for LLM-backed workflows:
+
+- shared provider registry and rolling quality/latency tracking,
+- concurrent planner/researcher/reviewer fan-out across configured candidates,
+- JSON-aware response scoring for structured routes such as playground planning and form-fill,
+- optional configured specialisation weights/roles in `config.json -> ai_orchestration`, and
+- concurrent SNN/AER specialist-engine profiles for neuromorphic tasks, with an AARNN fallback path auto-attached when no explicit AARNN engine is configured.
+
+The default metrics file is `job_data/ai/provider_metrics.json`.
+Operator-facing orchestration status is exposed through `GET /api/health` and `GET /api/admin/stats`, and delivery pipeline reports now preserve project-solver orchestration metadata under `ai_orchestration`.
+For deeper operator inspection, `GET /api/admin/ai-orchestration` returns the provider registry, engine registry, and condensed candidate metrics used by the admin dashboard panel.
+The admin dashboard panel supports client-side filtering, per-section sorting, and JSON/CSV export of the current visible orchestration view.
+Engine registry entries can mix AARNN and other `snn_aer`-style specialist runtimes concurrently alongside the LLM registry.
+See [REFINER_AI_ORCHESTRATION.md](REFINER_AI_ORCHESTRATION.md) for the workflow-by-workflow breakdown and specialist-engine configuration.
 
 ### API auth endpoints
 - `POST /api/login` with JSON `{ "username": "...", "password": "..." }` sets the session cookie.

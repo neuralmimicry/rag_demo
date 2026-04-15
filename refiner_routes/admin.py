@@ -19,6 +19,7 @@ def register_admin_routes(
     capabilities_report: Callable,
     admin_stats: Callable,
     admin_llm_telemetry: Callable,
+    admin_ai_orchestration: Callable,
     workers_telemetry: Callable,
     api_audit: Callable,
 ) -> None:
@@ -35,5 +36,6 @@ def register_admin_routes(
     app.add_url_rule("/api/capabilities", view_func=capabilities_report)
     app.add_url_rule("/api/admin/stats", view_func=admin_stats)
     app.add_url_rule("/api/admin/llm-telemetry", view_func=admin_llm_telemetry)
+    app.add_url_rule("/api/admin/ai-orchestration", view_func=admin_ai_orchestration)
     app.add_url_rule("/api/workers/telemetry", view_func=workers_telemetry)
     app.add_url_rule("/api/audit", view_func=api_audit)

@@ -1075,6 +1075,10 @@ h1 {
   align-items: start;
 }
 
+.admin-wide {
+  grid-column: 1 / -1;
+}
+
 .admin-metrics {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1176,6 +1180,118 @@ h1 {
   font-size: 13px;
 }
 
+.admin-status-card span {
+  display: grid;
+  gap: 4px;
+}
+
+.admin-status-card small {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: none;
+}
+
+.admin-card-header-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.admin-inline-actions {
+  margin-left: auto;
+}
+
+.admin-ai-toolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.5fr) minmax(180px, 0.7fr) auto;
+  gap: 12px;
+  margin-top: 14px;
+  align-items: end;
+}
+
+.admin-ai-export-actions {
+  justify-content: flex-end;
+}
+
+.admin-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: var(--surface-strong);
+}
+
+.admin-checkbox input {
+  margin: 0;
+}
+
+.admin-ai-layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.admin-ai-section {
+  display: grid;
+  gap: 10px;
+}
+
+.admin-section-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: end;
+  flex-wrap: wrap;
+}
+
+.admin-inline-field {
+  display: grid;
+  gap: 6px;
+  min-width: 180px;
+}
+
+.admin-inline-field span {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+}
+
+.admin-ai-span {
+  grid-column: 1 / -1;
+}
+
+.admin-section-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+}
+
+.admin-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.admin-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 11px;
+  color: var(--ink);
+}
+
 .refund-list {
   display: grid;
   gap: 14px;
@@ -1253,6 +1369,18 @@ h1 {
   .admin-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .admin-ai-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-ai-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-ai-span {
+    grid-column: auto;
+  }
 }
 
 @media (max-width: 720px) {
@@ -1262,6 +1390,24 @@ h1 {
 
   .admin-status-grid {
     grid-template-columns: 1fr;
+  }
+
+  .admin-card-header-actions {
+    flex-direction: column;
+  }
+
+  .admin-inline-actions {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .admin-ai-export-actions {
+    justify-content: flex-start;
+  }
+
+  .admin-inline-field {
+    min-width: 0;
+    width: 100%;
   }
 }
 

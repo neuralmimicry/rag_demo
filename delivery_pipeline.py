@@ -1013,17 +1013,6 @@ def _write_solver_context(
     return path
 
 
-def _load_solver_summary(path: str) -> Dict[str, Any]:
-    if not path or not os.path.exists(path):
-        return {}
-    try:
-        data = _read_json(path)
-    except Exception:
-        return {}
-    summary = data.get("completion_summary") if isinstance(data, dict) else None
-    return summary if isinstance(summary, dict) else {}
-
-
 def _extract_req_ids(text: str) -> List[str]:
     if not text:
         return []
@@ -1275,6 +1264,37 @@ def _load_project_solution(path: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _solver_ai_orchestration(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not data:
+        return {}
+    ai = data.get("ai_orchestration")
+    return ai if isinstance(ai, dict) else {}
+
+
+def _summarize_solver_ai(
+    project_solution_ai: Optional[Dict[str, Any]],
+    fallback_attempts: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    attempts = fallback_attempts or []
+    latest: Dict[str, Any] = {}
+    attempts_with_ai = 0
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        ai = attempt.get("ai_orchestration")
+        if not isinstance(ai, dict) or not ai:
+            continue
+        attempts_with_ai += 1
+        latest = ai
+    return {
+        "project_solution": project_solution_ai if isinstance(project_solution_ai, dict) else {},
+        "solver_fallback": {
+            "attempts_with_ai": attempts_with_ai,
+            "latest": latest,
+        },
+    }
+
+
 def _solver_summary(data: Optional[Dict[str, Any]], project_root: str) -> Dict[str, Any]:
     if not data:
         return {}
@@ -1468,6 +1488,7 @@ def run_delivery_pipeline(
 
     solver_data = _load_project_solution(project_solution_path) if project_solution_path else None
     solver_summary = _solver_summary(solver_data, project_root)
+    solver_ai_orchestration = _solver_ai_orchestration(solver_data)
     solver_incomplete = bool(solver_summary.get("needs_more_iterations"))
     solver_gate = config.solver_gate
     if config.require_solver_completion:
@@ -1495,6 +1516,7 @@ def run_delivery_pipeline(
                 "attempts": [],
                 "attempt_count": 0,
             },
+            "ai_orchestration": _summarize_solver_ai(solver_ai_orchestration),
         }
         with open(output_path, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2)
@@ -1535,6 +1557,7 @@ def run_delivery_pipeline(
                 "attempts": [],
                 "attempt_count": 0,
             },
+            "ai_orchestration": _summarize_solver_ai(solver_ai_orchestration),
             "stages": [],
             "workflow": None,
         }
@@ -1833,7 +1856,9 @@ def run_delivery_pipeline(
                                         codingagent_model=solver_codingagent_model,
                                         codingagent_reasoning_effort=solver_codingagent_reasoning,
                                     )
-                                    solver_summary = _load_solver_summary(solver_out_path)
+                                    solver_attempt_data = _load_project_solution(solver_out_path)
+                                    solver_summary = _solver_summary(solver_attempt_data, solver_root)
+                                    solver_attempt_ai = _solver_ai_orchestration(solver_attempt_data)
                                     solver_attempt = {
                                         "attempt": solver_attempts_used,
                                         "stage": stage.name,
@@ -1845,6 +1870,7 @@ def run_delivery_pipeline(
                                         "output_path": solver_out_path,
                                         "exit_code": solver_exit,
                                         "summary": solver_summary,
+                                        "ai_orchestration": solver_attempt_ai,
                                     }
                                     stage_solver_attempts.append(solver_attempt)
                                     solver_fallback_log.append(solver_attempt)
@@ -2063,6 +2089,7 @@ def run_delivery_pipeline(
             "attempts": solver_fallback_log,
             "attempt_count": len(solver_fallback_log),
         },
+        "ai_orchestration": _summarize_solver_ai(solver_ai_orchestration, solver_fallback_log),
         "rag": rag_meta,
         "mcp": {"servers": mcp_server_masks},
         "summary": run_summary,

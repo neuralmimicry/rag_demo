@@ -61,7 +61,7 @@ from flask import (
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from llm_providers import get_provider, LLMError, register_event_callback
+from llm_providers import get_provider, LLMError, LLMProvider, register_event_callback
 from document_schema import coerce_document_elements
 from file_converter import FileConverter
 from rag_engine import RagDocument, RagIndex, RagStore
@@ -110,6 +110,7 @@ from refiner_settings import (
 )
 from versioning import get_public_version_info, get_version_info
 from web_research import fetch_url_content, fetch_youtube_transcript, is_youtube_url
+from refiner_ai_orchestration import build_workflow_provider, orchestration_status
 
 logger = logging.getLogger(__name__)
 try:
@@ -8871,6 +8872,92 @@ def _resolve_llm_settings(
     }
 
 
+def _api_key_for_provider_type(provider_type: Optional[str], env: Dict[str, str]) -> Optional[str]:
+    lowered = str(provider_type or "").strip().lower()
+    if lowered in {"gpt", "chatgpt", "openai"}:
+        return env.get("OPENAI_API_KEY")
+    if lowered in {"gemini", "google"}:
+        return (
+            env.get("GEMINI_API_KEY")
+            or env.get("GOOGLE_API_KEY")
+            or env.get("GOOGLE_GENERATIVE_AI_API_KEY")
+        )
+    return None
+
+
+def _fallback_llm_settings(user: str, primary: Dict[str, Any]) -> Dict[str, Any]:
+    env = build_effective_llm_env(_get_secret_store(user).get_env(), process_env=os.environ)
+    cfg = _load_llm_config()
+    providers = cfg.get("llm_providers") if isinstance(cfg.get("llm_providers"), list) else []
+    primary_provider = str(primary.get("provider") or "").strip().lower()
+    primary_model = str(primary.get("model") or "").strip()
+
+    for item in providers:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        provider_type = str(item.get("type") or item.get("provider") or name).strip()
+        model = str(item.get("model") or "").strip()
+        if not provider_type:
+            continue
+        same_provider = provider_type.lower() == primary_provider
+        same_model = not primary_model or model == primary_model
+        if same_provider and same_model:
+            continue
+        return {
+            "provider": provider_type,
+            "model": model or None,
+            "base_url": item.get("base_url"),
+            "api_key": _api_key_for_provider_type(provider_type, env),
+        }
+    return {"provider": None, "model": None, "base_url": None, "api_key": None}
+
+
+def _build_request_llm_provider(
+    user: str,
+    settings: Dict[str, Any],
+    *,
+    workflow: str,
+    role: str = "assistant",
+) -> Optional[LLMProvider]:
+    fallback = _fallback_llm_settings(user, settings)
+    provider = build_workflow_provider(
+        workflow=workflow,
+        role=role,
+        preferred_provider=settings.get("provider"),
+        preferred_model=settings.get("model"),
+        preferred_api_key=settings.get("api_key"),
+        fallback_provider=fallback.get("provider"),
+        fallback_model=fallback.get("model"),
+        fallback_api_key=fallback.get("api_key"),
+        base_url=settings.get("base_url") or fallback.get("base_url"),
+        provider_factory=get_provider,
+        config_path=os.path.join(BASE_DIR, "config.json"),
+        inter_request_gap=0.0,
+    )
+    return provider
+
+
+def _ai_orchestration_status(*, probe_engines: bool = False, candidate_limit: int = 12) -> Dict[str, Any]:
+    """Return orchestration registry status without breaking health/admin routes."""
+
+    try:
+        return orchestration_status(
+            config_path=os.path.join(BASE_DIR, "config.json"),
+            include_metrics=True,
+            probe_engines=probe_engines,
+            candidate_limit=candidate_limit,
+        )
+    except Exception as exc:
+        logger.warning("ai orchestration status unavailable: %s", exc)
+        return {
+            "enabled": False,
+            "degraded": True,
+            "error": "ai_orchestration_status_unavailable",
+            "details": str(exc),
+        }
+
+
 def _apply_user_job_defaults(payload: Dict[str, Any], owner: str) -> None:
     if not isinstance(payload, dict):
         return
@@ -13804,6 +13891,7 @@ def health() -> Response:
     version = get_public_version_info()
     learning = None
     autoscaler_status = _continuum_autoscaler_status()
+    ai_status = _ai_orchestration_status(probe_engines=False, candidate_limit=5)
     if stt_learning_store:
         try:
             learning = stt_learning_store.stats()
@@ -13832,6 +13920,7 @@ def health() -> Response:
             "workers_summary": autoscaler_status.get("workers") if isinstance(autoscaler_status, dict) else {},
             "sso": _sso_store_health(),
             "stt_learning": learning,
+            "ai_orchestration": ai_status,
             "service_integrations": {
                 "nmchain": {"enabled": _chain_enabled(), "base_url": NMCHAIN.base_url if _chain_enabled() else None},
                 "customers": {
@@ -13878,6 +13967,7 @@ def admin_stats() -> Response:
         jobs_by_status[status] = jobs_by_status.get(status, 0) + 1
     active_users = _active_users_snapshot()
     retention_status = _llm_telemetry_retention_status()
+    ai_status = _ai_orchestration_status(probe_engines=True, candidate_limit=20)
     llm_request_telemetry: Dict[str, Any] = {
         "enabled": False,
         "retention": retention_status,
@@ -13919,6 +14009,7 @@ def admin_stats() -> Response:
             "jobs_paused": jobs_by_status.get("paused", 0),
             "jobs_by_status": jobs_by_status,
             "llm_request_telemetry": llm_request_telemetry,
+            "ai_orchestration": ai_status,
             "continuum_autoscaler": _continuum_autoscaler_status(),
             "uptime_sec": int(time.time() - APP_START_TIME),
         }
@@ -13988,6 +14079,24 @@ def admin_llm_telemetry() -> Response:
     payload["limit"] = limit
     payload["include_subjects"] = include_subjects
     payload["subject_limit"] = subject_limit
+    return jsonify(payload)
+
+
+def admin_ai_orchestration() -> Response:
+    """Return AI orchestration registry status for admin drill-down views."""
+
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    if not _is_admin_user(user):
+        return jsonify({"error": "forbidden"}), 403
+
+    probe_engines = _is_truthy(request.args.get("probe_engines"))
+    limit = max(1, min(_safe_int(request.args.get("limit"), 20), 100))
+    payload = _ai_orchestration_status(probe_engines=probe_engines, candidate_limit=limit)
+    payload["probe_engines"] = probe_engines
+    payload["limit"] = limit
+    payload["fetched_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     return jsonify(payload)
 
 
@@ -14270,12 +14379,11 @@ def assistant_rag_mcp() -> Response:
     model_hint = payload.get("model") or payload.get("llm_model")
     settings = _resolve_llm_settings(user=user, provider_hint=provider_hint, model_hint=model_hint)
     try:
-        provider = get_provider(
-            settings["provider"],
-            model=settings.get("model"),
-            base_url=settings.get("base_url"),
-            api_key=settings.get("api_key"),
-            inter_request_gap=0.0,
+        provider = _build_request_llm_provider(
+            user,
+            settings,
+            workflow="assistant_rag_mcp",
+            role="assistant",
         )
     except Exception as exc:
         return jsonify({"error": "llm_init_failed", "details": str(exc)}), 400
@@ -14593,12 +14701,11 @@ def screen_refund(job_id: str, request_id: str) -> Response:
         return jsonify({"error": "refund not found"}), 404
     settings = _resolve_llm_settings(user=user)
     try:
-        provider = get_provider(
-            settings["provider"],
-            model=settings.get("model"),
-            base_url=settings.get("base_url"),
-            api_key=settings.get("api_key"),
-            inter_request_gap=0.0,
+        provider = _build_request_llm_provider(
+            user,
+            settings,
+            workflow="admin_refund_screening",
+            role="reviewer",
         )
     except Exception as exc:
         return jsonify({"error": "llm_unavailable", "details": str(exc)}), 400
@@ -17059,12 +17166,11 @@ def assistant_requirements() -> Response:
         except Exception as exc:
             logger.debug("Marketing assistant knowledge lookup skipped: %s", exc)
     try:
-        provider = get_provider(
-            settings["provider"],
-            model=settings.get("model"),
-            base_url=settings.get("base_url"),
-            api_key=settings.get("api_key"),
-            inter_request_gap=0.0,
+        provider = _build_request_llm_provider(
+            user,
+            settings,
+            workflow="assistant_requirements",
+            role="assistant",
         )
     except LLMError as exc:
         return jsonify({"error": "llm_unavailable", "details": str(exc)}), 400
@@ -17270,12 +17376,11 @@ def assistant_form_fill() -> Response:
     )
     assistant_memory_enabled = bool(settings.get("assistant_use_memory", True))
     try:
-        provider = get_provider(
-            settings["provider"],
-            model=settings.get("model"),
-            base_url=settings.get("base_url"),
-            api_key=settings.get("api_key"),
-            inter_request_gap=0.0,
+        provider = _build_request_llm_provider(
+            user,
+            settings,
+            workflow="assistant_form_fill",
+            role="assistant",
         )
     except Exception as exc:
         return jsonify({"error": "llm_init_failed", "details": str(exc)}), 400
@@ -17445,12 +17550,11 @@ def playground_plan() -> Response:
     )
     assistant_memory_enabled = bool(settings.get("assistant_use_memory", True))
     try:
-        provider = get_provider(
-            settings["provider"],
-            model=settings.get("model"),
-            base_url=settings.get("base_url"),
-            api_key=settings.get("api_key"),
-            inter_request_gap=0.0,
+        provider = _build_request_llm_provider(
+            user,
+            settings,
+            workflow="playground_plan",
+            role="planner",
         )
     except Exception as exc:
         return jsonify({"error": "llm_init_failed", "details": str(exc)}), 400
@@ -17616,6 +17720,7 @@ if hasattr(app, "add_url_rule"):
         capabilities_report=capabilities_report,
         admin_stats=admin_stats,
         admin_llm_telemetry=admin_llm_telemetry,
+        admin_ai_orchestration=admin_ai_orchestration,
         workers_telemetry=workers_telemetry,
         api_audit=api_audit,
     )

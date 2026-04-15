@@ -39,6 +39,10 @@ The codebase is built to support two primary operating modes:
 - `mcp_client.py`: JSON-RPC MCP client and server registry storage.
 - `web_research.py`: search engine abstraction, Google search integration, fetch/content extraction.
 - `llm_providers.py`: provider abstraction and fallback handling.
+- `refiner_ai_orchestration.py`: concurrent provider routing, scoring, and metrics persistence.
+- `refiner_ai_specialists.py`: specialist-engine registry and concurrent SNN/AER analysis orchestration.
+- `refiner_ai_aarnn.py`: AARNN/SNN engine adapter with HTTP, UDS AER, offline heuristic modes, and generic `snn_aer` specialisation support.
+- `refiner_ai_aer.py`: Python `AER1` encoder/decoder compatible with `aarnn_rust`.
 
 ### Security and platform controls
 
@@ -95,8 +99,9 @@ Primary sequence:
 1. Ingest source topic file or URL.
 2. Generate iterative query plan (Jira/CQL/web search).
 3. Gather cross-source evidence.
-4. Draft and refine with agentic phases.
-5. Verify completeness and write output document (+ optional references file).
+4. Fan out planner/researcher/reviewer roles through the shared AI orchestrator.
+5. Draft and refine with agentic phases.
+6. Verify completeness and write output document (+ optional references file).
 
 Cross-cutting controls:
 
@@ -109,10 +114,11 @@ Cross-cutting controls:
 Primary sequence:
 
 1. Discover/extract requirements.
-2. Build structured plan.
-3. Optionally apply generated file edits.
-4. Optionally execute constrained commands.
-5. Verify outcomes and produce completion metadata.
+2. Build structured plans with concurrent planner candidates and role-specific routing.
+3. Optionally enrich planning with reviewer/researcher/multi-engine SNN-AER specialist context, including auto-attached AARNN fallback when no explicit AARNN engine is registered.
+4. Optionally apply generated file edits.
+5. Optionally execute constrained commands.
+6. Verify outcomes and produce completion metadata.
 
 The output includes iteration status, applied steps, and requirement-traceability fields for downstream delivery gating.
 
@@ -126,6 +132,7 @@ Primary sequence:
 4. Persist stage reports and final status.
 
 Optional integration with project-solver fallback can be controlled from CLI flags.
+When solver fallback is used, delivery reports also preserve the solver `ai_orchestration` metadata so model/engine decisions remain traceable through release stages.
 
 ## 5) Web/API runtime workflow (`refiner_web.py`)
 
@@ -150,6 +157,7 @@ The web server acts as a control plane with these major capability groups:
   - Token ledger/balance APIs.
   - Refund and admin operations.
   - Metrics and health endpoints.
+  - AI orchestration status visibility on health/admin surfaces.
 
 ## 6) Data and state model
 
@@ -177,6 +185,8 @@ Implemented across modules:
 - Bounded queue/semaphore controls for STT/assistant throughput.
 - Retry and backoff wrappers for external HTTP dependencies.
 - Fallback behavior when optional dependencies or external systems are unavailable.
+- Provider orchestration telemetry with rolling health/latency/quality signals.
+- Neuromorphic/AARNN routing fallback to offline heuristic AER translation when live runtime is unavailable, while still allowing multiple specialist SNN/AER engines to contribute concurrently.
 
 ## 8) Testing posture and verification strategy
 
@@ -201,6 +211,6 @@ Interpretation:
 1. Keep `run_refiner.py` as the single workflow routing authority.
 2. Treat `main.py` as the canonical Jira statistics pipeline; avoid duplicating fetch/fallback logic elsewhere.
 3. Keep route modules (`refiner_routes/*`) thin and business logic in shared modules for testability.
-4. Expand tests around security boundaries and external-call fallbacks whenever adding new endpoints or integrations.
-5. Preserve additive auditability (events/logs) for all state-changing API operations.
-
+4. Keep provider selection logic in `refiner_ai_orchestration.py`; do not reintroduce per-module fallback wrappers.
+5. Expand tests around security boundaries, provider scoring, and neuromorphic routing whenever adding new endpoints or integrations.
+6. Preserve additive auditability (events/logs) for all state-changing API operations.

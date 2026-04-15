@@ -56,6 +56,7 @@ from web_research import (
     summarize_web_research,
 )
 from skills_engine import build_skill_context, format_skill_directives
+from refiner_ai_orchestration import build_workflow_provider, describe_provider
 
 logger = logging.getLogger(__name__)
 
@@ -8032,40 +8033,28 @@ def run_project_solver(
         raise ValueError(f"Project root is not a directory: {project_root}")
 
     actions_log: List[str] = []
-    provider = get_provider(
-        llm_provider,
-        model=llm_model,
+    provider = build_workflow_provider(
+        workflow="project_solver",
+        role="general",
+        preferred_provider=llm_provider,
+        preferred_model=llm_model,
+        preferred_api_key=llm_api_key,
+        fallback_provider=fallback_llm_provider,
+        fallback_model=fallback_llm_model,
+        fallback_api_key=fallback_llm_api_key,
         base_url=ollama_base_url,
+        provider_factory=get_provider,
         inter_request_gap=llm_inter_request_gap,
-        api_key=llm_api_key,
+        actions_log=actions_log,
     )
     if not provider:
         raise ValueError("No LLM provider available for project solving.")
-
-    fallback_provider = None
-    if fallback_llm_provider:
-        f_kwargs: Dict[str, object] = {}
-        if fallback_llm_api_key:
-            if fallback_llm_provider in ("gemini", "google") and fallback_llm_api_key.startswith("ya29."):
-                f_kwargs["access_token"] = fallback_llm_api_key
-            else:
-                f_kwargs["api_key"] = fallback_llm_api_key
-        try:
-            fallback_provider = get_provider(
-                fallback_llm_provider,
-                model=fallback_llm_model,
-                base_url=ollama_base_url,
-                inter_request_gap=llm_inter_request_gap,
-                **f_kwargs,
-            )
-            actions_log.append(
-                f"Initialized fallback LLM provider: {getattr(fallback_provider, 'name', fallback_llm_provider)}"
-            )
-        except Exception as exc:
-            actions_log.append(f"Failed to initialize fallback LLM provider {fallback_llm_provider}: {exc}")
-            fallback_provider = None
-    if fallback_provider:
-        provider = _FallbackProvider(provider, fallback_provider, actions_log)
+    provider_summary = describe_provider(provider)
+    if provider_summary.get("mode") == "orchestrated":
+        actions_log.append(
+            "AI orchestration enabled for project_solver: "
+            f"{len(provider_summary.get('candidates') or [])} provider candidates available."
+        )
 
     role_configs: Dict[str, Dict[str, object]] = {}
     if isinstance(agentic_roles, dict):
@@ -8092,34 +8081,35 @@ def run_project_solver(
 
     def _build_role_provider(role_name: str):
         cfg = role_configs.get(role_name)
-        if not isinstance(cfg, dict) or not cfg:
-            return provider
-        provider_type = cfg.get("provider") or cfg.get("type") or cfg.get("llm_provider")
-        if not provider_type:
-            return provider
+        if not isinstance(cfg, dict):
+            cfg = {}
+        provider_type = cfg.get("provider") or cfg.get("type") or cfg.get("llm_provider") or llm_provider
         model = cfg.get("model") or llm_model
         base_url = cfg.get("base_url") or ollama_base_url
         api_key = cfg.get("api_key")
-        kwargs = {}
-        if api_key:
-            if provider_type in ("gemini", "google") and str(api_key).startswith("ya29."):
-                kwargs["access_token"] = api_key
-            else:
-                kwargs["api_key"] = api_key
+        if not api_key and provider_type == llm_provider:
+            api_key = llm_api_key
+        if not api_key and provider_type == fallback_llm_provider:
+            api_key = fallback_llm_api_key
         try:
-            role_provider = get_provider(
-                provider_type,
-                model=model,
+            role_provider = build_workflow_provider(
+                workflow="project_solver",
+                role=role_name,
+                preferred_provider=str(provider_type) if provider_type else llm_provider,
+                preferred_model=model,
+                preferred_api_key=str(api_key) if api_key else None,
+                fallback_provider=fallback_llm_provider,
+                fallback_model=fallback_llm_model,
+                fallback_api_key=fallback_llm_api_key,
                 base_url=base_url,
+                provider_factory=get_provider,
                 inter_request_gap=llm_inter_request_gap,
-                **kwargs,
+                actions_log=actions_log,
             )
         except Exception as exc:
             actions_log.append(f"Failed to init role provider '{role_name}': {exc}")
             return provider
-        if fallback_provider:
-            role_provider = _FallbackProvider(role_provider, fallback_provider, actions_log)
-        return role_provider
+        return role_provider or provider
 
     planner_provider = _build_role_provider("planner")
     reviewer_provider = _build_role_provider("reviewer")
@@ -10676,6 +10666,12 @@ def run_project_solver(
                 role: {k: v for k, v in cfg.items() if k != "api_key"}
                 for role, cfg in role_configs.items()
             },
+        },
+        "ai_orchestration": {
+            "general": provider_summary,
+            "planner": describe_provider(planner_provider),
+            "reviewer": describe_provider(reviewer_provider),
+            "researcher": describe_provider(researcher_provider),
         },
         "resume": {
             "used": resume_used,

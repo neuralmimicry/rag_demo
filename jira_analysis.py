@@ -143,6 +143,7 @@ except Exception:  # pragma: no cover - fallback at runtime if not installed
     jira_api = None  # type: ignore
 
 from llm_providers import get_provider, LLMProvider, LLMError, LLMQuotaError
+from refiner_ai_orchestration import build_workflow_provider
 
 
 AI_MARKER_PREFIX = "JIRASTATS_AI:id="
@@ -844,27 +845,20 @@ def analyze_jira_and_write_report(
     provider: Optional[LLMProvider] = None
     if llm_provider:
         try:
-            provider = get_provider(llm_provider, model=llm_model, base_url=ollama_base_url, inter_request_gap=llm_inter_request_gap)
+            provider = build_workflow_provider(
+                workflow="jira_analysis",
+                role="reviewer",
+                preferred_provider=llm_provider,
+                preferred_model=llm_model,
+                fallback_provider=fallback_llm_provider,
+                fallback_model=fallback_llm_model,
+                fallback_api_key=fallback_llm_api_key,
+                base_url=ollama_base_url,
+                provider_factory=get_provider,
+                inter_request_gap=llm_inter_request_gap,
+            )
         except LLMError:
             provider = None
-        if provider and fallback_llm_provider:
-            f_kwargs: Dict[str, Any] = {}
-            if fallback_llm_api_key:
-                if fallback_llm_provider in ("gemini", "google") and fallback_llm_api_key.startswith("ya29."):
-                    f_kwargs["access_token"] = fallback_llm_api_key
-                else:
-                    f_kwargs["api_key"] = fallback_llm_api_key
-            try:
-                fallback_provider = get_provider(
-                    fallback_llm_provider,
-                    model=fallback_llm_model,
-                    base_url=ollama_base_url,
-                    inter_request_gap=llm_inter_request_gap,
-                    **f_kwargs,
-                )
-                provider = _FallbackProvider(provider, fallback_provider)
-            except LLMError:
-                pass
 
     # Executive summary (LLM-backed if available)
     def _heuristic_exec() -> str:
