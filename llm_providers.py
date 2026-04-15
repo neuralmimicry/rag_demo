@@ -167,6 +167,28 @@ def _normalize_reasoning_effort(value: Optional[str]) -> Optional[str]:
     return cleaned.lower()
 
 
+def _normalize_openai_model_name(model: Optional[str]) -> str:
+    cleaned = str(model or "").strip().lower()
+    if not cleaned:
+        return ""
+    for sep in ("/", ":"):
+        if sep not in cleaned:
+            continue
+        prefix, remainder = cleaned.split(sep, 1)
+        if prefix == "openai" and remainder.strip():
+            return remainder.strip()
+    return cleaned
+
+
+def _openai_model_supports_reasoning_effort(model: Optional[str]) -> bool:
+    """Conservatively allow reasoning only on model families known to accept it."""
+
+    cleaned = _normalize_openai_model_name(model)
+    if not cleaned:
+        return False
+    return cleaned.startswith(("o1", "o3", "o4", "codex"))
+
+
 def _validate_reasoning_effort(effort: Optional[str], *, model: Optional[str]) -> List[str]:
     issues: List[str] = []
     if effort is None:
@@ -1121,6 +1143,22 @@ def _is_model_not_found(resp: requests.Response) -> bool:
     return False
 
 
+def _is_openai_reasoning_effort_unsupported(resp: requests.Response) -> bool:
+    if resp is None:
+        return False
+    if resp.status_code not in (400, 404, 422):
+        return False
+    message = _extract_error_message(resp)
+    haystack = (message or resp.text or "").lower()
+    if "reasoning.effort" not in haystack:
+        return False
+    return (
+        "unsupported parameter" in haystack
+        or "not supported" in haystack
+        or "unknown parameter" in haystack
+    )
+
+
 def _is_cached_content_error(resp: requests.Response) -> bool:
     if resp is None:
         return False
@@ -1158,13 +1196,20 @@ class OpenAIProvider(LLMProvider):
         reasoning_effort: Optional[str] = None,
     ) -> LLMResponse:
         effort = _normalize_reasoning_effort(reasoning_effort)
-        use_responses = bool(effort) or os.getenv("OPENAI_USE_RESPONSES", "").strip().lower() in ("1", "true", "yes")
+        responses_forced = _env_bool("OPENAI_USE_RESPONSES", False)
+        effective_effort = effort if _openai_model_supports_reasoning_effort(self.model) else None
+        if effort and effective_effort is None:
+            logger.info(
+                "OpenAI model %s does not support reasoning.effort; omitting it for this request.",
+                self.model,
+            )
+        use_responses = responses_forced or bool(effective_effort)
         service_tier = _openai_service_tier("responses" if use_responses else "chat")
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         base_timeout = timeout or _env_int("OPENAI_TIMEOUT_SECONDS", _env_int("LLM_TIMEOUT_SECONDS", 180))
-        if effort in {"high", "xhigh"}:
+        if effective_effort in {"high", "xhigh"}:
             base_timeout = max(base_timeout, _env_int("OPENAI_HIGH_REASONING_TIMEOUT", 300))
-        if effort == "xhigh":
+        if effective_effort == "xhigh":
             base_timeout = max(base_timeout, _env_int("OPENAI_XHIGH_REASONING_TIMEOUT", 600))
         openai_max_retries = _env_optional_int("OPENAI_MAX_RETRIES")
         openai_timeout = _openai_timeout_tuple(base_timeout, service_tier=service_tier)
@@ -1173,9 +1218,10 @@ class OpenAIProvider(LLMProvider):
         if use_responses:
             url = "https://api.openai.com/v1/responses"
             max_tokens_override = max_tokens
-            effort_override = effort
+            effort_override = effective_effort
             empty_retry_used = False
             incomplete_retry_used = False
+            reasoning_retry_used = False
             replay_attempted = False
             replay_response_id: Optional[str] = None
             replay_prompt: Optional[str] = None
@@ -1296,7 +1342,7 @@ class OpenAIProvider(LLMProvider):
                 if background_enabled:
                     payload["background"] = True
                     payload["store"] = True
-                if effort in (None, "", "none"):
+                if effort_override in (None, "", "none"):
                     payload["temperature"] = temperature
                 if not use_replay and not disable_prompt_cache:
                     cache_key = _build_prompt_cache_key(system, messages, model=self.model, kind="responses")
@@ -1352,6 +1398,19 @@ class OpenAIProvider(LLMProvider):
                     raise
                 latency_ms = int((time.time() - start) * 1000)
                 if resp.status_code >= 300:
+                    if (
+                        effort_override
+                        and not reasoning_retry_used
+                        and _is_openai_reasoning_effort_unsupported(resp)
+                    ):
+                        logger.warning(
+                            "OpenAI model %s rejected reasoning.effort=%s; retrying without reasoning metadata.",
+                            self.model,
+                            effort_override,
+                        )
+                        reasoning_retry_used = True
+                        effort_override = None
+                        continue
                     if replay_response_id and replay_prompt:
                         message = _extract_error_message(resp)
                         haystack = (message or resp.text or "").lower()

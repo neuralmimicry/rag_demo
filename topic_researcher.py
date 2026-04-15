@@ -32,6 +32,7 @@ from web_research import (
     search_web,
 )
 from skills_engine import build_skill_context, format_skill_directives
+from refiner_ai_orchestration import describe_provider, orchestrate_provider_candidates
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -173,6 +174,19 @@ class TopicResearcher:
                 logger.info(f"Initialized fallback LLM provider: {fallback_llm_provider}")
             except Exception as e:
                 logger.warning(f"Failed to initialize fallback LLM provider {fallback_llm_provider}: {e}")
+
+        self.llm = (
+            orchestrate_provider_candidates(
+                [self.llm, self.fallback_llm],
+                workflow="topic_research",
+                role="researcher",
+                provider_factory=get_provider,
+                config_path=os.getenv("REFINER_CONFIG_PATH") or "config.json",
+                base_url=ollama_base_url,
+                inter_request_gap=llm_inter_request_gap,
+            )
+            or self.llm
+        )
 
         self.llm_params = {
             "temperature": llm_temperature,
@@ -323,6 +337,18 @@ class TopicResearcher:
                 inter_request_gap=self.llm_inter_request_gap,
                 **kwargs,
             )
+            provider = (
+                orchestrate_provider_candidates(
+                    [provider, self.fallback_llm],
+                    workflow="topic_research",
+                    role=role,
+                    provider_factory=get_provider,
+                    config_path=os.getenv("REFINER_CONFIG_PATH") or "config.json",
+                    base_url=base_url,
+                    inter_request_gap=self.llm_inter_request_gap,
+                )
+                or provider
+            )
             self.role_providers[role] = provider
             params = {}
             for key in ("temperature", "max_tokens", "timeout", "reasoning_effort"):
@@ -343,6 +369,8 @@ class TopicResearcher:
         Calls the selected LLM provider and falls back to the secondary one if quota is hit.
         """
         primary = provider or self.llm
+        if getattr(primary, "refiner_orchestrated", False):
+            return primary.predict(messages, system=system, **kwargs)
         if primary is self.llm and self._quota_reached and self.fallback_llm:
             logger.info("Using fallback LLM provider due to previous quota limit.")
             return self.fallback_llm.predict(messages, system=system, **kwargs)
@@ -4730,6 +4758,14 @@ class TopicResearcher:
         self.agentic_report = workflow.export()
         if self.agentic_report is not None:
             self.agentic_report["progress_tracker"] = self.progress_tracker.export()
+            self.agentic_report["ai_orchestration"] = {
+                "general": describe_provider(self.llm),
+                "fallback": describe_provider(self.fallback_llm),
+                "roles": {
+                    role: describe_provider(provider)
+                    for role, provider in self.role_providers.items()
+                },
+            }
 
         if not workflow_state.context.get("completed"):
             status_update(f"Reached maximum iterations ({max_iterations}). Finalising document.")

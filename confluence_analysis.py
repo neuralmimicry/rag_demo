@@ -137,6 +137,7 @@ class _FallbackProvider:
 # Optional LLM providers (OpenAI, Gemini, Ollama)
 from llm_providers import get_provider, LLMProvider, LLMError, LLMQuotaError
 from atlassian_utils import PageInfo, ConfluenceClient, parse_atlassian_datetime as _parse_dt
+from refiner_ai_orchestration import build_workflow_provider
 
 
 # ----------------------------
@@ -885,7 +886,18 @@ def analyze_space_and_write_report(
     provider: Optional[LLMProvider] = None
     if llm_provider:
         try:
-            provider = get_provider(llm_provider, model=llm_model, base_url=ollama_base_url, inter_request_gap=llm_inter_request_gap)
+            provider = build_workflow_provider(
+                workflow="confluence_analysis",
+                role="reviewer",
+                preferred_provider=llm_provider,
+                preferred_model=llm_model,
+                fallback_provider=fallback_llm_provider,
+                fallback_model=fallback_llm_model,
+                fallback_api_key=fallback_llm_api_key,
+                base_url=ollama_base_url,
+                provider_factory=get_provider,
+                inter_request_gap=llm_inter_request_gap,
+            )
         except LLMError as e:
             provider = None
             findings.append({
@@ -893,28 +905,6 @@ def analyze_space_and_write_report(
                 "severity": "low",
                 "message": f"LLM provider setup failed: {e}"
             })
-        if provider and fallback_llm_provider:
-            f_kwargs: Dict[str, Any] = {}
-            if fallback_llm_api_key:
-                if fallback_llm_provider in ("gemini", "google") and fallback_llm_api_key.startswith("ya29."):
-                    f_kwargs["access_token"] = fallback_llm_api_key
-                else:
-                    f_kwargs["api_key"] = fallback_llm_api_key
-            try:
-                fallback_provider = get_provider(
-                    fallback_llm_provider,
-                    model=fallback_llm_model,
-                    base_url=ollama_base_url,
-                    inter_request_gap=llm_inter_request_gap,
-                    **f_kwargs,
-                )
-                provider = _FallbackProvider(provider, fallback_provider)
-            except LLMError as e:
-                findings.append({
-                    "category": "LLM Integration",
-                    "severity": "low",
-                    "message": f"Fallback LLM provider setup failed: {e}"
-                })
         # Preflight health check for availability and latency
         if provider:
             try:

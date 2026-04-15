@@ -296,6 +296,17 @@ def test_admin_llm_telemetry_endpoint_passes_filters(monkeypatch):
     monkeypatch.setattr(refiner_web, "user_store", _DummyUserStore())
     monkeypatch.setattr(refiner_web.manager, "list_jobs", lambda: [])
     monkeypatch.setattr(refiner_web, "_active_users_snapshot", lambda: [])
+    monkeypatch.setattr(
+        refiner_web,
+        "orchestration_status",
+        lambda **_kwargs: {
+            "enabled": True,
+            "provider_count": 2,
+            "engine_count": 1,
+            "metrics": {"candidate_count": 3},
+            "engines": [{"type": "aarnn", "available": True}],
+        },
+    )
 
     with refiner_web.app.test_client() as client:
         response = client.get(
@@ -324,8 +335,57 @@ def test_admin_llm_telemetry_endpoint_passes_filters(monkeypatch):
         assert stats_response.status_code == 200
         stats = stats_response.get_json()
         assert stats["llm_request_telemetry"]["retention"]["retention_hours"] == 72
+        assert stats["ai_orchestration"]["provider_count"] == 2
+        assert stats["ai_orchestration"]["engines"][0]["type"] == "aarnn"
         assert telemetry.summary_calls[1]["hours"] == 72
         assert telemetry.summary_calls[1]["limit"] == 12
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_admin_ai_orchestration_endpoint_supports_probe_and_limit(monkeypatch):
+    calls = []
+
+    def _fake_orchestration_status(**kwargs):
+        calls.append(dict(kwargs))
+        return {
+            "enabled": True,
+            "selection_mode": "best",
+            "provider_count": 2,
+            "providers": [{"name": "OpenAIPrimary", "provider": "openai", "model": "gpt-4o-mini"}],
+            "engine_count": 1,
+            "engines": [{"name": "AARNNNeuromorphic", "type": "aarnn", "available": True}],
+            "metrics": {
+                "path": "job_data/ai/provider_metrics.json",
+                "exists": True,
+                "candidate_count": 1,
+                "healthy_candidates": 1,
+                "degraded_candidates": 0,
+                "candidates": [],
+            },
+        }
+
+    monkeypatch.setattr(refiner_web, "_current_user", lambda: "alice")
+    monkeypatch.setattr(refiner_web, "_is_admin_user", lambda _user: True)
+    monkeypatch.setattr(refiner_web, "orchestration_status", _fake_orchestration_status)
+
+    with refiner_web.app.test_client() as client:
+        response = client.get("/api/admin/ai-orchestration?probe_engines=1&limit=7")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["probe_engines"] is True
+    assert data["limit"] == 7
+    assert data["provider_count"] == 2
+    assert data["engines"][0]["type"] == "aarnn"
+    assert data["fetched_at"]
+    assert calls == [
+        {
+            "config_path": f"{refiner_web.BASE_DIR}/config.json",
+            "include_metrics": True,
+            "probe_engines": True,
+            "candidate_limit": 7,
+        }
+    ]
 
 
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")

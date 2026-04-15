@@ -25,6 +25,54 @@
       "model": "gemini-1.5-flash"
     }
   ],
+  "ai_orchestration": {
+    "enabled": true,
+    "selection_mode": "best",
+    "max_parallel_candidates": 3,
+    "health_ttl_seconds": 1800,
+    "registry_path": "job_data/ai/provider_metrics.json",
+    "providers": [
+      {
+        "name": "OpenAIPlanner",
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "roles": ["planner", "reviewer", "assistant"],
+        "specialties": ["planning", "json", "code"],
+        "weight": 0.4
+      },
+      {
+        "name": "GeminiResearch",
+        "provider": "gemini",
+        "model": "gemini-1.5-flash",
+        "roles": ["researcher", "reviewer"],
+        "specialties": ["research", "citations", "long_context"],
+        "weight": 0.3
+      },
+      {
+        "name": "LocalDraft",
+        "provider": "ollama",
+        "model": "qwen2.5-coder:7b",
+        "roles": ["planner", "assistant"],
+        "specialties": ["local", "draft", "code"],
+        "weight": 0.2
+      }
+    ],
+    "engines": [
+      {
+        "name": "AARNNNeuromorphic",
+        "type": "aarnn",
+        "repo_root": "/home/pbisaacs/Developer/neuralmimicry/aarnn_rust",
+        "socket_path": "/tmp/aarnn_rust.nn",
+        "endpoint": "http://127.0.0.1:8000",
+        "sensory_size": 32,
+        "output_size": 16,
+        "aer_sensory_base": 4096,
+        "aer_output_base": 16384,
+        "roles": ["planner", "researcher", "reviewer", "assistant"],
+        "specialties": ["aarnn", "snn", "neuromorphic", "aer"]
+      }
+    ]
+  },
   "search_engines": [
     {
       "name": "GoogleResearch",
