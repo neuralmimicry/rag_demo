@@ -1,8 +1,8 @@
-from stt_rust_contracts import RustGesturePlanRequest, sanitize_rust_motion_response
+from nmstt_contracts import NmsttGesturePlanRequest, sanitize_nmstt_motion_response
 
 
-def test_rust_gesture_plan_request_contains_motion_style_alias():
-    payload = RustGesturePlanRequest(
+def test_nmstt_gesture_plan_request_contains_motion_style_alias():
+    payload = NmsttGesturePlanRequest(
         text="hello",
         gesture_mode="bsl",
         avatar_mode="office",
@@ -15,8 +15,8 @@ def test_rust_gesture_plan_request_contains_motion_style_alias():
     assert payload["office_mode"] is True
 
 
-def test_sanitize_rust_motion_response_filters_invalid_keyframes_and_timeline():
-    result = sanitize_rust_motion_response(
+def test_sanitize_nmstt_motion_response_filters_invalid_keyframes_and_timeline():
+    result = sanitize_nmstt_motion_response(
         {
             "gesture_mode": "bsl",
             "avatar_mode": "office",

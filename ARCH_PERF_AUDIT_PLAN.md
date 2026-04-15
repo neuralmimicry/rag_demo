@@ -2,14 +2,14 @@
 
 ## Scope
 - Backend API/runtime: `refiner_web.py`, `project_solver.py`, `llm_providers.py`
-- STT low-latency path: `stt_rust/src/main.rs` + Python bridge in `refiner_web.py`
+- STT low-latency path: `../nmstt/src/main.rs` + Python bridge in `refiner_web.py`
 - Frontend surface in this repo: `web/static/*.js`
 - Frontend alignment context (external repo): `neuralmimicry.ai-website/src/components/AIChatWidget.jsx`
 
 ## Baseline Snapshot
 - `refiner_web.py`: 11,604 LOC, 88 Flask routes, 22 `requests.*` calls, 3 `subprocess.run` calls.
 - `project_solver.py`: 10,130 LOC, 9 `requests.*` calls, 5 `subprocess.run` calls.
-- `stt_rust/src/main.rs`: 2,106 LOC, async server with `spawn_blocking` + semaphore concurrency gating.
+- `../nmstt/src/main.rs`: 2,106 LOC, async server with `spawn_blocking` + semaphore concurrency gating.
 - `web/static/app.js`: 4,900 LOC / ~172 KB source file.
 - External frontend build (already observed): main JS chunk warning around ~1.4 MB minified.
 

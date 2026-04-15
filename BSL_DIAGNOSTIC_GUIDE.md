@@ -14,13 +14,13 @@
 ### Step 1: Restart STT Service
 
 ```bash
-cd /home/pbisaacs/Developer/neuralmimicry/rag_demo/stt_rust
+cd /home/pbisaacs/Developer/neuralmimicry/nmstt
 
 # Kill existing STT service
-pkill -f refiner-stt
+pkill -f nmstt
 
 # Start new service (watch console output)
-./target/release/refiner-stt --bind 127.0.0.1:8002
+./target/release/nmstt --bind 127.0.0.1:8002
 ```
 
 ### Step 2: Restart Frontend
@@ -111,9 +111,9 @@ export REFINER_STT_GESTURE_ENABLED=true
 
 **Fix**:
 ```bash
-pkill -f refiner-stt
+pkill -f nmstt
 cargo build --release
-./target/release/refiner-stt --bind 127.0.0.1:8002
+./target/release/nmstt --bind 127.0.0.1:8002
 ```
 
 ### Scenario 3: Frontend Shows hasMotionClip: false
@@ -251,7 +251,7 @@ If after all diagnostics arms still go behind back:
    ```bash
    # In STT service, add verbose logging
    export RUST_LOG=debug
-   ./target/release/refiner-stt --bind 127.0.0.1:8002
+   ./target/release/nmstt --bind 127.0.0.1:8002
    ```
 
 2. **Check raw motion data**:
@@ -279,7 +279,7 @@ If after all diagnostics arms still go behind back:
 ## Files to Check
 
 **Backend**:
-- `stt_rust/src/main.rs` lines 914-915, 931-932, 1299-1300
+- `../nmstt/src/main.rs` lines 914-915, 931-932, 1299-1300
 
 **Frontend**:
 - `src/components/AIChatWidget.jsx` lines 464-473, 757-806
