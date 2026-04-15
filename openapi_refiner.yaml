@@ -1264,6 +1264,43 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+  /api/admin/ai-orchestration:
+    get:
+      tags: [Admin]
+      summary: Return AI orchestration drill-down state
+      description: |
+        Admin-only orchestration status view used by the Control Room AI panel.
+
+        The payload includes:
+        - configured provider registry entries,
+        - specialist engine availability,
+        - condensed candidate metrics,
+        - cached local-model inventory for Ollama, and
+        - inventory monitor status for the background refresh loop.
+      parameters:
+        - name: probe_engines
+          in: query
+          description: When true, actively probe specialist engine health endpoints before returning the payload.
+          schema:
+            type: boolean
+        - name: limit
+          in: query
+          description: Maximum number of candidate metric rows and inventory model rows returned.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        '200':
+          description: AI orchestration drill-down payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericObject'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /api/workers/telemetry:
     get:
       tags: [Admin]

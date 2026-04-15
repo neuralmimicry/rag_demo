@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from unittest.mock import MagicMock, patch
 
@@ -109,3 +110,27 @@ def test_openai_responses_retry_without_reasoning_when_api_rejects_parameter(moc
     assert first_payload["reasoning"] == {"effort": "high"}
     assert "reasoning" not in second_payload
     assert second_payload["temperature"] == 0.2
+
+
+@patch("llm_providers._http_post")
+def test_openai_unsupported_reasoning_log_emitted_once_per_provider(mock_post, caplog):
+    mock_post.return_value = _mock_openai_response(
+        200,
+        {"choices": [{"message": {"content": "Hello from chat"}}]},
+    )
+
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True):
+        provider = OpenAIProvider(model="gpt-4o-mini")
+        caplog.set_level(logging.INFO)
+        provider.predict(
+            [{"role": "user", "content": "Hi"}],
+            system="You are concise.",
+            reasoning_effort="medium",
+        )
+        provider.predict(
+            [{"role": "user", "content": "Hi again"}],
+            system="You are concise.",
+            reasoning_effort="medium",
+        )
+
+    assert caplog.text.count("does not support reasoning.effort") == 1

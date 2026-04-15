@@ -362,11 +362,41 @@ def test_admin_ai_orchestration_endpoint_supports_probe_and_limit(monkeypatch):
                 "degraded_candidates": 0,
                 "candidates": [],
             },
+            "model_inventory": {
+                "generated_at": "2026-04-15T17:00:00Z",
+                "counts": {
+                    "ready_models": 2,
+                    "download_candidates": 1,
+                },
+                "models": [
+                    {
+                        "model": "llama3.2:latest",
+                        "installed": True,
+                        "runtime_ready": True,
+                        "fit_status": "ready",
+                    }
+                ],
+            },
         }
 
     monkeypatch.setattr(refiner_web, "_current_user", lambda: "alice")
     monkeypatch.setattr(refiner_web, "_is_admin_user", lambda _user: True)
     monkeypatch.setattr(refiner_web, "orchestration_status", _fake_orchestration_status)
+    monkeypatch.setattr(
+        refiner_web,
+        "ai_model_inventory_monitor",
+        SimpleNamespace(
+            status=lambda: {
+                "enabled": True,
+                "running": True,
+                "poll_sec": 900,
+                "path": "job_data/ai/model_inventory.json",
+                "last_run_at": "2026-04-15T17:05:00Z",
+                "last_error": None,
+                "last_summary": {"ready_models": 2},
+            }
+        ),
+    )
 
     with refiner_web.app.test_client() as client:
         response = client.get("/api/admin/ai-orchestration?probe_engines=1&limit=7")
@@ -377,6 +407,8 @@ def test_admin_ai_orchestration_endpoint_supports_probe_and_limit(monkeypatch):
     assert data["limit"] == 7
     assert data["provider_count"] == 2
     assert data["engines"][0]["type"] == "aarnn"
+    assert data["model_inventory"]["counts"]["ready_models"] == 2
+    assert data["model_inventory"]["monitor"]["running"] is True
     assert data["fetched_at"]
     assert calls == [
         {

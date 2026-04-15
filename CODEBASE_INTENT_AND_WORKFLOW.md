@@ -40,6 +40,7 @@ The codebase is built to support two primary operating modes:
 - `web_research.py`: search engine abstraction, Google search integration, fetch/content extraction.
 - `llm_providers.py`: provider abstraction and fallback handling.
 - `refiner_ai_orchestration.py`: concurrent provider routing, scoring, and metrics persistence.
+- `refiner_ai_model_inventory.py`: cached local-model capacity/relevance inventory and safe Ollama selection guardrails.
 - `refiner_ai_specialists.py`: specialist-engine registry and concurrent SNN/AER analysis orchestration.
 - `refiner_ai_aarnn.py`: AARNN/SNN engine adapter with HTTP, UDS AER, offline heuristic modes, and generic `snn_aer` specialisation support.
 - `refiner_ai_aer.py`: Python `AER1` encoder/decoder compatible with `aarnn_rust`.

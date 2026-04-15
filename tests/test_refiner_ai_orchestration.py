@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 
 from llm_providers import LLMResponse
@@ -51,6 +52,41 @@ class _FakeProvider:
 
     def get_context_window(self) -> int:
         return 32000
+
+
+class _FallbackModelProvider(_FakeProvider):
+    def __init__(self, name: str, model: str, fallback_model: str, text: str, delay: float = 0.0):
+        super().__init__(name=name, model=model, text=text, delay=delay)
+        self.fallback_model = fallback_model
+
+    def predict(
+        self,
+        messages,
+        max_tokens=None,
+        temperature=0.2,
+        system=None,
+        timeout=None,
+        reasoning_effort=None,
+    ):
+        self.calls.append(
+            {
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "system": system,
+                "timeout": timeout,
+                "reasoning_effort": reasoning_effort,
+                "started_at": time.time(),
+            }
+        )
+        time.sleep(self.delay)
+        self.model = self.fallback_model
+        return LLMResponse(
+            text=self.text,
+            raw={"provider": self.name, "model": self.model},
+            provider=self.name,
+            model=self.model,
+        )
 
 
 class _FakeSpecialistEngine:
@@ -303,6 +339,65 @@ def test_orchestrator_wraps_single_provider_when_specialist_engines_present(monk
     assert response.provider == "solo"
     assert response.raw["refiner_ai"]["specialist_engines"]["engine_count"] == 1
     assert "AARNNPrimary specialist context" in (solo.calls[0]["system"] or "")
+
+
+def test_orchestrator_logs_dispatch_and_resolved_runtime_model(tmp_path, monkeypatch, caplog):
+    invalid = _FakeProvider("openai", "gpt-4o-mini", "not json", delay=0.02)
+    fallback = _FallbackModelProvider(
+        "gemini",
+        "gemini-1.5-flash",
+        "gemini-2.5-flash",
+        '{"summary": "ok"}',
+        delay=0.02,
+    )
+    actions_log = []
+    metrics_path = tmp_path / "provider_metrics.json"
+    monkeypatch.setenv("REFINER_AI_REGISTRY_PATH", str(metrics_path))
+    monkeypatch.setenv("REFINER_AARNN_ENABLED", "0")
+    caplog.set_level(logging.INFO)
+
+    provider = orchestrate_provider_candidates(
+        [invalid, fallback],
+        workflow="playground_plan",
+        role="planner",
+        include_configured=False,
+        config_path=str(tmp_path / "missing-config.json"),
+        selection_mode="best",
+        max_candidates=2,
+        actions_log=actions_log,
+    )
+    assert provider is not None
+
+    response = provider.predict(
+        messages=[{"role": "user", "content": "Build a reading quiz."}],
+        system="Return ONLY valid JSON with keys: summary",
+    )
+
+    selected = response.raw["refiner_ai"]["selected"]
+    candidates = response.raw["refiner_ai"]["candidates"]
+
+    assert response.provider == "gemini"
+    assert response.model == "gemini-2.5-flash"
+    assert selected["model"] == "gemini-2.5-flash"
+    assert selected["configured_model"] == "gemini-1.5-flash"
+    assert any(item["model"] == "gemini-2.5-flash" for item in candidates)
+    assert any(
+        "AI orchestration dispatch playground_plan:planner to 2/2 candidate(s)" in entry
+        for entry in actions_log
+    )
+    assert any(
+        "AI orchestration result playground_plan:planner <- gemini/gemini-2.5-flash (configured gemini-1.5-flash)"
+        in entry
+        for entry in actions_log
+    )
+    assert any(
+        "AI orchestration selected gemini/gemini-2.5-flash (configured gemini-1.5-flash)"
+        in entry
+        for entry in actions_log
+    )
+    assert "AI orchestration dispatch playground_plan:planner to 2/2 candidate(s)" in caplog.text
+    assert "AI orchestration result playground_plan:planner <- gemini/gemini-2.5-flash (configured gemini-1.5-flash)" in caplog.text
+    assert "AI orchestration selected gemini/gemini-2.5-flash (configured gemini-1.5-flash)" in caplog.text
 
 
 def test_orchestrator_auto_attaches_aarnn_alongside_generic_specialists(tmp_path, monkeypatch):
