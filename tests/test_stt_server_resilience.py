@@ -83,6 +83,14 @@ def test_run_stt_server_bytes_retries_transport_failures(monkeypatch):
 
 
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_resolve_stt_backend_defaults_to_server_when_url_is_configured():
+    assert refiner_web._resolve_stt_backend("", "http://stt.local") == "server"
+    assert refiner_web._resolve_stt_backend(None, "http://stt.local") == "server"
+    assert refiner_web._resolve_stt_backend("", "") == "command"
+    assert refiner_web._resolve_stt_backend("command", "http://stt.local") == "command"
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
 def test_api_voice_stt_uses_direct_server_path_without_preprocess(monkeypatch):
     calls = {"direct": 0, "temp_write": 0}
 
@@ -145,7 +153,7 @@ def test_api_voice_stt_returns_capacity_unavailable(monkeypatch):
 
 
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
-def test_run_rust_gesture_plan_uses_dedicated_endpoint(monkeypatch):
+def test_run_nmstt_gesture_plan_uses_dedicated_endpoint(monkeypatch):
     calls = {"url": "", "payload": {}}
 
     class _FakeSession:
@@ -168,11 +176,11 @@ def test_run_rust_gesture_plan_uses_dedicated_endpoint(monkeypatch):
 
     monkeypatch.setattr(refiner_web, "_stt_server_session", lambda: _FakeSession())
     monkeypatch.setattr(refiner_web, "STT_SERVER_URL", "http://stt.local")
-    monkeypatch.setattr(refiner_web, "STT_GESTURE_RUST_FALLBACK", True)
+    monkeypatch.setattr(refiner_web, "STT_GESTURE_NMSTT_FALLBACK", True)
     monkeypatch.setattr(refiner_web, "STT_SERVER_RETRIES", 0)
-    monkeypatch.setattr(refiner_web, "STT_GESTURE_RUST_TIMEOUT", 0.2)
+    monkeypatch.setattr(refiner_web, "STT_GESTURE_NMSTT_TIMEOUT", 0.2)
 
-    payload = refiner_web._run_rust_gesture_plan(
+    payload = refiner_web._run_nmstt_gesture_plan(
         "hello",
         gesture_mode="bsl",
         avatar_mode="office",

@@ -67,7 +67,7 @@ from file_converter import FileConverter
 from rag_engine import RagDocument, RagIndex, RagStore
 from stt_learning import SttLearningStore
 from stt_gesture_planner import plan_stt_avatar_motion, sanitize_avatar_mode, sanitize_gesture_mode
-from stt_rust_contracts import RustGesturePlanRequest, sanitize_rust_motion_response
+from nmstt_contracts import NmsttGesturePlanRequest, sanitize_nmstt_motion_response
 from mcp_client import MCPClient, MCPServerConfig, MCPServerStore, PostgresMCPServerStore
 from nmchain_client import NmChainClient, NmChainError
 from customers_client import CustomersClient, CustomersServiceError
@@ -233,8 +233,17 @@ STT_PREPROCESS_COMMAND = (os.getenv("REFINER_STT_PREPROCESS_COMMAND") or "").str
 STT_PREPROCESS_ARGS = (os.getenv("REFINER_STT_PREPROCESS_ARGS") or "{input} {output}").strip()
 STT_PREPROCESS_EXT = (os.getenv("REFINER_STT_PREPROCESS_EXT") or ".wav").strip()
 STT_LANG_DEFAULT = (os.getenv("REFINER_STT_LANG") or "en-GB").strip()
-STT_BACKEND = (os.getenv("REFINER_STT_BACKEND") or "command").strip().lower()
 STT_SERVER_URL = (os.getenv("REFINER_STT_SERVER_URL") or "").strip()
+
+
+def _resolve_stt_backend(raw_backend: Optional[str], stt_server_url: str) -> str:
+    backend = (raw_backend or "").strip().lower()
+    if backend:
+        return backend
+    return "server" if (stt_server_url or "").strip() else "command"
+
+
+STT_BACKEND = _resolve_stt_backend(os.getenv("REFINER_STT_BACKEND"), STT_SERVER_URL)
 STT_SERVER_TIMEOUT = float(os.getenv("REFINER_STT_SERVER_TIMEOUT", "25"))
 STT_SERVER_PREPROCESS = _env_flag("REFINER_STT_SERVER_PREPROCESS", False)
 STT_SERVER_SEND_PROMPT = _env_flag("REFINER_STT_SERVER_SEND_PROMPT", False)
@@ -261,8 +270,20 @@ STT_LEARNING_MAX_MEMORY_DOCS = int(os.getenv("REFINER_STT_LEARNING_MAX_MEMORY_DO
 STT_GESTURE_ENABLED = _env_flag("REFINER_STT_GESTURE_ENABLED", True)
 STT_BSL_ENABLED = _env_flag("REFINER_STT_BSL_ENABLED", True)
 STT_GESTURE_PREFER_SERVER = _env_flag("REFINER_STT_GESTURE_PREFER_SERVER", True)
-STT_GESTURE_RUST_FALLBACK = _env_flag("REFINER_STT_GESTURE_RUST_FALLBACK", True)
-STT_GESTURE_RUST_TIMEOUT = max(0.1, float(os.getenv("REFINER_STT_GESTURE_RUST_TIMEOUT", "4.0")))
+STT_GESTURE_NMSTT_FALLBACK = _env_flag(
+    "REFINER_STT_GESTURE_NMSTT_FALLBACK",
+    _env_flag("REFINER_STT_GESTURE_RUST_FALLBACK", True),
+)
+STT_GESTURE_NMSTT_TIMEOUT = max(
+    0.1,
+    float(
+        _env_first(
+            "REFINER_STT_GESTURE_NMSTT_TIMEOUT",
+            "REFINER_STT_GESTURE_RUST_TIMEOUT",
+            default="4.0",
+        )
+    ),
+)
 STT_GESTURE_DEFAULT_MODE = (os.getenv("REFINER_STT_GESTURE_DEFAULT_MODE") or "gesticulation").strip().lower()
 STT_GESTURE_DEFAULT_AVATAR_MODE = (os.getenv("REFINER_STT_GESTURE_DEFAULT_AVATAR_MODE") or "chat").strip().lower()
 _STT_SERVER_SESSION_LOCAL = threading.local()
@@ -10145,7 +10166,7 @@ def _run_stt_server_bytes(
     if not isinstance(text, str) or not text.strip():
         return None, "stt_output_empty", None
 
-    server_payload = sanitize_rust_motion_response(payload)
+    server_payload = sanitize_nmstt_motion_response(payload)
     if "collaboration_mode" not in server_payload:
         collab_flag = _parse_boolish(payload.get("collaboration_mode"))
         if collab_flag is not None:
@@ -10154,21 +10175,21 @@ def _run_stt_server_bytes(
     return text.strip(), None, server_payload or None
 
 
-def _run_rust_gesture_plan(
+def _run_nmstt_gesture_plan(
     text: str,
     *,
     gesture_mode: str,
     avatar_mode: str,
     office_mode: Optional[bool],
 ) -> Optional[Dict[str, Any]]:
-    """Ask the Rust STT service to plan avatar gestures for an already-known transcript."""
-    if not STT_SERVER_URL or not STT_GESTURE_RUST_FALLBACK:
+    """Ask nmstt to plan avatar gestures for an already-known transcript."""
+    if not STT_SERVER_URL or not STT_GESTURE_NMSTT_FALLBACK:
         return None
     transcript = str(text or "").strip()
     if not transcript:
         return None
     endpoint = STT_SERVER_URL.rstrip("/") + "/gesture-plan"
-    request_payload = RustGesturePlanRequest(
+    request_payload = NmsttGesturePlanRequest(
         text=transcript,
         gesture_mode=str(gesture_mode or "").strip(),
         avatar_mode=str(avatar_mode or "").strip(),
@@ -10179,7 +10200,7 @@ def _run_rust_gesture_plan(
     resp: Optional[requests.Response] = None
     for attempt in range(attempts):
         try:
-            resp = session.post(endpoint, json=request_payload.as_dict(), timeout=STT_GESTURE_RUST_TIMEOUT)
+            resp = session.post(endpoint, json=request_payload.as_dict(), timeout=STT_GESTURE_NMSTT_TIMEOUT)
         except requests.RequestException:
             if attempt + 1 >= attempts:
                 return None
@@ -10199,7 +10220,7 @@ def _run_rust_gesture_plan(
         data = resp.json()
     except Exception:
         return None
-    out = sanitize_rust_motion_response(data)
+    out = sanitize_nmstt_motion_response(data)
     return out or None
 
 
@@ -13152,21 +13173,21 @@ def api_voice_stt() -> Response:
             office_mode=office_flag,
             default_mode=avatar_mode,
         )
-        planner_used = "rust_server"
+        planner_used = "nmstt_server"
 
-    if STT_GESTURE_ENABLED and planner_used != "rust_server":
+    if STT_GESTURE_ENABLED and planner_used != "nmstt_server":
         planner_started = time.perf_counter()
         try:
-            rust_motion_payload = None
-            if STT_GESTURE_RUST_FALLBACK and STT_BACKEND == "server" and STT_SERVER_URL:
-                rust_motion_payload = _run_rust_gesture_plan(
+            nmstt_motion_payload = None
+            if STT_GESTURE_NMSTT_FALLBACK and STT_BACKEND == "server" and STT_SERVER_URL:
+                nmstt_motion_payload = _run_nmstt_gesture_plan(
                     transcript,
                     gesture_mode=gesture_mode,
                     avatar_mode=avatar_mode,
                     office_mode=office_flag,
                 )
-            if isinstance(rust_motion_payload, dict):
-                response_payload.update(rust_motion_payload)
+            if isinstance(nmstt_motion_payload, dict):
+                response_payload.update(nmstt_motion_payload)
                 response_payload["gesture_mode"] = sanitize_gesture_mode(
                     response_payload.get("gesture_mode"),
                     default_mode=gesture_mode,
@@ -13177,7 +13198,7 @@ def api_voice_stt() -> Response:
                     office_mode=office_flag,
                     default_mode=avatar_mode,
                 )
-                planner_used = "rust_gesture_plan"
+                planner_used = "nmstt_gesture_plan"
             else:
                 motion_payload = plan_stt_avatar_motion(
                     transcript,
@@ -16916,16 +16937,16 @@ def _assistant_reply_payload(
     }
     if not STT_GESTURE_ENABLED:
         return response_payload
-    if STT_GESTURE_RUST_FALLBACK and STT_BACKEND == "server" and STT_SERVER_URL:
+    if STT_GESTURE_NMSTT_FALLBACK and STT_BACKEND == "server" and STT_SERVER_URL:
         try:
-            rust_payload = _run_rust_gesture_plan(
+            nmstt_payload = _run_nmstt_gesture_plan(
                 reply_text,
                 gesture_mode=gesture_mode,
                 avatar_mode=avatar_mode,
                 office_mode=office_flag,
             )
-            if isinstance(rust_payload, dict):
-                response_payload.update(rust_payload)
+            if isinstance(nmstt_payload, dict):
+                response_payload.update(nmstt_payload)
                 response_payload["gesture_mode"] = sanitize_gesture_mode(
                     response_payload.get("gesture_mode"),
                     default_mode=gesture_mode,
@@ -16938,7 +16959,7 @@ def _assistant_reply_payload(
                 )
                 return response_payload
         except Exception as exc:
-            logger.debug("Assistant Rust gesture planning skipped: %s", exc)
+            logger.debug("Assistant nmstt gesture planning skipped: %s", exc)
     try:
         motion_payload = plan_stt_avatar_motion(
             reply_text,

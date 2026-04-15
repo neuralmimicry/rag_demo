@@ -1,4 +1,4 @@
-"""Typed contracts for Python <-> Rust STT gesture planning APIs.
+"""Typed contracts for Python <-> nmstt gesture-planning APIs.
 
 This module centralizes request/response normalization so both voice STT and
 assistant-side gesture planning consume one canonical schema.
@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Mapping, Optional
 
 
 @dataclass(frozen=True)
-class RustGesturePlanRequest:
-    """Canonical request payload for Rust `/gesture-plan` endpoint."""
+class NmsttGesturePlanRequest:
+    """Canonical request payload for the nmstt `/gesture-plan` endpoint."""
 
     text: str
     gesture_mode: str
@@ -69,8 +69,8 @@ def _coerce_timeline(value: Any) -> List[Dict[str, Any]]:
     return timeline
 
 
-def sanitize_rust_motion_response(payload: Any) -> Dict[str, Any]:
-    """Normalize Rust STT motion payloads into a strict frontend-ready shape."""
+def sanitize_nmstt_motion_response(payload: Any) -> Dict[str, Any]:
+    """Normalize nmstt motion payloads into a strict frontend-ready shape."""
     if not isinstance(payload, Mapping):
         return {}
     data: Dict[str, Any] = {}

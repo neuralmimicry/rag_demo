@@ -217,9 +217,9 @@ User-level systemd unit (repo-local paths, no root user required):
 Robust local launcher (STT + `refiner_web.py` with health checks and restart loop):
 - `./scripts/start_refiner_stack.sh`
 - If no model is found locally, it auto-downloads `ggml-tiny.en.bin` from the official `ggerganov/whisper.cpp` Hugging Face repo.
-- Optional explicit model: `STT_MODEL=/path/to/ggml-*.bin ./scripts/start_refiner_stack.sh`
-- Optional profile override: `STT_MODEL_PROFILE=base.en ./scripts/start_refiner_stack.sh`
-- Optional URL override: `STT_MODEL_URL=https://.../ggml-model.bin ./scripts/start_refiner_stack.sh`
+- Optional explicit model: `NMSTT_MODEL=/path/to/ggml-*.bin ./scripts/start_refiner_stack.sh`
+- Optional profile override: `NMSTT_MODEL_PROFILE=base.en ./scripts/start_refiner_stack.sh`
+- Optional URL override: `NMSTT_MODEL_URL=https://.../ggml-model.bin ./scripts/start_refiner_stack.sh`
 - One-shot mode (no restart loop): `./scripts/start_refiner_stack.sh --once`
 
 ### Prometheus/Grafana metrics
@@ -284,8 +284,8 @@ The `Containerfile` is now aligned for both local container runtime use and Kube
 - non-root runtime user (`uid/gid 10001`)
 - writable job-data volume at `/app/job_data`
 - built-in healthcheck against `/api/health`
-- built-in Rust STT binary for the managed stack launcher
-- explicit entrypoint modes: `full` (managed STT + `refiner_web.py`), `backend` (backend only, for external STT), `frontend`, `tests`, `smoke`, `cli`
+- external `nmstt` integration for the managed stack launcher
+- explicit entrypoint modes: `full` (Refiner plus external/local `nmstt` resolution), `backend` (backend only), `frontend`, `tests`, `smoke`, `cli`
 
 #### 1) Build image locally
 Refiner stamps runtime build metadata from explicit build args, so the Control Room build version can show as `x.y.zzzz` and change on every commit without copying `.git` into the build context. Official release tags and Python package artifacts still follow `pyproject.toml`.
@@ -315,8 +315,8 @@ Frontend helper mode:
 
 Default/full mode:
 - `podman run --rm -p 5001:5001 -v "$(pwd)/job_data:/app/job_data:Z" refiner:latest`
-- This starts the same managed STT + `refiner_web.py` stack as `./scripts/start_refiner_stack.sh`.
-- If no STT model is present, the container auto-downloads it into `/app/job_data/models`.
+- This starts the same `./scripts/start_refiner_stack.sh` workflow as the repo checkout.
+- Provide `REFINER_STT_SERVER_URL` for the normal split deployment path, or mount a sibling `../nmstt` checkout if you want the launcher to start a local `nmstt` process.
 
 Run full automated test suite inside the image:
 - `podman run --rm refiner:latest tests`

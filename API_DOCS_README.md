@@ -3,9 +3,9 @@
 Refiner exposes three HTTP surfaces:
 - `refiner_web.py`: the main backend and Control Room UI (`127.0.0.1:5001` by default)
 - `frontend_server.py`: an optional frontend-only shell (`0.0.0.0:8080` by default)
-- `stt_rust`: an optional Rust speech-to-text service (`127.0.0.1:7079` by default)
+- `nmstt`: the standalone speech-to-text and gesture-planning service (`127.0.0.1:7079` by default)
 
-This document tracks the backend routes that are actually registered today. The matching backend OpenAPI spec lives in `openapi_refiner.yaml`, and the STT service spec lives in `stt_rust/openapi_stt.yaml`.
+This document tracks the backend routes that are actually registered today. The matching backend OpenAPI spec lives in `openapi_refiner.yaml`, and the speech-service spec lives in `../nmstt/openapi_stt.yaml`.
 
 ## Backend docs endpoints
 
@@ -290,16 +290,16 @@ curl -X POST http://127.0.0.1:5001/api/requirements/export \
   -o requirements_register.csv
 ```
 
-## STT service quick reference
+## nmstt quick reference
 
-The Rust STT service is documented separately in `stt_rust/README.md` and `stt_rust/openapi_stt.yaml`.
+The standalone speech service is documented separately in `../nmstt/README.md` and `../nmstt/openapi_stt.yaml`.
 
-Current Rust routes:
+Current `nmstt` routes:
 - `GET /health`
 - `POST /transcribe`
 - `POST /gesture-plan`
 
-The backend uses that service when `REFINER_STT_BACKEND=server` and `REFINER_STT_SERVER_URL` are configured.
+The backend uses that service when `REFINER_STT_SERVER_URL` is configured. `REFINER_STT_BACKEND=server` remains supported, but Refiner now infers server mode automatically when a speech-service URL is present.
 
 ## Verification
 
