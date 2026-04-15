@@ -23,6 +23,7 @@ const uptimeValueEl = document.getElementById('uptimeValue');
 const aiOrchestrationSummaryEl = document.getElementById('aiOrchestrationSummary');
 const aiProviderListEl = document.getElementById('aiProviderList');
 const aiEngineListEl = document.getElementById('aiEngineList');
+const aiModelListEl = document.getElementById('aiModelList');
 const aiCandidateListEl = document.getElementById('aiCandidateList');
 const aiOrchestrationStatusEl = document.getElementById('aiOrchestrationStatus');
 const aiOrchestrationSearchEl = document.getElementById('aiOrchestrationSearch');
@@ -33,9 +34,11 @@ const aiOrchestrationExportJsonBtn = document.getElementById('aiOrchestrationExp
 const aiOrchestrationExportCsvBtn = document.getElementById('aiOrchestrationExportCsv');
 const aiProviderMetaEl = document.getElementById('aiProviderMeta');
 const aiEngineMetaEl = document.getElementById('aiEngineMeta');
+const aiModelMetaEl = document.getElementById('aiModelMeta');
 const aiCandidateMetaEl = document.getElementById('aiCandidateMeta');
 const aiProviderSortEl = document.getElementById('aiProviderSort');
 const aiEngineSortEl = document.getElementById('aiEngineSort');
+const aiModelSortEl = document.getElementById('aiModelSort');
 const aiCandidateSortEl = document.getElementById('aiCandidateSort');
 const activeUsersListEl = document.getElementById('activeUsersList');
 const jobsStatusGridEl = document.getElementById('jobsStatusGrid');
@@ -129,6 +132,20 @@ function formatLatencyValue(value) {
   const num = Number(value);
   if (!Number.isFinite(num)) return '--';
   return `${Math.round(num)} ms`;
+}
+
+function formatBytes(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return '--';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let current = num;
+  let index = 0;
+  while (current >= 1024 && index < units.length - 1) {
+    current /= 1024;
+    index += 1;
+  }
+  const digits = current >= 100 || index === 0 ? 0 : current >= 10 ? 1 : 2;
+  return `${current.toFixed(digits)} ${units[index]}`;
 }
 
 function formatAbsoluteTimeFromMs(ms) {
@@ -292,6 +309,7 @@ function aiCurrentFilters() {
     runtime_state: aiOrchestrationRuntimeFilterEl?.value || 'all',
     provider_sort: aiProviderSortEl?.value || 'weight_desc',
     engine_sort: aiEngineSortEl?.value || 'availability_desc',
+    model_sort: aiModelSortEl?.value || 'ready_desc',
     candidate_sort: aiCandidateSortEl?.value || 'success_desc',
   };
 }
@@ -305,6 +323,13 @@ function aiRuntimeState(kind, item) {
   if (kind === 'candidate') {
     if (item?.health_ok === true) return 'ok';
     if (item?.health_ok === false) return 'degraded';
+    return 'unknown';
+  }
+  if (kind === 'model') {
+    if (item?.runtime_ready || item?.download_recommended || item?.fit_status === 'ready' || item?.fit_status === 'download_candidate') {
+      return 'ok';
+    }
+    if (item?.fit_status) return 'degraded';
     return 'unknown';
   }
   return 'config';
@@ -350,6 +375,19 @@ function aiCandidateSearchText(candidate) {
   ]);
 }
 
+function aiModelSearchText(model) {
+  return joinSearchParts([
+    model?.model,
+    model?.sources,
+    model?.capabilities,
+    model?.matched_capabilities,
+    model?.fit_status,
+    model?.modality,
+    model?.family,
+    model?.quantization,
+  ]);
+}
+
 function aiMatchesFilters(kind, item, filters) {
   const search = normalizeText(filters?.search);
   const runtimeState = filters?.runtime_state || 'all';
@@ -358,6 +396,8 @@ function aiMatchesFilters(kind, item, filters) {
     haystack = aiProviderSearchText(item);
   } else if (kind === 'engine') {
     haystack = aiEngineSearchText(item);
+  } else if (kind === 'model') {
+    haystack = aiModelSearchText(item);
   } else {
     haystack = aiCandidateSearchText(item);
   }
@@ -396,6 +436,36 @@ function sortAiProviders(items, sortKey) {
           compareMaybeNumber(left?.weight, right?.weight, 'desc')
           || compareBoolean(left?.preferred, right?.preferred, 'desc')
           || compareText(left?.name || left?.provider, right?.name || right?.provider)
+        );
+    }
+  });
+}
+
+function sortAiModels(items, sortKey) {
+  return stableSort(items, (left, right) => {
+    switch (sortKey) {
+      case 'relevance_desc':
+        return (
+          compareMaybeNumber(left?.relevance_score, right?.relevance_score, 'desc')
+          || compareBoolean(left?.runtime_ready, right?.runtime_ready, 'desc')
+          || compareText(left?.model, right?.model)
+        );
+      case 'size_asc':
+        return (
+          compareMaybeNumber(left?.size_bytes, right?.size_bytes, 'asc')
+          || compareBoolean(left?.runtime_ready, right?.runtime_ready, 'desc')
+          || compareText(left?.model, right?.model)
+        );
+      case 'name_asc':
+        return compareText(left?.model, right?.model);
+      case 'ready_desc':
+      default:
+        return (
+          compareBoolean(left?.runtime_ready, right?.runtime_ready, 'desc')
+          || compareBoolean(left?.download_recommended, right?.download_recommended, 'desc')
+          || compareMaybeNumber(left?.relevance_score, right?.relevance_score, 'desc')
+          || compareMaybeNumber(left?.size_bytes, right?.size_bytes, 'asc')
+          || compareText(left?.model, right?.model)
         );
     }
   });
@@ -468,6 +538,7 @@ function aiViewFor(data) {
   const filters = aiCurrentFilters();
   const providersRaw = Array.isArray(data?.providers) ? data.providers : [];
   const enginesRaw = Array.isArray(data?.engines) ? data.engines : [];
+  const modelsRaw = Array.isArray(data?.model_inventory?.models) ? data.model_inventory.models : [];
   const candidatesRaw = Array.isArray(data?.metrics?.candidates) ? data.metrics.candidates : [];
   const providers = sortAiProviders(
     providersRaw.filter((item) => aiMatchesFilters('provider', item, filters)),
@@ -476,6 +547,10 @@ function aiViewFor(data) {
   const engines = sortAiEngines(
     enginesRaw.filter((item) => aiMatchesFilters('engine', item, filters)),
     filters.engine_sort,
+  );
+  const models = sortAiModels(
+    modelsRaw.filter((item) => aiMatchesFilters('model', item, filters)),
+    filters.model_sort,
   );
   const candidates = sortAiCandidates(
     candidatesRaw.filter((item) => aiMatchesFilters('candidate', item, filters)),
@@ -487,6 +562,8 @@ function aiViewFor(data) {
     providers_total: providersRaw.length,
     engines,
     engines_total: enginesRaw.length,
+    models,
+    models_total: modelsRaw.length,
     candidates,
     candidates_total: candidatesRaw.length,
   };
@@ -529,14 +606,17 @@ function aiExportPayload() {
       selection_mode: aiOrchestrationSnapshot?.selection_mode || null,
       max_parallel_candidates: aiOrchestrationSnapshot?.max_parallel_candidates ?? null,
       metrics_path: aiOrchestrationSnapshot?.metrics?.path || null,
+      model_inventory_path: aiOrchestrationSnapshot?.model_inventory?.path || null,
     },
     visible_counts: {
       providers: view.providers.length,
       engines: view.engines.length,
+      models: view.models.length,
       candidates: view.candidates.length,
     },
     providers: view.providers,
     engines: view.engines,
+    models: view.models,
     candidates: view.candidates,
   };
 }
@@ -557,6 +637,7 @@ function aiExportCsv() {
       'model',
       'type',
       'source',
+      'status',
       'roles',
       'specialties',
       'weight',
@@ -572,6 +653,10 @@ function aiExportCsv() {
       'last_status',
       'updated_at',
       'location',
+      'matched_capabilities',
+      'required_ram_bytes',
+      'download_recommended',
+      'relevance_score',
     ],
   ];
 
@@ -583,6 +668,7 @@ function aiExportCsv() {
       provider?.model || '',
       '',
       provider?.source || '',
+      '',
       (provider?.roles || []).join('; '),
       (provider?.specialties || []).join('; '),
       provider?.weight ?? '',
@@ -598,6 +684,10 @@ function aiExportCsv() {
       '',
       '',
       provider?.base_url || '',
+      '',
+      '',
+      '',
+      '',
     ]);
   });
 
@@ -608,6 +698,7 @@ function aiExportCsv() {
       '',
       '',
       engine?.type || '',
+      '',
       '',
       (engine?.roles || []).join('; '),
       (engine?.specialties || []).join('; '),
@@ -624,6 +715,40 @@ function aiExportCsv() {
       '',
       '',
       engine?.endpoint || engine?.socket_path || engine?.repo_root || '',
+      '',
+      '',
+      '',
+      '',
+    ]);
+  });
+
+  payload.models.forEach((model) => {
+    rows.push([
+      'model',
+      model?.model || '',
+      'ollama',
+      model?.model || '',
+      model?.modality || '',
+      (model?.sources || []).join('; '),
+      model?.fit_status || '',
+      '',
+      (model?.capabilities || []).join('; '),
+      '',
+      '',
+      model?.installed ? 'yes' : 'no',
+      model?.runtime_ready ? 'yes' : model?.fits_memory === false ? 'no' : '',
+      model?.fit_status || '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      (model?.matched_capabilities || []).join('; '),
+      model?.required_ram_bytes ?? '',
+      model?.download_recommended ? 'yes' : 'no',
+      model?.relevance_score ?? '',
     ]);
   });
 
@@ -633,6 +758,7 @@ function aiExportCsv() {
       candidate?.candidate_id || '',
       candidate?.provider || '',
       candidate?.model || '',
+      '',
       '',
       '',
       '',
@@ -649,6 +775,10 @@ function aiExportCsv() {
       candidate?.total ?? '',
       candidate?.last_status || '',
       candidate?.updated_at ?? '',
+      '',
+      '',
+      '',
+      '',
       '',
     ]);
   });
@@ -717,6 +847,9 @@ function renderJobStatusGrid(statuses) {
 function renderAiOrchestrationSummary(data, view) {
   if (!aiOrchestrationSummaryEl) return;
   const metrics = data?.metrics || {};
+  const modelInventory = data?.model_inventory || {};
+  const modelCounts = modelInventory?.counts || {};
+  const modelMonitor = modelInventory?.monitor || {};
   const filters = view?.filters || {};
   const filterSummary = filters.search
     ? `Search: ${filters.search}`
@@ -742,6 +875,16 @@ function renderAiOrchestrationSummary(data, view) {
       meta: `${formatInteger(view?.engines?.length)} visible of ${formatInteger(view?.engines_total)}`,
     },
     {
+      label: 'Ready Local Models',
+      value: formatInteger(modelCounts?.ready_models),
+      meta: `${formatInteger(view?.models?.length)} visible of ${formatInteger(view?.models_total)}`,
+    },
+    {
+      label: 'Download Shortlist',
+      value: formatInteger(modelCounts?.download_candidates),
+      meta: modelInventory?.provider?.auto_pull_guard ? 'Auto-pull guarded' : 'Auto-pull allowed',
+    },
+    {
       label: 'Parallel Candidates',
       value: formatInteger(data?.max_parallel_candidates),
       meta: `Health TTL ${formatDuration(Number(data?.health_ttl_seconds || 0))}`,
@@ -760,6 +903,11 @@ function renderAiOrchestrationSummary(data, view) {
       label: 'Metrics Updated',
       value: formatTimestamp(metrics?.updated_at),
       meta: data?.fetched_at ? `Fetched ${formatTimestamp(data.fetched_at)}` : 'No fetch time',
+    },
+    {
+      label: 'Inventory Updated',
+      value: formatTimestamp(modelInventory?.generated_at),
+      meta: modelMonitor?.running ? `Monitor polling every ${formatDuration(Number(modelMonitor.poll_sec || 0))}` : 'Monitor idle',
     },
     {
       label: 'Candidate Limit',
@@ -890,6 +1038,70 @@ function renderAiEngineList(items, totalCount) {
   });
 }
 
+function renderAiModelList(items, totalCount) {
+  if (!aiModelListEl) return;
+  renderAiSectionMeta(aiModelMetaEl, items.length, totalCount);
+  if (!Array.isArray(items) || !items.length) {
+    aiModelListEl.innerHTML = totalCount > 0
+      ? '<p class="subtitle">No local models match the current filters.</p>'
+      : '<p class="subtitle">No cached local model inventory yet.</p>';
+    return;
+  }
+  aiModelListEl.innerHTML = '';
+  items.forEach((model) => {
+    const sourceLabel = Array.isArray(model?.sources) && model.sources.length ? model.sources.join(' · ') : '--';
+    const card = document.createElement('div');
+    card.className = 'admin-item';
+    card.innerHTML = `
+      <div class="admin-item-head">
+        <strong>${escapeHtml(model.model || 'model')}</strong>
+        <span class="subtitle">${model.runtime_ready ? 'ready' : model.download_recommended ? 'download candidate' : escapeHtml(model.fit_status || 'unknown')} · ${escapeHtml(model.modality || 'text')} · ${escapeHtml(sourceLabel)}</span>
+      </div>
+      <div class="admin-form-grid">
+        <div class="field grid-2">
+          <div>
+            <label>Capabilities</label>
+            <div class="admin-chip-list">${tagListHtml(model.capabilities)}</div>
+          </div>
+          <div>
+            <label>Matches Need</label>
+            <div class="admin-chip-list">${tagListHtml(model.matched_capabilities)}</div>
+          </div>
+        </div>
+        <div class="field grid-3">
+          <div>
+            <label>Installed</label>
+            <div class="input-static">${model.installed ? 'yes' : 'no'}</div>
+          </div>
+          <div>
+            <label>Size</label>
+            <div class="input-static">${escapeHtml(formatBytes(model.size_bytes))}</div>
+          </div>
+          <div>
+            <label>RAM Needed</label>
+            <div class="input-static">${escapeHtml(formatBytes(model.required_ram_bytes))}</div>
+          </div>
+        </div>
+        <div class="field grid-3">
+          <div>
+            <label>Fits Memory</label>
+            <div class="input-static">${model.fits_memory === true ? 'yes' : model.fits_memory === false ? 'no' : '--'}</div>
+          </div>
+          <div>
+            <label>Fits Disk</label>
+            <div class="input-static">${model.fits_disk === true ? 'yes' : model.fits_disk === false ? 'no' : '--'}</div>
+          </div>
+          <div>
+            <label>Relevance</label>
+            <div class="input-static">${escapeHtml(formatMetricNumber(model.relevance_score, 2))}</div>
+          </div>
+        </div>
+      </div>
+    `;
+    aiModelListEl.appendChild(card);
+  });
+}
+
 function renderAiCandidateList(items, totalCount) {
   if (!aiCandidateListEl) return;
   renderAiSectionMeta(aiCandidateMetaEl, items.length, totalCount);
@@ -959,11 +1171,12 @@ function renderAiOrchestrationPanel(data) {
   renderAiOrchestrationSummary(data, view);
   renderAiProviderList(view.providers, view.providers_total);
   renderAiEngineList(view.engines, view.engines_total);
+  renderAiModelList(view.models, view.models_total);
   renderAiCandidateList(view.candidates, view.candidates_total);
 }
 
 async function loadAiOrchestration({ probe = false, silent = false } = {}) {
-  if (!aiOrchestrationSummaryEl && !aiProviderListEl && !aiEngineListEl && !aiCandidateListEl) return;
+  if (!aiOrchestrationSummaryEl && !aiProviderListEl && !aiEngineListEl && !aiModelListEl && !aiCandidateListEl) return;
   if (!silent) {
     setStatus(
       aiOrchestrationStatusEl,
@@ -1661,7 +1874,7 @@ if (aiOrchestrationRuntimeFilterEl) {
   });
 }
 
-[aiProviderSortEl, aiEngineSortEl, aiCandidateSortEl].forEach((selectEl) => {
+[aiProviderSortEl, aiEngineSortEl, aiModelSortEl, aiCandidateSortEl].forEach((selectEl) => {
   if (!selectEl) return;
   selectEl.addEventListener('change', () => {
     rerenderAiOrchestration();

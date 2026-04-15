@@ -56,7 +56,7 @@ from web_research import (
     summarize_web_research,
 )
 from skills_engine import build_skill_context, format_skill_directives
-from refiner_ai_orchestration import build_workflow_provider, describe_provider
+from refiner_ai_orchestration import build_workflow_provider, describe_provider, provider_log_summary
 
 logger = logging.getLogger(__name__)
 
@@ -8050,11 +8050,6 @@ def run_project_solver(
     if not provider:
         raise ValueError("No LLM provider available for project solving.")
     provider_summary = describe_provider(provider)
-    if provider_summary.get("mode") == "orchestrated":
-        actions_log.append(
-            "AI orchestration enabled for project_solver: "
-            f"{len(provider_summary.get('candidates') or [])} provider candidates available."
-        )
 
     role_configs: Dict[str, Dict[str, object]] = {}
     if isinstance(agentic_roles, dict):
@@ -8114,6 +8109,17 @@ def run_project_solver(
     planner_provider = _build_role_provider("planner")
     reviewer_provider = _build_role_provider("reviewer")
     researcher_provider = _build_role_provider("researcher")
+
+    def _log_provider_setup(role_name: str, role_provider) -> None:
+        message = f"AI provider {role_name}: {provider_log_summary(role_provider)}."
+        actions_log.append(message)
+        logger.info(message)
+
+    _log_provider_setup("general", provider)
+    _log_provider_setup("planner", planner_provider)
+    _log_provider_setup("reviewer", reviewer_provider)
+    _log_provider_setup("researcher", researcher_provider)
+
     planner_params = _role_params("planner")
     reviewer_params = _role_params("reviewer")
     researcher_params = _role_params("researcher")

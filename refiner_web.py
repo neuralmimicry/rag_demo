@@ -111,6 +111,7 @@ from refiner_settings import (
 from versioning import get_public_version_info, get_version_info
 from web_research import fetch_url_content, fetch_youtube_transcript, is_youtube_url
 from refiner_ai_orchestration import build_workflow_provider, orchestration_status
+from refiner_ai_model_inventory import AIModelInventoryMonitor
 
 logger = logging.getLogger(__name__)
 try:
@@ -7738,6 +7739,7 @@ todo_scheduler = TodoScheduler(
     subtask_manager=subtask_manager,
 )
 llm_telemetry_janitor = LLMTelemetryJanitor(telemetry_store_factory=_llm_request_telemetry_store)
+ai_model_inventory_monitor = AIModelInventoryMonitor(config_path=os.path.join(BASE_DIR, "config.json"))
 
 
 def _llm_telemetry_retention_status() -> Dict[str, Any]:
@@ -8942,12 +8944,16 @@ def _ai_orchestration_status(*, probe_engines: bool = False, candidate_limit: in
     """Return orchestration registry status without breaking health/admin routes."""
 
     try:
-        return orchestration_status(
+        payload = orchestration_status(
             config_path=os.path.join(BASE_DIR, "config.json"),
             include_metrics=True,
             probe_engines=probe_engines,
             candidate_limit=candidate_limit,
         )
+        model_inventory = payload.get("model_inventory") if isinstance(payload.get("model_inventory"), dict) else {}
+        model_inventory["monitor"] = ai_model_inventory_monitor.status()
+        payload["model_inventory"] = model_inventory
+        return payload
     except Exception as exc:
         logger.warning("ai orchestration status unavailable: %s", exc)
         return {
@@ -17844,6 +17850,7 @@ if hasattr(app, "add_url_rule"):
         todo_scheduler.start()
     if LLM_TELEMETRY_RETENTION_HOURS > 0:
         llm_telemetry_janitor.start()
+    ai_model_inventory_monitor.start()
 
 
 if __name__ == "__main__":

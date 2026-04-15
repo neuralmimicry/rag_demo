@@ -40,6 +40,8 @@ import logging
 import re
 import threading
 
+from refiner_ai_model_inventory import resolve_ollama_model_for_request
+
 logger = logging.getLogger(__name__)
 
 ALLOWED_REASONING_EFFORT = {"none", "low", "medium", "high", "xhigh"}
@@ -1185,6 +1187,7 @@ class OpenAIProvider(LLMProvider):
         if not self.api_key:
             raise LLMError("OPENAI_API_KEY not set")
         self._session = requests.Session()
+        self._unsupported_reasoning_logged = set()
 
     def _predict_impl(
         self,
@@ -1198,11 +1201,12 @@ class OpenAIProvider(LLMProvider):
         effort = _normalize_reasoning_effort(reasoning_effort)
         responses_forced = _env_bool("OPENAI_USE_RESPONSES", False)
         effective_effort = effort if _openai_model_supports_reasoning_effort(self.model) else None
-        if effort and effective_effort is None:
+        if effort and effective_effort is None and self.model not in self._unsupported_reasoning_logged:
             logger.info(
                 "OpenAI model %s does not support reasoning.effort; omitting it for this request.",
                 self.model,
             )
+            self._unsupported_reasoning_logged.add(self.model)
         use_responses = responses_forced or bool(effective_effort)
         service_tier = _openai_service_tier("responses" if use_responses else "chat")
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
@@ -2128,6 +2132,28 @@ class OllamaProvider(LLMProvider):
         
         if system:
             prompt = f"System: {system}\n" + prompt
+        requested_model = self.model
+        resolution = resolve_ollama_model_for_request(
+            requested_model,
+            prompt_text=f"{system or ''}\n{prompt}",
+            base_url=self.base_url,
+        )
+        selected_model = str(resolution.get("selected_model") or "").strip()
+        if not selected_model:
+            recommended_downloads = [str(item).strip() for item in (resolution.get("recommended_downloads") or []) if str(item).strip()]
+            recommendation_text = f" Recommended downloads: {', '.join(recommended_downloads)}." if recommended_downloads else ""
+            raise LLMError(
+                f"Ollama model {requested_model} is not safely available locally and auto-pull is disabled."
+                f"{recommendation_text}"
+            )
+        if selected_model != requested_model:
+            logger.warning(
+                "Ollama model %s is not safely available locally; using installed fallback %s (%s).",
+                requested_model,
+                selected_model,
+                resolution.get("reason") or "fallback",
+            )
+            self.model = selected_model
         url = f"{self.base_url}/api/generate"
         def _build_payload() -> Dict[str, Any]:
             payload = {

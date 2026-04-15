@@ -52,7 +52,7 @@ Voice and STT routes support additional auth patterns:
 - `GET /api/version` - public version payload
 - `GET /api/capabilities` - current capability inventory for authenticated users
 - `GET /api/admin/stats` - admin-only usage and worker summary, including recent `llm_request_telemetry` rollups when the shared Postgres control-plane store is enabled
-- `GET /api/admin/ai-orchestration` - admin-only AI orchestration drill-down, including provider registry entries, specialist engines, and condensed candidate metrics; accepts `probe_engines=1` and `limit=<n>`
+- `GET /api/admin/ai-orchestration` - admin-only AI orchestration drill-down, including provider registry entries, specialist engines, cached local-model inventory/download shortlist, and condensed candidate metrics; accepts `probe_engines=1` and `limit=<n>`
 - `GET /api/workers/telemetry` - worker/autoscaler telemetry for the Control Room
 - `GET /api/audit` - admin-only audit trail
 

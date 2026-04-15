@@ -123,7 +123,7 @@
       <div class="card-header admin-card-header-actions">
         <div>
           <h2>AI Orchestration</h2>
-          <p>Provider registry, specialist engines, and rolling candidate telemetry.</p>
+          <p>Provider registry, specialist engines, local model inventory, and rolling candidate telemetry.</p>
         </div>
         <div class="assistant-actions admin-inline-actions">
           <label class="admin-checkbox" for="aiOrchestrationProbe">
@@ -189,6 +189,24 @@
             </label>
           </div>
           <div id="aiEngineList" class="admin-list"></div>
+        </section>
+        <section class="admin-ai-section">
+          <div class="admin-section-head">
+            <div>
+              <div class="admin-section-title">Local Model Inventory</div>
+              <div class="subtitle" id="aiModelMeta">--</div>
+            </div>
+            <label class="admin-inline-field" for="aiModelSort">
+              <span>Sort</span>
+              <select id="aiModelSort">
+                <option value="ready_desc">Ready first</option>
+                <option value="relevance_desc">Relevance</option>
+                <option value="size_asc">Size</option>
+                <option value="name_asc">Name A-Z</option>
+              </select>
+            </label>
+          </div>
+          <div id="aiModelList" class="admin-list"></div>
         </section>
         <section class="admin-ai-section admin-ai-span">
           <div class="admin-section-head">

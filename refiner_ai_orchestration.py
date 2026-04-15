@@ -26,6 +26,7 @@ import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from llm_providers import LLMError, LLMProvider, LLMQuotaError, LLMResponse, get_provider as default_get_provider
+from refiner_ai_model_inventory import model_inventory_status
 from refiner_ai_specialists import analyze_specialist_engines, build_specialist_engines, specialist_engine_summaries
 
 
@@ -119,6 +120,23 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _compact_text(value: Any, limit: int = 180) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "..."
+
+
+def _preview_labels(values: Sequence[str], *, limit: int = 5) -> str:
+    labels = [str(value).strip() for value in values if str(value).strip()]
+    if not labels:
+        return "none"
+    preview = labels[: max(1, int(limit))]
+    if len(labels) > len(preview):
+        preview.append(f"+{len(labels) - len(preview)} more")
+    return ", ".join(preview)
 
 
 def _safe_write_json(path: str, payload: Dict[str, Any]) -> None:
@@ -413,20 +431,46 @@ class ProviderCandidate:
     source: str
     provider_type: str
     model: str
+    configured_model: str = ""
     weight: float = 0.0
     specialties: Set[str] = field(default_factory=set)
     roles: Set[str] = field(default_factory=set)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not self.configured_model:
+            self.configured_model = self.model
+
+    def sync_runtime_model(self) -> str:
+        runtime_model = str(getattr(self.provider, "model", "") or "").strip()
+        if runtime_model and runtime_model != self.model:
+            self.model = runtime_model
+        return self.model
+
+    @property
+    def resolved_model(self) -> str:
+        return self.sync_runtime_model()
+
     @property
     def candidate_id(self) -> str:
-        return f"{self.provider_type}/{self.model or 'default'}"
+        return f"{self.provider_type}/{self.resolved_model or 'default'}"
+
+    def label(self) -> str:
+        resolved_model = self.resolved_model or "default"
+        configured_model = str(self.configured_model or "").strip()
+        if configured_model and configured_model != resolved_model:
+            return f"{self.provider_type}/{resolved_model} (configured {configured_model})"
+        return f"{self.provider_type}/{resolved_model}"
 
     def summary(self) -> Dict[str, Any]:
+        resolved_model = self.resolved_model
+        configured_model = str(self.configured_model or "").strip() or resolved_model
         return {
             "candidate_id": self.candidate_id,
             "provider": self.provider_type,
-            "model": self.model,
+            "model": resolved_model,
+            "configured_model": configured_model,
+            "resolved_model": resolved_model,
             "source": self.source,
             "specialties": sorted(self.specialties),
             "roles": sorted(self.roles),
@@ -485,9 +529,12 @@ class ProviderMetricsStore:
         return dict(health) if isinstance(health, dict) else {}
 
     def record_health(self, candidate: ProviderCandidate, health: Dict[str, Any]) -> None:
+        resolved_model = candidate.resolved_model
         bucket = self._candidate_bucket(candidate.candidate_id)
         bucket["provider"] = candidate.provider_type
-        bucket["model"] = candidate.model
+        bucket["model"] = resolved_model
+        bucket["configured_model"] = candidate.configured_model or resolved_model
+        bucket["resolved_model"] = resolved_model
         bucket["specialties"] = sorted(candidate.specialties)
         bucket["health"] = dict(health or {})
         bucket["health"]["checked_at"] = time.time()
@@ -527,9 +574,12 @@ class ProviderMetricsStore:
         quality: float,
         error: Optional[str] = None,
     ) -> None:
+        resolved_model = candidate.resolved_model
         bucket = self._candidate_bucket(candidate.candidate_id)
         bucket["provider"] = candidate.provider_type
-        bucket["model"] = candidate.model
+        bucket["model"] = resolved_model
+        bucket["configured_model"] = candidate.configured_model or resolved_model
+        bucket["resolved_model"] = resolved_model
         bucket["specialties"] = sorted(candidate.specialties)
         self._record_stat_bucket(bucket, success=success, latency_ms=latency_ms, quality=quality, error=error)
         role_key = f"{workflow}:{role}"
@@ -604,8 +654,44 @@ class ConcurrentLLMProvider(LLMProvider):
         return [candidate.summary() for candidate in self.candidates]
 
     def _record_action(self, message: str) -> None:
+        cleaned = str(message or "").strip()
+        if not cleaned:
+            return
         if self.actions_log is not None:
-            self.actions_log.append(message)
+            self.actions_log.append(cleaned)
+        logger.info(cleaned)
+
+    def _candidate_labels(self, candidates: Sequence[ProviderCandidate]) -> str:
+        return _preview_labels([candidate.label() for candidate in candidates], limit=6)
+
+    def _specialist_labels(self, specialist_meta: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(specialist_meta, dict):
+            return "none"
+        labels: List[str] = []
+        for entry in specialist_meta.get("engines") or []:
+            if not isinstance(entry, dict):
+                continue
+            engine_type = str(entry.get("engine") or entry.get("engine_type") or "").strip().lower()
+            engine_name = str(entry.get("engine_name") or engine_type or "engine").strip()
+            if engine_type and engine_name and engine_name.lower() != engine_type:
+                labels.append(f"{engine_name}<{engine_type}>")
+            else:
+                labels.append(engine_name or engine_type or "engine")
+        return _preview_labels(labels, limit=6)
+
+    def _candidate_result_message(self, result: InvocationResult) -> str:
+        candidate = result.candidate
+        status = "ok" if result.response is not None else "error"
+        latency = "n/a" if result.latency_ms is None else f"{result.latency_ms}ms"
+        message = (
+            f"AI orchestration result {self.workflow}:{self.role} <- {candidate.label()} "
+            f"status={status} latency={latency}"
+        )
+        if result.response is not None:
+            message += f" quality={result.quality:.2f}"
+        if result.error is not None:
+            message += f" error={_compact_text(result.error, limit=160)}"
+        return message
 
     def _probe_health(self, candidate: ProviderCandidate) -> Dict[str, Any]:
         cached = self.metrics_store.health_snapshot(candidate.candidate_id)
@@ -780,6 +866,11 @@ class ConcurrentLLMProvider(LLMProvider):
                     context = str(specialist_meta.get("context") or "").strip()
                     if context:
                         system_to_send = (f"{system}\n\n{context}" if system else context)
+                    self._record_action(
+                        f"AI orchestration attached {int(specialist_meta.get('engine_count') or 0)} "
+                        f"specialist engine(s) for {self.workflow}:{self.role}: "
+                        f"{self._specialist_labels(specialist_meta)}."
+                    )
             except Exception as exc:
                 logger.debug("Specialist engine analysis skipped: %s", exc)
 
@@ -787,23 +878,28 @@ class ConcurrentLLMProvider(LLMProvider):
         selected = [candidate for _, candidate in ranked_candidates[: self.max_candidates]]
         if not selected:
             raise LLMError("No LLM providers are available for orchestration")
+        self._record_action(
+            f"AI orchestration dispatch {self.workflow}:{self.role} to "
+            f"{len(selected)}/{len(ranked_candidates)} candidate(s): {self._candidate_labels(selected)}. "
+            f"tags={_preview_labels(sorted(task_tags), limit=8)}"
+        )
 
         expected_json = _expected_json(messages, system_to_send)
         results: List[InvocationResult] = []
         returned_early = False
         if len(selected) == 1:
-            results.append(
-                self._invoke_candidate(
-                    selected[0],
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    system=system_to_send,
-                    timeout=timeout,
-                    reasoning_effort=reasoning_effort,
-                    expected_json=expected_json,
-                    )
+            result = self._invoke_candidate(
+                selected[0],
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system_to_send,
+                timeout=timeout,
+                reasoning_effort=reasoning_effort,
+                expected_json=expected_json,
             )
+            results.append(result)
+            self._record_action(self._candidate_result_message(result))
         else:
             executor = ThreadPoolExecutor(max_workers=len(selected))
             future_map = {
@@ -841,6 +937,7 @@ class ConcurrentLLMProvider(LLMProvider):
                     for future in done:
                         result = self._collect_future_result(future, future_map)
                         results.append(result)
+                        self._record_action(self._candidate_result_message(result))
                         if self.early_success_enabled and self._accepts_early_success(result):
                             if self.selection_mode == "fastest":
                                 returned_early = True
@@ -891,6 +988,10 @@ class ConcurrentLLMProvider(LLMProvider):
 
         if not successful:
             if failures:
+                self._record_action(
+                    f"AI orchestration exhausted {len(selected)} candidate(s) for {self.workflow}:{self.role}; "
+                    f"last_error={_compact_text(failures[-1].error, limit=160)}"
+                )
                 last_error = failures[-1].error
                 if isinstance(last_error, Exception):
                     raise last_error
@@ -901,8 +1002,9 @@ class ConcurrentLLMProvider(LLMProvider):
         chosen_provider = chosen.response.provider or chosen.candidate.provider_type
         chosen_model = chosen.response.model or chosen.candidate.model
         self._record_action(
-            f"AI orchestrator selected {chosen_provider}/{chosen_model or 'default'} "
-            f"for {self.workflow}:{self.role} from {len(selected)} candidate(s)."
+            f"AI orchestration selected {chosen.candidate.label()} for {self.workflow}:{self.role} "
+            f"from {len(selected)} candidate(s); mode={self.selection_mode} "
+            f"returned_early={returned_early if len(selected) > 1 else False}."
         )
         raw_payload = chosen.response.raw if isinstance(chosen.response.raw, dict) else {"raw": chosen.response.raw}
         raw_payload = dict(raw_payload)
@@ -1244,6 +1346,44 @@ def describe_provider(provider: Optional[LLMProvider]) -> Dict[str, Any]:
     }
 
 
+def provider_log_summary(provider: Optional[LLMProvider]) -> str:
+    """Return a concise provider summary suitable for live logs."""
+
+    if provider is None:
+        return "unavailable"
+    if getattr(provider, "refiner_orchestrated", False):
+        candidates = provider.candidate_summaries()  # type: ignore[attr-defined]
+        candidate_labels: List[str] = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            provider_type = str(candidate.get("provider") or "provider").strip()
+            resolved_model = str(candidate.get("resolved_model") or candidate.get("model") or "default").strip() or "default"
+            configured_model = str(candidate.get("configured_model") or "").strip()
+            label = f"{provider_type}/{resolved_model}"
+            if configured_model and configured_model != resolved_model:
+                label += f" (configured {configured_model})"
+            candidate_labels.append(label)
+        engine_labels: List[str] = []
+        for engine in getattr(provider, "specialist_engines", []):
+            engine_type = str(getattr(engine, "engine_type", "") or "").strip().lower()
+            engine_name = str(getattr(engine, "name", "") or engine_type or "engine").strip()
+            if engine_type and engine_name and engine_name.lower() != engine_type:
+                engine_labels.append(f"{engine_name}<{engine_type}>")
+            else:
+                engine_labels.append(engine_name or engine_type or "engine")
+        summary = (
+            f"orchestrated mode={getattr(provider, 'selection_mode', 'best')} "
+            f"candidates={_preview_labels(candidate_labels, limit=6)}"
+        )
+        if engine_labels:
+            summary += f"; specialist_engines={_preview_labels(engine_labels, limit=6)}"
+        return summary
+    provider_name = str(getattr(provider, "name", "") or provider.__class__.__name__).strip().lower() or "provider"
+    model = str(getattr(provider, "model", "") or "").strip() or "default"
+    return f"single {provider_name}/{model}"
+
+
 def _as_list(value: Any) -> List[str]:
     if isinstance(value, str):
         value = [value]
@@ -1286,6 +1426,8 @@ def _metrics_summary(path: str, *, limit: int = 20) -> Dict[str, Any]:
                 "candidate_id": str(candidate_id),
                 "provider": bucket.get("provider"),
                 "model": bucket.get("model"),
+                "configured_model": bucket.get("configured_model"),
+                "resolved_model": bucket.get("resolved_model") or bucket.get("model"),
                 "specialties": bucket.get("specialties") if isinstance(bucket.get("specialties"), list) else [],
                 "successes": successes,
                 "failures": failures,
@@ -1352,4 +1494,9 @@ def orchestration_status(
             "path": metrics_path,
             "exists": os.path.exists(metrics_path),
         },
+        "model_inventory": model_inventory_status(
+            config_path=config_file,
+            limit=candidate_limit,
+            refresh_if_missing=False,
+        ),
     }
