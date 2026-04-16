@@ -2254,6 +2254,20 @@ def get_provider(name: Optional[str], model: Optional[str] = None, base_url: Opt
     if not name:
         return None
     name = name.lower().strip()
+    try:
+        from refiner_ai_gail import build_direct_provider as _build_gail_direct_provider, gail_enabled as _gail_enabled
+
+        if _gail_enabled():
+            return _build_gail_direct_provider(
+                name,
+                model=model,
+                base_url=base_url,
+                inter_request_gap=inter_request_gap,
+                api_key=kwargs.get("api_key"),
+                access_token=kwargs.get("access_token"),
+            )
+    except Exception as exc:
+        logger.debug("Gail direct-provider bridge unavailable, falling back to local providers: %s", exc)
     if name in ("openai", "chatgpt", "gpt"):
         return OpenAIProvider(model=model, inter_request_gap=inter_request_gap, **kwargs)
     if name in ("gemini", "google"):
