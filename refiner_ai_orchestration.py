@@ -1154,6 +1154,34 @@ def _candidate_from_spec(
     )
 
 
+def _gail_bridge() -> Optional[Dict[str, Callable[..., Any]]]:
+    """Load the optional Gail bridge lazily to avoid import cycles."""
+
+    try:
+        from refiner_ai_gail import (
+            build_workflow_provider as gail_build_workflow_provider,
+            build_workflow_provider_from_candidates as gail_build_workflow_provider_from_candidates,
+            gail_enabled as is_gail_enabled,
+            gail_status as fetch_gail_status,
+        )
+    except Exception as exc:
+        logger.debug("Gail workflow bridge unavailable, using local orchestration: %s", exc)
+        return None
+
+    try:
+        if not is_gail_enabled():
+            return None
+    except Exception as exc:
+        logger.debug("Gail enablement check failed, using local orchestration: %s", exc)
+        return None
+
+    return {
+        "build_workflow_provider": gail_build_workflow_provider,
+        "build_workflow_provider_from_candidates": gail_build_workflow_provider_from_candidates,
+        "gail_status": fetch_gail_status,
+    }
+
+
 def orchestrate_provider_candidates(
     candidates: Sequence[Optional[LLMProvider]],
     *,
@@ -1176,6 +1204,19 @@ def orchestrate_provider_candidates(
         return None
     if len(existing) == 1 and getattr(existing[0], "refiner_orchestrated", False):
         return existing[0]
+
+    gail_bridge = _gail_bridge()
+    if gail_bridge is not None:
+        return gail_bridge["build_workflow_provider_from_candidates"](
+            existing,
+            workflow=workflow,
+            role=role,
+            include_configured=include_configured,
+            base_url=base_url,
+            inter_request_gap=inter_request_gap,
+            selection_mode=selection_mode,
+            max_candidates=max_candidates,
+        )
 
     if not _orchestration_enabled(config_path):
         return existing[0]
@@ -1273,6 +1314,28 @@ def build_workflow_provider(
     specialist_engines: Optional[Sequence[Any]] = None,
 ) -> Optional[LLMProvider]:
     """Build and orchestrate providers from provider/model configuration."""
+
+    gail_bridge = _gail_bridge()
+    if gail_bridge is not None:
+        preferred_kwargs = _provider_kwargs(preferred_provider, preferred_api_key)
+        fallback_kwargs = _provider_kwargs(fallback_provider, fallback_api_key)
+        return gail_bridge["build_workflow_provider"](
+            workflow=workflow,
+            role=role,
+            preferred_provider=preferred_provider,
+            preferred_model=preferred_model,
+            preferred_api_key=preferred_kwargs.get("api_key"),
+            preferred_access_token=preferred_kwargs.get("access_token"),
+            fallback_provider=fallback_provider,
+            fallback_model=fallback_model,
+            fallback_api_key=fallback_kwargs.get("api_key"),
+            fallback_access_token=fallback_kwargs.get("access_token"),
+            base_url=base_url,
+            include_configured=include_configured,
+            inter_request_gap=inter_request_gap,
+            selection_mode=selection_mode,
+            max_candidates=max_candidates,
+        )
 
     factory = provider_factory or default_get_provider
     built: List[Optional[LLMProvider]] = []
@@ -1472,6 +1535,14 @@ def orchestration_status(
     candidate_limit: int = 20,
 ) -> Dict[str, Any]:
     """Return a serialisable view of configured providers, engines, and telemetry."""
+
+    gail_bridge = _gail_bridge()
+    if gail_bridge is not None:
+        return gail_bridge["gail_status"](
+            candidate_limit=candidate_limit,
+            probe_engines=probe_engines,
+            probe_providers=False,
+        )
 
     config_file = _default_config_path(config_path)
     provider_specs = [_provider_spec_summary(spec) for spec in _configured_provider_specs(config_file)]
