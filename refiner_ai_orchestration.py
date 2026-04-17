@@ -27,66 +27,15 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 
 from llm_providers import LLMError, LLMProvider, LLMQuotaError, LLMResponse, get_provider as default_get_provider
 from refiner_ai_model_inventory import model_inventory_status
+from refiner_ai_routing_profiles import (
+    base_provider_specialties as routing_base_provider_specialties,
+    load_routing_profiles,
+    workflow_tags as routing_workflow_tags,
+)
 from refiner_ai_specialists import analyze_specialist_engines, build_specialist_engines, specialist_engine_summaries
 
 
 logger = logging.getLogger(__name__)
-
-WORKFLOW_ROUTING_PROFILES: Dict[str, Dict[str, Set[str]]] = {
-    "project_solver": {
-        "general": {"planning", "json", "code", "safety"},
-        "planner": {"planning", "code", "json"},
-        "reviewer": {"review", "safety", "json"},
-        "researcher": {"research", "docs", "citations"},
-    },
-    "topic_research": {
-        "general": {"research", "citations", "long_context"},
-        "planner": {"planning", "query_planning", "research"},
-        "reviewer": {"review", "citations", "fact_check"},
-        "researcher": {"research", "citations", "long_context"},
-    },
-    "jira_analysis": {
-        "general": {"analysis", "summary", "action_plan"},
-        "reviewer": {"review", "analysis", "action_plan"},
-    },
-    "confluence_analysis": {
-        "general": {"analysis", "summary", "long_context"},
-        "reviewer": {"review", "analysis", "action_plan"},
-    },
-    "assistant_requirements": {
-        "general": {"requirements", "json", "clarity"},
-        "assistant": {"requirements", "json", "clarity"},
-    },
-    "assistant_form_fill": {
-        "general": {"json", "structured_data"},
-        "assistant": {"json", "structured_data"},
-    },
-    "assistant_rag_mcp": {
-        "general": {"research", "json", "citations"},
-        "assistant": {"research", "citations"},
-    },
-    "playground_plan": {
-        "general": {"requirements", "education", "json", "planning"},
-        "planner": {"requirements", "education", "planning", "json"},
-    },
-}
-
-KEYWORD_TAGS: Dict[str, Set[str]] = {
-    "json": {"json", "schema", "field_id", "structured_data"},
-    "code": {"code", "implement", "refactor", "bug", "pytest", "test", "module", "api"},
-    "research": {"research", "reference", "citation", "source", "evidence", "confluence", "jira"},
-    "review": {"review", "audit", "risk", "security", "quality", "critique", "policy"},
-    "planning": {"plan", "steps", "roadmap", "requirements", "workflow", "milestone"},
-    "education": {"school", "pupil", "classroom", "reading quiz", "spelling", "child-friendly"},
-    "neuromorphic": {"aarnn", "aer", "snn", "spiking", "neuromorphic", "celegans", "drosophila"},
-}
-
-PROVIDER_SPECIALTIES: Dict[str, Set[str]] = {
-    "openai": {"planning", "json", "review", "code"},
-    "gemini": {"research", "long_context", "summary", "citations"},
-    "google": {"research", "long_context", "summary", "citations"},
-    "ollama": {"local", "privacy", "draft", "code"},
-}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -346,17 +295,7 @@ def _flatten_prompt_text(messages: Sequence[Dict[str, Any]], system: Optional[st
 
 
 def _workflow_tags(workflow: str, role: str, text: str) -> Set[str]:
-    tags: Set[str] = set()
-    workflow_key = str(workflow or "").strip().lower()
-    role_key = str(role or "").strip().lower() or "general"
-    profile = WORKFLOW_ROUTING_PROFILES.get(workflow_key, {})
-    tags.update(profile.get("general", set()))
-    tags.update(profile.get(role_key, set()))
-    lowered = str(text or "").lower()
-    for tag, keywords in KEYWORD_TAGS.items():
-        if any(keyword in lowered for keyword in keywords):
-            tags.add(tag)
-    return tags
+    return routing_workflow_tags(workflow, role, text)
 
 
 def _expected_json(messages: Sequence[Dict[str, Any]], system: Optional[str]) -> bool:
@@ -398,7 +337,7 @@ def _infer_specialties(
     source: str,
     configured: Optional[Sequence[str]] = None,
 ) -> Set[str]:
-    specialties = set(PROVIDER_SPECIALTIES.get(provider_type, set()))
+    specialties = routing_base_provider_specialties(provider_type)
     lowered_model = str(model or "").lower()
     lowered_source = str(source or "").lower()
     if "codex" in lowered_model:
@@ -1547,11 +1486,17 @@ def orchestration_status(
     config_file = _default_config_path(config_path)
     provider_specs = [_provider_spec_summary(spec) for spec in _configured_provider_specs(config_file)]
     engine_summaries = specialist_engine_summaries(config_file, probe_health=probe_engines)
+    try:
+        routing_profiles = load_routing_profiles()
+    except Exception:
+        routing_profiles = {}
 
     metrics_path = _metrics_path(config_file)
     return {
         "enabled": _orchestration_enabled(config_file),
         "config_path": config_file,
+        "routing_profiles_path": routing_profiles.get("path"),
+        "routing_profiles_version": routing_profiles.get("version"),
         "selection_mode": _selection_mode(config_file),
         "max_parallel_candidates": _max_parallel_candidates(config_file),
         "health_ttl_seconds": _health_ttl_seconds(config_file),

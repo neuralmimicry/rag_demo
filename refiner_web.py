@@ -99,7 +99,12 @@ from security_utils import (
     hash_identifier,
     url_allowed,
 )
-from refiner_central_store import create_central_store_from_env
+from refiner_central_store import (
+    PostgresScheduleDocumentStore,
+    PostgresSessionRoomStore,
+    PostgresTodoDocumentStore,
+    create_central_store_from_env,
+)
 from refiner_settings import (
     SettingsValidationError,
     default_settings as default_user_settings,
@@ -1392,6 +1397,12 @@ def _init_central_store() -> Optional[Any]:
 
 
 CENTRAL_STORE = _init_central_store()
+
+
+def _central_job_store() -> Optional[Any]:
+    if CENTRAL_STORE is None:
+        return None
+    return getattr(CENTRAL_STORE, "jobs", None)
 
 
 def _init_sso_store() -> Dict[str, Any]:
@@ -3737,6 +3748,85 @@ class ScheduleStore:
             return self._update_item_locked(data, schedule_id, _mutate)
 
 
+class PostgresTodoStore(TodoStore):
+    """Todo store that persists Thought Inbox metadata in the central Postgres store."""
+
+    def __init__(
+        self,
+        root: str,
+        document_store: PostgresTodoDocumentStore,
+        *,
+        claim_ttl_sec: int = TODO_CLAIM_TTL_SEC,
+        retention_days: int = TODO_RETENTION_DAYS,
+    ):
+        super().__init__(root, claim_ttl_sec=claim_ttl_sec, retention_days=retention_days)
+        self.document_store = document_store
+
+    def _load(self, user: str) -> Dict[str, Any]:
+        cleaned = str(user or "").strip()
+        if cleaned:
+            try:
+                data = self.document_store.load_user(cleaned)
+                if isinstance(data, dict):
+                    return data
+            except Exception as exc:
+                logger.debug("todo metadata load fell back to disk for %s: %s", cleaned, exc)
+        data = super()._load(user)
+        if cleaned and (os.path.exists(self._path(user)) or data.get("items")):
+            try:
+                self.document_store.write_user(cleaned, data)
+            except Exception as exc:
+                logger.debug("todo metadata backfill skipped for %s: %s", cleaned, exc)
+        return data
+
+    def _write(self, user: str, data: Dict[str, Any]) -> None:
+        cleaned = str(user or "").strip()
+        if cleaned:
+            try:
+                self.document_store.write_user(cleaned, data)
+                return
+            except Exception as exc:
+                logger.warning("todo metadata write fell back to disk for %s: %s", cleaned, exc)
+        super()._write(user, data)
+
+
+class PostgresScheduleStore(ScheduleStore):
+    """Schedule store that persists deferred TODO metadata in central Postgres."""
+
+    def __init__(
+        self,
+        root: str,
+        document_store: PostgresScheduleDocumentStore,
+        *,
+        claim_ttl_sec: int = TODO_SCHEDULE_CLAIM_TTL_SEC,
+    ):
+        super().__init__(root, claim_ttl_sec=claim_ttl_sec)
+        self.document_store = document_store
+
+    def _load(self) -> Dict[str, Any]:
+        try:
+            data = self.document_store.load()
+            if isinstance(data, dict):
+                return data
+        except Exception as exc:
+            logger.debug("schedule metadata load fell back to disk: %s", exc)
+        data = super()._load()
+        if os.path.exists(self.path) or data.get("items"):
+            try:
+                self.document_store.write(data)
+            except Exception as exc:
+                logger.debug("schedule metadata backfill skipped: %s", exc)
+        return data
+
+    def _write(self, data: Dict[str, Any]) -> None:
+        try:
+            self.document_store.write(data)
+            return
+        except Exception as exc:
+            logger.warning("schedule metadata write fell back to disk: %s", exc)
+        super()._write(data)
+
+
 class SessionHistoryStore:
     """Persistent append-only history of conversational room events."""
 
@@ -3770,6 +3860,26 @@ class SessionHistoryStore:
     def write(self, room_id: str, data: Dict[str, Any]) -> None:
         path = self._room_path(room_id)
         _write_json_atomic(path, data)
+
+    def persist_snapshot(self, room_id: str, snapshot: Dict[str, Any]) -> None:
+        if not room_id or not isinstance(snapshot, dict):
+            return
+        with self.lock:
+            data = self.load(room_id) or {
+                "room_id": room_id,
+                "created_at": snapshot.get("created_at") or _now_iso(),
+                "updated_at": snapshot.get("updated_at") or _now_iso(),
+                "events": [],
+            }
+            if snapshot.get("job_id") and not data.get("job_id"):
+                data["job_id"] = snapshot.get("job_id")
+            if snapshot.get("project_id") and not data.get("project_id"):
+                data["project_id"] = snapshot.get("project_id")
+            if snapshot.get("created_by") and not data.get("created_by"):
+                data["created_by"] = snapshot.get("created_by")
+            data["snapshot"] = dict(snapshot)
+            data["updated_at"] = snapshot.get("updated_at") or _now_iso()
+            self.write(room_id, data)
 
     def append_event(self, room_id: str, event: Dict[str, Any]) -> None:
         if not room_id:
@@ -3834,6 +3944,77 @@ class SessionHistoryStore:
         return rooms
 
 
+class PostgresSessionHistoryStore(SessionHistoryStore):
+    """Session history store backed by the central Postgres room registry."""
+
+    def __init__(
+        self,
+        root: str,
+        room_store: PostgresSessionRoomStore,
+        max_events: int = SESSION_HISTORY_MAX,
+    ):
+        super().__init__(root, max_events=max_events)
+        self.room_store = room_store
+
+    def load(self, room_id: str) -> Optional[Dict[str, Any]]:
+        cleaned = str(room_id or "").strip()
+        if cleaned:
+            try:
+                data = self.room_store.load_room(cleaned)
+                if isinstance(data, dict):
+                    return data
+            except Exception as exc:
+                logger.debug("session history load fell back to disk for %s: %s", cleaned, exc)
+        data = super().load(room_id)
+        if cleaned and data:
+            try:
+                self.room_store.write_room(cleaned, data)
+            except Exception as exc:
+                logger.debug("session history backfill skipped for %s: %s", cleaned, exc)
+        return data
+
+    def write(self, room_id: str, data: Dict[str, Any]) -> None:
+        cleaned = str(room_id or "").strip()
+        if cleaned:
+            try:
+                self.room_store.write_room(cleaned, data)
+                return
+            except Exception as exc:
+                logger.warning("session history write fell back to disk for %s: %s", cleaned, exc)
+        super().write(room_id, data)
+
+    def persist_snapshot(self, room_id: str, snapshot: Dict[str, Any]) -> None:
+        cleaned = str(room_id or "").strip()
+        if cleaned and isinstance(snapshot, dict):
+            try:
+                self.room_store.persist_snapshot(cleaned, snapshot)
+                return
+            except Exception as exc:
+                logger.warning("session snapshot write fell back to disk for %s: %s", cleaned, exc)
+        super().persist_snapshot(room_id, snapshot)
+
+    def list_rooms(self, limit: int = 50, tail: int = 5) -> List[Dict[str, Any]]:
+        try:
+            rooms = self.room_store.list_rooms(limit=limit, tail=tail)
+            if rooms:
+                return rooms
+        except Exception as exc:
+            logger.debug("session room listing fell back to disk: %s", exc)
+        rooms = super().list_rooms(limit=limit, tail=tail)
+        for room in rooms:
+            room_id = str(room.get("room_id") or "").strip()
+            if not room_id:
+                continue
+            data = super().load(room_id)
+            if not data:
+                continue
+            try:
+                self.room_store.write_room(room_id, data)
+            except Exception as exc:
+                logger.debug("session history room backfill skipped for %s: %s", room_id, exc)
+        return rooms
+
+
 class WorkspaceSession:
     """In-memory workspace collaboration session model."""
 
@@ -3881,6 +4062,12 @@ class WorkspaceSession:
             payload["detail"] = detail
         session_history.append_event(self.room_id, payload)
 
+    def _persist_snapshot(self, snapshot: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            session_history.persist_snapshot(self.room_id, snapshot or self.snapshot())
+        except Exception:
+            logger.debug("session snapshot persistence skipped for room %s", self.room_id, exc_info=True)
+
     def join(self, user: str, role: Optional[str] = None) -> None:
         now = _now_iso()
         with self.lock:
@@ -3891,6 +4078,7 @@ class WorkspaceSession:
             self.participants[user] = entry
             self.updated_at = now
             snapshot = self.snapshot()
+        self._persist_snapshot(snapshot)
         self._notify("presence", snapshot)
         self._record_event("join", user=user, detail={"role": role})
 
@@ -3902,6 +4090,7 @@ class WorkspaceSession:
                 snapshot = self.snapshot()
             else:
                 return
+        self._persist_snapshot(snapshot)
         self._notify("presence", snapshot)
         self._record_event("leave", user=user)
 
@@ -3914,6 +4103,8 @@ class WorkspaceSession:
             entry["last_seen"] = now
             self.participants[user] = entry
             self.updated_at = now
+            snapshot = self.snapshot()
+        self._persist_snapshot(snapshot)
 
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
@@ -3963,18 +4154,40 @@ class SessionStore:
         if not session_id:
             return None
         with self.lock:
-            return self.sessions.get(session_id)
+            session = self.sessions.get(session_id)
+        if session:
+            return session
+        session = self._load_from_history(session_id)
+        if session:
+            with self.lock:
+                self.sessions[session_id] = session
+        return session
 
     def _load_from_history(self, room_id: str) -> Optional[WorkspaceSession]:
         data = session_history.load(room_id)
         if not data:
             return None
-        job_id = str(data.get("job_id") or "").strip()
-        project_id = data.get("project_id")
-        created_by = data.get("created_by") or "system"
+        snapshot = data.get("snapshot") if isinstance(data.get("snapshot"), dict) else {}
+        job_id = str(data.get("job_id") or snapshot.get("job_id") or "").strip()
+        project_id = data.get("project_id") or snapshot.get("project_id")
+        created_by = data.get("created_by") or snapshot.get("created_by") or "system"
         session = WorkspaceSession(room_id, job_id, project_id, created_by)
-        session.created_at = data.get("created_at") or session.created_at
-        session.updated_at = data.get("updated_at") or session.updated_at
+        session.created_at = snapshot.get("created_at") or data.get("created_at") or session.created_at
+        session.updated_at = snapshot.get("updated_at") or data.get("updated_at") or session.updated_at
+        participants = snapshot.get("participants") if isinstance(snapshot.get("participants"), list) else []
+        cutoff = self._now_ts() - float(self.ttl_sec or 0)
+        hydrated: Dict[str, Dict[str, Any]] = {}
+        for entry in participants:
+            if not isinstance(entry, dict):
+                continue
+            username = str(entry.get("user") or "").strip()
+            if not username:
+                continue
+            last_seen = self._parse_ts(entry.get("last_seen") or entry.get("joined_at"))
+            if cutoff > 0 and last_seen and last_seen < cutoff:
+                continue
+            hydrated[username] = dict(entry)
+        session.participants = hydrated
         return session
 
     def get_or_create(
@@ -4798,11 +5011,22 @@ class Job:
         now = time.time()
         if not force and now - self._last_persist_ts < 1.0:
             return
+        payload = self.to_persisted_dict()
+        persisted = False
         try:
-            _write_json_atomic(self.meta_path, self.to_persisted_dict())
-            self._last_persist_ts = now
+            _write_json_atomic(self.meta_path, payload)
+            persisted = True
         except Exception:
             pass
+        central_job_store = _central_job_store()
+        if central_job_store is not None:
+            try:
+                central_job_store.upsert(payload)
+                persisted = True
+            except Exception as exc:
+                logger.debug("job metadata sync skipped for %s: %s", self.job_id, exc)
+        if persisted:
+            self._last_persist_ts = now
 
     @classmethod
     def from_persisted(cls, data: Dict[str, Any], meta_path: str) -> "Job":
@@ -5943,9 +6167,39 @@ class JobManager:
         except Exception:
             return None
 
+    def _remember_loaded_job(self, job: Job) -> None:
+        existing = self.jobs.get(job.job_id)
+        if existing and _timestamp_sort_key(existing.updated_at) > _timestamp_sort_key(job.updated_at):
+            return
+        self.jobs[job.job_id] = job
+
+    def _load_jobs_from_central_store(self) -> None:
+        central_job_store = _central_job_store()
+        if central_job_store is None:
+            return
+        try:
+            rows = central_job_store.list_jobs(limit=10000)
+        except Exception as exc:
+            logger.debug("central job metadata load skipped: %s", exc)
+            return
+        for data in rows:
+            if not isinstance(data, dict):
+                continue
+            job_id = str(data.get("id") or data.get("job_id") or "").strip()
+            if not job_id:
+                continue
+            meta_path = os.path.join(JOB_ROOT, job_id, JOB_META_FILENAME)
+            try:
+                job = Job.from_persisted(data, meta_path)
+            except Exception:
+                continue
+            self._remember_loaded_job(job)
+
     def _load_jobs_from_disk(self) -> None:
+        self._load_jobs_from_central_store()
         if not os.path.isdir(JOB_ROOT):
             return
+        central_job_store = _central_job_store()
         skip_dirs = {"projects", "secrets", "workspaces"}
         for entry in os.listdir(JOB_ROOT):
             if entry in skip_dirs:
@@ -5963,7 +6217,12 @@ class JobManager:
                 job = Job.from_persisted(data, meta_path)
             except Exception:
                 continue
-            self.jobs[job.job_id] = job
+            self._remember_loaded_job(job)
+            if central_job_store is not None:
+                try:
+                    central_job_store.upsert(job.to_persisted_dict())
+                except Exception as exc:
+                    logger.debug("central job metadata backfill skipped for %s: %s", job.job_id, exc)
 
         for job in self.jobs.values():
             if job.status in {"queued", "running", "paused"}:
@@ -5978,6 +6237,7 @@ class JobManager:
             return
         cutoff = time.time() - JOB_RETENTION_DAYS * 86400
         removed = 0
+        central_job_store = _central_job_store()
         for job in list(self.jobs.values()):
             if job.status not in {"completed", "failed", "stopped"}:
                 continue
@@ -5995,6 +6255,11 @@ class JobManager:
                 shutil.rmtree(job_dir, ignore_errors=True)
                 with self.lock:
                     self.jobs.pop(job.job_id, None)
+                if central_job_store is not None:
+                    try:
+                        central_job_store.delete(job.job_id)
+                    except Exception as exc:
+                        logger.debug("central job metadata cleanup skipped for %s: %s", job.job_id, exc)
                 removed += 1
             except Exception:
                 continue
@@ -7727,11 +7992,23 @@ token_ledger = CENTRAL_STORE.user_ledger if CENTRAL_STORE is not None else Token
 team_token_ledger = CENTRAL_STORE.team_ledger if CENTRAL_STORE is not None else TokenLedger(TEAM_LEDGER_ROOT)
 rag_store = RagStore(RAG_STORE_ROOT)
 mcp_store = PostgresMCPServerStore(CENTRAL_STORE.pool) if CENTRAL_STORE is not None else MCPServerStore(MCP_STORE_ROOT)
-session_history = SessionHistoryStore(SESSIONS_ROOT)
+session_history = (
+    PostgresSessionHistoryStore(SESSIONS_ROOT, CENTRAL_STORE.session_rooms)
+    if CENTRAL_STORE is not None
+    else SessionHistoryStore(SESSIONS_ROOT)
+)
 session_store = SessionStore()
 voice_token_store = CENTRAL_STORE.voice_tokens if CENTRAL_STORE is not None else VoiceTokenStore(VOICE_TOKEN_PATH)
-todo_store = TodoStore(TODO_ROOT)
-schedule_store = ScheduleStore(SCHEDULE_ROOT)
+todo_store = (
+    PostgresTodoStore(TODO_ROOT, CENTRAL_STORE.todo_documents)
+    if CENTRAL_STORE is not None
+    else TodoStore(TODO_ROOT)
+)
+schedule_store = (
+    PostgresScheduleStore(SCHEDULE_ROOT, CENTRAL_STORE.schedule_documents)
+    if CENTRAL_STORE is not None
+    else ScheduleStore(SCHEDULE_ROOT)
+)
 subtask_manager = SubtaskManager()
 todo_scheduler = TodoScheduler(
     schedule_store=schedule_store,

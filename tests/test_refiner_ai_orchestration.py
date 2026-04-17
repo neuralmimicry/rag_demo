@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 import time
 
 from llm_providers import LLMResponse
@@ -577,3 +578,41 @@ def test_orchestration_status_includes_generic_and_auto_attached_aarnn(tmp_path,
     assert {engine["type"] for engine in status["engines"]} == {"aarnn", "snn_aer"}
     assert {engine["name"] for engine in status["engines"]} == {"AARNN", "VisionSpikes"}
     assert all(engine["health"]["mode"] == "offline_heuristic" for engine in status["engines"])
+
+
+def test_orchestration_status_reports_routing_contract_path_and_version(tmp_path, monkeypatch):
+    contract_path = tmp_path / "ai-routing-profiles.json"
+    contract_path.write_text(
+        json.dumps(
+            {
+                "version": 7,
+                "workflow_profiles": {
+                    "assistant_requirements": {
+                        "general": ["requirements"],
+                        "assistant": ["json"],
+                    }
+                },
+                "keyword_tags": {"json": ["json"]},
+                "provider_specialties": {"openai": ["code"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("REFINER_AI_ROUTING_PROFILES_PATH", str(contract_path))
+
+    status = orchestration_status(
+        config_path=str(tmp_path / "missing-config.json"),
+        include_metrics=False,
+    )
+
+    assert status["routing_profiles_path"] == str(contract_path.resolve())
+    assert status["routing_profiles_version"] == 7
+
+
+def test_refiner_routing_contract_matches_gail_copy_when_available():
+    refiner_path = Path(__file__).resolve().parents[1] / "config" / "ai-routing-profiles.json"
+    gail_path = Path(__file__).resolve().parents[2] / "gail" / "config" / "ai-routing-profiles.json"
+    if not gail_path.is_file():
+        return
+
+    assert refiner_path.read_text(encoding="utf-8") == gail_path.read_text(encoding="utf-8")

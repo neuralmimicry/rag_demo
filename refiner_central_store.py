@@ -157,6 +157,71 @@ SCHEMA_STATEMENTS: Sequence[str] = (
     CREATE INDEX IF NOT EXISTS nm_llm_request_telemetry_bucket_idx
         ON nm_llm_request_telemetry (bucket_hour DESC)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS nm_jobs (
+        job_id TEXT PRIMARY KEY,
+        owner TEXT,
+        workflow TEXT NOT NULL DEFAULT 'project_solver',
+        status TEXT NOT NULL DEFAULT 'queued',
+        progress INTEGER NOT NULL DEFAULT 0,
+        project_name TEXT,
+        project_id TEXT,
+        team_id TEXT,
+        archived BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        started_at TIMESTAMPTZ,
+        finished_at TIMESTAMPTZ,
+        data JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_jobs_owner_updated_idx
+        ON nm_jobs (owner, updated_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_jobs_status_updated_idx
+        ON nm_jobs (status, updated_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS nm_todo_inboxes (
+        username TEXT PRIMARY KEY,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        data JSONB NOT NULL DEFAULT '{"version": 2, "items": []}'::jsonb
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_todo_inboxes_updated_idx
+        ON nm_todo_inboxes (updated_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS nm_schedule_queues (
+        queue_id TEXT PRIMARY KEY,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        data JSONB NOT NULL DEFAULT '{"version": 1, "items": []}'::jsonb
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS nm_session_rooms (
+        room_id TEXT PRIMARY KEY,
+        job_id TEXT,
+        project_id TEXT,
+        created_by TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        events_count INTEGER NOT NULL DEFAULT 0,
+        snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+        data JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_session_rooms_updated_idx
+        ON nm_session_rooms (updated_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS nm_session_rooms_job_updated_idx
+        ON nm_session_rooms (job_id, updated_at DESC)
+    """,
 )
 
 
@@ -237,6 +302,15 @@ def _coerce_event_datetime(value: Any) -> dt.datetime:
     return dt.datetime.now(UTC)
 
 
+def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
+    if value in (None, ""):
+        return None
+    try:
+        return _coerce_event_datetime(value)
+    except Exception:
+        return None
+
+
 def _hour_bucket(value: dt.datetime) -> dt.datetime:
     moment = _coerce_event_datetime(value)
     return moment.replace(minute=0, second=0, microsecond=0)
@@ -305,6 +379,10 @@ class PostgresCentralStore:
         self.user_ledger = PostgresTokenLedger(self, "user")
         self.team_ledger = PostgresTokenLedger(self, "team")
         self.llm_request_telemetry = PostgresLLMRequestTelemetry(self)
+        self.jobs = PostgresJobStore(self)
+        self.todo_documents = PostgresTodoDocumentStore(self)
+        self.schedule_documents = PostgresScheduleDocumentStore(self)
+        self.session_rooms = PostgresSessionRoomStore(self)
 
     def close(self) -> None:
         self.pool.close()
@@ -1503,6 +1581,401 @@ class PostgresLLMRequestTelemetry:
                     (cutoff,),
                 )
         return max(0, int(result.rowcount or 0))
+
+
+class PostgresJobStore:
+    def __init__(self, store: PostgresCentralStore):
+        self.store = store
+
+    @staticmethod
+    def _payload_from_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        payload = dict(row.get("data")) if isinstance(row.get("data"), dict) else {}
+        payload.setdefault("id", row.get("job_id"))
+        if row.get("owner") and not payload.get("owner"):
+            payload["owner"] = row.get("owner")
+        if row.get("workflow") and not payload.get("workflow"):
+            payload["workflow"] = row.get("workflow")
+        if row.get("status") and not payload.get("status"):
+            payload["status"] = row.get("status")
+        if row.get("project_name") and not payload.get("project_name"):
+            payload["project_name"] = row.get("project_name")
+        if row.get("project_id") and not payload.get("project_id"):
+            payload["project_id"] = row.get("project_id")
+        if row.get("team_id") and not payload.get("team_id"):
+            payload["team_id"] = row.get("team_id")
+        if "progress" not in payload:
+            payload["progress"] = int(row.get("progress") or 0)
+        if "archived" not in payload:
+            payload["archived"] = bool(row.get("archived"))
+        for column in ("created_at", "updated_at", "started_at", "finished_at"):
+            if column not in payload:
+                payload[column] = _timestamp(row.get(column))
+        return payload
+
+    def upsert(self, data: Dict[str, Any]) -> None:
+        payload = dict(data or {})
+        job_id = str(payload.get("id") or payload.get("job_id") or "").strip()
+        if not job_id:
+            raise ValueError("job id is required")
+        owner = str(payload.get("owner") or "").strip() or None
+        workflow = str(payload.get("workflow") or "project_solver").strip() or "project_solver"
+        status = str(payload.get("status") or "queued").strip() or "queued"
+        progress = max(0, min(100, _coerce_int(payload.get("progress"), 0)))
+        project_name = _clean_optional_text(payload.get("project_name"), max_length=240)
+        project_id = _clean_optional_text(payload.get("project_id"), max_length=240)
+        team_id = _clean_optional_text(payload.get("team_id"), max_length=240)
+        archived = bool(payload.get("archived"))
+        created_at = _coerce_optional_datetime(payload.get("created_at")) or dt.datetime.now(UTC)
+        updated_at = _coerce_optional_datetime(payload.get("updated_at")) or created_at
+        started_at = _coerce_optional_datetime(payload.get("started_at"))
+        finished_at = _coerce_optional_datetime(payload.get("finished_at"))
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    INSERT INTO nm_jobs (
+                        job_id,
+                        owner,
+                        workflow,
+                        status,
+                        progress,
+                        project_name,
+                        project_id,
+                        team_id,
+                        archived,
+                        created_at,
+                        updated_at,
+                        started_at,
+                        finished_at,
+                        data
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT (job_id) DO UPDATE
+                    SET owner = COALESCE(EXCLUDED.owner, nm_jobs.owner),
+                        workflow = EXCLUDED.workflow,
+                        status = EXCLUDED.status,
+                        progress = EXCLUDED.progress,
+                        project_name = COALESCE(EXCLUDED.project_name, nm_jobs.project_name),
+                        project_id = COALESCE(EXCLUDED.project_id, nm_jobs.project_id),
+                        team_id = COALESCE(EXCLUDED.team_id, nm_jobs.team_id),
+                        archived = EXCLUDED.archived,
+                        created_at = COALESCE(nm_jobs.created_at, EXCLUDED.created_at),
+                        updated_at = EXCLUDED.updated_at,
+                        started_at = COALESCE(EXCLUDED.started_at, nm_jobs.started_at),
+                        finished_at = EXCLUDED.finished_at,
+                        data = EXCLUDED.data
+                    """,
+                    (
+                        job_id,
+                        owner,
+                        workflow,
+                        status,
+                        progress,
+                        project_name,
+                        project_id,
+                        team_id,
+                        archived,
+                        created_at,
+                        updated_at,
+                        started_at,
+                        finished_at,
+                        _jsonb(payload),
+                    ),
+                )
+
+    def get(self, job_id: str) -> Optional[Dict[str, Any]]:
+        cleaned = str(job_id or "").strip()
+        if not cleaned:
+            return None
+        with self.store.pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    job_id, owner, workflow, status, progress, project_name, project_id,
+                    team_id, archived, created_at, updated_at, started_at, finished_at, data
+                FROM nm_jobs
+                WHERE job_id = %s
+                """,
+                (cleaned,),
+            ).fetchone()
+        return self._payload_from_row(row)
+
+    def list_jobs(
+        self,
+        *,
+        owner: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        limit_value = max(1, min(_coerce_int(limit, 5000), 10000))
+        owner_value = _clean_optional_text(owner, max_length=120)
+        status_value = _clean_optional_text(status, max_length=64)
+        with self.store.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    job_id, owner, workflow, status, progress, project_name, project_id,
+                    team_id, archived, created_at, updated_at, started_at, finished_at, data
+                FROM nm_jobs
+                WHERE (%s IS NULL OR owner = %s)
+                  AND (%s IS NULL OR status = %s)
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT %s
+                """,
+                (owner_value, owner_value, status_value, status_value, limit_value),
+            ).fetchall()
+        return [item for item in (self._payload_from_row(row) for row in rows or []) if item]
+
+    def delete(self, job_id: str) -> bool:
+        cleaned = str(job_id or "").strip()
+        if not cleaned:
+            return False
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                result = conn.execute(
+                    "DELETE FROM nm_jobs WHERE job_id = %s",
+                    (cleaned,),
+                )
+        return bool(result.rowcount)
+
+
+class PostgresTodoDocumentStore:
+    def __init__(self, store: PostgresCentralStore):
+        self.store = store
+
+    def load_user(self, username: str) -> Optional[Dict[str, Any]]:
+        cleaned = str(username or "").strip()
+        if not cleaned:
+            return None
+        with self.store.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT data FROM nm_todo_inboxes WHERE username = %s",
+                (cleaned,),
+            ).fetchone()
+        payload = (row or {}).get("data")
+        return dict(payload) if isinstance(payload, dict) else None
+
+    def write_user(self, username: str, data: Dict[str, Any]) -> None:
+        cleaned = str(username or "").strip()
+        if not cleaned:
+            raise ValueError("username is required")
+        payload = dict(data or {})
+        updated_at = _coerce_optional_datetime(payload.get("updated_at")) or dt.datetime.now(UTC)
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    INSERT INTO nm_todo_inboxes (username, updated_at, data)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (username) DO UPDATE
+                    SET updated_at = EXCLUDED.updated_at,
+                        data = EXCLUDED.data
+                    """,
+                    (cleaned, updated_at, _jsonb(payload)),
+                )
+
+
+class PostgresScheduleDocumentStore:
+    DEFAULT_QUEUE_ID = "default"
+
+    def __init__(self, store: PostgresCentralStore):
+        self.store = store
+
+    def load(self, queue_id: str = DEFAULT_QUEUE_ID) -> Optional[Dict[str, Any]]:
+        cleaned = str(queue_id or self.DEFAULT_QUEUE_ID).strip() or self.DEFAULT_QUEUE_ID
+        with self.store.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT data FROM nm_schedule_queues WHERE queue_id = %s",
+                (cleaned,),
+            ).fetchone()
+        payload = (row or {}).get("data")
+        return dict(payload) if isinstance(payload, dict) else None
+
+    def write(self, data: Dict[str, Any], queue_id: str = DEFAULT_QUEUE_ID) -> None:
+        cleaned = str(queue_id or self.DEFAULT_QUEUE_ID).strip() or self.DEFAULT_QUEUE_ID
+        payload = dict(data or {})
+        updated_at = _coerce_optional_datetime(payload.get("updated_at")) or dt.datetime.now(UTC)
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    INSERT INTO nm_schedule_queues (queue_id, updated_at, data)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (queue_id) DO UPDATE
+                    SET updated_at = EXCLUDED.updated_at,
+                        data = EXCLUDED.data
+                    """,
+                    (cleaned, updated_at, _jsonb(payload)),
+                )
+
+
+class PostgresSessionRoomStore:
+    def __init__(self, store: PostgresCentralStore):
+        self.store = store
+
+    @staticmethod
+    def _payload_from_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        payload = dict(row.get("data")) if isinstance(row.get("data"), dict) else {}
+        payload.setdefault("room_id", row.get("room_id"))
+        if row.get("job_id") and not payload.get("job_id"):
+            payload["job_id"] = row.get("job_id")
+        if row.get("project_id") and not payload.get("project_id"):
+            payload["project_id"] = row.get("project_id")
+        if row.get("created_by") and not payload.get("created_by"):
+            payload["created_by"] = row.get("created_by")
+        if "created_at" not in payload:
+            payload["created_at"] = _timestamp(row.get("created_at"))
+        if "updated_at" not in payload:
+            payload["updated_at"] = _timestamp(row.get("updated_at"))
+        if "snapshot" not in payload and isinstance(row.get("snapshot"), dict):
+            payload["snapshot"] = dict(row.get("snapshot") or {})
+        if "events" not in payload:
+            payload["events"] = []
+        return payload
+
+    def load_room(self, room_id: str) -> Optional[Dict[str, Any]]:
+        cleaned = str(room_id or "").strip()
+        if not cleaned:
+            return None
+        with self.store.pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    room_id, job_id, project_id, created_by, created_at, updated_at,
+                    events_count, snapshot, data
+                FROM nm_session_rooms
+                WHERE room_id = %s
+                """,
+                (cleaned,),
+            ).fetchone()
+        return self._payload_from_row(row)
+
+    def write_room(self, room_id: str, data: Dict[str, Any]) -> None:
+        cleaned = str(room_id or "").strip()
+        if not cleaned:
+            raise ValueError("room_id is required")
+        payload = dict(data or {})
+        payload["room_id"] = cleaned
+        snapshot = dict(payload.get("snapshot")) if isinstance(payload.get("snapshot"), dict) else {}
+        events = payload.get("events") if isinstance(payload.get("events"), list) else []
+        job_id = _clean_optional_text(payload.get("job_id") or snapshot.get("job_id"), max_length=240)
+        project_id = _clean_optional_text(payload.get("project_id") or snapshot.get("project_id"), max_length=240)
+        created_by = _clean_optional_text(payload.get("created_by") or snapshot.get("created_by"), max_length=120)
+        created_at = (
+            _coerce_optional_datetime(payload.get("created_at"))
+            or _coerce_optional_datetime(snapshot.get("created_at"))
+            or dt.datetime.now(UTC)
+        )
+        updated_at = (
+            _coerce_optional_datetime(payload.get("updated_at"))
+            or _coerce_optional_datetime(snapshot.get("updated_at"))
+            or created_at
+        )
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    INSERT INTO nm_session_rooms (
+                        room_id,
+                        job_id,
+                        project_id,
+                        created_by,
+                        created_at,
+                        updated_at,
+                        events_count,
+                        snapshot,
+                        data
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT (room_id) DO UPDATE
+                    SET job_id = COALESCE(EXCLUDED.job_id, nm_session_rooms.job_id),
+                        project_id = COALESCE(EXCLUDED.project_id, nm_session_rooms.project_id),
+                        created_by = COALESCE(EXCLUDED.created_by, nm_session_rooms.created_by),
+                        created_at = COALESCE(nm_session_rooms.created_at, EXCLUDED.created_at),
+                        updated_at = EXCLUDED.updated_at,
+                        events_count = EXCLUDED.events_count,
+                        snapshot = CASE
+                            WHEN EXCLUDED.snapshot = '{}'::jsonb THEN nm_session_rooms.snapshot
+                            ELSE EXCLUDED.snapshot
+                        END,
+                        data = EXCLUDED.data
+                    """,
+                    (
+                        cleaned,
+                        job_id,
+                        project_id,
+                        created_by,
+                        created_at,
+                        updated_at,
+                        len(events),
+                        _jsonb(snapshot),
+                        _jsonb(payload),
+                    ),
+                )
+
+    def persist_snapshot(self, room_id: str, snapshot: Dict[str, Any]) -> None:
+        cleaned = str(room_id or "").strip()
+        if not cleaned or not isinstance(snapshot, dict):
+            return
+        payload = self.load_room(cleaned) or {
+            "room_id": cleaned,
+            "created_at": snapshot.get("created_at") or _timestamp(dt.datetime.now(UTC)),
+            "updated_at": snapshot.get("updated_at") or _timestamp(dt.datetime.now(UTC)),
+            "events": [],
+        }
+        payload["snapshot"] = dict(snapshot)
+        if snapshot.get("job_id") and not payload.get("job_id"):
+            payload["job_id"] = snapshot.get("job_id")
+        if snapshot.get("project_id") and not payload.get("project_id"):
+            payload["project_id"] = snapshot.get("project_id")
+        if snapshot.get("created_by") and not payload.get("created_by"):
+            payload["created_by"] = snapshot.get("created_by")
+        payload["updated_at"] = snapshot.get("updated_at") or _timestamp(dt.datetime.now(UTC))
+        self.write_room(cleaned, payload)
+
+    def list_rooms(self, limit: int = 50, tail: int = 5) -> List[Dict[str, Any]]:
+        limit_value = max(1, min(_coerce_int(limit, 50), 500))
+        tail_value = max(0, _coerce_int(tail, 5))
+        with self.store.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    room_id, job_id, project_id, created_by, created_at, updated_at,
+                    events_count, snapshot, data
+                FROM nm_session_rooms
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT %s
+                """,
+                (limit_value,),
+            ).fetchall()
+        rooms: List[Dict[str, Any]] = []
+        for row in rows or []:
+            payload = self._payload_from_row(row) or {}
+            events = payload.get("events") if isinstance(payload.get("events"), list) else []
+            last_event = events[-1] if events else None
+            rooms.append(
+                {
+                    "room_id": payload.get("room_id") or row.get("room_id"),
+                    "job_id": payload.get("job_id") or row.get("job_id"),
+                    "project_id": payload.get("project_id") or row.get("project_id"),
+                    "created_by": payload.get("created_by") or row.get("created_by"),
+                    "created_at": payload.get("created_at") or _timestamp(row.get("created_at")),
+                    "updated_at": payload.get("updated_at") or _timestamp(row.get("updated_at")),
+                    "events_count": len(events) if events else int(row.get("events_count") or 0),
+                    "last_event": last_event,
+                    "events_tail": events[-tail_value:] if tail_value and events else [],
+                }
+            )
+        return rooms
 
 
 def create_central_store_from_env() -> Optional[PostgresCentralStore]:
