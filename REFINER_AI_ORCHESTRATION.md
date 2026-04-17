@@ -14,6 +14,8 @@ The orchestration layer exists to:
 
 - `refiner_ai_orchestration.py`
   Central concurrent-provider wrapper, provider registry loading, scoring, and metrics persistence.
+- `refiner_ai_routing_profiles.py`
+  Shared routing-contract loader used to keep Refiner's fallback tags aligned with Gail's runtime contract.
 - `refiner_ai_specialists.py`
   Specialist-engine registry, concurrent specialist analysis, and AARNN fallback attachment logic.
 - `refiner_ai_aarnn.py`
@@ -145,6 +147,8 @@ Important fields:
 - `max_parallel_candidates`
 - `health_ttl_seconds`
 - `registry_path`
+- `REFINER_AI_ROUTING_PROFILES_PATH`
+  Optional override for the shared routing-contract file. By default Refiner uses `config/ai-routing-profiles.json`.
 - `providers`
   Extra provider descriptors with roles/specialties/weights.
 - `engines`
