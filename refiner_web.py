@@ -12146,6 +12146,7 @@ def _require_login() -> Optional[Response]:
         return None
     if path in {
         "/login",
+        "/auth/external-login",
         "/sso",
         "/oidc/login",
         "/oidc/callback",
