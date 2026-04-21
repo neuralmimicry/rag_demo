@@ -65,6 +65,19 @@ require_cmd() {
   command -v "${cmd}" >/dev/null 2>&1 || die "Missing command: ${cmd}"
 }
 
+resolve_python_entry() {
+  local path="$1"
+  if [[ -f "${path}" ]]; then
+    echo "${path}"
+    return 0
+  fi
+  if [[ -f "${path}c" ]]; then
+    echo "${path}c"
+    return 0
+  fi
+  return 1
+}
+
 flag_enabled() {
   local raw="${1:-}"
   local normalized
@@ -317,6 +330,7 @@ NMSTT_MAX_AUDIO_BYTES="${NMSTT_MAX_AUDIO_BYTES:-${STT_MAX_AUDIO_BYTES:-8000000}}
 NMSTT_BUILD="${NMSTT_BUILD:-${STT_BUILD:-1}}"
 
 REFINER_WEB_SCRIPT="${REFINER_WEB_SCRIPT:-${ROOT_DIR}/refiner_web.py}"
+REFINER_WEB_SCRIPT="$(resolve_python_entry "${REFINER_WEB_SCRIPT}" || true)"
 REFINER_HOST="${REFINER_HOST:-127.0.0.1}"
 REFINER_PORT="${REFINER_PORT:-5001}"
 PYTHON_BIN="${PYTHON_BIN:-}"
@@ -350,7 +364,7 @@ require_cmd curl
 require_cmd "${PYTHON_BIN}"
 
 [[ -x "${PYTHON_BIN}" ]] || die "Python executable not found or not executable: ${PYTHON_BIN}"
-[[ -f "${REFINER_WEB_SCRIPT}" ]] || die "Missing refiner web script: ${REFINER_WEB_SCRIPT}"
+[[ -n "${REFINER_WEB_SCRIPT}" ]] || die "Missing refiner web script: ${ROOT_DIR}/refiner_web.py(.pyc)"
 
 if (( FORCE_START_NMSTT == 1 )); then
   MANAGE_LOCAL_NMSTT=1

@@ -126,6 +126,13 @@ _SKILL_INDEX_DEFAULT_PATHS = (
     os.path.join("data", "skills_index.json"),
     os.path.join("data", "antigravity_skills_index.json"),
 )
+_ANALYSIS_REPORT_ENV_VARS = (
+    "REFINER_ANALYSIS_REPORT_PATH",
+    "REFINER_CAPABILITIES_REPORT_PATH",
+)
+_ANALYSIS_REPORT_DEFAULT_PATHS = (
+    os.path.join("data", "capabilities_report.json"),
+)
 _DEFAULT_DENYLIST = [
     "red-team",
     "red team",
@@ -233,6 +240,65 @@ def _normalize_index_path(candidate: str) -> Optional[str]:
     if os.path.isdir(candidate):
         candidate = os.path.join(candidate, "skills_index.json")
     return candidate if os.path.exists(candidate) else None
+
+
+def _normalize_analysis_report_path(candidate: str) -> Optional[str]:
+    """Normalize a bundled analysis report path candidate."""
+    if not candidate:
+        return None
+    candidate = candidate.strip()
+    if not candidate:
+        return None
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(_REPO_ROOT, candidate)
+    return candidate if os.path.exists(candidate) else None
+
+
+def _resolve_analysis_report_path() -> Optional[str]:
+    """Resolve the optional precomputed capability analysis report path."""
+    for env_name in _ANALYSIS_REPORT_ENV_VARS:
+        env_value = os.getenv(env_name)
+        if env_value:
+            resolved = _normalize_analysis_report_path(env_value)
+            if resolved:
+                return resolved
+    for candidate in _ANALYSIS_REPORT_DEFAULT_PATHS:
+        resolved = _normalize_analysis_report_path(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def _load_bundled_analysis_report() -> Optional[Dict[str, Any]]:
+    """Load a bundled analysis snapshot when runtime source files are absent."""
+    path = _resolve_analysis_report_path()
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            report = json.load(handle)
+    except Exception:
+        return None
+    return report if isinstance(report, dict) else None
+
+
+def _analysis_needs_fallback(report: Dict[str, Any]) -> bool:
+    """Return True when live source analysis is unavailable or incomplete."""
+    if not isinstance(report, dict):
+        return True
+    if report.get("error"):
+        return True
+    api = report.get("api") if isinstance(report.get("api"), dict) else {}
+    routes = api.get("routes") if isinstance(api.get("routes"), list) else []
+    try:
+        files_scanned = int(report.get("files_scanned") or 0)
+    except Exception:
+        files_scanned = 0
+    try:
+        total_routes = int(api.get("total_routes") or len(routes))
+    except Exception:
+        total_routes = len(routes)
+    return files_scanned == 0 or total_routes == 0
 
 
 def _resolve_skill_index_path(cfg: Dict[str, Any]) -> Optional[str]:
@@ -535,10 +601,13 @@ def _load_analysis(force_refresh: bool = False) -> Dict[str, Any]:
     global _CAPABILITY_CACHE
     if not force_refresh and _CAPABILITY_CACHE.get("report"):
         return _CAPABILITY_CACHE["report"]
+    bundled_report = _load_bundled_analysis_report()
     try:
         report = analyse_repo(_REPO_ROOT)
+        if bundled_report and _analysis_needs_fallback(report):
+            report = bundled_report
     except Exception as exc:
-        report = {"error": str(exc)}
+        report = bundled_report or {"error": str(exc)}
     _CAPABILITY_CACHE = {"ts": time.time(), "report": report}
     return report
 

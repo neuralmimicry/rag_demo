@@ -195,6 +195,19 @@ except Exception:
     jwt = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_python_script_path(script_name: str) -> str:
+    """Resolve a runtime script path, preferring source but allowing legacy bytecode."""
+    script_path = os.path.join(BASE_DIR, script_name)
+    if os.path.exists(script_path):
+        return script_path
+    bytecode_path = f"{script_path}c"
+    if os.path.exists(bytecode_path):
+        return bytecode_path
+    return script_path
+
+
 PUBLIC_DIR = os.path.join(BASE_DIR, "web", "public")
 JOB_ROOT = os.getenv("REFINER_JOB_DIR", os.path.join(BASE_DIR, "job_data"))
 PROJECTS_ROOT = os.path.join(JOB_ROOT, "projects")
@@ -6855,7 +6868,7 @@ class JobManager:
             payload["llm_max_tokens"] = DEFAULT_LLM_MAX_TOKENS
         command = [
             os.getenv("REFINER_PYTHON", sys.executable),
-            os.path.join(BASE_DIR, "run_refiner.py"),
+            _resolve_python_script_path("run_refiner.py"),
             "--log-file",
             job.log_path,
             "--emit-events",

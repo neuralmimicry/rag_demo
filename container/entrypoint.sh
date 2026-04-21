@@ -19,6 +19,23 @@ if [ -z "${REFINER_FRONTEND_PORT:-}" ] && [ -n "${PORT:-}" ]; then
   export REFINER_FRONTEND_PORT="$PORT"
 fi
 
+resolve_python_entry() {
+  local path="$1"
+  if [ -f "$path" ]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+  if [ -f "${path}c" ]; then
+    printf '%s\n' "${path}c"
+    return 0
+  fi
+  return 1
+}
+
+backend_script="$(resolve_python_entry "refiner_web.py" || true)"
+frontend_script="$(resolve_python_entry "frontend_server.py" || true)"
+cli_script="$(resolve_python_entry "run_refiner.py" || true)"
+
 gpu_status="not_detected"
 gpu_source="none"
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -46,22 +63,41 @@ echo "Refiner: GPU detection=${gpu_status} source=${gpu_source}"
 
 case "$mode" in
   backend)
-    exec python refiner_web.py "$@"
+    [ -n "$backend_script" ] || {
+      echo "Missing refiner backend script (expected refiner_web.py or refiner_web.pyc)." >&2
+      exit 1
+    }
+    exec python "$backend_script" "$@"
     ;;
   frontend)
-    exec python frontend_server.py "$@"
+    [ -n "$frontend_script" ] || {
+      echo "Missing frontend server script (expected frontend_server.py or frontend_server.pyc)." >&2
+      exit 1
+    }
+    exec python "$frontend_script" "$@"
     ;;
   tests|test|suite)
+    if [ ! -d tests ]; then
+      echo "Tests are not bundled in this runtime image." >&2
+      exit 1
+    fi
     if [ "$#" -gt 0 ]; then
       exec pytest "$@"
     fi
     exec pytest tests
     ;;
   smoke)
-    exec python -m py_compile refiner_web.py run_refiner.py "$@"
+    if [ -f refiner_web.py ] && [ -f run_refiner.py ]; then
+      exec python -m py_compile refiner_web.py run_refiner.py "$@"
+    fi
+    exec python -c 'import refiner_web, run_refiner'
     ;;
   cli)
-    exec python run_refiner.py "$@"
+    [ -n "$cli_script" ] || {
+      echo "Missing CLI runner script (expected run_refiner.py or run_refiner.pyc)." >&2
+      exit 1
+    }
+    exec python "$cli_script" "$@"
     ;;
   full|combined|stack)
     exec ./scripts/start_refiner_stack.sh "$@"
