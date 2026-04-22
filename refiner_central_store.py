@@ -15,6 +15,16 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from central_store import (
+    ASSISTANT_SCHEMA_STATEMENTS,
+    RAG_SCHEMA_STATEMENTS,
+    PostgresAssistantConversationStore,
+    PostgresAssistantEpisodeStore,
+    PostgresAssistantSemanticCacheStore,
+    PostgresAssistantTraceStore,
+    PostgresRagMetadataStore,
+)
+
 UTC = dt.timezone.utc
 DEFAULT_ACCESS_TOKEN_TTL_SECONDS = int(os.getenv("REFINER_ACCESS_TOKEN_TTL", "43200"))
 DEFAULT_SSO_TOKEN_TTL_SECONDS = int(os.getenv("REFINER_SSO_TTL", "300"))
@@ -222,7 +232,7 @@ SCHEMA_STATEMENTS: Sequence[str] = (
     CREATE INDEX IF NOT EXISTS nm_session_rooms_job_updated_idx
         ON nm_session_rooms (job_id, updated_at DESC)
     """,
-)
+) + ASSISTANT_SCHEMA_STATEMENTS + RAG_SCHEMA_STATEMENTS
 
 
 def _timestamp(value: Optional[dt.datetime]) -> Optional[str]:
@@ -383,6 +393,11 @@ class PostgresCentralStore:
         self.todo_documents = PostgresTodoDocumentStore(self)
         self.schedule_documents = PostgresScheduleDocumentStore(self)
         self.session_rooms = PostgresSessionRoomStore(self)
+        self.assistant_conversations = PostgresAssistantConversationStore(self)
+        self.assistant_episodes = PostgresAssistantEpisodeStore(self)
+        self.assistant_semantic_cache = PostgresAssistantSemanticCacheStore(self)
+        self.assistant_traces = PostgresAssistantTraceStore(self)
+        self.rag_metadata = PostgresRagMetadataStore(self)
 
     def close(self) -> None:
         self.pool.close()
