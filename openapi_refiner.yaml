@@ -3,7 +3,7 @@ info:
   title: Refiner API
   version: 0.1.0
   description: |
-    Backend API exposed by `refiner_web.py`.
+    Backend API exposed by the `refiner.refiner_web` module.
 
     Refiner combines session-based web auth, assistant and planning endpoints,
     voice/STT ingestion, job orchestration, TODO routing, RAG indexing, MCP
@@ -399,6 +399,8 @@ components:
           $ref: '#/components/schemas/GenericObject'
         mcp:
           $ref: '#/components/schemas/GenericObject'
+        atlassian:
+          $ref: '#/components/schemas/AtlassianActionRequest'
         provider:
           type: string
         model:
@@ -409,6 +411,30 @@ components:
           type: integer
       required:
         - prompt
+    AtlassianActionRequest:
+      type: object
+      properties:
+        product:
+          type: string
+          enum: [jira, confluence]
+        action:
+          type: string
+          description: Jira supports create_issue, update_issue, transition_issue, and upsert_comment. Confluence supports create_page, update_page, and upsert_comment.
+        instance:
+          type: string
+        confirmed:
+          type: boolean
+        preview:
+          type: boolean
+        dry_run:
+          type: boolean
+        allow_unsafe:
+          type: boolean
+        arguments:
+          $ref: '#/components/schemas/GenericObject'
+      required:
+        - product
+        - action
     PlaygroundPlanRequest:
       type: object
       properties:
@@ -1036,7 +1062,7 @@ paths:
     get:
       tags: [Public]
       summary: Public docs health helper
-      description: Available when the docs helper is registered by `api_docs.add_api_documentation_support()`.
+      description: Available when the docs helper is registered by `refiner.api_docs.add_api_documentation_support()`.
       security: []
       responses:
         '200':
@@ -1407,7 +1433,7 @@ paths:
   /api/assistant/rag-mcp:
     post:
       tags: [Assistant]
-      summary: Ask a question using optional RAG context and optional MCP data
+      summary: Ask a question using optional RAG context, optional MCP data, and optional explicit Jira/Confluence write actions
       requestBody:
         required: true
         content:
@@ -1416,7 +1442,7 @@ paths:
               $ref: '#/components/schemas/RagMcpRequest'
       responses:
         '200':
-          description: Assistant answer with optional RAG matches and MCP result
+          description: Assistant answer with optional RAG matches, MCP result, and Atlassian action result
           content:
             application/json:
               schema:

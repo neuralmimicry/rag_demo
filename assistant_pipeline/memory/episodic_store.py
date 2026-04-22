@@ -12,7 +12,7 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
-from solver_memory import SolverEpisode, SolverEpisodeStore
+from refiner.solver_memory import SolverEpisode, SolverEpisodeStore
 
 
 EpisodeStoreFactory = Callable[[str], SolverEpisodeStore]

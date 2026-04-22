@@ -1,4 +1,4 @@
-from solver_memory import SolverEpisode, SolverEpisodeStore
+from refiner.solver_memory import SolverEpisode, SolverEpisodeStore
 
 
 def _episode(

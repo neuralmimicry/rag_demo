@@ -57,38 +57,56 @@ The current code already provides useful building blocks that should be preserve
 - extracted conservative semantic-cache helpers in `assistant_pipeline/cache/semantic_cache.py`
 - extracted sparse/dense hybrid retrieval helpers in `assistant_pipeline/retrieval/*`
 - extracted assistant trace recorder in `assistant_pipeline/tracing/recorder.py`
-- layout-aware extraction in `file_converter.py`
-- structure-preserving document blocks and locators in `document_schema.py`
-- lexical BM25-like retrieval in `rag_engine.py`
-- per-user episodic JSONL memory in `solver_memory.py`
-- provider orchestration and Gail bridging in `refiner_ai_orchestration.py` and `refiner_ai_gail.py`
-- Postgres-backed shared state in `refiner_central_store.py`
+- explicit assistant-side Jira/Confluence write execution in `refiner/integrations/atlassian/actions.py`
+- layout-aware extraction in `refiner/file_converter.py`
+- structure-preserving document blocks and locators in `refiner/document_schema.py`
+- lexical BM25-like retrieval in `refiner/rag_engine.py`
+- per-user episodic JSONL memory in `refiner/solver_memory.py`
+- provider orchestration and Gail bridging in `refiner/refiner_ai_orchestration.py` and `refiner/refiner_ai_gail.py`
+- Postgres-backed shared state in `refiner/refiner_central_store.py`
 - Postgres-backed assistant/RAG metadata stores in `central_store/*`
-- Postgres-backed MCP registry via `mcp_client.py`
+- Postgres-backed MCP registry via `refiner/mcp_client.py`
 - thin route registrars already separated under `refiner_routes/`
 
 The current gaps are:
 
-- `refiner_web.py` still owns configuration wiring and compatibility shims for the extracted assistant/RAG modules
+- `refiner/refiner_web.py` still owns configuration wiring and compatibility shims for the extracted assistant/RAG modules
 - RAG storage is still file-backed, but the read path now has an optional hybrid sparse+dense retrieval layer behind feature flags
-- queued/versioned RAG builds now exist, but asynchronous mode is still opt-in behind `REFINER_RAG_ASYNC_INDEX_BUILDS` or request-level `"async": true`
+- queued/versioned RAG builds now stage immutable artefacts in Postgres before the legacy active mirror is finalised, but asynchronous mode is still opt-in behind `REFINER_RAG_ASYNC_INDEX_BUILDS` or request-level `"async": true`
 - the security envelope is now modularised, but stricter message-role blocking, prompt-leak blocking, remote-URL validation, and output PII redaction still roll out behind feature flags
 - intent-specific prompt routing now exists, but it is deterministic and policy-driven rather than model-classified
 - a conservative Postgres-backed semantic cache now exists for safe read-only routes, but it is token/string-similarity-based rather than embedding-based
-- hybrid retrieval now exists behind feature flags using lexical search plus a deterministic hashed dense backend with persisted sidecar artefacts on shared storage; reranking and richer decomposition are still pending
-- deterministic retrieval coverage grading and one retry/decomposition pass now exist behind feature flags for RAG-backed routes, but richer decomposition, reranking, and citation-level claim binding are still pending
-- citations are preserved in chunks but not audited end-to-end as claim bindings
+- hybrid retrieval now exists behind feature flags using lexical search plus a deterministic hashed dense backend with persisted sidecar artefacts on shared storage; deterministic reranking now sits on top of those candidates behind its own rollout flags
+- deterministic retrieval coverage grading, richer decomposition, one retry/decomposition pass, deterministic reranking, and citation-level claim binding now exist behind feature flags for RAG-backed routes; broader multi-pass planning is still pending
+- Refiner request chokepoints now use owner-aware assistant/STT capacity limiting plus fair subtask and job-action admission so one active user cannot monopolise shared execution slots
+- the core FIFO job queue now emits owner-distribution telemetry through autoscaler, health, admin, and worker-capacity views so any future owner-aware admission decision can be evidence-led rather than speculative
 - basic per-stage trace recording now exists in a dedicated recorder module, and admin read-side trace/conversation APIs now exist, but retention and richer analytics are still pending
-- assistant episodic memory now dual-writes to Postgres, and conversation persistence helpers are modularised, but broader assistant state is still partly file-backed or request-local
+- assistant episodic memory now dual-writes to Postgres, route-level rollout checks cover both JSONL-backed and Postgres-backed read/write paths, and conversation persistence helpers are modularised, but broader assistant state is still partly file-backed or request-local
 
 Current rollout flags for the security slice:
 
 - `REFINER_ASSISTANT_SECURITY_POLICY_ENABLED`
 - `REFINER_ASSISTANT_SECURITY_STRICT_MESSAGE_ROLES`
 - `REFINER_ASSISTANT_SECURITY_BLOCK_PROMPT_LEAK`
+- `REFINER_ASSISTANT_MCP_ADMIN_ONLY`
+- `REFINER_ASSISTANT_BLOCK_UNSAFE_TOOL_REQUESTS`
 - `REFINER_ASSISTANT_SECURITY_VALIDATE_RAG_SOURCE_URLS`
 - `REFINER_ASSISTANT_OUTPUT_REDACT_PII`
+
+Current runtime fairness flags for multi-user Refiner operation:
+
+- `REFINER_ASSISTANT_MAX_CONCURRENT`
+- `REFINER_ASSISTANT_MAX_CONCURRENT_PER_USER`
+- `REFINER_STT_MAX_CONCURRENT`
+- `REFINER_STT_MAX_CONCURRENT_PER_USER`
+- `REFINER_JOB_ACTION_MAX_OUTSTANDING_PER_OWNER`
+- `REFINER_JOB_ACTION_MAX_INFLIGHT_PER_OWNER`
+- `REFINER_SUBTASK_MAX_OUTSTANDING_PER_OWNER`
+- `REFINER_SUBTASK_MAX_INFLIGHT_PER_OWNER`
 - `REFINER_ASSISTANT_OUTPUT_VALIDATE_SHAPES`
+
+Queue-owner skew for the core FIFO job queue is now observable, but it remains a telemetry-only signal.
+Admission for the core queue should stay FIFO unless production evidence shows sustained cross-user contention there as well.
 
 Current rollout flags for routing and cache:
 
@@ -117,6 +135,8 @@ Current rollout flags for retrieval grading and retry:
 - `REFINER_ASSISTANT_RETRIEVAL_RETRY_ENABLED`
 - `REFINER_ASSISTANT_RETRIEVAL_MAX_RETRY_QUERIES`
 - `REFINER_ASSISTANT_RETRIEVAL_MIN_CLAUSE_TERMS`
+- `REFINER_ASSISTANT_RETRIEVAL_RERANK_ENABLED`
+- `REFINER_ASSISTANT_RETRIEVAL_RERANK_MAX_PHRASE_TERMS`
 - `REFINER_ASSISTANT_RETRIEVAL_REFUSE_ON_INSUFFICIENT`
 
 ## Target Runtime Architecture
@@ -150,6 +170,7 @@ assistant_pipeline.service
   |     |-- coverage grader
   |     `-- citation enricher
   |-- mcp_bridge
+  |-- atlassian_action_bridge
   |-- prompt_builder
   |-- generation_gateway
   |     `-- existing refiner_ai_orchestration / Gail bridge
@@ -216,8 +237,9 @@ For `assistant_rag_mcp` and future tool-enabled intents:
 
 - input guard decides whether the request is eligible for tool use
 - tool execution remains explicit and policy-gated
-- semantic cache is disabled for live tool calls
+- semantic cache is disabled for live MCP calls and live Atlassian write actions
 - MCP remains separate from retrieval and is merged only at prompt-building time
+- Jira/Confluence write actions run through the same guard/trace boundary, but use the built-in Atlassian executor rather than the MCP registry
 
 ### Structured-output path
 
@@ -237,7 +259,7 @@ For `assistant_form_fill` and `playground_plan`:
 | Semantic cache | `assistant_pipeline/cache/semantic_cache.py` | Conservative Postgres-backed cache is now implemented for `rag_query` and RAG-only `assistant_rag_mcp`; embedding-backed matching can replace the current token/string scorer later without changing the service boundary |
 | Intent routing | `assistant_pipeline/routing/intent_router.py` | Deterministic route strategies and prompt profiles now exist for requirements, marketing, form fill, playground, RAG, and RAG+MCP flows |
 | Hybrid retrieval | `assistant_pipeline/retrieval/hybrid_retriever.py` | Sparse + dense + fusion now exist behind rollout flags; the dense side now persists hashed feature sidecars alongside index artefacts so a richer embedding backend can replace it later without changing the service boundary |
-| Self-correcting retrieval | `assistant_pipeline/retrieval/coverage_grader.py` and `assistant_pipeline/retrieval/retrieval_planner.py` | Deterministic coverage grading, decomposition, one retry pass, and evidence-based refusal now exist behind rollout flags; richer reranking and multi-pass planning are still pending |
+| Self-correcting retrieval | `assistant_pipeline/retrieval/coverage_grader.py`, `assistant_pipeline/retrieval/retrieval_planner.py`, and `assistant_pipeline/retrieval/reranker.py` | Deterministic coverage grading, richer decomposition, reranking, one retry pass, evidence-based refusal, and citation-aware generation now exist behind rollout flags; broader multi-pass planning is still pending |
 | Citation enrichment | `assistant_pipeline/retrieval/citation_enricher.py` | Claim-to-chunk binding with page/block locator preservation |
 | Output security | `assistant_pipeline/security/output_guard.py` | Response-shape validation is live; optional PII redaction is available behind feature flags before wider rollout |
 | Observability | `assistant_pipeline/tracing/recorder.py` | Per-stage spans, latency, cache, retrieval, provider, refusal signals |
@@ -293,6 +315,7 @@ assistant_pipeline/
   ingestion/
     source_loader.py
     artifact_store.py
+    publication.py
     extractor.py
     chunker.py
     metadata.py
@@ -335,7 +358,7 @@ Boundary rules:
 - `assistant_pipeline/integrations/*` owns external services and must not know HTTP route details.
 - `assistant_pipeline/retrieval/*` owns retrieval behavior and must not talk directly to Billing or Customers.
 - `central_store/*` owns Postgres stores and schema evolution.
-- `refiner_routes/admin.py` owns assistant admin/debug route registration rather than leaving those routes inline in `refiner_web.py`.
+- `refiner_routes/admin.py` owns assistant admin/debug route registration rather than leaving those routes inline in `refiner/refiner_web.py`.
 
 ## Route Strategy Matrix
 
@@ -414,7 +437,7 @@ Rules:
 - cache entries include the active collection fingerprint so collection updates invalidate old cache hits
 - full raw traces are optional and sampled; trace headers stay in Postgres
 - legacy JSONL memory remains during migration only
-- the current implementation still publishes the legacy flat active index file alongside the immutable version artefact so retrieval remains backwards compatible, but assistant reads now prefer the immutable active-version artefact recorded in Postgres when it is available
+- the current implementation still publishes the legacy flat active index file alongside the immutable version artefact so retrieval remains backwards compatible; publication is now staged explicitly in Postgres before the active mirror is finalised, and assistant reads prefer the immutable active-version artefact recorded there when it is available
 
 ### Dense retrieval backend choice
 
@@ -442,9 +465,10 @@ The ingestion path should be asynchronous and versioned.
 6. metadata enricher computes source fingerprints, previews, and chunk manifests
 7. sparse index builder builds the lexical artefact
 8. dense index builder computes the current hashed dense projections and writes the dense sidecar artefact
-9. collection version is written to storage
-10. Postgres metadata is upserted and becomes the active-version read authority for assistant retrieval
+9. collection version artefact is written to storage
+10. Postgres stages the new version as `publishing` with the immutable artefact path
 11. the legacy flat active file is mirrored for compatibility with older consumers
+12. Postgres finalises the version as active after the mirror succeeds
 
 ### Why use subtasks first
 
@@ -559,18 +583,19 @@ Make the first routing cleanup:
 | `assistant_rag_mcp`, `assistant_requirements`, `assistant_form_fill`, `playground_plan` | `assistant_api/assistant_handlers.py` | Thin HTTP wrappers calling `assistant_pipeline.service` |
 | `_coerce_rag_sources`, `_build_rag_documents` | `assistant_pipeline/ingestion/source_loader.py` | Shared source normalization and loading |
 | versioned collection artefact paths and writes | `assistant_pipeline/ingestion/artifact_store.py` | Immutable version payloads under `job_data/rag/collections/...` |
+| staged/final collection publication orchestration | `assistant_pipeline/ingestion/publication.py` | Coordinates immutable writes, legacy mirroring, and Postgres publication states |
 | `_render_rag_context`, `_serialize_rag_match`, citation helpers | `assistant_pipeline/retrieval/citation_enricher.py` | Shared retrieval presentation helpers |
-| `_assistant_memory_*` helpers | `assistant_pipeline/memory/episodic_store.py` | Start as adapter over `solver_memory.py`, then migrate to Postgres |
+| `_assistant_memory_*` helpers | `assistant_pipeline/memory/episodic_store.py` | Start as adapter over `refiner/solver_memory.py`, then migrate to Postgres |
 | `_guardrail_scan` | `assistant_pipeline/security/input_guard.py` | Replaced by richer request policy engine |
 | `_assistant_reply_payload` | `assistant_pipeline/security/output_guard.py` and `assistant_pipeline/service.py` | Split response validation from presentation |
 | background build actions | `assistant_pipeline/ingestion/index_builder.py` | New `rag_collection_build` subtask action |
 
 ### Central-store modularisation
 
-Do not extend `refiner_central_store.py` as one larger file.
-Split it into the `central_store/` package and keep `refiner_central_store.py` as a compatibility import shim until the migration is complete.
+Do not extend `refiner/refiner_central_store.py` as one larger file.
+Split it into the `central_store/` package and keep `refiner/refiner_central_store.py` as a compatibility import shim until the migration is complete.
 
-Add new store classes there rather than in `refiner_web.py`.
+Add new store classes there rather than in `refiner/refiner_web.py`.
 
 ## Implementation Sequence
 
@@ -600,7 +625,7 @@ Deliverables:
 
 Behavior:
 
-- move current route logic out of `refiner_web.py`
+- move current route logic out of `refiner/refiner_web.py`
 - keep the existing lexical RAG and JSONL memory behavior intact
 - keep the HTTP contract unchanged
 
@@ -634,7 +659,7 @@ Behavior:
 
 - `/api/rag/index` can queue builds through the existing subtask manager without changing the route shape
 - asynchronous mode is opt-in first via `REFINER_RAG_ASYNC_INDEX_BUILDS` or request-level `"async": true`
-- collections become versioned artefacts while continuing to publish the legacy active file for compatibility, while assistant retrieval prefers the immutable active-version path from Postgres metadata
+- collections become versioned artefacts while continuing to publish the legacy active file for compatibility; publication is staged in Postgres before the active mirror is finalised, and assistant retrieval prefers the immutable active-version path from metadata
 - retrieval still uses sparse lexical search first
 
 ### Phase 4: add the security and observability envelopes
@@ -684,7 +709,7 @@ Deliverables:
 Behavior:
 
 - sparse plus dense retrieval with fused ranking
-- evidence grading and one retry loop for decomposition
+- evidence grading, deterministic reranking, and one retry loop with richer decomposition
 - refusal when evidence remains insufficient
 - claim-to-source binding using exact chunk and locator ids
 
@@ -699,24 +724,24 @@ Deliverables:
 
 Behavior:
 
-- old helper functions disappear from `refiner_web.py`
+- old helper functions disappear from `refiner/refiner_web.py`
 - assistant/RAG logic is fully owned by the new package tree
 
 ## Suggested Feature Flags
 
 Use environment flags so the migration can be gradual.
-Suggested names:
+Current and recommended names:
 
 - `REFINER_ASSISTANT_PIPELINE_ENABLED`
 - `REFINER_ASSISTANT_PIPELINE_DUAL_WRITE`
 - `REFINER_ASSISTANT_TRACE_ENABLED`
 - `REFINER_ASSISTANT_QUERY_REWRITE_ENABLED`
 - `REFINER_ASSISTANT_SEMANTIC_CACHE_ENABLED`
-- `REFINER_RAG_ASYNC_BUILD_ENABLED`
-- `REFINER_RAG_HYBRID_ENABLED`
-- `REFINER_RAG_RERANK_ENABLED`
-- `REFINER_RAG_RETRIEVAL_GRADER_ENABLED`
-- `REFINER_RAG_SELF_CORRECTION_ENABLED`
+- `REFINER_RAG_ASYNC_INDEX_BUILDS`
+- `REFINER_ASSISTANT_HYBRID_RETRIEVAL_ENABLED`
+- `REFINER_ASSISTANT_RETRIEVAL_RERANK_ENABLED`
+- `REFINER_ASSISTANT_RETRIEVAL_COVERAGE_ENABLED`
+- `REFINER_ASSISTANT_RETRIEVAL_RETRY_ENABLED`
 
 ## Continuum / Deployment Changes
 
@@ -760,6 +785,8 @@ No ingress or hostname changes are required.
 
 Create an offline evaluation harness under `tests/evals/assistant_rag/`.
 
+The first golden suites now exist for rewrite/regression checks, citation binding coverage, and unsafe tool-use refusals.
+
 Minimum suites:
 
 - query rewriting correctness
@@ -783,7 +810,7 @@ Minimum tracked metrics:
 
 The assistant/RAG slice reaches the target architecture when all of the following are true:
 
-- assistant and RAG route logic no longer lives in `refiner_web.py`
+- assistant and RAG route logic no longer lives in `refiner/refiner_web.py`
 - assistant shared state is Postgres-backed by default
 - collection artefacts are versioned on shared storage
 - hybrid retrieval is available behind a stable service interface

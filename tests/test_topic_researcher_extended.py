@@ -1,7 +1,7 @@
 import pytest
 import json
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
+from refiner.topic_researcher import TopicResearcher
 
 @pytest.fixture
 def mock_llm():
@@ -89,8 +89,8 @@ def test_sanitize_cql_reversed_in(researcher):
     expected = '(creator IN ("User A", "User B") OR contributor IN ("User A", "User B"))'
     assert sanitized["cql"] == expected
 
-@patch('topic_researcher.get_provider')
-@patch('topic_researcher.requests.Session')
+@patch('refiner.topic_researcher.get_provider')
+@patch('refiner.topic_researcher.requests.Session')
 def test_topic_researcher_with_context(mock_session_class, mock_get_provider, mock_llm, tmp_path):
     mock_get_provider.return_value = mock_llm
     
@@ -138,7 +138,7 @@ def test_topic_researcher_with_context(mock_session_class, mock_get_provider, mo
     assert "Additional context from URL" in user_content
     assert "Local context info" in user_content
 
-@patch('topic_researcher.get_provider')
+@patch('refiner.topic_researcher.get_provider')
 def test_agentic_debate_logic(mock_get_provider, mock_llm, tmp_path):
     mock_get_provider.return_value = mock_llm
     
@@ -167,7 +167,7 @@ def test_agentic_debate_logic(mock_get_provider, mock_llm, tmp_path):
     assert "Critic feedback" in editor_call[0][0][0]['content']
     assert "Professional British Editor" in editor_call[1]['system']
 
-@patch('topic_researcher.get_provider')
+@patch('refiner.topic_researcher.get_provider')
 def test_identify_thin_sections(mock_get_provider):
     mock_llm = MagicMock()
     mock_get_provider.return_value = mock_llm
@@ -196,9 +196,9 @@ Short.
     assert "Substantial" not in thin
     assert "Report" not in thin # Main title should be excluded
 
-@patch('topic_researcher.get_provider')
-@patch('topic_researcher.jira_fetch_issues')
-@patch('topic_researcher._conf_get')
+@patch('refiner.topic_researcher.get_provider')
+@patch('refiner.topic_researcher.jira_fetch_issues')
+@patch('refiner.topic_researcher._conf_get')
 def test_detect_and_expand_outline(mock_conf_get, mock_jira_fetch, mock_get_provider, mock_llm, tmp_path):
     mock_get_provider.return_value = mock_llm
     
@@ -275,7 +275,7 @@ def test_detect_and_expand_outline(mock_conf_get, mock_jira_fetch, mock_get_prov
     assert "Section 2" in content
     assert "# Test Document" in content
 
-@patch('topic_researcher.get_provider')
+@patch('refiner.topic_researcher.get_provider')
 def test_cql_page_auto_correction(mock_get_provider):
     mock_llm = MagicMock()
     mock_get_provider.return_value = mock_llm
@@ -294,7 +294,7 @@ def test_cql_page_auto_correction(mock_get_provider):
     assert "page =" not in queries["cql"]
     assert "title =" in queries["cql"]
 
-@patch('topic_researcher.get_provider')
+@patch('refiner.topic_researcher.get_provider')
 def test_cql_page_tilde_auto_correction(mock_get_provider):
     mock_llm = MagicMock()
     mock_get_provider.return_value = mock_llm
@@ -313,8 +313,8 @@ def test_cql_page_tilde_auto_correction(mock_get_provider):
     assert "page ~" not in queries["cql"]
     assert "title ~" in queries["cql"]
 
-@patch('topic_researcher.get_provider')
-@patch('topic_researcher._conf_get')
+@patch('refiner.topic_researcher.get_provider')
+@patch('refiner.topic_researcher._conf_get')
 def test_cql_400_fallback(mock_conf_get, mock_get_provider):
     mock_llm = MagicMock()
     mock_get_provider.return_value = mock_llm
@@ -343,9 +343,9 @@ def test_cql_400_fallback(mock_conf_get, mock_get_provider):
     assert "confluence_pages" in results
     
 
-@patch('topic_researcher.get_provider')
-@patch('topic_researcher.jira_fetch_issues')
-@patch('topic_researcher._conf_get')
+@patch('refiner.topic_researcher.get_provider')
+@patch('refiner.topic_researcher.jira_fetch_issues')
+@patch('refiner.topic_researcher._conf_get')
 def test_topic_researcher_resume_from_existing(mock_conf_get, mock_jira_fetch, mock_get_provider, mock_llm, tmp_path):
     mock_get_provider.return_value = mock_llm
     
@@ -392,9 +392,9 @@ def test_topic_researcher_resume_from_existing(mock_conf_get, mock_jira_fetch, m
     assert "Thin Section" in content
     assert "Refined content" in content
 
-@patch('topic_researcher.get_provider')
-@patch('topic_researcher.jira_fetch_issues')
-@patch('topic_researcher._conf_get')
+@patch('refiner.topic_researcher.get_provider')
+@patch('refiner.topic_researcher.jira_fetch_issues')
+@patch('refiner.topic_researcher._conf_get')
 def test_topic_researcher_no_resume_if_irrelevant(mock_conf_get, mock_jira_fetch, mock_get_provider, mock_llm, tmp_path):
     mock_get_provider.return_value = mock_llm
     
@@ -438,9 +438,9 @@ def test_topic_researcher_no_resume_if_irrelevant(mock_conf_get, mock_jira_fetch
     assert "Irrelevant content" not in content
     assert "Totally Different Topic" not in content
 
-@patch('topic_researcher.get_provider')
-@patch('topic_researcher.jira_fetch_issues')
-@patch('topic_researcher._conf_get')
+@patch('refiner.topic_researcher.get_provider')
+@patch('refiner.topic_researcher.jira_fetch_issues')
+@patch('refiner.topic_researcher._conf_get')
 def test_topic_researcher_immediate_complete_if_resumed_perfect(mock_conf_get, mock_jira_fetch, mock_get_provider, mock_llm, tmp_path):
     mock_get_provider.return_value = mock_llm
     
@@ -496,7 +496,7 @@ def test_topic_researcher_immediate_complete_if_resumed_perfect(mock_conf_get, m
 
 @pytest.fixture
 def researcher():
-    with patch("topic_researcher.get_provider"):
+    with patch("refiner.topic_researcher.get_provider"):
         r = TopicResearcher(
             jira_base_url="https://test.atlassian.net",
             jira_auth=("user", "token"),
@@ -671,9 +671,9 @@ def test_sanitize_all_hallucinated_containers(researcher):
     assert 'text ~ "GHOST"' in sanitized["jql"]
     assert 'text ~ "PHANTOM"' in sanitized["cql"]
 
-@patch("topic_researcher.get_provider")
-@patch("topic_researcher.jira_fetch_issues")
-@patch("topic_researcher._conf_get")
+@patch("refiner.topic_researcher.get_provider")
+@patch("refiner.topic_researcher.jira_fetch_issues")
+@patch("refiner.topic_researcher._conf_get")
 def test_completeness_feedback_integration(mock_conf_get, mock_jira_fetch, mock_get_provider, tmp_path):
     mock_llm = MagicMock()
     mock_llm.get_context_window.return_value = 8192
@@ -703,7 +703,7 @@ def test_completeness_feedback_integration(mock_conf_get, mock_jira_fetch, mock_
         MagicMock(text='# Draft 2 Polished')
     ]
     
-    from topic_researcher import TopicResearcher
+    from refiner.topic_researcher import TopicResearcher
     researcher = TopicResearcher(
         jira_base_url="https://test.atlassian.net",
         jira_auth=("user", "pass"),

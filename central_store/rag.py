@@ -166,6 +166,50 @@ class PostgresRagMetadataStore:
             ),
         )
 
+    def _upsert_collection_version_state(
+        self,
+        conn: Any,
+        *,
+        owner: str,
+        name: str,
+        version_id: str,
+        status: str,
+        artifact_path: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO nm_rag_collection_versions (
+                version_id,
+                owner,
+                name,
+                status,
+                artifact_path,
+                source_count,
+                document_count,
+                chunk_count,
+                metadata,
+                published_at
+            )
+            VALUES (%s, %s, %s, %s, %s, 0, 0, 0, %s, NULL)
+            ON CONFLICT (version_id) DO UPDATE
+            SET status = EXCLUDED.status,
+                artifact_path = COALESCE(NULLIF(EXCLUDED.artifact_path, ''), nm_rag_collection_versions.artifact_path),
+                metadata = CASE
+                    WHEN EXCLUDED.metadata = '{}'::jsonb THEN nm_rag_collection_versions.metadata
+                    ELSE nm_rag_collection_versions.metadata || EXCLUDED.metadata
+                END
+            """,
+            (
+                version_id,
+                owner,
+                name,
+                clamp_text(status, default="building", max_length=24),
+                clamp_text(artifact_path, max_length=2048) or None,
+                jsonb(metadata),
+            ),
+        )
+
     def start_collection_build(
         self,
         owner: str,
@@ -192,37 +236,14 @@ class PostgresRagMetadataStore:
                     status=status,
                     metadata=metadata,
                 )
-                conn.execute(
-                    """
-                    INSERT INTO nm_rag_collection_versions (
-                        version_id,
-                        owner,
-                        name,
-                        status,
-                        artifact_path,
-                        source_count,
-                        document_count,
-                        chunk_count,
-                        metadata,
-                        published_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, 0, 0, 0, %s, NULL)
-                    ON CONFLICT (version_id) DO UPDATE
-                    SET status = EXCLUDED.status,
-                        artifact_path = COALESCE(NULLIF(EXCLUDED.artifact_path, ''), nm_rag_collection_versions.artifact_path),
-                        metadata = CASE
-                            WHEN EXCLUDED.metadata = '{}'::jsonb THEN nm_rag_collection_versions.metadata
-                            ELSE EXCLUDED.metadata
-                        END
-                    """,
-                    (
-                        version_id,
-                        owner,
-                        name,
-                        clamp_text(status, default="building", max_length=24),
-                        clamp_text(artifact_path, max_length=2048) or None,
-                        jsonb(metadata),
-                    ),
+                self._upsert_collection_version_state(
+                    conn,
+                    owner=owner,
+                    name=name,
+                    version_id=version_id,
+                    status=status,
+                    artifact_path=artifact_path,
+                    metadata=metadata,
                 )
         return version_id
 
@@ -251,37 +272,51 @@ class PostgresRagMetadataStore:
                     status=status,
                     metadata=metadata,
                 )
-                conn.execute(
-                    """
-                    INSERT INTO nm_rag_collection_versions (
-                        version_id,
-                        owner,
-                        name,
-                        status,
-                        artifact_path,
-                        source_count,
-                        document_count,
-                        chunk_count,
-                        metadata,
-                        published_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, 0, 0, 0, %s, NULL)
-                    ON CONFLICT (version_id) DO UPDATE
-                    SET status = EXCLUDED.status,
-                        artifact_path = COALESCE(NULLIF(EXCLUDED.artifact_path, ''), nm_rag_collection_versions.artifact_path),
-                        metadata = CASE
-                            WHEN EXCLUDED.metadata = '{}'::jsonb THEN nm_rag_collection_versions.metadata
-                            ELSE EXCLUDED.metadata
-                        END
-                    """,
-                    (
-                        version_id,
-                        owner,
-                        name,
-                        clamp_text(status, default="failed", max_length=24),
-                        clamp_text(artifact_path, max_length=2048) or None,
-                        jsonb(metadata),
-                    ),
+                self._upsert_collection_version_state(
+                    conn,
+                    owner=owner,
+                    name=name,
+                    version_id=version_id,
+                    status=status,
+                    artifact_path=artifact_path,
+                    metadata=metadata,
+                )
+        return version_id
+
+    def stage_collection_version(
+        self,
+        owner: str,
+        name: str,
+        *,
+        version_id: str,
+        status: str = "publishing",
+        scope: str = "user",
+        artifact_path: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        owner = clamp_text(owner, max_length=128)
+        name = clamp_text(name, max_length=128)
+        version_id = clamp_text(version_id, max_length=128)
+        if not owner or not name or not version_id:
+            return ""
+        with self.store.pool.connection() as conn:
+            with conn.transaction():
+                self._upsert_collection_state(
+                    conn,
+                    owner=owner,
+                    name=name,
+                    scope=scope,
+                    status=status,
+                    metadata=metadata,
+                )
+                self._upsert_collection_version_state(
+                    conn,
+                    owner=owner,
+                    name=name,
+                    version_id=version_id,
+                    status=status,
+                    artifact_path=artifact_path,
+                    metadata=metadata,
                 )
         return version_id
 
@@ -366,7 +401,10 @@ class PostgresRagMetadataStore:
                         source_count = EXCLUDED.source_count,
                         document_count = EXCLUDED.document_count,
                         chunk_count = EXCLUDED.chunk_count,
-                        metadata = EXCLUDED.metadata,
+                        metadata = CASE
+                            WHEN EXCLUDED.metadata = '{}'::jsonb THEN nm_rag_collection_versions.metadata
+                            ELSE nm_rag_collection_versions.metadata || EXCLUDED.metadata
+                        END,
                         published_at = NOW()
                     """,
                     (

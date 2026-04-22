@@ -1,8 +1,6 @@
 import json
 
-import web_research as wr
-
-
+from refiner import web_research as wr
 class _Response:
     def __init__(self, status_code=200, *, reason="OK", text="", content=b"", headers=None, encoding="utf-8"):
         self.status_code = status_code

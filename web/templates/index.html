@@ -624,7 +624,7 @@
             </div>
 
             <div class="field">
-              <label for="extraArgs" class="has-tip" data-tooltip="Raw CLI arguments passed to run_refiner.py. Use this for anything not covered above.">Extra CLI Args (optional)</label>
+              <label for="extraArgs" class="has-tip" data-tooltip="Raw CLI arguments passed to the refiner.run_refiner workflow router. Use this for anything not covered above.">Extra CLI Args (optional)</label>
               <input id="extraArgs" type="text" placeholder="--llm-timeout 120 --post-comments">
             </div>
 
@@ -767,7 +767,7 @@
           <div class="cli-builder">
             <div class="card-header">
               <h3 class="has-tip" data-tooltip="Click a bubble to open a pop-up with choices. Your selections build a CLI args string you can apply below.">CLI Args Builder</h3>
-              <p>Click bubbles to add flags and options. This helps build accurate run_refiner.py arguments.</p>
+              <p>Click bubbles to add flags and options. This helps build accurate `refiner.run_refiner` arguments.</p>
             </div>
             <div class="bubble-row" id="cliBubbles"></div>
             <div id="bubblePopover" class="bubble-popover" hidden>

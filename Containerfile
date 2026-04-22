@@ -1,6 +1,6 @@
 ARG BASE_IMAGE=python:3.11-slim-bookworm
 
-FROM ${BASE_IMAGE} AS builder
+FROM ${BASE_IMAGE} AS source-metadata
 
 ARG BUILD_NUMBER=0
 ARG GIT_COMMIT=unknown
@@ -54,7 +54,7 @@ RUN case "${BUILD_NUMBER}" in \
 RUN mkdir -p /src/data \
     && PYTHONPATH=/src /opt/venv/bin/python - <<'PY'
 import json
-from capability_analyzer import analyse_repo
+from refiner.capability_analyzer import analyse_repo
 
 with open("/src/data/capabilities_report.json", "w", encoding="utf-8") as handle:
     json.dump(analyse_repo("/src"), handle, ensure_ascii=True)
@@ -149,9 +149,9 @@ RUN sed -i '/-proposed/d' /etc/apt/sources.list /etc/apt/sources.list.d/*.list |
     && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /bin/sh "${APP_USER}" \
     && mkdir -p ${REFINER_JOB_DIR} /tmp/refiner
 
-COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /src ${APP_HOME}
-COPY --from=builder /usr/local/bin/nvidia-smi /usr/local/bin/nvidia-smi
+COPY --from=source-metadata /opt/venv /opt/venv
+COPY --from=source-metadata /src ${APP_HOME}
+COPY --from=source-metadata /usr/local/bin/nvidia-smi /usr/local/bin/nvidia-smi
 RUN chown -R "${APP_UID}:${APP_GID}" ${APP_HOME} /tmp/refiner
 
 EXPOSE 5001

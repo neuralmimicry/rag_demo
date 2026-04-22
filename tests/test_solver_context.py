@@ -1,4 +1,4 @@
-from solver_context import (
+from refiner.solver_context import (
     PromptSection,
     assemble_prompt_sections,
     estimate_prompt_budget_chars,

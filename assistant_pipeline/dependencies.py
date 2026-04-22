@@ -42,9 +42,10 @@ class AssistantPipelineDependencies:
     format_skill_brief: Callable[[Any], str]
     is_admin_user: Callable[[str], bool]
     mcp_execute: Callable[..., Any]
+    execute_atlassian_action: Optional[Callable[..., Any]]
     resolve_llm_settings: Callable[..., Dict[str, Any]]
     build_request_llm_provider: Callable[..., Any]
-    acquire_request_capacity: Callable[[Any, float], bool]
+    acquire_request_capacity: Callable[..., bool]
     guardrail_scan: Callable[[str], Optional[str]]
     stt_motion_context: Callable[[Optional[Dict[str, Any]]], Tuple[str, str, bool]]
     is_marketing_assistant_request: Callable[[Dict[str, Any], str], bool]
@@ -65,3 +66,4 @@ class AssistantPipelineDependencies:
     estimate_job_tokens: Callable[[Dict[str, Any]], int]
     opencode_available_for_playground: Callable[[], bool]
     submit_subtask: Optional[Callable[..., Any]] = None
+    record_runtime_telemetry: Optional[Callable[[str, Dict[str, Any]], Any]] = None

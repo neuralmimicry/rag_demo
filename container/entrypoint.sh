@@ -19,22 +19,9 @@ if [ -z "${REFINER_FRONTEND_PORT:-}" ] && [ -n "${PORT:-}" ]; then
   export REFINER_FRONTEND_PORT="$PORT"
 fi
 
-resolve_python_entry() {
-  local path="$1"
-  if [ -f "$path" ]; then
-    printf '%s\n' "$path"
-    return 0
-  fi
-  if [ -f "${path}c" ]; then
-    printf '%s\n' "${path}c"
-    return 0
-  fi
-  return 1
-}
-
-backend_script="$(resolve_python_entry "refiner_web.py" || true)"
-frontend_script="$(resolve_python_entry "frontend_server.py" || true)"
-cli_script="$(resolve_python_entry "run_refiner.py" || true)"
+BACKEND_MODULE="${REFINER_BACKEND_MODULE:-refiner.refiner_web}"
+FRONTEND_MODULE="${REFINER_FRONTEND_MODULE:-refiner.frontend_server}"
+CLI_MODULE="${REFINER_CLI_MODULE:-refiner.run_refiner}"
 
 gpu_status="not_detected"
 gpu_source="none"
@@ -63,18 +50,10 @@ echo "Refiner: GPU detection=${gpu_status} source=${gpu_source}"
 
 case "$mode" in
   backend)
-    [ -n "$backend_script" ] || {
-      echo "Missing refiner backend script (expected refiner_web.py or refiner_web.pyc)." >&2
-      exit 1
-    }
-    exec python "$backend_script" "$@"
+    exec python -m "$BACKEND_MODULE" "$@"
     ;;
   frontend)
-    [ -n "$frontend_script" ] || {
-      echo "Missing frontend server script (expected frontend_server.py or frontend_server.pyc)." >&2
-      exit 1
-    }
-    exec python "$frontend_script" "$@"
+    exec python -m "$FRONTEND_MODULE" "$@"
     ;;
   tests|test|suite)
     if [ ! -d tests ]; then
@@ -87,17 +66,13 @@ case "$mode" in
     exec pytest tests
     ;;
   smoke)
-    if [ -f refiner_web.py ] && [ -f run_refiner.py ]; then
-      exec python -m py_compile refiner_web.py run_refiner.py "$@"
+    if [ -f refiner/refiner_web.py ] && [ -f refiner/run_refiner.py ]; then
+      exec python -m py_compile refiner/refiner_web.py refiner/run_refiner.py "$@"
     fi
-    exec python -c 'import refiner_web, run_refiner'
+    exec python -c 'from refiner import refiner_web, run_refiner'
     ;;
   cli)
-    [ -n "$cli_script" ] || {
-      echo "Missing CLI runner script (expected run_refiner.py or run_refiner.pyc)." >&2
-      exit 1
-    }
-    exec python "$cli_script" "$@"
+    exec python -m "$CLI_MODULE" "$@"
     ;;
   full|combined|stack)
     exec ./scripts/start_refiner_stack.sh "$@"

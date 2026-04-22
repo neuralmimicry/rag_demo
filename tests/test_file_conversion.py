@@ -1,8 +1,8 @@
 import os
 import pytest
 from unittest.mock import MagicMock, patch
-from file_converter import FileConverter
-from llm_providers import LLMProvider, LLMResponse
+from refiner.file_converter import FileConverter
+from refiner.llm_providers import LLMProvider, LLMResponse
 
 @pytest.fixture
 def mock_llm():
@@ -137,8 +137,8 @@ def test_transcribe_audio(tmp_path, mock_llm):
     mock_llm.transcribe.assert_called_once_with(str(f), timeout=None)
 
 def test_read_source_binary_url(mock_llm):
-    from topic_researcher import TopicResearcher
-    with patch("topic_researcher.requests.Session") as mock_session_class:
+    from refiner.topic_researcher import TopicResearcher
+    with patch("refiner.topic_researcher.requests.Session") as mock_session_class:
         mock_session = MagicMock()
         mock_session_class.return_value = mock_session
         mock_resp = MagicMock()
@@ -147,7 +147,7 @@ def test_read_source_binary_url(mock_llm):
         mock_resp.headers = {"Content-Type": "application/pdf"}
         mock_session.get.return_value = mock_resp
         
-        with patch("topic_researcher.get_provider") as mock_get_provider:
+        with patch("refiner.topic_researcher.get_provider") as mock_get_provider:
             mock_get_provider.return_value = mock_llm
             # Mock the structured extraction API used by TopicResearcher.
             with patch("file_converter.FileConverter.extract") as mock_extract:

@@ -12,15 +12,15 @@ The orchestration layer exists to:
 
 ## Modules
 
-- `refiner_ai_orchestration.py`
+- `refiner/refiner_ai_orchestration.py`
   Central concurrent-provider wrapper, provider registry loading, scoring, and metrics persistence.
-- `refiner_ai_routing_profiles.py`
+- `refiner/refiner_ai_routing_profiles.py`
   Shared routing-contract loader used to keep Refiner's fallback tags aligned with Gail's runtime contract.
-- `refiner_ai_specialists.py`
+- `refiner/refiner_ai_specialists.py`
   Specialist-engine registry, concurrent specialist analysis, and AARNN fallback attachment logic.
-- `refiner_ai_aarnn.py`
+- `refiner/refiner_ai_aarnn.py`
   AARNN/SNN-AER adapter that can use HTTP, Unix datagram AER transport, or deterministic offline heuristics.
-- `refiner_ai_aer.py`
+- `refiner/refiner_ai_aer.py`
   Python implementation of the `AER1` binary format used by `aarnn_rust`.
 
 ## Workflow Breakdown

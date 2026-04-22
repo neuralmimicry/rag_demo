@@ -1,6 +1,6 @@
 import pytest
 
-from refiner_settings import (
+from refiner.refiner_settings import (
     SettingsValidationError,
     metadata_with_settings,
     settings_from_metadata,

@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
+from refiner.topic_researcher import TopicResearcher
 import requests
 
 @pytest.fixture
@@ -9,10 +9,10 @@ def mock_llm():
     llm.predict.return_value = MagicMock(text="Fallback search results")
     return llm
 
-@patch('topic_researcher.get_provider')
-@patch('topic_researcher.requests.Session')
-@patch('topic_researcher.jira_fetch_issues')
-@patch('topic_researcher._conf_get')
+@patch('refiner.topic_researcher.get_provider')
+@patch('refiner.topic_researcher.requests.Session')
+@patch('refiner.topic_researcher.jira_fetch_issues')
+@patch('refiner.topic_researcher._conf_get')
 def test_jira_fetch_failure_fallback(mock_conf_get, mock_jira_fetch, mock_session_class, mock_get_provider, mock_llm):
     mock_get_provider.return_value = mock_llm
     
@@ -43,8 +43,8 @@ def test_jira_fetch_failure_fallback(mock_conf_get, mock_jira_fetch, mock_sessio
     # In the new implementation, it should NOT just be an error dict if fallback succeeded
     assert any("error" not in issue for issue in results["jira_issues"])
 
-@patch('topic_researcher.get_provider')
-@patch('topic_researcher.requests.Session')
+@patch('refiner.topic_researcher.get_provider')
+@patch('refiner.topic_researcher.requests.Session')
 def test_read_source_failure_fallback(mock_session_class, mock_get_provider, mock_llm):
     mock_get_provider.return_value = mock_llm
     

@@ -1,8 +1,8 @@
 import pytest
 import os
 from unittest.mock import MagicMock, patch
-from llm_providers import OpenAIProvider, GeminiProvider, OllamaProvider, get_provider
-from topic_researcher import TopicResearcher
+from refiner.llm_providers import OpenAIProvider, GeminiProvider, OllamaProvider, get_provider
+from refiner.topic_researcher import TopicResearcher
 
 def test_openai_context_window():
     with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}):
@@ -47,7 +47,7 @@ def test_topic_researcher_dynamic_thresholds():
     # Mock 128k context window (e.g. gpt-4o)
     mock_llm.get_context_window.return_value = 128000
     
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
         researcher = TopicResearcher(
             jira_base_url="https://test.atlassian.net",
             jira_auth=("user", "pass"),
@@ -60,7 +60,7 @@ def test_topic_researcher_dynamic_thresholds():
         
     # Mock 4k context window (e.g. gpt-3.5-turbo or small local)
     mock_llm.get_context_window.return_value = 4096
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
         researcher = TopicResearcher(
             jira_base_url="https://test.atlassian.net",
             jira_auth=("user", "pass"),
@@ -69,7 +69,7 @@ def test_topic_researcher_dynamic_thresholds():
         assert researcher.token_threshold == 1024 # 4096 // 4
         assert researcher.max_content_chars == 8192 # 4096 * 2
 
-@patch("topic_researcher.get_provider")
+@patch("refiner.topic_researcher.get_provider")
 def test_efficient_context_trigger(mock_get_provider):
     mock_llm = MagicMock()
     mock_llm.get_context_window.return_value = 4000 # 1000 threshold

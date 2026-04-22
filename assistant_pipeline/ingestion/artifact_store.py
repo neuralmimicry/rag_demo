@@ -58,7 +58,7 @@ def load_index_artifact(path: str) -> Any:
             payload = json.load(handle)
         if not isinstance(payload, dict):
             return None
-        from rag_engine import RagIndex
+        from refiner.rag_engine import RagIndex
 
         index = RagIndex.from_dict(payload)
     except Exception:

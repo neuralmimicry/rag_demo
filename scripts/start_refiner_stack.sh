@@ -329,8 +329,7 @@ NMSTT_WORKERS="${NMSTT_WORKERS:-${STT_WORKERS:-$(default_nmstt_workers)}}"
 NMSTT_MAX_AUDIO_BYTES="${NMSTT_MAX_AUDIO_BYTES:-${STT_MAX_AUDIO_BYTES:-8000000}}"
 NMSTT_BUILD="${NMSTT_BUILD:-${STT_BUILD:-1}}"
 
-REFINER_WEB_SCRIPT="${REFINER_WEB_SCRIPT:-${ROOT_DIR}/refiner_web.py}"
-REFINER_WEB_SCRIPT="$(resolve_python_entry "${REFINER_WEB_SCRIPT}" || true)"
+REFINER_WEB_MODULE="${REFINER_WEB_MODULE:-refiner.refiner_web}"
 REFINER_HOST="${REFINER_HOST:-127.0.0.1}"
 REFINER_PORT="${REFINER_PORT:-5001}"
 PYTHON_BIN="${PYTHON_BIN:-}"
@@ -364,8 +363,6 @@ require_cmd curl
 require_cmd "${PYTHON_BIN}"
 
 [[ -x "${PYTHON_BIN}" ]] || die "Python executable not found or not executable: ${PYTHON_BIN}"
-[[ -n "${REFINER_WEB_SCRIPT}" ]] || die "Missing refiner web script: ${ROOT_DIR}/refiner_web.py(.pyc)"
-
 if (( FORCE_START_NMSTT == 1 )); then
   MANAGE_LOCAL_NMSTT=1
 elif [[ -n "${REFINER_STT_SERVER_URL:-}" ]]; then
@@ -459,8 +456,8 @@ wait_for_external_nmstt() {
 }
 
 start_refiner() {
-  log "Starting refiner_web with REFINER_STT_SERVER_URL=${REFINER_STT_SERVER_URL}"
-  "${PYTHON_BIN}" "${REFINER_WEB_SCRIPT}" >>"${REFINER_LOG}" 2>&1 &
+  log "Starting ${REFINER_WEB_MODULE} with REFINER_STT_SERVER_URL=${REFINER_STT_SERVER_URL}"
+  "${PYTHON_BIN}" -m "${REFINER_WEB_MODULE}" >>"${REFINER_LOG}" 2>&1 &
   REFINER_PID="$!"
 
   wait_for_http_with_pid "${REFINER_HEALTH_URL}" "refiner_web" "${REFINER_PID}" "${HEALTH_TIMEOUT_SEC}"

@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
+from refiner.topic_researcher import TopicResearcher
 
 @pytest.fixture
 def mock_llm():
@@ -11,7 +11,7 @@ def mock_llm():
 
 @pytest.fixture
 def researcher(mock_llm):
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
         return TopicResearcher(
             jira_base_url="https://test.atlassian.net",
             jira_auth=("user", "token"),
@@ -33,8 +33,8 @@ def test_extract_references(researcher):
         assert "FAKE-999" in jira_refs
         assert "789" in conf_refs
 
-@patch("topic_researcher.jira_fetch_issues")
-@patch("topic_researcher._conf_get")
+@patch("refiner.topic_researcher.jira_fetch_issues")
+@patch("refiner.topic_researcher._conf_get")
 def test_sanity_check_verifies_references(mock_conf_get, mock_jira_fetch, researcher, mock_llm):
     # Mock research data
     research_data = {

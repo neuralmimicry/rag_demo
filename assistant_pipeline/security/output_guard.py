@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Tuple
 
-from security_utils import redact_text
+from refiner.security_utils import redact_text
 
 from assistant_pipeline.contracts import ServiceError
 from assistant_pipeline.security.policies import AssistantSecurityPolicy
@@ -19,12 +19,14 @@ _UK_NI_RE = re.compile(r"\b(?:[A-CEGHJ-PR-TW-Z]{2}\d{6}[A-D])\b", flags=re.IGNOR
 _CARD_RE = re.compile(r"\b(?:\d[ -]*?){13,16}\b")
 _REDACTABLE_TEXT_KEYS = {
     "answer",
+    "claim_text",
     "context",
     "reply",
     "requirements_text",
     "rationale",
     "summary",
     "text",
+    "text_preview",
     "value",
 }
 _REDACTABLE_STRING_LIST_KEYS = {"steps"}
@@ -146,11 +148,19 @@ def _validate_output_shape(route: str, payload: Dict[str, Any]) -> None:
     if route == "assistant_rag_mcp":
         _require_string(route, payload, "answer")
         _require_list(route, payload, "rag_matches")
+        if "citations" in payload:
+            _require_list(route, payload, "citations")
+        if "claim_bindings" in payload:
+            _require_list(route, payload, "claim_bindings")
+        if "citation_audit" in payload:
+            _require_dict(route, payload, "citation_audit")
         return
     if route == "rag_query":
         for key in ("name", "query", "context"):
             _require_string(route, payload, key)
         _require_list(route, payload, "matches")
+        if "citations" in payload:
+            _require_list(route, payload, "citations")
 
 
 def apply_output_guard(

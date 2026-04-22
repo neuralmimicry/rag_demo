@@ -1,4 +1,4 @@
-from refiner_ai_aer import AerEvent, decode_events, decode_spikes, decode_spikes_auto, encode_events, encode_spikes
+from refiner.refiner_ai_aer import AerEvent, decode_events, decode_spikes, decode_spikes_auto, encode_events, encode_spikes
 
 
 def test_aer_round_trip_spike_vector():

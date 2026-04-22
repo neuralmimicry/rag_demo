@@ -24,10 +24,10 @@ Nov.19th Initial commit to repository
 - Prompts updated so insights end with a `Draft ticket` section; Jira comment upsert remains unchanged and includes the draft by posting the full assessment.
 
 2025-12-23 Topic Research and Document Generation
-- Added `topic_researcher.py` for iterative document generation based on a topic and requirements.
+- Added `refiner/topic_researcher.py` for iterative document generation based on a topic and requirements.
 - Supports querying Jira, Confluence, LLMs, and Search Engines (simulated via LLM).
 - Ensures document is comprehensive and uses professional British English.
-- Exposed functionality via `--topic-research` CLI argument in `run_refiner.py`.
+- Exposed functionality via `--topic-research` CLI argument in `refiner/run_refiner.py`.
 - Added tests to verify iterative research and document formulation.
 - Extended with `--context` support to provide additional URLs and documents for context, relevance, and focus.
 - Integrated an agentic debate mechanism using multiple LLM roles (Critic, Editor) to fine-tune the document.
@@ -37,16 +37,16 @@ Nov.19th Initial commit to repository
   - Automatic conversion of remote binary files from URLs.
 - Fixed packaging and installation:
   - Configured `pyproject.toml` to correctly export the `refiner` package from the project root.
-  - Added `sys.path` injection in `__init__.py` and `cli.py` to support legacy top-level imports when invoked via the console script.
-- Fixed `AttributeError` in `topic_researcher.py` where `LLMResponse` was incorrectly accessed via `.content` instead of `.text`.
+  - Added `sys.path` injection in `__init__.py` and `refiner/cli.py` to support legacy top-level imports when invoked via the console script.
+- Fixed `AttributeError` in `refiner/topic_researcher.py` where `LLMResponse` was incorrectly accessed via `.content` instead of `.text`.
 - Enhanced `TopicResearcher` with URL failure fallback logic:
   - Added `_fallback_url_research` to analyse failed URLs (Jira, Confluence, or general) using LLM.
   - Automatically attempts alternative searches (Web, Jira Keywords, Confluence Keywords) when primary fetches or search queries fail.
   - Improved robustness of `--topic-research` and `--context` fetching.
 - Robust LLM Timeout Configuration:
-  - Added `--llm-timeout` CLI argument to `run_refiner.py`.
+  - Added `--llm-timeout` CLI argument to `refiner/run_refiner.py`.
   - Added `LLM_TIMEOUT_SECONDS` environment variable support.
-  - Corrected `llm_providers.py` to allow overriding the default 180-second timeout, particularly useful for local LLMs like Ollama.
+  - Corrected `refiner/llm_providers.py` to allow overriding the default 180-second timeout, particularly useful for local LLMs like Ollama.
 - Improved Research Robustness and Query Generation:
   - Updated LLM prompts to ensure valid JQL/CQL query strings, preventing malformed URL-style parameter splitting.
   - Enhanced `TopicResearcher` to detect Jira/Confluence URLs in context/source and fetch them via authenticated APIs if direct access fails.
@@ -55,9 +55,9 @@ Nov.19th Initial commit to repository
 
 2025-12-23 Logging, Debug, and Status Monitoring
 - Implemented a robust logging system with support for verbose and debug levels.
-- Added CLI arguments `--verbose` (-v), `--debug` (-d), and `--log-file` to `run_refiner.py`.
+- Added CLI arguments `--verbose` (-v), `--debug` (-d), and `--log-file` to `refiner/run_refiner.py`.
 - Enhanced `TopicResearcher` with real-time status updates (prefixed with `[*]`) to monitor progress during long-running research tasks.
-- Added detailed debug logging across all major modules (`llm_providers.py`, `jira_analysis.py`, `confluence_analysis.py`, `file_converter.py`):
+- Added detailed debug logging across all major modules (`refiner/llm_providers.py`, `refiner/jira_analysis.py`, `refiner/confluence_analysis.py`, `refiner/file_converter.py`):
   - Truncated LLM request payloads and responses.
   - Detailed Jira and Confluence API request logs.
   - File conversion process details and results.
@@ -120,7 +120,7 @@ Nov.19th Initial commit to repository
 - Added a `_quota_reached` circuit breaker in `TopicResearcher` to prevent redundant failing LLM calls once a quota limit is detected.
 - Implemented `_heuristic_relevance_check` (keyword-based) as an alternate non-LLM method for content relevance verification when LLM quota is hit.
 - Enhanced `TopicResearcher` with primary-to-secondary LLM failover support (`_predict_with_fallback`), allowing research to continue seamlessly using a secondary provider (e.g., Ollama) if the primary hits a limit.
-- Exposed `--fallback-llm-provider` and `--fallback-llm-model` CLI arguments in `run_refiner.py`.
+- Exposed `--fallback-llm-provider` and `--fallback-llm-model` CLI arguments in `refiner/run_refiner.py`.
 - Updated all core research functions to use robust failover logic, ensuring better resilience during long-running tasks.
 - Added a comprehensive test suite for quota detection and failover mechanisms.
 
@@ -128,7 +128,7 @@ Nov.19th Initial commit to repository
 - Extended `TopicResearcher` to track comprehensive metadata (titles, URLs, identifiers) for all Jira, Confluence, and Web sources used during research.
 - Added automated source recording during API fetches and search engine queries.
 - Implemented `_generate_bibliography` to produce a structured Markdown file containing all references grouped by source type.
-- Exposed `--references-output` CLI argument in `run_refiner.py` to allow users to specify a separate file for the report's bibliography.
+- Exposed `--references-output` CLI argument in `refiner/run_refiner.py` to allow users to specify a separate file for the report's bibliography.
 - Added unit tests to verify accurate bibliography generation and saving.
 
 2025-12-30 Robust Query Execution and Sanitization

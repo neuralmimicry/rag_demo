@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llm_providers import LLMError, OllamaProvider
-from refiner_ai_model_inventory import (
+from refiner.llm_providers import LLMError, OllamaProvider
+from refiner.refiner_ai_model_inventory import (
     AIModelInventoryMonitor,
     build_model_inventory_snapshot,
     resolve_ollama_model_for_request,

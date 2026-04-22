@@ -5,21 +5,20 @@ import types
 
 def test_run_refiner_import_and_attr():
     # Ensure importing CLI module does not execute workflow and exposes run
-    import run_refiner
+    from refiner import run_refiner
     assert hasattr(run_refiner, "run")
 
 
 def test_run_topic_research_uses_config_loader_not_main(monkeypatch, tmp_path):
-    import config_loader
-    import credentials
-
+    from refiner import config_loader
+    from refiner import credentials
     source_file = tmp_path / "topic.txt"
     source_file.write_text("Topic: Test", encoding="utf-8")
     output_file = tmp_path / "output.md"
 
     calls = {}
 
-    fake_topic_researcher = types.ModuleType("topic_researcher")
+    fake_topic_researcher = types.ModuleType("refiner.topic_researcher")
 
     class DummyTopicResearcher:
         def __init__(self, **kwargs):
@@ -37,7 +36,7 @@ def test_run_topic_research_uses_config_loader_not_main(monkeypatch, tmp_path):
                 handle.write("# Stub Research\n")
 
     fake_topic_researcher.TopicResearcher = DummyTopicResearcher
-    monkeypatch.setitem(sys.modules, "topic_researcher", fake_topic_researcher)
+    monkeypatch.setitem(sys.modules, "refiner.topic_researcher", fake_topic_researcher)
 
     broken_main = types.ModuleType("main")
 
@@ -47,8 +46,8 @@ def test_run_topic_research_uses_config_loader_not_main(monkeypatch, tmp_path):
     broken_main.__getattr__ = _unexpected_main_access
     monkeypatch.setitem(sys.modules, "main", broken_main)
 
-    sys.modules.pop("run_refiner", None)
-    run_refiner = importlib.import_module("run_refiner")
+    sys.modules.pop("refiner.run_refiner", None)
+    run_refiner = importlib.import_module("refiner.run_refiner")
 
     monkeypatch.setattr(
         config_loader,

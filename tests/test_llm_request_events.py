@@ -1,6 +1,6 @@
 import pytest
 
-from llm_providers import (
+from refiner.llm_providers import (
     LLMProvider,
     LLMQuotaError,
     LLMResponse,

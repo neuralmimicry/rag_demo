@@ -1,5 +1,5 @@
-from solver_command_policy import evaluate_command_policy
-from solver_command_trust import CommandTrustStore
+from refiner.solver_command_policy import evaluate_command_policy
+from refiner.solver_command_trust import CommandTrustStore
 
 
 def test_command_trust_store_promotes_repeat_successes(tmp_path):

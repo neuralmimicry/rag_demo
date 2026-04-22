@@ -1,7 +1,7 @@
 import sys
 
-import project_solver
-from solver_command_policy import evaluate_command_policy
+from refiner import project_solver
+from refiner.solver_command_policy import evaluate_command_policy
 
 
 def test_command_policy_allows_simple_verification_with_env_prefix():

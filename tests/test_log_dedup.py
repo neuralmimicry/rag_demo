@@ -1,8 +1,6 @@
 from types import SimpleNamespace as NS
 
-import main as m
-
-
+from refiner import main as m
 def test_rank_auto_retry_log_prints_once_per_jql(monkeypatch):
     # Ensure AVOID_RANK_ORDER is disabled so auto-retry path is used
     monkeypatch.setattr(m, "AVOID_RANK_ORDER", False, raising=False)

@@ -3,8 +3,8 @@
 This project provides security controls that support ISO 27001 and SOC 2 alignment. It does not, by itself, confer certification. Compliance depends on your operating environment, policies, and evidence collection.
 
 ### Scope
-- Web control plane: `refiner_web.py` (auth, secrets, jobs, RAG/MCP).
-- CLI workflows: `run_refiner.py`, `project_solver.py`, `topic_researcher.py`.
+- Web control plane: `refiner/refiner_web.py` (auth, secrets, jobs, RAG/MCP).
+- CLI workflows: `refiner/run_refiner.py`, `refiner/project_solver.py`, `refiner/topic_researcher.py`.
 - Data at rest: job metadata, logs, secrets store, RAG indexes.
 
 ### Implemented control highlights

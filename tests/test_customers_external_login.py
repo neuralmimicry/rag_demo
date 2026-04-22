@@ -4,7 +4,7 @@ import pytest
 
 HAS_REAL_FLASK = hasattr(flask.Flask, "test_client")
 if HAS_REAL_FLASK:
-    import refiner_web  # noqa: E402
+    from refiner import refiner_web  # noqa: E402
 
 
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")

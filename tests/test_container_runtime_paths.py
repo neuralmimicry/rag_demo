@@ -1,13 +1,13 @@
 import json
 
-import capabilities
+from refiner import capabilities
 import flask
 import pytest
 
 
 HAS_REAL_FLASK = hasattr(flask.Flask, "test_client")
 if HAS_REAL_FLASK:
-    import refiner_web  # noqa: E402
+    from refiner import refiner_web  # noqa: E402
 
 
 def test_load_analysis_uses_bundled_report_when_runtime_source_is_absent(monkeypatch, tmp_path):
@@ -37,6 +37,7 @@ def test_load_analysis_uses_bundled_report_when_runtime_source_is_absent(monkeyp
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
 def test_resolve_python_script_path_prefers_bytecode_when_source_is_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(refiner_web, "BASE_DIR", str(tmp_path))
+    monkeypatch.setattr(refiner_web, "PACKAGE_DIR", str(tmp_path))
     bytecode_path = tmp_path / "run_refiner.pyc"
     bytecode_path.write_bytes(b"")
 

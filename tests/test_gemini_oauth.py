@@ -2,7 +2,7 @@
 import pytest
 import os
 from unittest.mock import patch, MagicMock
-from llm_providers import GeminiProvider, LLMError
+from refiner.llm_providers import GeminiProvider, LLMError
 
 def test_gemini_oauth_init():
     with patch.dict(os.environ, {"GEMINI_ACCESS_TOKEN": "test-token"}, clear=True):

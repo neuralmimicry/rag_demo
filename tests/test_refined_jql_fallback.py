@@ -1,9 +1,7 @@
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
-import main as m
-
-
+from refiner import main as m
 def test_refined_jql_zero_results_clears_cache_and_falls_back(monkeypatch, tmp_path):
     # Arrange: run in a temp cwd so cache path is predictable
     monkeypatch.chdir(tmp_path)
@@ -84,7 +82,7 @@ def test_projects_only_refinement_tries_broadened_query(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
 
     # Avoid interactive input
-    import main as m
+    from refiner import main as m
     monkeypatch.setattr(m, "get_credentials", lambda: ("user", "token"))
 
     fake_jira = NS()
@@ -139,7 +137,7 @@ def test_final_recent_epics_fallback_before_base(monkeypatch, tmp_path):
     # Ensure isolated cwd
     monkeypatch.chdir(tmp_path)
 
-    import main as m
+    from refiner import main as m
     monkeypatch.setattr(m, "get_credentials", lambda: ("user", "token"))
     fake_jira = NS()
     monkeypatch.setattr(m, "create_jira_connection", lambda u, p: fake_jira)
@@ -191,7 +189,7 @@ def test_final_recent_epics_fallback_before_base(monkeypatch, tmp_path):
 def test_min_results_relaxation_projects_only(monkeypatch, tmp_path):
     # Arrange
     monkeypatch.chdir(tmp_path)
-    import main as m
+    from refiner import main as m
     monkeypatch.setattr(m, "get_credentials", lambda: ("user", "token"))
     fake_jira = NS()
     monkeypatch.setattr(m, "create_jira_connection", lambda u, p: fake_jira)
@@ -239,7 +237,7 @@ def test_min_results_relaxation_projects_only(monkeypatch, tmp_path):
 def test_min_results_env_override(monkeypatch, tmp_path):
     # With MIN_RESULTS=3, a refined result of 2 should trigger relaxation steps
     monkeypatch.chdir(tmp_path)
-    import main as m
+    from refiner import main as m
     monkeypatch.setenv("MIN_RESULTS", "3")
     monkeypatch.setattr(m, "get_credentials", lambda: ("user", "token"))
     fake_jira = NS()
@@ -279,7 +277,7 @@ def test_min_results_env_override(monkeypatch, tmp_path):
 def test_ultra_broad_final_fallback(monkeypatch, tmp_path):
     # After all fallbacks (broadened, recent epics, recent delivery) yield empty, ultra-broad should be tried
     monkeypatch.chdir(tmp_path)
-    import main as m
+    from refiner import main as m
     monkeypatch.setattr(m, "get_credentials", lambda: ("user", "token"))
     fake_jira = NS()
     monkeypatch.setattr(m, "create_jira_connection", lambda u, p: fake_jira)
@@ -331,7 +329,7 @@ def test_ultra_broad_final_fallback(monkeypatch, tmp_path):
 def test_extreme_broad_after_ultra_broad_empty(monkeypatch, tmp_path):
     # When even ultra-broad returns empty, we try an extreme-broad no-filter query
     monkeypatch.chdir(tmp_path)
-    import main as m
+    from refiner import main as m
     monkeypatch.setattr(m, "get_credentials", lambda: ("user", "token"))
     fake_jira = NS()
     monkeypatch.setattr(m, "create_jira_connection", lambda u, p: fake_jira)
@@ -388,7 +386,7 @@ def test_extreme_broad_after_ultra_broad_empty(monkeypatch, tmp_path):
 def test_force_ultra_broad_env(monkeypatch, tmp_path):
     # With FORCE_ULTRA_BROAD=1, discovery should be bypassed and updated-only query used first
     monkeypatch.chdir(tmp_path)
-    import main as m
+    from refiner import main as m
     monkeypatch.setenv("FORCE_ULTRA_BROAD", "1")
     # Need to reload module-level constants respecting env? Not necessary; main reads FORCE_ULTRA_BROAD at import time.
     # Work around by updating attribute directly

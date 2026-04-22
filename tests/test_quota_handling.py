@@ -1,8 +1,8 @@
 import pytest
 import json
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
-from llm_providers import LLMQuotaError, LLMResponse
+from refiner.topic_researcher import TopicResearcher
+from refiner.llm_providers import LLMQuotaError, LLMResponse
 
 @pytest.fixture
 def mock_primary_llm():
@@ -18,7 +18,7 @@ def mock_fallback_llm():
     llm.estimate_tokens.side_effect = lambda x: len(x) // 4
     return llm
 
-@patch('topic_researcher.get_provider')
+@patch('refiner.topic_researcher.get_provider')
 def test_quota_relevance_heuristic_fallback(mock_get_provider, mock_primary_llm):
     mock_get_provider.return_value = mock_primary_llm
     
@@ -64,7 +64,7 @@ def test_heuristic_relevance_logic():
     # Irrelevant
     assert researcher._heuristic_relevance_check("How to bake a cake with flour", topic, reqs) is False
 
-@patch('topic_researcher.get_provider')
+@patch('refiner.topic_researcher.get_provider')
 def test_quota_provider_fallback(mock_get_provider, mock_primary_llm, mock_fallback_llm):
     # Setup mock_get_provider to return primary then fallback
     mock_get_provider.side_effect = [mock_primary_llm, mock_fallback_llm]
@@ -89,7 +89,7 @@ def test_quota_provider_fallback(mock_get_provider, mock_primary_llm, mock_fallb
     assert mock_primary_llm.predict.call_count == 1
     assert mock_fallback_llm.predict.call_count == 1
 
-@patch('topic_researcher.get_provider')
+@patch('refiner.topic_researcher.get_provider')
 def test_circuit_breaker_prevents_llm_calls(mock_get_provider, mock_primary_llm):
     mock_get_provider.return_value = mock_primary_llm
     

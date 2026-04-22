@@ -2,10 +2,11 @@ import json
 import logging
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
-from llm_providers import LLMResponse
-from refiner_ai_orchestration import orchestrate_provider_candidates, orchestration_status
-from refiner_ai_specialists import analyze_specialist_engines
+from refiner.llm_providers import LLMResponse
+from refiner.refiner_ai_orchestration import orchestrate_provider_candidates, orchestration_status
+from refiner.refiner_ai_specialists import analyze_specialist_engines
 
 
 class _FakeProvider:
@@ -85,6 +86,35 @@ class _FallbackModelProvider(_FakeProvider):
         return LLMResponse(
             text=self.text,
             raw={"provider": self.name, "model": self.model},
+            provider=self.name,
+            model=self.model,
+        )
+
+
+class _LeanResponseProvider(_FakeProvider):
+    def predict(
+        self,
+        messages,
+        max_tokens=None,
+        temperature=0.2,
+        system=None,
+        timeout=None,
+        reasoning_effort=None,
+    ):
+        self.calls.append(
+            {
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "system": system,
+                "timeout": timeout,
+                "reasoning_effort": reasoning_effort,
+                "started_at": time.time(),
+            }
+        )
+        time.sleep(self.delay)
+        return SimpleNamespace(
+            text=self.text,
             provider=self.name,
             model=self.model,
         )
@@ -251,6 +281,36 @@ def test_orchestrator_fastest_mode_returns_first_acceptable_success(tmp_path, mo
 
     assert response.provider == "fast"
     assert elapsed < 0.12
+    assert response.raw["refiner_ai"]["returned_early"] is True
+
+
+def test_orchestrator_tolerates_provider_responses_without_raw_payload(tmp_path, monkeypatch):
+    fast = _LeanResponseProvider("fast", "m1", "A quick acceptable answer.", delay=0.02)
+    slow = _LeanResponseProvider("slow", "m2", "A slower acceptable answer.", delay=0.08)
+    metrics_path = tmp_path / "provider_metrics.json"
+    monkeypatch.setenv("REFINER_AI_REGISTRY_PATH", str(metrics_path))
+    monkeypatch.setenv("REFINER_AARNN_ENABLED", "0")
+
+    provider = orchestrate_provider_candidates(
+        [fast, slow],
+        workflow="assistant_requirements",
+        role="assistant",
+        include_configured=False,
+        config_path=str(tmp_path / "missing-config.json"),
+        selection_mode="fastest",
+        max_candidates=2,
+    )
+    assert provider is not None
+
+    response = provider.predict(
+        messages=[{"role": "user", "content": "Say hello."}],
+        system="Answer in concise prose.",
+    )
+
+    assert response.provider == "fast"
+    assert response.model == "m1"
+    assert response.raw["provider"] == "fast"
+    assert response.raw["model"] == "m1"
     assert response.raw["refiner_ai"]["returned_early"] is True
 
 

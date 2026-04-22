@@ -1,9 +1,7 @@
 import os
 from types import SimpleNamespace as NS
 
-import main as m
-
-
+from refiner import main as m
 def make_issue(project_key="PRJ", created="2025-01-01", duedate="2025-02-01", done=False):
     status = NS(statusCategory=NS(key=("done" if done else "indeterminate")))
     fields = NS(

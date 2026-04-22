@@ -1,6 +1,7 @@
 from assistant_pipeline.retrieval import dense_artifact_path_for_index, search_dense
-from document_schema import DocumentElement
-from rag_engine import RagDocument, RagIndex, RagStore, chunk_text
+from assistant_pipeline.ingestion.artifact_store import write_versioned_index_artifact
+from refiner.document_schema import DocumentElement
+from refiner.rag_engine import RagDocument, RagIndex, RagStore, chunk_text
 
 
 def test_chunk_text_respects_overlap():
@@ -68,6 +69,28 @@ def test_rag_store_delete_index_removes_dense_sidecar(tmp_path):
     assert store.delete_index("alice", "idx") is True
     assert not tmp_path.joinpath("alice", "idx.json").exists()
     assert not tmp_path.joinpath("alice", "idx.dense.json").exists()
+
+
+def test_rag_store_mirror_index_artifact_copies_versioned_payload_and_dense_sidecar(tmp_path):
+    active_store = RagStore(str(tmp_path / "active"))
+    version_root = tmp_path / "versioned"
+    docs = [RagDocument(doc_id="1", source="doc.txt", text="retry failed operations after sync", metadata={})]
+    index = RagIndex.build("idx", docs)
+
+    version_path = write_versioned_index_artifact(str(version_root), "alice", "idx", "version-1", index)
+    active_path = active_store.mirror_index_artifact("alice", "idx", version_path)
+    version_dense_path = dense_artifact_path_for_index(version_path)
+    active_dense_path = dense_artifact_path_for_index(active_path)
+
+    assert active_path
+    assert version_dense_path
+    assert active_dense_path
+    assert tmp_path.joinpath("active", "alice", "idx.json").read_text(encoding="utf-8") == (
+        tmp_path.joinpath("versioned", "collections", "alice", "idx", "version-1", "index.json").read_text(encoding="utf-8")
+    )
+    assert tmp_path.joinpath("active", "alice", "idx.dense.json").read_text(encoding="utf-8") == (
+        tmp_path.joinpath("versioned", "collections", "alice", "idx", "version-1", "index.dense.json").read_text(encoding="utf-8")
+    )
 
 
 def test_rag_index_prefers_layout_aware_chunks_and_citations():
