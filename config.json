@@ -7,10 +7,6 @@
     {
       "name": "NeuralMimicryConfluence",
       "confluence_url": "https://neuralmimicry.atlassian.net"
-    },
-    {
-      "name": "Galactic",
-      "confluence_url": "https://galactic.virginmedia.co.uk"
     }
   ],
   "llm_providers": [

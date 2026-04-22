@@ -16,6 +16,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
+from assistant_pipeline.retrieval.dense_artifacts import (
+    DenseIndexArtifact,
+    attach_dense_artifact,
+    dense_artifact_path_for_index,
+    ensure_dense_artifact,
+)
 from document_schema import DocumentElement, coerce_document_elements, format_locator, format_source_citation
 
 
@@ -265,6 +271,8 @@ class RagIndex:
         self.chunks = chunks
         self.idf = idf
         self.avg_len = avg_len or 1.0
+        self.dense_artifact: Optional[DenseIndexArtifact] = None
+        self._dense_chunk_lookup: Dict[str, RagChunk] = {}
 
     @classmethod
     def build(
@@ -407,6 +415,17 @@ class RagStore:
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name or "index")
         return os.path.join(self.root, safe_owner, f"{safe_name}.json")
 
+    def _write_json_atomic(self, path: str, payload: Dict[str, Any]) -> None:
+        tmp = f"{path}.tmp"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+
     def list_indexes(self, owner: str) -> List[Dict[str, Any]]:
         """List persisted index names and chunk counts for one owner."""
         safe_owner = re.sub(r"[^A-Za-z0-9_.-]+", "_", owner or "default")
@@ -415,7 +434,7 @@ class RagStore:
             return []
         results = []
         for filename in os.listdir(owner_dir):
-            if not filename.endswith(".json"):
+            if not filename.endswith(".json") or filename.endswith(".dense.json"):
                 continue
             path = os.path.join(owner_dir, filename)
             try:
@@ -434,9 +453,11 @@ class RagStore:
     def save_index(self, owner: str, index: RagIndex) -> str:
         """Persist an index and return the file path used."""
         path = self._index_path(owner, index.name)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(index.to_dict(), handle)
+        self._write_json_atomic(path, index.to_dict())
+        dense_artifact = ensure_dense_artifact(index)
+        dense_path = dense_artifact_path_for_index(path)
+        if dense_path:
+            self._write_json_atomic(dense_path, dense_artifact.to_dict())
         return path
 
     def load_index(self, owner: str, name: str) -> Optional[RagIndex]:
@@ -447,17 +468,31 @@ class RagStore:
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
-            return RagIndex.from_dict(payload)
+            index = RagIndex.from_dict(payload)
         except Exception:
             return None
+        dense_path = dense_artifact_path_for_index(path)
+        if dense_path and os.path.exists(dense_path):
+            try:
+                with open(dense_path, "r", encoding="utf-8") as handle:
+                    dense_payload = json.load(handle)
+                if isinstance(dense_payload, dict):
+                    attach_dense_artifact(index, DenseIndexArtifact.from_dict(dense_payload))
+            except Exception:
+                pass
+        return index
 
     def delete_index(self, owner: str, name: str) -> bool:
         """Delete a persisted index, returning success state."""
         path = self._index_path(owner, name)
-        if not os.path.exists(path):
-            return False
-        try:
-            os.remove(path)
-            return True
-        except Exception:
-            return False
+        dense_path = dense_artifact_path_for_index(path)
+        deleted = False
+        for target in (path, dense_path):
+            if not target or not os.path.exists(target):
+                continue
+            try:
+                os.remove(target)
+                deleted = True
+            except Exception:
+                return False
+        return deleted

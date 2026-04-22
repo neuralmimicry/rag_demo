@@ -1,3 +1,4 @@
+from assistant_pipeline.retrieval import dense_artifact_path_for_index, search_dense
 from document_schema import DocumentElement
 from rag_engine import RagDocument, RagIndex, RagStore, chunk_text
 
@@ -32,6 +33,41 @@ def test_rag_store_round_trip(tmp_path):
     assert loaded.name == "idx"
     assert len(loaded.chunks) == len(index.chunks)
     assert store.delete_index("alice", "idx")
+
+
+def test_rag_store_persists_dense_sidecar_and_keeps_listing_clean(tmp_path):
+    store = RagStore(str(tmp_path))
+    docs = [RagDocument(doc_id="1", source="doc.txt", text="retry failed operations after sync", metadata={})]
+    index = RagIndex.build("idx", docs)
+
+    saved_path = store.save_index("alice", index)
+    dense_path = dense_artifact_path_for_index(saved_path)
+    listed = store.list_indexes("alice")
+    loaded = store.load_index("alice", "idx")
+
+    assert dense_path
+    assert dense_path.endswith(".dense.json")
+    assert tmp_path.joinpath("alice", "idx.dense.json").exists()
+    assert listed == [{"name": "idx", "chunks": len(index.chunks)}]
+    assert loaded is not None
+    result = search_dense(loaded, "retrying failed operation", limit=1, min_score=0.05)
+    assert result.candidates
+    assert result.metadata["backend"] == "persisted"
+
+
+def test_rag_store_delete_index_removes_dense_sidecar(tmp_path):
+    store = RagStore(str(tmp_path))
+    docs = [RagDocument(doc_id="1", source="doc.txt", text="retry failed operations after sync", metadata={})]
+    index = RagIndex.build("idx", docs)
+
+    saved_path = store.save_index("alice", index)
+    dense_path = dense_artifact_path_for_index(saved_path)
+
+    assert dense_path
+    assert tmp_path.joinpath("alice", "idx.dense.json").exists()
+    assert store.delete_index("alice", "idx") is True
+    assert not tmp_path.joinpath("alice", "idx.json").exists()
+    assert not tmp_path.joinpath("alice", "idx.dense.json").exists()
 
 
 def test_rag_index_prefers_layout_aware_chunks_and_citations():

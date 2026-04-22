@@ -62,9 +62,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 from llm_providers import get_provider, LLMError, LLMProvider, register_event_callback
-from document_schema import coerce_document_elements
-from file_converter import FileConverter
-from rag_engine import RagDocument, RagIndex, RagStore
+from rag_engine import RagIndex, RagStore
 from stt_learning import SttLearningStore
 from stt_gesture_planner import plan_stt_avatar_motion, sanitize_avatar_mode, sanitize_gesture_mode
 from nmstt_contracts import NmsttGesturePlanRequest, sanitize_nmstt_motion_response
@@ -88,9 +86,32 @@ from thought_inbox import (
 )
 from refiner_routes.voice import register_voice_routes
 from refiner_routes.assistant import register_assistant_routes
+from refiner_routes.rag import register_rag_routes
 from refiner_routes.admin import register_admin_routes
 from refiner_routes.auth import register_auth_routes
 from refiner_routes.jobs import register_jobs_routes
+from assistant_api.admin_handlers import build_assistant_admin_handlers
+from assistant_api.assistant_handlers import build_assistant_handlers
+from assistant_api.rag_handlers import build_rag_handlers
+from assistant_pipeline import service as assistant_service
+from assistant_pipeline.contracts import ServiceError
+from assistant_pipeline.dependencies import AssistantPipelineDependencies
+from assistant_pipeline.ingestion import (
+    build_rag_documents as _build_rag_documents_impl,
+    coerce_rag_sources as _coerce_rag_sources_impl,
+)
+from assistant_pipeline.memory.episodic_store import (
+    assistant_memory_entry_line as _assistant_memory_entry_line_impl,
+    assistant_memory_matches as _assistant_memory_matches_impl,
+    assistant_memory_prompt_block as _assistant_memory_prompt_block_impl,
+    assistant_memory_query_text as _assistant_memory_query_text_impl,
+    assistant_memory_reference_payload as _assistant_memory_reference_payload_impl,
+    assistant_memory_requirement_ids as _assistant_memory_requirement_ids_impl,
+    assistant_memory_scope as _assistant_memory_scope_impl,
+    assistant_memory_summary as _assistant_memory_summary_impl,
+    record_assistant_memory as _record_assistant_memory_impl,
+    should_use_assistant_ask_memory as _should_use_assistant_ask_memory_impl,
+)
 from security_utils import (
     AuditLogger,
     attach_redaction_filter,
@@ -114,7 +135,6 @@ from refiner_settings import (
     validate_settings_patch,
 )
 from versioning import get_public_version_info, get_version_info
-from web_research import fetch_url_content, fetch_youtube_transcript, is_youtube_url
 from refiner_ai_orchestration import build_workflow_provider, orchestration_status
 from refiner_ai_model_inventory import AIModelInventoryMonitor
 
@@ -309,6 +329,74 @@ STT_GESTURE_DEFAULT_AVATAR_MODE = (os.getenv("REFINER_STT_GESTURE_DEFAULT_AVATAR
 _STT_SERVER_SESSION_LOCAL = threading.local()
 ASSISTANT_MAX_CONCURRENT = max(1, int(os.getenv("REFINER_ASSISTANT_MAX_CONCURRENT", "6")))
 ASSISTANT_CAPACITY_WAIT_SEC = max(0.0, float(os.getenv("REFINER_ASSISTANT_CAPACITY_WAIT_SEC", "0.5")))
+ASSISTANT_SECURITY_POLICY_ENABLED = _env_flag("REFINER_ASSISTANT_SECURITY_POLICY_ENABLED", True)
+ASSISTANT_SECURITY_STRICT_MESSAGE_ROLES = _env_flag("REFINER_ASSISTANT_SECURITY_STRICT_MESSAGE_ROLES", False)
+ASSISTANT_SECURITY_BLOCK_PROMPT_LEAK = _env_flag("REFINER_ASSISTANT_SECURITY_BLOCK_PROMPT_LEAK", False)
+ASSISTANT_SECURITY_VALIDATE_RAG_SOURCE_URLS = _env_flag(
+    "REFINER_ASSISTANT_SECURITY_VALIDATE_RAG_SOURCE_URLS",
+    False,
+)
+ASSISTANT_OUTPUT_REDACT_PII = _env_flag("REFINER_ASSISTANT_OUTPUT_REDACT_PII", False)
+ASSISTANT_OUTPUT_VALIDATE_SHAPES = _env_flag("REFINER_ASSISTANT_OUTPUT_VALIDATE_SHAPES", True)
+ASSISTANT_INTENT_ROUTING_ENABLED = _env_flag("REFINER_ASSISTANT_INTENT_ROUTING_ENABLED", False)
+ASSISTANT_ROUTING_SKILL_HINT_LIMIT = max(1, int(os.getenv("REFINER_ASSISTANT_ROUTING_SKILL_HINT_LIMIT", "4")))
+ASSISTANT_ROUTING_CAPABILITY_MAX_ITEMS = max(
+    1,
+    int(os.getenv("REFINER_ASSISTANT_ROUTING_CAPABILITY_MAX_ITEMS", "4")),
+)
+ASSISTANT_SEMANTIC_CACHE_ENABLED = _env_flag("REFINER_ASSISTANT_SEMANTIC_CACHE_ENABLED", False)
+ASSISTANT_SEMANTIC_CACHE_TTL_HOURS = max(0.0, float(os.getenv("REFINER_ASSISTANT_SEMANTIC_CACHE_TTL_HOURS", "12")))
+ASSISTANT_SEMANTIC_CACHE_MIN_SIMILARITY = min(
+    1.0,
+    max(0.0, float(os.getenv("REFINER_ASSISTANT_SEMANTIC_CACHE_MIN_SIMILARITY", "0.94"))),
+)
+ASSISTANT_SEMANTIC_CACHE_MAX_CANDIDATES = max(
+    1,
+    int(os.getenv("REFINER_ASSISTANT_SEMANTIC_CACHE_MAX_CANDIDATES", "20")),
+)
+ASSISTANT_HYBRID_RETRIEVAL_ENABLED = _env_flag("REFINER_ASSISTANT_HYBRID_RETRIEVAL_ENABLED", False)
+ASSISTANT_HYBRID_RETRIEVAL_SPARSE_WEIGHT = min(
+    1.0,
+    max(0.0, float(os.getenv("REFINER_ASSISTANT_HYBRID_RETRIEVAL_SPARSE_WEIGHT", "0.65"))),
+)
+ASSISTANT_HYBRID_RETRIEVAL_DENSE_WEIGHT = min(
+    1.0,
+    max(0.0, float(os.getenv("REFINER_ASSISTANT_HYBRID_RETRIEVAL_DENSE_WEIGHT", "0.35"))),
+)
+ASSISTANT_HYBRID_RETRIEVAL_CANDIDATE_MULTIPLIER = max(
+    1,
+    int(os.getenv("REFINER_ASSISTANT_HYBRID_RETRIEVAL_CANDIDATE_MULTIPLIER", "4")),
+)
+ASSISTANT_HYBRID_RETRIEVAL_MIN_DENSE_SCORE = min(
+    1.0,
+    max(0.0, float(os.getenv("REFINER_ASSISTANT_HYBRID_RETRIEVAL_MIN_DENSE_SCORE", "0.18"))),
+)
+ASSISTANT_RETRIEVAL_COVERAGE_ENABLED = _env_flag("REFINER_ASSISTANT_RETRIEVAL_COVERAGE_ENABLED", False)
+ASSISTANT_RETRIEVAL_MIN_QUERY_TERM_COVERAGE = min(
+    1.0,
+    max(0.0, float(os.getenv("REFINER_ASSISTANT_RETRIEVAL_MIN_QUERY_TERM_COVERAGE", "0.5"))),
+)
+ASSISTANT_RETRIEVAL_MIN_MATCH_COUNT = max(
+    0,
+    int(os.getenv("REFINER_ASSISTANT_RETRIEVAL_MIN_MATCH_COUNT", "1")),
+)
+ASSISTANT_RETRIEVAL_MIN_CONTEXT_CHARS = max(
+    0,
+    int(os.getenv("REFINER_ASSISTANT_RETRIEVAL_MIN_CONTEXT_CHARS", "24")),
+)
+ASSISTANT_RETRIEVAL_RETRY_ENABLED = _env_flag("REFINER_ASSISTANT_RETRIEVAL_RETRY_ENABLED", False)
+ASSISTANT_RETRIEVAL_MAX_RETRY_QUERIES = max(
+    0,
+    int(os.getenv("REFINER_ASSISTANT_RETRIEVAL_MAX_RETRY_QUERIES", "3")),
+)
+ASSISTANT_RETRIEVAL_MIN_CLAUSE_TERMS = max(
+    1,
+    int(os.getenv("REFINER_ASSISTANT_RETRIEVAL_MIN_CLAUSE_TERMS", "2")),
+)
+ASSISTANT_RETRIEVAL_REFUSE_ON_INSUFFICIENT = _env_flag(
+    "REFINER_ASSISTANT_RETRIEVAL_REFUSE_ON_INSUFFICIENT",
+    True,
+)
 _STT_REQUEST_CAPACITY = threading.BoundedSemaphore(STT_MAX_CONCURRENT)
 _ASSISTANT_REQUEST_CAPACITY = threading.BoundedSemaphore(ASSISTANT_MAX_CONCURRENT)
 JOB_ACTION_WORKERS = max(1, int(os.getenv("REFINER_JOB_ACTION_WORKERS", "2")))
@@ -466,6 +554,8 @@ RAG_MAX_DOC_BYTES = int(os.getenv("REFINER_RAG_MAX_DOC_BYTES", "600000"))
 RAG_DEFAULT_CHUNK_SIZE = int(os.getenv("REFINER_RAG_CHUNK_SIZE", "1200"))
 RAG_DEFAULT_CHUNK_OVERLAP = int(os.getenv("REFINER_RAG_CHUNK_OVERLAP", "200"))
 RAG_DEFAULT_MAX_CHUNKS = int(os.getenv("REFINER_RAG_MAX_CHUNKS", "2000"))
+RAG_ASYNC_INDEX_BUILDS = _env_flag("REFINER_RAG_ASYNC_INDEX_BUILDS", False)
+RAG_BUILD_TIMEOUT_SEC = max(5.0, float(os.getenv("REFINER_RAG_BUILD_TIMEOUT_SEC", str(SUBTASK_TIMEOUT_SEC))))
 NMCHAIN = NmChainClient.from_env()
 CUSTOMERS_SERVICE = CustomersClient.from_env()
 BILLING_SERVICE = BillingClient.from_env()
@@ -1550,52 +1640,8 @@ def _normalise_allowed_roots() -> List[str]:
     return sorted(set(roots))
 
 
-def _is_path_allowed(path: str, allowed_roots: Optional[List[str]] = None) -> bool:
-    if not path:
-        return False
-    roots = allowed_roots or _normalise_allowed_roots()
-    try:
-        abs_path = os.path.abspath(path)
-    except Exception:
-        return False
-    for root in roots:
-        if abs_path == root or abs_path.startswith(root + os.sep):
-            return True
-    return False
-
-
-def _safe_source_label(path: str) -> str:
-    return os.path.basename(path) or path
-
-
 def _coerce_rag_sources(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    sources = []
-    raw_sources = payload.get("sources")
-    if isinstance(raw_sources, list):
-        for item in raw_sources:
-            if isinstance(item, dict):
-                sources.append(item)
-            elif isinstance(item, str):
-                cleaned = item.strip()
-                if not cleaned:
-                    continue
-                if cleaned.startswith(("http://", "https://")):
-                    sources.append({"url": cleaned})
-                else:
-                    sources.append({"path": cleaned})
-    raw_paths = payload.get("paths")
-    if isinstance(raw_paths, list):
-        for path in raw_paths:
-            if isinstance(path, str):
-                sources.append({"path": path})
-    raw_urls = payload.get("urls")
-    if isinstance(raw_urls, list):
-        for url in raw_urls:
-            if isinstance(url, str):
-                cleaned = url.strip()
-                if cleaned:
-                    sources.append({"url": cleaned})
-    return sources
+    return _coerce_rag_sources_impl(payload)
 
 
 def _build_rag_documents(
@@ -1604,89 +1650,13 @@ def _build_rag_documents(
     max_docs: int,
     max_doc_bytes: int,
     allowed_roots: Optional[List[str]] = None,
-) -> List[RagDocument]:
-    docs: List[RagDocument] = []
-    converter = FileConverter(llm=None, llm_params=None)
-    for idx, entry in enumerate(sources[:max_docs], start=1):
-        if not isinstance(entry, dict):
-            continue
-        text = entry.get("text")
-        path = entry.get("path")
-        url = entry.get("url")
-        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
-        source_label = entry.get("source") or entry.get("title")
-        elements = coerce_document_elements(entry.get("elements") or [])
-        if path and isinstance(path, str):
-            path = path.strip()
-            if not path:
-                continue
-            if not _is_path_allowed(path, allowed_roots):
-                continue
-            if not os.path.exists(path):
-                continue
-            try:
-                if os.path.getsize(path) > max_doc_bytes:
-                    continue
-            except Exception:
-                continue
-            source_label = source_label or _safe_source_label(path)
-            extraction = converter.extract(path)
-            text = extraction.text
-            if isinstance(text, str) and text.startswith("Error:"):
-                continue
-            elements = extraction.elements
-            extraction_meta = extraction.summary_metadata()
-            merged_meta = dict(metadata)
-            for key, value in extraction_meta.items():
-                merged_meta.setdefault(key, value)
-            if path:
-                merged_meta.setdefault("source_path", path)
-            metadata = merged_meta
-        elif url and isinstance(url, str):
-            url = url.strip()
-            if not url:
-                continue
-            merged_meta = dict(metadata)
-            merged_meta.setdefault("source_url", url)
-            if is_youtube_url(url):
-                try:
-                    text, transcript_meta = fetch_youtube_transcript(url, timeout=20)
-                except Exception:
-                    continue
-                for key, value in transcript_meta.items():
-                    merged_meta.setdefault(key, value)
-                source_label = source_label or str(transcript_meta.get("title") or url).strip()
-            else:
-                text = fetch_url_content(
-                    url,
-                    timeout=20,
-                    max_bytes=max_doc_bytes,
-                    file_converter=converter,
-                    raise_on_error=False,
-                )
-                if not text:
-                    continue
-                source_label = source_label or url
-            try:
-                if max_doc_bytes and len(text.encode("utf-8")) > max_doc_bytes:
-                    continue
-            except Exception:
-                if max_doc_bytes and len(text) > max_doc_bytes:
-                    continue
-            metadata = merged_meta
-        if not text or not isinstance(text, str):
-            continue
-        doc_id = entry.get("id") or f"doc-{idx:03d}"
-        docs.append(
-            RagDocument(
-                doc_id=str(doc_id),
-                source=str(source_label or doc_id),
-                text=text,
-                metadata=metadata,
-                elements=elements,
-            )
-        )
-    return docs
+) -> List[Any]:
+    return _build_rag_documents_impl(
+        sources,
+        max_docs=max_docs,
+        max_doc_bytes=max_doc_bytes,
+        allowed_roots=allowed_roots or _normalise_allowed_roots(),
+    )
 
 
 def _rag_match_citation(match: Any) -> str:
@@ -5639,6 +5609,7 @@ class SubtaskManager:
                     "details": "Cancelled before execution started.",
                     "status_code": 409,
                 }
+                _mark_subtask_cancelled_side_effects(task)
             return True
 
     def _purge_expired_locked(self) -> None:
@@ -5686,6 +5657,7 @@ class SubtaskManager:
                     task.status = "cancelled"
                     task.finished_at = _now_iso()
                     task.error = task.error or "cancelled_before_execution"
+                    _mark_subtask_cancelled_side_effects(task)
                     self.queue.task_done()
                     continue
                 task.status = "running"
@@ -14531,210 +14503,6 @@ def export_requirements() -> Response:
     return response
 
 
-def rag_indexes() -> Response:
-    """RAG endpoint for indexes."""
-    user = _current_user()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-    indexes = rag_store.list_indexes(user)
-    return jsonify({"indexes": indexes})
-
-
-def rag_index_create() -> Response:
-    """RAG endpoint for index create."""
-    user = _current_user()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True, silent=True) or {}
-    name = str(payload.get("name") or "default").strip()
-    if not name:
-        return jsonify({"error": "name_required"}), 400
-    chunk_size = _safe_int(payload.get("chunk_size"), RAG_DEFAULT_CHUNK_SIZE) or RAG_DEFAULT_CHUNK_SIZE
-    chunk_overlap = _safe_int(payload.get("chunk_overlap"), RAG_DEFAULT_CHUNK_OVERLAP) or RAG_DEFAULT_CHUNK_OVERLAP
-    max_chunks = _safe_int(payload.get("max_chunks"), RAG_DEFAULT_MAX_CHUNKS) or RAG_DEFAULT_MAX_CHUNKS
-    sources = _coerce_rag_sources(payload)
-    if not sources:
-        return jsonify({"error": "sources_required"}), 400
-    docs = _build_rag_documents(
-        sources,
-        max_docs=RAG_MAX_DOCS,
-        max_doc_bytes=RAG_MAX_DOC_BYTES,
-    )
-    if not docs:
-        return jsonify({"error": "no_documents"}), 400
-    index = RagIndex.build(
-        name=name,
-        documents=docs,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        max_chunks=max_chunks,
-    )
-    rag_store.save_index(user, index)
-    return jsonify(
-        {
-            "name": name,
-            "documents": len(docs),
-            "chunks": len(index.chunks),
-        }
-    )
-
-
-def rag_index_delete(name: str) -> Response:
-    """RAG endpoint for index delete."""
-    user = _current_user()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-    if not name:
-        return jsonify({"error": "name_required"}), 400
-    deleted = rag_store.delete_index(user, name)
-    if not deleted:
-        return jsonify({"error": "not_found"}), 404
-    return jsonify({"status": "deleted", "name": name})
-
-
-def rag_query() -> Response:
-    """RAG endpoint for query."""
-    user = _current_user()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True, silent=True) or {}
-    name = str(payload.get("name") or "default").strip()
-    query = str(payload.get("query") or "").strip()
-    if not query:
-        return jsonify({"error": "query_required"}), 400
-    index = rag_store.load_index(user, name)
-    if not index:
-        return jsonify({"error": "index_not_found"}), 404
-    top_k = _safe_int(payload.get("top_k"), 5) or 5
-    min_score = float(payload.get("min_score") or 0.0)
-    matches = index.search(query, limit=top_k, min_score=min_score)
-    context = _render_rag_context(matches)
-    return jsonify(
-        {
-            "name": name,
-            "query": query,
-            "matches": [_serialize_rag_match(m) for m in matches],
-            "context": context,
-        }
-    )
-
-
-def assistant_rag_mcp() -> Response:
-    """Handle the assistant rag mcp route."""
-    user = _current_user()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True, silent=True) or {}
-    prompt = (payload.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({"error": "prompt_required"}), 400
-
-    skills = select_skills(prompt, limit=4)
-    skills_hint = format_skill_brief(skills)
-    capabilities_hint = capability_summary(max_items=4)
-
-    rag_cfg = payload.get("rag") if isinstance(payload.get("rag"), dict) else {}
-    rag_index_name = str(rag_cfg.get("index") or "").strip()
-    rag_matches = []
-    rag_context = ""
-    if rag_index_name:
-        index = rag_store.load_index(user, rag_index_name)
-        if not index:
-            return jsonify({"error": "rag_index_not_found"}), 404
-        top_k = _safe_int(rag_cfg.get("top_k"), 4) or 4
-        matches = index.search(prompt, limit=top_k, min_score=0.0)
-        rag_matches = [_serialize_rag_match(m) for m in matches]
-        rag_context = _render_rag_context(matches)
-
-    mcp_cfg = payload.get("mcp") if isinstance(payload.get("mcp"), dict) else {}
-    mcp_result = None
-    if mcp_cfg:
-        if not _is_admin_user(user):
-            return jsonify({"error": "mcp_forbidden"}), 403
-        server_name = str(mcp_cfg.get("server") or "").strip()
-        tool_name = str(mcp_cfg.get("tool") or "").strip()
-        if not server_name or not tool_name:
-            return jsonify({"error": "mcp_server_and_tool_required"}), 400
-        arguments = mcp_cfg.get("arguments")
-        if arguments is not None and not isinstance(arguments, dict):
-            return jsonify({"error": "mcp_invalid_arguments"}), 400
-        try:
-            mcp_result = _mcp_execute(
-                user,
-                server_name,
-                "call",
-                lambda client: client.call_tool(tool_name, arguments or {}),
-                audit_details={"tool": tool_name, "source": "assistant"},
-                runtime_from_result=lambda _result: {"last_tool": tool_name},
-            )
-        except KeyError:
-            return jsonify({"error": "mcp_server_not_found"}), 404
-        except Exception as exc:
-            return jsonify({"error": "mcp_request_failed", "details": str(exc)}), 400
-
-    provider_hint = payload.get("provider") or payload.get("llm_provider")
-    model_hint = payload.get("model") or payload.get("llm_model")
-    settings = _resolve_llm_settings(user=user, provider_hint=provider_hint, model_hint=model_hint)
-    try:
-        provider = _build_request_llm_provider(
-            user,
-            settings,
-            workflow="assistant_rag_mcp",
-            role="assistant",
-        )
-    except Exception as exc:
-        return jsonify({"error": "llm_init_failed", "details": str(exc)}), 400
-
-    system_lines = [
-        "You are a practical, concise assistant. Use UK British English spelling.",
-        "Use the provided RAG context and MCP data where relevant.",
-        "If the context is insufficient, state what is missing.",
-        "Prefer RAG for stable unstructured context and MCP for live structured data/actions.",
-    ]
-    if capabilities_hint:
-        system_lines.append("Capabilities summary:")
-        system_lines.append(capabilities_hint)
-    if skills_hint:
-        system_lines.append("Relevant skills:")
-        system_lines.append(skills_hint)
-    if rag_context:
-        system_lines.append(
-            "When using RAG context, preserve the supplied source citation labels, "
-            "including page/block locators, in the answer where they support factual claims."
-        )
-    system = "\n".join(system_lines)
-    user_blocks = [f"User request:\n{prompt}"]
-    if rag_context:
-        user_blocks.append(f"RAG context:\n{rag_context}")
-    if mcp_result is not None:
-        user_blocks.append(f"MCP result:\n{json.dumps(mcp_result, ensure_ascii=True)}")
-    user_text = "\n\n".join(user_blocks)
-
-    capacity_acquired = _acquire_request_capacity(_ASSISTANT_REQUEST_CAPACITY, ASSISTANT_CAPACITY_WAIT_SEC)
-    if not capacity_acquired:
-        return jsonify({"error": "assistant_capacity_unavailable"}), 503
-    try:
-        response = provider.predict(
-            messages=[{"role": "user", "content": user_text}],
-            system=system,
-            temperature=payload.get("temperature", 0.2),
-            max_tokens=payload.get("max_tokens", 1200),
-            reasoning_effort=payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or settings.get("reasoning_effort"),
-        )
-    except Exception as exc:
-        return jsonify({"error": "llm_request_failed", "details": str(exc)}), 400
-    finally:
-        _ASSISTANT_REQUEST_CAPACITY.release()
-
-    return jsonify(
-        {
-            "answer": response.text,
-            "rag_matches": rag_matches,
-            "mcp_result": mcp_result,
-        }
-    )
-
-
 def mcp_servers() -> Response:
     """MCP endpoint for servers."""
     user = _current_user()
@@ -15521,6 +15289,31 @@ def _execute_todo_route(
         raise
 
 
+def _mark_subtask_cancelled_side_effects(task: "Subtask") -> None:
+    """Best-effort cleanup for queued subtasks that are cancelled before execution."""
+
+    if not task or task.action != "rag_collection_build":
+        return
+    payload = task.payload if isinstance(task.payload, dict) else {}
+    name = str(payload.get("name") or "").strip()
+    version_id = str(payload.get("_rag_version_id") or payload.get("version_id") or "").strip()
+    if not name or not version_id:
+        return
+    metadata_store = getattr(CENTRAL_STORE, "rag_metadata", None) if CENTRAL_STORE is not None else None
+    if metadata_store is None:
+        return
+    try:
+        metadata_store.fail_collection_build(
+            task.owner,
+            name,
+            version_id=version_id,
+            status="cancelled",
+            metadata={"error_code": "cancelled", "error_detail": "Cancelled before execution started."},
+        )
+    except Exception as exc:  # pragma: no cover - best effort only
+        logger.debug("Cancelled RAG subtask metadata update skipped for %s/%s: %s", task.owner, name, exc)
+
+
 def _execute_subtask(task: Subtask) -> Dict[str, Any]:
     """Dispatch generic subtasks to existing API handlers or TODO route execution helpers."""
     if task.cancel_requested:
@@ -15561,6 +15354,17 @@ def _execute_subtask(task: Subtask) -> Dict[str, Any]:
         if job_id:
             result["job_id"] = job_id
         return result
+    if task.action == "rag_collection_build":
+        try:
+            result = assistant_service.rag_collection_build(
+                _assistant_pipeline_dependencies(),
+                user=task.owner,
+                payload=payload,
+            )
+        except ServiceError as exc:
+            raise SubtaskExecutionError(exc.code, exc.details or exc.code, status_code=exc.status_code) from exc
+        response = result.payload if isinstance(result.payload, dict) else {"data": result.payload}
+        return {"action": task.action, "response": response, "version_id": response.get("version_id")}
     raise SubtaskExecutionError("invalid_action", f"Unsupported subtask action: {task.action}", status_code=400)
 
 
@@ -17073,13 +16877,18 @@ def _assistant_memory_store(user: str) -> SolverEpisodeStore:
     )
 
 
+def _central_assistant_episode_store() -> Optional[Any]:
+    """Return the shared assistant episode store when central metadata is enabled."""
+
+    if CENTRAL_STORE is None:
+        return None
+    return getattr(CENTRAL_STORE, "assistant_episodes", None)
+
+
 def _assistant_memory_scope(route: str, *, mode: str = "", profile: str = "") -> str:
-    parts = [str(route or "").strip().lower()]
-    if mode:
-        parts.append(str(mode).strip().lower())
-    if profile:
-        parts.append(str(profile).strip().lower())
-    return ":".join(part for part in parts if part)
+    """Compatibility wrapper for the extracted assistant memory scope helper."""
+
+    return _assistant_memory_scope_impl(route, mode=mode, profile=profile)
 
 
 def _assistant_memory_query_text(
@@ -17089,21 +16898,14 @@ def _assistant_memory_query_text(
     messages: Optional[List[Dict[str, Any]]] = None,
     extra_parts: Optional[List[str]] = None,
 ) -> str:
-    """Build a compact lexical query over the current assistant request."""
+    """Compatibility wrapper for the extracted assistant memory query helper."""
 
-    blocks: List[str] = []
-    for part in [prompt, requirements_text] + list(extra_parts or []):
-        cleaned = str(part or "").strip()
-        if cleaned:
-            blocks.append(cleaned)
-    for msg in (messages or [])[-6:]:
-        if not isinstance(msg, dict):
-            continue
-        role = str(msg.get("role") or "").strip().lower()
-        content = str(msg.get("content") or "").strip()
-        if role in {"user", "assistant"} and content:
-            blocks.append(f"{role}: {content}")
-    return "\n\n".join(blocks).strip()
+    return _assistant_memory_query_text_impl(
+        prompt=prompt,
+        requirements_text=requirements_text,
+        messages=messages,
+        extra_parts=extra_parts,
+    )
 
 
 def _assistant_memory_matches(
@@ -17113,31 +16915,23 @@ def _assistant_memory_matches(
     query_text: str,
     limit: int,
 ) -> List[SolverEpisode]:
-    """Prefer same-scope memories, then fall back to the user's wider history."""
+    """Compatibility wrapper for the extracted assistant memory lookup helper."""
 
-    store = _assistant_memory_store(user)
-    if query_text:
-        matches = store.search(query_text, source_path=scope, limit=limit)
-        if matches:
-            return matches
-        return store.search(query_text, limit=limit)
-    matches = store.recent(source_path=scope, limit=limit)
-    if matches:
-        return matches
-    return store.recent(limit=limit)
+    return _assistant_memory_matches_impl(
+        user,
+        scope=scope,
+        query_text=query_text,
+        limit=limit,
+        episode_store_for_user=_assistant_memory_store,
+        get_central_store=_central_assistant_episode_store,
+        logger=logger,
+    )
 
 
 def _assistant_memory_entry_line(entry: SolverEpisode) -> str:
-    bits: List[str] = []
-    summary = str(entry.summary or "").strip()
-    if summary:
-        bits.append(summary)
-    if entry.requirement_ids:
-        bits.append("requirements=" + ", ".join(entry.requirement_ids[:4]))
-    context_notes = [note for note in entry.notes[:2] if isinstance(note, str) and note.strip()]
-    if context_notes:
-        bits.append("context=" + "; ".join(context_notes))
-    return ". ".join(bit for bit in bits if bit).strip()
+    """Compatibility wrapper for the extracted assistant memory render helper."""
+
+    return _assistant_memory_entry_line_impl(entry)
 
 
 def _assistant_memory_prompt_block(
@@ -17149,22 +16943,19 @@ def _assistant_memory_prompt_block(
     limit: int = 3,
     max_chars: int = 1400,
 ) -> str:
-    try:
-        matches = _assistant_memory_matches(user, scope=scope, query_text=query_text, limit=limit)
-    except Exception as exc:
-        logger.debug("Assistant memory lookup failed: %s", exc)
-        return ""
-    if not matches:
-        return ""
-    lines = [header]
-    for entry in matches:
-        line = _assistant_memory_entry_line(entry)
-        if line:
-            lines.append(f"- {line}")
-    text = "\n".join(lines).strip()
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 15].rstrip() + "...(truncated)"
+    """Compatibility wrapper for the extracted assistant prompt memory helper."""
+
+    return _assistant_memory_prompt_block_impl(
+        user,
+        scope=scope,
+        query_text=query_text,
+        header=header,
+        episode_store_for_user=_assistant_memory_store,
+        get_central_store=_central_assistant_episode_store,
+        logger=logger,
+        limit=limit,
+        max_chars=max_chars,
+    )
 
 
 def _assistant_memory_reference_payload(
@@ -17174,80 +16965,29 @@ def _assistant_memory_reference_payload(
     query_text: str,
     limit: int = 3,
 ) -> List[Dict[str, Any]]:
-    try:
-        matches = _assistant_memory_matches(user, scope=scope, query_text=query_text, limit=limit)
-    except Exception as exc:
-        logger.debug("Assistant memory lookup failed: %s", exc)
-        return []
-    payload: List[Dict[str, Any]] = []
-    for entry in matches:
-        item: Dict[str, Any] = {
-            "summary": str(entry.summary or "").strip(),
-        }
-        if entry.requirement_ids:
-            item["requirement_ids"] = list(entry.requirement_ids[:6])
-        if entry.notes:
-            item["notes"] = [str(note).strip() for note in entry.notes[:2] if str(note).strip()]
-        metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
-        project_name = str(metadata.get("project_name") or "").strip()
-        if project_name:
-            item["project_name"] = project_name
-        workflow = str(metadata.get("workflow") or "").strip()
-        if workflow:
-            item["workflow"] = workflow
-        scope_name = str(metadata.get("scope") or "").strip()
-        if scope_name:
-            item["scope"] = scope_name
-        field_ids = metadata.get("field_ids")
-        if isinstance(field_ids, list):
-            item["field_ids"] = [str(field_id).strip() for field_id in field_ids[:8] if str(field_id).strip()]
-        steps = metadata.get("steps")
-        if isinstance(steps, list):
-            item["steps"] = [str(step).strip() for step in steps[:4] if str(step).strip()]
-        suggestions = metadata.get("suggestions")
-        if isinstance(suggestions, list):
-            cleaned_suggestions: List[Dict[str, Any]] = []
-            for suggestion in suggestions[:4]:
-                if not isinstance(suggestion, dict):
-                    continue
-                field_id = str(suggestion.get("field_id") or suggestion.get("id") or "").strip()
-                value = suggestion.get("value")
-                rationale = str(suggestion.get("rationale") or "").strip()
-                if not field_id:
-                    continue
-                entry_payload: Dict[str, Any] = {"field_id": field_id}
-                if value not in (None, ""):
-                    entry_payload["value"] = value
-                if rationale:
-                    entry_payload["rationale"] = rationale[:160]
-                cleaned_suggestions.append(entry_payload)
-            if cleaned_suggestions:
-                item["suggestions"] = cleaned_suggestions
-        if item.get("summary") or item.get("notes") or item.get("steps") or item.get("suggestions"):
-            payload.append(item)
-    return payload
+    """Compatibility wrapper for the extracted assistant memory reference helper."""
+
+    return _assistant_memory_reference_payload_impl(
+        user,
+        scope=scope,
+        query_text=query_text,
+        episode_store_for_user=_assistant_memory_store,
+        get_central_store=_central_assistant_episode_store,
+        logger=logger,
+        limit=limit,
+    )
 
 
 def _assistant_memory_requirement_ids(text: str, limit: int = 12) -> List[str]:
-    seen = set()
-    result: List[str] = []
-    for match in re.finditer(r"\bREQ-\d{3,}\b", text or "", re.I):
-        req_id = match.group(0).upper()
-        if req_id in seen:
-            continue
-        seen.add(req_id)
-        result.append(req_id)
-        if len(result) >= limit:
-            break
-    return result
+    """Compatibility wrapper for the extracted assistant requirement-id helper."""
+
+    return _assistant_memory_requirement_ids_impl(text, limit=limit)
 
 
 def _assistant_memory_summary(text: str, *, fallback: str = "", max_chars: int = 260) -> str:
-    source = text or fallback
-    cleaned = re.sub(r"\s+", " ", str(source or "")).strip()
-    if len(cleaned) <= max_chars:
-        return cleaned
-    return cleaned[: max_chars - 15].rstrip() + "...(truncated)"
+    """Compatibility wrapper for the extracted assistant summary helper."""
+
+    return _assistant_memory_summary_impl(text, fallback=fallback, max_chars=max_chars)
 
 
 def _record_assistant_memory(
@@ -17262,50 +17002,22 @@ def _record_assistant_memory(
     extra_notes: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Persist a compact assistant episode without affecting request success."""
+    """Compatibility wrapper for the extracted assistant write helper."""
 
-    if not user:
-        return
-    try:
-        store = _assistant_memory_store(user)
-        recent = store.snapshot(source_path=scope, limit=1)
-        iteration = (recent[-1].iteration if recent else 0) + 1
-        notes: List[str] = []
-        for raw in [
-            f"prompt: {_assistant_memory_summary(prompt_text, max_chars=180)}" if prompt_text else "",
-            f"context: {_assistant_memory_summary(requirements_text, max_chars=180)}" if requirements_text else "",
-        ] + list(extra_notes or []):
-            cleaned = str(raw or "").strip()
-            if cleaned and cleaned not in notes:
-                notes.append(cleaned)
-        episode_metadata: Dict[str, Any] = {
-            "project_name": _assistant_memory_summary(project_name, max_chars=80) if project_name else "",
-            "steps": [str(step).strip() for step in (steps or [])[:6] if str(step).strip()],
-            "reply_chars": len(reply_text or ""),
-        }
-        if isinstance(metadata, dict):
-            for key, value in metadata.items():
-                cleaned_key = str(key or "").strip()
-                if not cleaned_key:
-                    continue
-                if value in ("", None, [], {}):
-                    continue
-                episode_metadata[cleaned_key] = value
-        store.record(
-            SolverEpisode(
-                episode_id=uuid.uuid4().hex,
-                source_path=scope,
-                iteration=iteration,
-                created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                outcome="success",
-                summary=_assistant_memory_summary(reply_text, fallback=prompt_text),
-                requirement_ids=_assistant_memory_requirement_ids(reply_text),
-                notes=notes[:6],
-                metadata=episode_metadata,
-            )
-        )
-    except Exception as exc:
-        logger.debug("Assistant episodic memory skipped: %s", exc)
+    _record_assistant_memory_impl(
+        user,
+        scope=scope,
+        prompt_text=prompt_text,
+        requirements_text=requirements_text,
+        reply_text=reply_text,
+        episode_store_for_user=_assistant_memory_store,
+        get_central_store=_central_assistant_episode_store,
+        logger=logger,
+        project_name=project_name,
+        steps=steps,
+        extra_notes=extra_notes,
+        metadata=metadata,
+    )
 
 
 def _should_use_assistant_ask_memory(
@@ -17315,14 +17027,14 @@ def _should_use_assistant_ask_memory(
     messages: Optional[List[Dict[str, Any]]],
     is_marketing_assistant: bool,
 ) -> bool:
-    """Only add memory to ask flows when the request has enough reusable context."""
+    """Compatibility wrapper for the extracted assistant memory policy helper."""
 
-    if is_marketing_assistant:
-        return False
-    prompt_len = len((prompt or "").strip())
-    context_len = len((requirements_text or "").strip())
-    message_count = len(messages or [])
-    return bool(prompt_len >= 80 or context_len >= 80 or message_count >= 3)
+    return _should_use_assistant_ask_memory_impl(
+        prompt,
+        requirements_text=requirements_text,
+        messages=messages,
+        is_marketing_assistant=is_marketing_assistant,
+    )
 
 
 def _assistant_reply_payload(
@@ -17388,612 +17100,211 @@ def _assistant_reply_payload(
     return response_payload
 
 
-def assistant_requirements() -> Response:
-    """Handle the assistant requirements route."""
-    user = _current_user()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True, silent=True) or {}
-    gesture_mode, avatar_mode, office_flag = _stt_motion_context(payload)
-    mode = (payload.get("mode") or "ask").strip().lower()
-    prompt = (payload.get("prompt") or "").strip()
-    raw_prompt = prompt
-    requirements_text = (payload.get("requirements_text") or "").strip()
-    messages = payload.get("messages") or []
-    marketing_context = ""
-    marketing_vocab_hint = ""
+def _assistant_pipeline_rag_config() -> Dict[str, Any]:
+    return {
+        "max_docs": RAG_MAX_DOCS,
+        "max_doc_bytes": RAG_MAX_DOC_BYTES,
+        "default_chunk_size": RAG_DEFAULT_CHUNK_SIZE,
+        "default_chunk_overlap": RAG_DEFAULT_CHUNK_OVERLAP,
+        "default_max_chunks": RAG_DEFAULT_MAX_CHUNKS,
+        "async_index_builds": RAG_ASYNC_INDEX_BUILDS,
+        "build_timeout_sec": RAG_BUILD_TIMEOUT_SEC,
+    }
 
-    if mode not in {"ask", "draft"}:
-        return jsonify({"error": "invalid mode"}), 400
 
-    guard_text = "\n".join([requirements_text, prompt]).strip()
-    if guard_text:
-        reason = _guardrail_scan(guard_text)
-        if reason:
-            return jsonify({"error": "guardrail_blocked", "details": reason}), 400
+def _assistant_pipeline_runtime_config() -> Dict[str, Any]:
+    return {
+        "request_capacity": _ASSISTANT_REQUEST_CAPACITY,
+        "capacity_wait_sec": ASSISTANT_CAPACITY_WAIT_SEC,
+    }
 
-    provider_hint = payload.get("provider") or payload.get("llm_provider")
-    model_hint = payload.get("model") or payload.get("llm_model")
-    settings = _resolve_llm_settings(
-        user=user,
-        provider_hint=provider_hint,
-        model_hint=model_hint,
-    )
-    if not payload.get("assistant_profile") and settings.get("assistant_profile"):
-        payload = dict(payload)
-        payload["assistant_profile"] = settings.get("assistant_profile")
-    reasoning_effort = (
-        str(payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or settings.get("reasoning_effort") or "medium")
-        .strip()
-        .lower()
-    )
-    assistant_memory_enabled = bool(settings.get("assistant_use_memory", True))
-    is_marketing_assistant = _is_marketing_assistant_request(payload, requirements_text)
-    assistant_memory_scope = _assistant_memory_scope(
-        "assistant_requirements",
-        mode=mode,
-        profile="marketing" if is_marketing_assistant else "requirements",
-    )
 
-    if mode == "ask" and is_marketing_assistant and _is_simple_greeting(prompt):
-        return jsonify(
-            _assistant_reply_payload(
-                "Hello! I'm the NeuralMimicry marketing assistant, here to help with questions about our "
-                "neuromorphic AI products and services. What would you like to know?",
-                provider="rule",
-                model="greeting_fastpath",
-                payload=payload,
-            )
-        )
+def _assistant_pipeline_security_config() -> Dict[str, Any]:
+    return {
+        "policy_enabled": ASSISTANT_SECURITY_POLICY_ENABLED,
+        "strict_message_roles": ASSISTANT_SECURITY_STRICT_MESSAGE_ROLES,
+        "block_prompt_leak_requests": ASSISTANT_SECURITY_BLOCK_PROMPT_LEAK,
+        "validate_rag_source_urls": ASSISTANT_SECURITY_VALIDATE_RAG_SOURCE_URLS,
+        "redact_output_pii": ASSISTANT_OUTPUT_REDACT_PII,
+        "validate_output_shapes": ASSISTANT_OUTPUT_VALIDATE_SHAPES,
+    }
 
-    if is_marketing_assistant and stt_learning_store:
-        try:
-            seed_query = prompt or requirements_text
-            marketing_vocab_hint = stt_learning_store.build_prompt_hint(context=seed_query, max_terms=24)
-            matches = stt_learning_store.query_context(seed_query, limit=4)
-            if matches:
-                chunks = []
-                for match in matches:
-                    source = str(match.get("source") or "knowledge")
-                    text = str(match.get("text") or "").strip()
-                    if not text:
-                        continue
-                    chunks.append(f"[{source}]\\n{text}")
-                marketing_context = "\\n\\n".join(chunks)
-        except Exception as exc:
-            logger.debug("Marketing assistant knowledge lookup skipped: %s", exc)
-    try:
-        provider = _build_request_llm_provider(
+
+def _assistant_pipeline_routing_config() -> Dict[str, Any]:
+    return {
+        "enabled": ASSISTANT_INTENT_ROUTING_ENABLED,
+        "skill_hint_limit": ASSISTANT_ROUTING_SKILL_HINT_LIMIT,
+        "capability_hint_max_items": ASSISTANT_ROUTING_CAPABILITY_MAX_ITEMS,
+    }
+
+
+def _assistant_pipeline_cache_config() -> Dict[str, Any]:
+    return {
+        "enabled": ASSISTANT_SEMANTIC_CACHE_ENABLED,
+        "ttl_hours": ASSISTANT_SEMANTIC_CACHE_TTL_HOURS,
+        "min_similarity": ASSISTANT_SEMANTIC_CACHE_MIN_SIMILARITY,
+        "max_candidates": ASSISTANT_SEMANTIC_CACHE_MAX_CANDIDATES,
+    }
+
+
+def _assistant_pipeline_retrieval_config() -> Dict[str, Any]:
+    return {
+        "enabled": ASSISTANT_HYBRID_RETRIEVAL_ENABLED,
+        "sparse_weight": ASSISTANT_HYBRID_RETRIEVAL_SPARSE_WEIGHT,
+        "dense_weight": ASSISTANT_HYBRID_RETRIEVAL_DENSE_WEIGHT,
+        "candidate_multiplier": ASSISTANT_HYBRID_RETRIEVAL_CANDIDATE_MULTIPLIER,
+        "min_dense_score": ASSISTANT_HYBRID_RETRIEVAL_MIN_DENSE_SCORE,
+        "coverage_enabled": ASSISTANT_RETRIEVAL_COVERAGE_ENABLED,
+        "min_query_term_coverage": ASSISTANT_RETRIEVAL_MIN_QUERY_TERM_COVERAGE,
+        "min_match_count": ASSISTANT_RETRIEVAL_MIN_MATCH_COUNT,
+        "min_context_chars": ASSISTANT_RETRIEVAL_MIN_CONTEXT_CHARS,
+        "retry_enabled": ASSISTANT_RETRIEVAL_RETRY_ENABLED,
+        "max_retry_queries": ASSISTANT_RETRIEVAL_MAX_RETRY_QUERIES,
+        "min_clause_terms": ASSISTANT_RETRIEVAL_MIN_CLAUSE_TERMS,
+        "refuse_on_insufficient": ASSISTANT_RETRIEVAL_REFUSE_ON_INSUFFICIENT,
+    }
+
+
+def _assistant_pipeline_playground_config() -> Dict[str, Any]:
+    return {
+        "project_min_iterations": PLAYGROUND_PROJECT_MIN_ITERATIONS,
+        "project_max_iterations": PLAYGROUND_PROJECT_MAX_ITERATIONS,
+        "project_max_steps": PLAYGROUND_PROJECT_MAX_STEPS,
+        "llm_max_tokens": PLAYGROUND_LLM_MAX_TOKENS,
+    }
+
+
+def _assistant_pipeline_dependencies() -> AssistantPipelineDependencies:
+    """Return dynamic dependency accessors for the extracted assistant pipeline."""
+
+    return AssistantPipelineDependencies(
+        current_user=lambda: _current_user(),
+        logger=logger,
+        json_dumps=lambda value, **kwargs: json.dumps(value, **kwargs),
+        new_trace_id=lambda: uuid.uuid4().hex,
+        get_rag_store=lambda: rag_store,
+        get_rag_metadata_store=lambda: getattr(CENTRAL_STORE, "rag_metadata", None) if CENTRAL_STORE is not None else None,
+        get_assistant_conversation_store=lambda: (
+            getattr(CENTRAL_STORE, "assistant_conversations", None) if CENTRAL_STORE is not None else None
+        ),
+        get_assistant_trace_store=lambda: getattr(CENTRAL_STORE, "assistant_traces", None) if CENTRAL_STORE is not None else None,
+        get_assistant_cache_store=lambda: (
+            getattr(CENTRAL_STORE, "assistant_semantic_cache", None) if CENTRAL_STORE is not None else None
+        ),
+        get_stt_learning_store=lambda: stt_learning_store,
+        get_rag_config=lambda: _assistant_pipeline_rag_config(),
+        get_assistant_runtime_config=lambda: _assistant_pipeline_runtime_config(),
+        get_assistant_security_config=lambda: _assistant_pipeline_security_config(),
+        get_assistant_routing_config=lambda: _assistant_pipeline_routing_config(),
+        get_assistant_cache_config=lambda: _assistant_pipeline_cache_config(),
+        get_assistant_retrieval_config=lambda: _assistant_pipeline_retrieval_config(),
+        get_playground_config=lambda: _assistant_pipeline_playground_config(),
+        safe_int=lambda value, default=0: _safe_int(value, default),
+        coerce_rag_sources=lambda payload: _coerce_rag_sources(payload),
+        build_rag_documents=lambda sources, **kwargs: _build_rag_documents(sources, **kwargs),
+        build_rag_index=lambda **kwargs: RagIndex.build(**kwargs),
+        render_rag_context=lambda matches: _render_rag_context(matches),
+        serialize_rag_match=lambda match: _serialize_rag_match(match),
+        capability_summary=lambda **kwargs: capability_summary(**kwargs),
+        select_skills=lambda prompt, limit=4: select_skills(prompt, limit=limit),
+        format_skill_brief=lambda skills: format_skill_brief(skills),
+        is_admin_user=lambda user: _is_admin_user(user),
+        mcp_execute=lambda *args, **kwargs: _mcp_execute(*args, **kwargs),
+        resolve_llm_settings=lambda **kwargs: _resolve_llm_settings(**kwargs),
+        build_request_llm_provider=lambda user, settings, workflow, role: _build_request_llm_provider(
             user,
             settings,
-            workflow="assistant_requirements",
-            role="assistant",
-        )
-    except LLMError as exc:
-        return jsonify({"error": "llm_unavailable", "details": str(exc)}), 400
-    except Exception as exc:
-        return jsonify({"error": "llm_init_failed", "details": str(exc)}), 400
-
-    if not provider:
-        return jsonify({"error": "llm_unavailable"}), 400
-
-    if is_marketing_assistant:
-        system = (
-            "You are the NeuralMimicry marketing assistant. Answer questions about NeuralMimicry, its products, "
-            "and its services in a concise, helpful, business-oriented tone. "
-            "For simple greetings, respond in 1-3 short sentences, introduce your role briefly, and invite a relevant next question. "
-            "Do not output requirements-document structures unless explicitly asked to draft requirements."
-        )
-        if gesture_mode == "bsl":
-            system = (
-                f"{system} "
-                "The frontend avatar can sign in BSL, so do not claim that you cannot sign or gesture physically."
-            )
-        if marketing_vocab_hint:
-            system = f"{system}\\n\\nSpeech/STT vocabulary hints:\\n{marketing_vocab_hint}"
-    else:
-        system = (
-            "You are a requirements assistant. Help the user craft clear, testable requirements. "
-            "Ask concise clarifying questions when needed. "
-            "When drafting, output structured Markdown with sections: Overview, Goals, Non-Goals, "
-            "Functional Requirements, Non-Functional Requirements, Acceptance Criteria, Risks. "
-            "Include a 'Requirements Register' section with one requirement per line in the format "
-            "'- REQ-001: Short title' (zero-padded, unique IDs). Add any detail as indented bullets "
-            "beneath each REQ line so the register can be parsed."
-        )
-    capabilities_hint = capability_summary(max_items=3)
-    if capabilities_hint:
-        system = f"{system}\n\nCapabilities summary:\n{capabilities_hint}"
-
-    chat_messages: List[Dict[str, Any]] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role")
-        content = msg.get("content")
-        if role in {"user", "assistant"} and isinstance(content, str):
-            chat_messages.append({"role": role, "content": content})
-
-    assistant_memory_context = ""
-    use_assistant_ask_memory = False
-    if assistant_memory_enabled:
-        if mode == "draft":
-            assistant_memory_query = _assistant_memory_query_text(
-                prompt=prompt,
-                requirements_text=requirements_text,
-                messages=chat_messages,
-                extra_parts=[marketing_context] if marketing_context else None,
-            )
-            assistant_memory_context = _assistant_memory_prompt_block(
-                user,
-                scope=assistant_memory_scope,
-                query_text=assistant_memory_query,
-                header=(
-                    "Relevant patterns from this user's earlier successful drafts "
-                    "(adapt useful structure, but do not copy stale details blindly):"
-                ),
-            )
-        else:
-            use_assistant_ask_memory = _should_use_assistant_ask_memory(
-                prompt,
-                requirements_text=requirements_text,
-                messages=chat_messages,
-                is_marketing_assistant=is_marketing_assistant,
-            )
-            if use_assistant_ask_memory:
-                assistant_memory_query = _assistant_memory_query_text(
-                    prompt=prompt,
-                    requirements_text=requirements_text,
-                    messages=chat_messages,
-                )
-                assistant_memory_context = _assistant_memory_prompt_block(
-                    user,
-                    scope=assistant_memory_scope,
-                    query_text=assistant_memory_query,
-                    header=(
-                        "Relevant prior successful guidance for similar requirements questions "
-                        "(reuse useful reasoning, but resolve conflicts using the current notes first):"
-                    ),
-                    max_chars=1200,
-                )
-
-    if mode == "draft":
-        user_text = "Draft a complete requirements document."
-        if requirements_text:
-            user_text += f"\n\nCurrent notes:\n{requirements_text}"
-        if marketing_context:
-            user_text += f"\n\nNeuralMimicry context:\n{marketing_context}"
-        if assistant_memory_context:
-            user_text += f"\n\n{assistant_memory_context}"
-        chat_messages.append({"role": "user", "content": user_text})
-    else:
-        if not prompt:
-            return jsonify({"error": "prompt_required"}), 400
-        prompt_blocks: List[str] = []
-        if requirements_text:
-            if is_marketing_assistant:
-                prompt_blocks.append(f"Assistant context:\\n{requirements_text}")
-            else:
-                prompt_blocks.append(f"Current requirements notes:\\n{requirements_text}")
-        if marketing_context:
-            prompt_blocks.append(f"Retrieved NeuralMimicry knowledge:\\n{marketing_context}")
-        if assistant_memory_context:
-            prompt_blocks.append(assistant_memory_context)
-        if is_marketing_assistant:
-            prompt_blocks.append(f"User message: {prompt}")
-        else:
-            prompt_blocks.append(f"User question: {prompt}")
-        chat_messages.append({"role": "user", "content": "\\n\\n".join(prompt_blocks)})
-
-    temperature = payload.get("temperature", 0.2)
-    max_tokens = payload.get("max_tokens")
-    capacity_acquired = _acquire_request_capacity(_ASSISTANT_REQUEST_CAPACITY, ASSISTANT_CAPACITY_WAIT_SEC)
-    if not capacity_acquired:
-        return jsonify({"error": "assistant_capacity_unavailable"}), 503
-    try:
-        response = provider.predict(
-            messages=chat_messages,
-            system=system,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            reasoning_effort=reasoning_effort,
-        )
-    except Exception as exc:
-        return jsonify({"error": "llm_request_failed", "details": str(exc)}), 400
-    finally:
-        _ASSISTANT_REQUEST_CAPACITY.release()
-
-    reply_text = response.text if isinstance(response.text, str) else str(response.text)
-    if mode == "draft":
-        reply_text = _ensure_req_register_in_draft(reply_text)
-    if mode == "draft" and assistant_memory_enabled:
-        _record_assistant_memory(
-            user,
-            scope=assistant_memory_scope,
-            prompt_text=raw_prompt or "Draft a complete requirements document.",
-            requirements_text=requirements_text,
-            reply_text=reply_text,
-            extra_notes=[
-                "assistant_profile: marketing" if is_marketing_assistant else "assistant_profile: requirements"
-            ],
-        )
-    elif use_assistant_ask_memory and assistant_memory_enabled:
-        _record_assistant_memory(
-            user,
-            scope=assistant_memory_scope,
-            prompt_text=raw_prompt,
-            requirements_text=requirements_text,
-            reply_text=reply_text,
-            extra_notes=["assistant_profile: requirements", "mode: ask"],
-            metadata={"mode": "ask"},
-        )
-    if is_marketing_assistant:
-        _stt_record_learning(raw_prompt, source="assistant_marketing_user")
-        _stt_record_learning(reply_text, source="assistant_marketing_reply")
-
-    return jsonify(
-        _assistant_reply_payload(
+            workflow=workflow,
+            role=role,
+        ),
+        acquire_request_capacity=lambda semaphore, wait_seconds: _acquire_request_capacity(semaphore, wait_seconds),
+        guardrail_scan=lambda text: _guardrail_scan(text),
+        stt_motion_context=lambda payload=None: _stt_motion_context(payload),
+        is_marketing_assistant_request=lambda payload, requirements_text: _is_marketing_assistant_request(payload, requirements_text),
+        is_simple_greeting=lambda text: _is_simple_greeting(text),
+        assistant_memory_scope=lambda route, **kwargs: _assistant_memory_scope(route, **kwargs),
+        assistant_memory_query_text=lambda **kwargs: _assistant_memory_query_text(**kwargs),
+        assistant_memory_prompt_block=lambda user, **kwargs: _assistant_memory_prompt_block(user, **kwargs),
+        assistant_memory_reference_payload=lambda user, **kwargs: _assistant_memory_reference_payload(user, **kwargs),
+        should_use_assistant_ask_memory=lambda prompt, **kwargs: _should_use_assistant_ask_memory(prompt, **kwargs),
+        record_assistant_memory=lambda user, **kwargs: _record_assistant_memory(user, **kwargs),
+        assistant_reply_payload=lambda reply_text, provider, model, payload=None: _assistant_reply_payload(
             reply_text,
-            provider=response.provider or settings.get("provider"),
-            model=response.model or settings.get("model"),
+            provider,
+            model,
             payload=payload,
-        )
+        ),
+        ensure_req_register_in_draft=lambda text: _ensure_req_register_in_draft(text),
+        stt_record_learning=lambda text, **kwargs: _stt_record_learning(text, **kwargs),
+        extract_json_payload=lambda text: _extract_json_payload(text),
+        to_uk_english=lambda text: _to_uk_english(text),
+        global_requirements_titles=lambda: _global_requirements_titles(),
+        global_requirements_count=lambda: _global_requirements_count(),
+        estimate_job_tokens=lambda payload: _estimate_job_tokens(payload),
+        opencode_available_for_playground=lambda: _opencode_available_for_playground(),
+        submit_subtask=lambda **kwargs: subtask_manager.submit(**kwargs),
     )
+
+
+_EXTRACTED_ASSISTANT_HANDLERS = build_assistant_handlers(_assistant_pipeline_dependencies())
+_EXTRACTED_RAG_HANDLERS = build_rag_handlers(_assistant_pipeline_dependencies())
+_EXTRACTED_ASSISTANT_ADMIN_HANDLERS = build_assistant_admin_handlers(
+    current_user=lambda: _current_user(),
+    is_admin_user=lambda user: _is_admin_user(user),
+    get_assistant_conversation_store=lambda: (
+        getattr(CENTRAL_STORE, "assistant_conversations", None) if CENTRAL_STORE is not None else None
+    ),
+    get_assistant_trace_store=lambda: getattr(CENTRAL_STORE, "assistant_traces", None) if CENTRAL_STORE is not None else None,
+    safe_int=lambda value, default=0: _safe_int(value, default),
+)
+
+
+def rag_indexes() -> Response:
+    """RAG endpoint for indexes."""
+
+    return _EXTRACTED_RAG_HANDLERS["rag_indexes"]()
+
+
+def rag_index_create() -> Response:
+    """RAG endpoint for index create."""
+
+    return _EXTRACTED_RAG_HANDLERS["rag_index_create"]()
+
+
+def rag_index_delete(name: str) -> Response:
+    """RAG endpoint for index delete."""
+
+    return _EXTRACTED_RAG_HANDLERS["rag_index_delete"](name)
+
+
+def rag_query() -> Response:
+    """RAG endpoint for query."""
+
+    return _EXTRACTED_RAG_HANDLERS["rag_query"]()
+
+
+def assistant_rag_mcp() -> Response:
+    """Handle the assistant RAG + MCP route via the extracted assistant pipeline."""
+
+    return _EXTRACTED_ASSISTANT_HANDLERS["assistant_rag_mcp"]()
+
+
+def assistant_requirements() -> Response:
+    """Handle the assistant requirements route via the extracted assistant pipeline."""
+
+    return _EXTRACTED_ASSISTANT_HANDLERS["assistant_requirements"]()
 
 
 def assistant_form_fill() -> Response:
-    """Handle the assistant form fill route."""
-    user = _current_user()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True, silent=True) or {}
-    fields = payload.get("fields") or []
-    prompt = (payload.get("prompt") or "").strip()
-    workflow = (payload.get("workflow") or "").strip()
-    scope = (payload.get("scope") or "").strip()
-    if not isinstance(fields, list) or not fields:
-        return jsonify({"error": "fields_required"}), 400
+    """Handle the assistant form-fill route via the extracted assistant pipeline."""
 
-    reason = _guardrail_scan(prompt)
-    if reason:
-        return jsonify({"error": "guardrail_blocked", "details": reason}), 400
-
-    provider_hint = payload.get("provider") or payload.get("llm_provider")
-    model_hint = payload.get("model") or payload.get("llm_model")
-
-    settings = _resolve_llm_settings(
-        user=user,
-        provider_hint=provider_hint,
-        model_hint=model_hint,
-    )
-    reasoning_effort = (
-        str(payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or settings.get("reasoning_effort") or "medium")
-        .strip()
-        .lower()
-    )
-    assistant_memory_enabled = bool(settings.get("assistant_use_memory", True))
-    try:
-        provider = _build_request_llm_provider(
-            user,
-            settings,
-            workflow="assistant_form_fill",
-            role="assistant",
-        )
-    except Exception as exc:
-        return jsonify({"error": "llm_init_failed", "details": str(exc)}), 400
-    if not provider:
-        return jsonify({"error": "llm_unavailable"}), 400
-
-    field_descriptions = []
-    allowed_ids = []
-    for field in fields:
-        if not isinstance(field, dict):
-            continue
-        field_id = field.get("id") or field.get("field_id")
-        if not field_id:
-            continue
-        allowed_ids.append(field_id)
-        label = field.get("label") or field_id
-        ftype = field.get("type") or "text"
-        value = field.get("value")
-        options = field.get("options")
-        desc = field.get("description") or ""
-        entry = {
-            "id": field_id,
-            "label": label,
-            "type": ftype,
-            "value": value,
-            "options": options,
-            "description": desc,
-        }
-        field_descriptions.append(entry)
-
-    assistant_memory_scope = _assistant_memory_scope("assistant_form_fill")
-    field_context_lines: List[str] = []
-    for entry in field_descriptions[:10]:
-        field_id = str(entry.get("id") or "").strip()
-        label = str(entry.get("label") or "").strip()
-        description = str(entry.get("description") or "").strip()
-        options = entry.get("options")
-        option_preview = ""
-        if isinstance(options, list):
-            preview_items = [str(item).strip() for item in options[:4] if str(item).strip()]
-            if preview_items:
-                option_preview = " options=" + ", ".join(preview_items)
-        summary_bits = [bit for bit in [field_id, label, description] if bit]
-        if summary_bits:
-            field_context_lines.append(" | ".join(summary_bits) + option_preview)
-    form_memory_references = []
-    if assistant_memory_enabled:
-        form_memory_references = _assistant_memory_reference_payload(
-            user,
-            scope=assistant_memory_scope,
-            query_text=_assistant_memory_query_text(
-                prompt=prompt,
-                extra_parts=[workflow, scope, " ".join(allowed_ids)] + field_context_lines,
-            ),
-        )
-
-    system = (
-        "You are a form assistant. Return ONLY valid JSON. "
-        "Output an array of objects with keys: field_id, value, rationale (optional). "
-        "Only use field_id values from the allowed list. "
-        "Do not include markdown or extra text."
-    )
-    capabilities_hint = capability_summary(max_items=3)
-    if capabilities_hint:
-        system = f"{system}\n\nCapabilities summary:\n{capabilities_hint}"
-
-    user_text = {
-        "goal": prompt,
-        "workflow": workflow,
-        "scope": scope,
-        "allowed_fields": allowed_ids,
-        "fields": field_descriptions,
-    }
-    if form_memory_references:
-        user_text["reference_suggestions"] = form_memory_references
-
-    capacity_acquired = _acquire_request_capacity(_ASSISTANT_REQUEST_CAPACITY, ASSISTANT_CAPACITY_WAIT_SEC)
-    if not capacity_acquired:
-        return jsonify({"error": "assistant_capacity_unavailable"}), 503
-    try:
-        response = provider.predict(
-            messages=[{"role": "user", "content": json.dumps(user_text)}],
-            system=system,
-            temperature=payload.get("temperature", 0.2),
-            max_tokens=payload.get("max_tokens"),
-            reasoning_effort=reasoning_effort,
-        )
-    except Exception as exc:
-        return jsonify({"error": "llm_request_failed", "details": str(exc)}), 400
-    finally:
-        _ASSISTANT_REQUEST_CAPACITY.release()
-
-    parsed = _extract_json_payload(response.text)
-    if not isinstance(parsed, list):
-        return jsonify({"error": "invalid_llm_response", "details": response.text[:500]}), 400
-
-    cleaned = []
-    for item in parsed:
-        if not isinstance(item, dict):
-            continue
-        field_id = item.get("field_id") or item.get("id")
-        if not field_id or field_id not in allowed_ids:
-            continue
-        cleaned.append(
-            {
-                "field_id": field_id,
-                "value": item.get("value"),
-                "rationale": item.get("rationale"),
-            }
-        )
-
-    if not cleaned:
-        return jsonify({"error": "no_suggestions"}), 400
-
-    if assistant_memory_enabled:
-        _record_assistant_memory(
-            user,
-            scope=assistant_memory_scope,
-            prompt_text=prompt,
-            requirements_text=json.dumps({"workflow": workflow, "scope": scope, "fields": allowed_ids[:12]}),
-            reply_text=(
-                f"Suggested {len(cleaned)} field value(s) for workflow '{workflow or 'unknown'}' "
-                f"in scope '{scope or 'workflow'}'."
-            ),
-            extra_notes=[
-                f"workflow: {workflow}" if workflow else "",
-                f"scope: {scope}" if scope else "",
-                ("fields: " + ", ".join(allowed_ids[:10])) if allowed_ids else "",
-            ],
-            metadata={
-                "workflow": workflow,
-                "scope": scope,
-                "field_ids": allowed_ids[:12],
-                "suggestions": cleaned[:6],
-            },
-        )
-
-    return jsonify({"suggestions": cleaned})
+    return _EXTRACTED_ASSISTANT_HANDLERS["assistant_form_fill"]()
 
 
 def playground_plan() -> Response:
-    """Handle the playground plan route."""
-    user = _current_user()
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True, silent=True) or {}
-    prompt = (payload.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({"error": "prompt_required"}), 400
+    """Handle the playground plan route via the extracted assistant pipeline."""
 
-    reason = _guardrail_scan(prompt)
-    if reason:
-        return jsonify({"error": "guardrail_blocked", "details": reason}), 400
-
-    provider_hint = payload.get("provider") or payload.get("llm_provider")
-    model_hint = payload.get("model") or payload.get("llm_model")
-
-    settings = _resolve_llm_settings(
-        user=user,
-        provider_hint=provider_hint,
-        model_hint=model_hint,
-    )
-    reasoning_effort = (
-        str(payload.get("reasoning_effort") or payload.get("llm_reasoning_effort") or settings.get("reasoning_effort") or "medium")
-        .strip()
-        .lower()
-    )
-    assistant_memory_enabled = bool(settings.get("assistant_use_memory", True))
-    try:
-        provider = _build_request_llm_provider(
-            user,
-            settings,
-            workflow="playground_plan",
-            role="planner",
-        )
-    except Exception as exc:
-        return jsonify({"error": "llm_init_failed", "details": str(exc)}), 400
-    if not provider:
-        return jsonify({"error": "llm_unavailable"}), 400
-
-    system = (
-        "You are School Monitor, a friendly assistant for non-technical pupils. "
-        "Use UK British English spelling and phrasing. "
-        "Keep responses short, simple, and upbeat. Return ONLY valid JSON with keys: "
-        "summary (string), steps (array of strings), requirements_text (string), project_name (string). "
-        "Summary should be 1-2 sentences. Steps should be 4-7 short, easy-to-follow items. "
-        "Requirements text should be brief and practical, include a short overview and a "
-        "'Requirements Register' section with 6-10 lines formatted like '- REQ-001: ...'. "
-        "Keep the scope small and fast to build. "
-        "If the project is a web app, prefer Node.js and a playful, colourful UI with cards, "
-        "levels, and rewards similar to a child-friendly dashboard."
-    )
-
-    assistant_memory_scope = _assistant_memory_scope("playground_plan")
-    memory_references = []
-    if assistant_memory_enabled:
-        memory_references = _assistant_memory_reference_payload(
-            user,
-            scope=assistant_memory_scope,
-            query_text=_assistant_memory_query_text(prompt=prompt),
-        )
-    user_text = {
-        "prompt": prompt,
-        "constraints": {
-            "speed": "quick",
-            "scope": "small",
-        },
-    }
-    if memory_references:
-        # Feed prior successful playground outputs back as compact reference
-        # examples so the assistant can reuse working patterns without copying.
-        user_text["reference_patterns"] = memory_references
-
-    capacity_acquired = _acquire_request_capacity(_ASSISTANT_REQUEST_CAPACITY, ASSISTANT_CAPACITY_WAIT_SEC)
-    if not capacity_acquired:
-        return jsonify({"error": "assistant_capacity_unavailable"}), 503
-    try:
-        response = provider.predict(
-            messages=[{"role": "user", "content": json.dumps(user_text)}],
-            system=system,
-            temperature=payload.get("temperature", 0.2),
-            max_tokens=payload.get("max_tokens", 900),
-            reasoning_effort=reasoning_effort,
-        )
-    except Exception as exc:
-        return jsonify({"error": "llm_request_failed", "details": str(exc)}), 400
-    finally:
-        _ASSISTANT_REQUEST_CAPACITY.release()
-
-    parsed = _extract_json_payload(response.text)
-    if not isinstance(parsed, dict):
-        return jsonify({"error": "invalid_llm_response", "details": str(response.text)[:400]}), 400
-
-    summary = str(parsed.get("summary") or "").strip()
-    steps_raw = parsed.get("steps") or []
-    steps = [str(item).strip() for item in steps_raw if isinstance(item, (str, int, float)) and str(item).strip()]
-    requirements_text = str(parsed.get("requirements_text") or "").strip()
-    project_name = str(parsed.get("project_name") or "").strip()
-
-    summary = _to_uk_english(summary)
-    steps = [_to_uk_english(step) for step in steps]
-    requirements_text = _to_uk_english(requirements_text)
-
-    if not project_name:
-        project_name = (summary or prompt).strip()
-    project_name = project_name[:60] if project_name else "Playground Project"
-
-    if not requirements_text:
-        steps_block = "\n".join([f"- {step}" for step in steps]) if steps else ""
-        requirements_text = f"{summary or prompt}\n\nKey Features:\n{steps_block}\n\nRequirements Register:\n- REQ-001: Provide a simple web app\n- REQ-002: Keep the scope small and fast to build\n- REQ-003: Include clear, child-friendly UI copy\n- REQ-004: Add basic navigation between screens\n- REQ-005: Provide simple progress feedback\n- REQ-006: Use a clean, responsive layout\n"
-        requirements_text = _to_uk_english(requirements_text)
-
-    req_count = sum(1 for line in requirements_text.splitlines() if REQ_LINE_RE.match(line))
-    if req_count <= 0:
-        req_count = max(1, len(steps)) if steps else 6
-    requirements_lower = requirements_text.lower()
-    global_titles = _global_requirements_titles()
-    global_detected = "global requirement" in requirements_lower or "global-" in requirements_lower
-    if not global_detected and global_titles:
-        global_detected = any(title in requirements_lower for title in global_titles)
-    if not global_detected:
-        req_count += _global_requirements_count()
-
-    playground_iterations = min(
-        PLAYGROUND_PROJECT_MAX_ITERATIONS,
-        max(PLAYGROUND_PROJECT_MIN_ITERATIONS, req_count),
-    )
-    job_payload = {
-        "workflow": "project_solver",
-        "project_name": project_name,
-        "requirements_text": requirements_text,
-        "project_run": True,
-        "project_max_steps": PLAYGROUND_PROJECT_MAX_STEPS,
-        "project_iterations": playground_iterations,
-        "llm_provider": settings.get("provider") or provider_hint,
-        "llm_model": settings.get("model") or model_hint,
-        "llm_reasoning_effort": reasoning_effort,
-        "llm_temperature": 0.2,
-        "llm_max_tokens": PLAYGROUND_LLM_MAX_TOKENS,
-        "disable_jira": True,
-        "disable_confluence": True,
-        "action_plan": False,
-        "dry_run": False,
-        "token_scope": "personal",
-        "source": "playground",
-    }
-    codingagent = payload.get("codingagent")
-    if codingagent:
-        job_payload["codingagent"] = codingagent
-    elif _opencode_available_for_playground():
-        job_payload["codingagent"] = "opencode"
-    token_estimate = _estimate_job_tokens(job_payload)
-    if assistant_memory_enabled:
-        _record_assistant_memory(
-            user,
-            scope=assistant_memory_scope,
-            prompt_text=prompt,
-            requirements_text=requirements_text,
-            reply_text=f"{summary}\n\n{requirements_text}".strip(),
-            project_name=project_name,
-            steps=steps,
-            extra_notes=[f"project_name: {project_name}"] if project_name else None,
-        )
-
-    return jsonify(
-        {
-            "summary": summary,
-            "steps": steps,
-            "project_name": project_name,
-            "requirements_text": requirements_text,
-            "job_payload": job_payload,
-            "token_estimate": token_estimate,
-            "provider": response.provider or settings.get("provider"),
-            "model": response.model or settings.get("model"),
-        }
-    )
+    return _EXTRACTED_ASSISTANT_HANDLERS["playground_plan"]()
 
 
 def _sse(entry: Dict[str, Any]) -> str:
@@ -18018,6 +17329,10 @@ if hasattr(app, "add_url_rule"):
         admin_stats=admin_stats,
         admin_llm_telemetry=admin_llm_telemetry,
         admin_ai_orchestration=admin_ai_orchestration,
+        assistant_admin_conversations=_EXTRACTED_ASSISTANT_ADMIN_HANDLERS["assistant_admin_conversations"],
+        assistant_admin_conversation_detail=_EXTRACTED_ASSISTANT_ADMIN_HANDLERS["assistant_admin_conversation_detail"],
+        assistant_admin_traces=_EXTRACTED_ASSISTANT_ADMIN_HANDLERS["assistant_admin_traces"],
+        assistant_admin_trace_detail=_EXTRACTED_ASSISTANT_ADMIN_HANDLERS["assistant_admin_trace_detail"],
         workers_telemetry=workers_telemetry,
         api_audit=api_audit,
     )
@@ -18058,6 +17373,13 @@ if hasattr(app, "add_url_rule"):
         assistant_form_fill=assistant_form_fill,
         playground_plan=playground_plan,
     )
+    register_rag_routes(
+        app,
+        rag_indexes=rag_indexes,
+        rag_index_create=rag_index_create,
+        rag_index_delete=rag_index_delete,
+        rag_query=rag_query,
+    )
     register_jobs_routes(
         app,
         {
@@ -18091,10 +17413,6 @@ if hasattr(app, "add_url_rule"):
             "job_estimate": job_estimate,
             "import_requirements": import_requirements,
             "export_requirements": export_requirements,
-            "rag_indexes": rag_indexes,
-            "rag_index_create": rag_index_create,
-            "rag_index_delete": rag_index_delete,
-            "rag_query": rag_query,
             "mcp_servers": mcp_servers,
             "mcp_server_delete": mcp_server_delete,
             "mcp_server_tools": mcp_server_tools,

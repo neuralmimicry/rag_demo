@@ -2,6 +2,7 @@ import time
 
 import flask
 import pytest
+from assistant_pipeline.contracts import ServiceResult
 
 HAS_REAL_FLASK = hasattr(flask.Flask, "test_client")
 if HAS_REAL_FLASK:
@@ -84,3 +85,40 @@ def test_api_subtask_cancel_queued_task(monkeypatch):
             time.sleep(0.02)
 
     assert final_status == "cancelled"
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_subtask_manager_executes_rag_collection_build(monkeypatch):
+    local_subtasks = refiner_web.SubtaskManager(workers=1, max_queue=4, task_ttl_sec=600)
+    monkeypatch.setattr(
+        refiner_web.assistant_service,
+        "rag_collection_build",
+        lambda deps, *, user, payload: ServiceResult(
+            {
+                "status": "ready",
+                "name": str(payload.get("name") or ""),
+                "version_id": str(payload.get("_rag_version_id") or ""),
+            }
+        ),
+    )
+
+    task = local_subtasks.submit(
+        owner="alice",
+        action="rag_collection_build",
+        payload={"name": "docs", "_rag_version_id": "version-1"},
+        scope_type="rag_collection",
+        scope_id="docs",
+        timeout_sec=30,
+    )
+
+    final_task = None
+    for _ in range(40):
+        final_task = local_subtasks.get_task(task.task_id)
+        if final_task and final_task.status == "completed":
+            break
+        time.sleep(0.02)
+
+    assert final_task is not None
+    assert final_task.status == "completed"
+    assert final_task.result["response"]["status"] == "ready"
+    assert final_task.result["version_id"] == "version-1"

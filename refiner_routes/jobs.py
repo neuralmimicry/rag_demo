@@ -107,15 +107,6 @@ def register_jobs_routes(app, handlers: Dict[str, Callable]) -> None:
         methods=["POST"],
     )
 
-    app.add_url_rule("/api/rag/indexes", view_func=handlers["rag_indexes"], methods=["GET"])
-    app.add_url_rule("/api/rag/index", view_func=handlers["rag_index_create"], methods=["POST"])
-    app.add_url_rule(
-        "/api/rag/index/<name>",
-        view_func=handlers["rag_index_delete"],
-        methods=["DELETE"],
-    )
-    app.add_url_rule("/api/rag/query", view_func=handlers["rag_query"], methods=["POST"])
-
     app.add_url_rule("/api/mcp/servers", view_func=handlers["mcp_servers"], methods=["GET", "POST"])
     app.add_url_rule(
         "/api/mcp/servers/<name>",
