@@ -1,7 +1,5 @@
 from types import SimpleNamespace
-import main as m
-
-
+from refiner import main as m
 def make_issue(val):
     return SimpleNamespace(fields=SimpleNamespace(customfield_10104=val))
 

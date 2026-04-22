@@ -3,9 +3,7 @@ from __future__ import annotations
 import builtins
 import getpass
 
-import credentials
-
-
+from refiner import credentials
 def test_get_credentials_non_interactive_skips_prompts(monkeypatch) -> None:
     monkeypatch.delenv("JIRA_USERNAME", raising=False)
     monkeypatch.delenv("JIRA_PASSWORD", raising=False)

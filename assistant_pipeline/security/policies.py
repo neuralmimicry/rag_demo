@@ -28,6 +28,14 @@ def _normalise_roles(value: Any, *, default: FrozenSet[str]) -> FrozenSet[str]:
 
 
 @dataclass(frozen=True)
+class AssistantToolUsePolicy:
+    """Policy controls for assistant-triggered external tool and action use."""
+
+    admin_only_mcp: bool = True
+    block_unsafe_tool_requests: bool = False
+
+
+@dataclass(frozen=True)
 class AssistantInputPolicy:
     """Input-stage security controls for assistant and RAG requests."""
 
@@ -55,6 +63,7 @@ class AssistantSecurityPolicy:
     """Resolved request and response policy bundle for the assistant pipeline."""
 
     input: AssistantInputPolicy = field(default_factory=AssistantInputPolicy)
+    tool: AssistantToolUsePolicy = field(default_factory=AssistantToolUsePolicy)
     output: AssistantOutputPolicy = field(default_factory=AssistantOutputPolicy)
 
 
@@ -77,6 +86,10 @@ def assistant_security_policy_from_config(config: Mapping[str, Any] | None) -> A
                 values.get("blocked_impersonation_roles"),
                 default=_DEFAULT_BLOCKED_IMPERSONATION_ROLES,
             ),
+        ),
+        tool=AssistantToolUsePolicy(
+            admin_only_mcp=_flag(values.get("admin_only_mcp"), True),
+            block_unsafe_tool_requests=_flag(values.get("block_unsafe_tool_requests"), False),
         ),
         output=AssistantOutputPolicy(
             policy_enabled=_flag(values.get("output_policy_enabled"), policy_enabled),

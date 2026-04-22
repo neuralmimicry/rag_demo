@@ -1,23 +1,23 @@
 # Architecture & Performance Audit (2026-03-18)
 
 ## Scope
-- Backend API/runtime: `refiner_web.py`, `project_solver.py`, `llm_providers.py`
-- STT low-latency path: `../nmstt/src/main.rs` + Python bridge in `refiner_web.py`
+- Backend API/runtime: `refiner/refiner_web.py`, `refiner/project_solver.py`, `refiner/llm_providers.py`
+- STT low-latency path: `../nmstt/src/main.rs` + Python bridge in `refiner/refiner_web.py`
 - Frontend surface in this repo: `web/static/*.js`
 - Frontend alignment context (external repo): `neuralmimicry.ai-website/src/components/AIChatWidget.jsx`
 
 ## Baseline Snapshot
-- `refiner_web.py`: 11,604 LOC, 88 Flask routes, 22 `requests.*` calls, 3 `subprocess.run` calls.
-- `project_solver.py`: 10,130 LOC, 9 `requests.*` calls, 5 `subprocess.run` calls.
+- `refiner/refiner_web.py`: 11,604 LOC, 88 Flask routes, 22 `requests.*` calls, 3 `subprocess.run` calls.
+- `refiner/project_solver.py`: 10,130 LOC, 9 `requests.*` calls, 5 `subprocess.run` calls.
 - `../nmstt/src/main.rs`: 2,106 LOC, async server with `spawn_blocking` + semaphore concurrency gating.
 - `web/static/app.js`: 4,900 LOC / ~172 KB source file.
 - External frontend build (already observed): main JS chunk warning around ~1.4 MB minified.
 
 ## Priority Findings
-1. `P0` monolithic backend module risk: route, auth, orchestration, storage, and provider logic are coupled in `refiner_web.py`.
+1. `P0` monolithic backend module risk: route, auth, orchestration, storage, and provider logic are coupled in `refiner/refiner_web.py`.
 2. `P0` blocking request path risk: network + subprocess operations execute in request handlers (increases tail latency and error amplification).
 3. `P0` uneven resilience policy: retries/backoff/session pooling are not consistently applied to external HTTP calls.
-4. `P1` deployment/runtime risk: `refiner_web.py` runs Flask dev server in `__main__`; production worker model is not enforced.
+4. `P1` deployment/runtime risk: `refiner/refiner_web.py` runs Flask dev server in `__main__`; production worker model is not enforced.
 5. `P1` frontend bundle/component concentration: very large chat widget/module path likely drives parse/execute cost.
 6. `P2` observability gap: no unified request-stage timing metrics for STT/assistant critical paths.
 

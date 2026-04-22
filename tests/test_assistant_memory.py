@@ -4,11 +4,11 @@ from types import SimpleNamespace
 import flask
 import pytest
 
-from solver_memory import SolverEpisode
+from refiner.solver_memory import SolverEpisode
 
 HAS_REAL_FLASK = hasattr(flask.Flask, "test_client")
 if HAS_REAL_FLASK:
-    import refiner_web  # noqa: E402
+    from refiner import refiner_web  # noqa: E402
 
 
 class _DraftProvider:
@@ -89,6 +89,52 @@ class _FormFillProvider:
             provider="fake_provider",
             model="fake_model",
         )
+
+
+class _FakeCentralEpisodeStore:
+    def __init__(self):
+        self.entries = {}
+        self.record_calls = []
+        self.search_calls = []
+        self.recent_calls = []
+
+    def seed(self, owner: str, episode: SolverEpisode) -> None:
+        self.entries.setdefault(owner, []).append(episode)
+
+    def record(self, owner: str, episode: SolverEpisode) -> None:
+        self.record_calls.append({"owner": owner, "episode": episode})
+        self.entries.setdefault(owner, []).append(episode)
+
+    def recent(self, owner: str, *, source_path: str | None = None, limit: int = 3):
+        self.recent_calls.append({"owner": owner, "source_path": source_path, "limit": limit})
+        rows = list(self.entries.get(owner, []))
+        if source_path:
+            rows = [row for row in rows if row.source_path == source_path]
+        rows.sort(key=lambda row: row.created_at, reverse=True)
+        return rows[:limit]
+
+    def search(self, owner: str, query_text: str, *, source_path: str | None = None, limit: int = 3, **kwargs):
+        self.search_calls.append(
+            {
+                "owner": owner,
+                "query_text": query_text,
+                "source_path": source_path,
+                "limit": limit,
+                **kwargs,
+            }
+        )
+        query_tokens = {token for token in str(query_text or "").lower().split() if token}
+        rows = list(self.entries.get(owner, []))
+        if source_path:
+            rows = [row for row in rows if row.source_path == source_path]
+        scored = []
+        for row in rows:
+            haystack = row.search_blob().lower()
+            score = sum(1 for token in query_tokens if token in haystack)
+            if score > 0:
+                scored.append((score, row))
+        scored.sort(key=lambda item: (item[0], item[1].created_at), reverse=True)
+        return [row for _, row in scored[:limit]]
 
 
 def _setup_authenticated_user(monkeypatch, tmp_path):
@@ -258,6 +304,70 @@ def test_assistant_requirements_ask_uses_and_records_memory(monkeypatch, tmp_pat
     episodes = refiner_web._assistant_memory_store("integration_tester").snapshot(source_path=scope)
     assert len(episodes) == 2
     assert episodes[-1].metadata["mode"] == "ask"
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_assistant_requirements_ask_reads_central_memory_and_dual_writes(monkeypatch, tmp_path):
+    provider = _AskProvider()
+    central_store = _FakeCentralEpisodeStore()
+
+    _setup_authenticated_user(monkeypatch, tmp_path)
+    monkeypatch.setattr(refiner_web, "get_provider", lambda *args, **kwargs: provider)
+    monkeypatch.setattr(refiner_web, "CENTRAL_STORE", SimpleNamespace(assistant_episodes=central_store))
+
+    scope = refiner_web._assistant_memory_scope(
+        "assistant_requirements",
+        mode="ask",
+        profile="requirements",
+    )
+    central_store.seed(
+        "integration_tester",
+        SolverEpisode(
+            episode_id="central-1",
+            source_path=scope,
+            iteration=4,
+            created_at="2026-04-14T01:00:00Z",
+            outcome="success",
+            summary="Use acceptance criteria before implementation detail when tightening scope.",
+            notes=[
+                "prompt: clarify scope",
+                "context: requirements should remain testable and narrow",
+            ],
+            metadata={"mode": "ask"},
+        ),
+    )
+
+    with refiner_web.app.test_client() as client:
+        response = client.post(
+            "/api/assistant/requirements",
+            json={
+                "mode": "ask",
+                "prompt": "How should I tighten this requirements draft so the build stays small but still testable?",
+                "requirements_text": (
+                    "We need a requirements draft for a small classroom helper. "
+                    "The product should stay narrow in scope, remain testable, and avoid feature creep."
+                ),
+                "messages": [
+                    {"role": "user", "content": "Keep the project small."},
+                    {"role": "assistant", "content": "Focus on a single user journey."},
+                    {"role": "user", "content": "How do I make the acceptance criteria clearer?"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert provider.calls
+    prompt_text = provider.calls[0]["messages"][-1]["content"]
+    assert "Relevant prior successful guidance for similar requirements questions" in prompt_text
+    assert "Use acceptance criteria before implementation detail" in prompt_text
+    assert central_store.search_calls
+    assert central_store.record_calls
+    assert central_store.record_calls[-1]["owner"] == "integration_tester"
+    assert central_store.record_calls[-1]["episode"].metadata["mode"] == "ask"
+
+    local_episodes = refiner_web._assistant_memory_store("integration_tester").snapshot(source_path=scope)
+    assert len(local_episodes) == 1
+    assert local_episodes[0].metadata["mode"] == "ask"
 
 
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")

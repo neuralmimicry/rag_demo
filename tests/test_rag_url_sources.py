@@ -3,7 +3,7 @@ import pytest
 
 HAS_REAL_FLASK = hasattr(flask.Flask, "test_client")
 if HAS_REAL_FLASK:
-    import refiner_web  # noqa: E402
+    from refiner import refiner_web  # noqa: E402
 
 
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
@@ -26,8 +26,7 @@ def test_coerce_rag_sources_accepts_strings_and_urls():
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
 def test_build_rag_documents_supports_youtube_sources(monkeypatch):
     monkeypatch.setattr(
-        refiner_web,
-        "fetch_youtube_transcript",
+        "assistant_pipeline.ingestion.source_loader.fetch_youtube_transcript",
         lambda url, timeout: (
             "Transcript body",
             {

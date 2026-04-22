@@ -1,6 +1,6 @@
 import json
 
-from delivery_pipeline import run_delivery_pipeline
+from refiner.delivery_pipeline import run_delivery_pipeline
 
 
 def _write_config(path, config):

@@ -1,4 +1,5 @@
 import queue
+import threading
 import time
 
 import flask
@@ -6,7 +7,7 @@ import pytest
 
 HAS_REAL_FLASK = hasattr(flask.Flask, "test_client")
 if HAS_REAL_FLASK:
-    import refiner_web  # noqa: E402
+    from refiner import refiner_web  # noqa: E402
 
 
 class _FakeResponse:
@@ -149,3 +150,98 @@ def test_job_workspace_task_cancel_endpoint(monkeypatch):
             time.sleep(0.05)
 
     assert final_status == "cancelled"
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_job_action_manager_limits_owner_outstanding_tasks_without_blocking_other_users(monkeypatch):
+    action_manager = refiner_web.JobActionManager(
+        workers=1,
+        max_queue=4,
+        task_ttl_sec=600,
+        max_outstanding_per_owner=1,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _fake_execute(task):
+        started.set()
+        release.wait(timeout=1.0)
+        return {"owner": task.owner, "action": task.action}
+
+    monkeypatch.setattr(refiner_web, "_execute_job_action_task", _fake_execute)
+
+    first = action_manager.submit(job_id="job-1", owner="alice", action="workspace_refresh", payload={})
+    assert started.wait(timeout=1.0)
+
+    with pytest.raises(queue.Full):
+        action_manager.submit(job_id="job-1", owner="alice", action="workspace_create", payload={})
+
+    other = action_manager.submit(job_id="job-2", owner="bob", action="workspace_refresh", payload={})
+
+    release.set()
+    completed = set()
+    for _ in range(80):
+        for task_id in (first.task_id, other.task_id):
+            task = action_manager.get_task(task_id)
+            if task and task.status == "completed":
+                completed.add(task_id)
+        if completed == {first.task_id, other.task_id}:
+            break
+        time.sleep(0.02)
+
+    assert completed == {first.task_id, other.task_id}
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_job_action_manager_schedules_other_owner_while_first_owner_is_running(monkeypatch):
+    action_manager = refiner_web.JobActionManager(
+        workers=1,
+        max_queue=6,
+        task_ttl_sec=600,
+        max_outstanding_per_owner=4,
+        max_inflight_per_owner=1,
+    )
+    first_started = threading.Event()
+    two_started = threading.Event()
+    release = threading.Event()
+    start_lock = threading.Lock()
+    started_owners = []
+
+    def _fake_execute(task):
+        with start_lock:
+            started_owners.append(task.owner)
+            if len(started_owners) == 1:
+                first_started.set()
+            if len(started_owners) >= 2:
+                two_started.set()
+        release.wait(timeout=1.0)
+        return {"owner": task.owner, "action": task.action}
+
+    monkeypatch.setattr(refiner_web, "_execute_job_action_task", _fake_execute)
+
+    first = action_manager.submit(job_id="job-1", owner="alice", action="workspace_refresh", payload={})
+    assert first_started.wait(timeout=1.0)
+
+    second = action_manager.submit(job_id="job-2", owner="alice", action="workspace_create", payload={})
+    third = action_manager.submit(job_id="job-3", owner="bob", action="workspace_refresh", payload={})
+
+    worker = threading.Thread(target=action_manager._worker_loop, args=(1,), daemon=True)
+    worker.start()
+    action_manager.workers.append(worker)
+
+    assert two_started.wait(timeout=1.0)
+    with start_lock:
+        assert set(started_owners[:2]) == {"alice", "bob"}
+
+    release.set()
+    completed = set()
+    for _ in range(80):
+        for task_id in (first.task_id, second.task_id, third.task_id):
+            task = action_manager.get_task(task_id)
+            if task and task.status == "completed":
+                completed.add(task_id)
+        if completed == {first.task_id, second.task_id, third.task_id}:
+            break
+        time.sleep(0.02)
+
+    assert completed == {first.task_id, second.task_id, third.task_id}

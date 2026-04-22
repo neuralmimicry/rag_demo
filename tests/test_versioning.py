@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import versioning
-
-
+from refiner import versioning
 def _clear_cache() -> None:
     versioning._cached_version_info.cache_clear()
 

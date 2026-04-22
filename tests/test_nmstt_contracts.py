@@ -1,4 +1,4 @@
-from nmstt_contracts import NmsttGesturePlanRequest, sanitize_nmstt_motion_response
+from refiner.nmstt_contracts import NmsttGesturePlanRequest, sanitize_nmstt_motion_response
 
 
 def test_nmstt_gesture_plan_request_contains_motion_style_alias():

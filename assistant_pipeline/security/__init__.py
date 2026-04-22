@@ -6,19 +6,24 @@ from assistant_pipeline.security.policies import (
     AssistantInputPolicy,
     AssistantOutputPolicy,
     AssistantSecurityPolicy,
+    AssistantToolUsePolicy,
     assistant_security_policy_from_config,
 )
+from assistant_pipeline.security.tool_guard import ToolUseGuardResult, apply_tool_use_guard
 
 __all__ = [
     "AssistantInputPolicy",
     "AssistantOutputPolicy",
     "AssistantSecurityPolicy",
+    "AssistantToolUsePolicy",
     "InputGuardResult",
     "OutputGuardResult",
     "SourceGuardResult",
+    "ToolUseGuardResult",
     "apply_input_guard",
     "apply_output_guard",
     "apply_rag_source_guard",
+    "apply_tool_use_guard",
     "assistant_security_policy_from_config",
     "build_assistant_reply_payload",
 ]

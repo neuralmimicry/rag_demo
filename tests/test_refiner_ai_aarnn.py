@@ -1,4 +1,4 @@
-from refiner_ai_aarnn import AarnnEngine
+from refiner.refiner_ai_aarnn import AarnnEngine
 
 
 def test_aarnn_offline_analysis_still_exposes_aer_context(tmp_path):

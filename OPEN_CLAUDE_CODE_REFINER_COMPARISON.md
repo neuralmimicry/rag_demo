@@ -14,13 +14,13 @@ own implementation without importing a mismatched product model.
 Refiner currently operates as a multi-workflow engineering platform rather than
 a single-purpose RAG application.
 
-- `run_refiner.py` is the top-level workflow router.
-- `main.py` still owns the historical Jira analytics path.
-- `topic_researcher.py` handles iterative evidence gathering and drafting.
-- `project_solver.py` is the coding and remediation engine for requirement
+- `refiner/run_refiner.py` is the top-level workflow router.
+- `refiner/main.py` still owns the historical Jira analytics path.
+- `refiner/topic_researcher.py` handles iterative evidence gathering and drafting.
+- `refiner/project_solver.py` is the coding and remediation engine for requirement
   sources inside a local repository.
-- `delivery_pipeline.py` provides staged execution and gating.
-- `refiner_web.py` exposes the control-plane UI and JSON APIs for jobs,
+- `refiner/delivery_pipeline.py` provides staged execution and gating.
+- `refiner/refiner_web.py` exposes the control-plane UI and JSON APIs for jobs,
   sessions, workspaces, RAG, MCP, STT, auth, and admin operations.
 
 ### Structural intent
@@ -136,7 +136,7 @@ This is a better fit for Refiner than adding an interactive trust dashboard.
 
 ## Implemented in this pass
 
-### `solver_memory.py`
+### `refiner/solver_memory.py`
 
 Adds a durable solver episode store with:
 
@@ -146,7 +146,7 @@ Adds a durable solver episode store with:
   overlap,
 - prompt-ready formatting for the current requirement source.
 
-### `solver_context.py`
+### `refiner/solver_context.py`
 
 Adds prompt section budgeting with:
 
@@ -156,7 +156,7 @@ Adds prompt section budgeting with:
 - deterministic trimming for large sections,
 - a transparent inclusion report.
 
-### `solver_command_policy.py`
+### `refiner/solver_command_policy.py`
 
 Adds a non-interactive execution policy with:
 
@@ -165,7 +165,7 @@ Adds a non-interactive execution policy with:
 - support for environment-prefixed simple commands,
 - preparation for `subprocess.run(..., shell=False)`.
 
-### `project_solver.py`
+### `refiner/project_solver.py`
 
 Updated to:
 

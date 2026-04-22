@@ -22,7 +22,7 @@ def _page(PageInfo, id: str, title: str, depth: int | None, parent: str | None, 
 
 
 def test_tree_depth_scopes_analysis_but_not_baseline(tmp_path, monkeypatch):
-    from confluence_analysis import analyze_space_and_write_report, PageInfo
+    from refiner.confluence_analysis import analyze_space_and_write_report, PageInfo
 
     # Build synthetic pages: depths 0,1,2,4,10 and unknown (None)
     r = _page(PageInfo, "r", "root", 0, None, ["c1"])  # root
@@ -35,12 +35,12 @@ def test_tree_depth_scopes_analysis_but_not_baseline(tmp_path, monkeypatch):
     pages_full = [r, c1, g1, d4, d10, u]
 
     # Monkeypatch network-bound functions
-    monkeypatch.setattr("confluence_analysis.fetch_space", lambda base_url, auth, space_key: {"name": "Test Space", "key": space_key})
-    monkeypatch.setattr("confluence_analysis.fetch_space_pages", lambda base_url, auth, space_key: pages_full)
+    monkeypatch.setattr("refiner.confluence_analysis.fetch_space", lambda base_url, auth, space_key: {"name": "Test Space", "key": space_key})
+    monkeypatch.setattr("refiner.confluence_analysis.fetch_space_pages", lambda base_url, auth, space_key: pages_full)
     # Do not alter hierarchy (depths already set)
-    monkeypatch.setattr("confluence_analysis.enrich_pages_with_ancestors", lambda base_url, auth, pages: None)
+    monkeypatch.setattr("refiner.confluence_analysis.enrich_pages_with_ancestors", lambda base_url, auth, pages: None)
     # Avoid page body fetching
-    monkeypatch.setattr("confluence_analysis.get_page_text", lambda base_url, auth, space_key, p: "lorem ipsum" * 10)
+    monkeypatch.setattr("refiner.confluence_analysis.get_page_text", lambda base_url, auth, space_key, p: "lorem ipsum" * 10)
 
     out = tmp_path / "report.html"
     analyze_space_and_write_report(

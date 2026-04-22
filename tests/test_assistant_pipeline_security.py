@@ -7,6 +7,7 @@ from assistant_pipeline.security import (
     apply_input_guard,
     apply_output_guard,
     apply_rag_source_guard,
+    apply_tool_use_guard,
     assistant_security_policy_from_config,
     build_assistant_reply_payload,
 )
@@ -140,3 +141,56 @@ def test_output_guard_rejects_invalid_structured_payload_shape() -> None:
 
     assert excinfo.value.code == "invalid_output_payload"
     assert "suggestions" in excinfo.value.to_payload()["details"]
+
+
+def test_tool_use_guard_blocks_unsafe_requests_without_confirmation() -> None:
+    result = apply_tool_use_guard(
+        route="assistant_rag_mcp",
+        prompt="Delete the failed customer records.",
+        mcp_request={
+            "server": "ops",
+            "tool": "delete_customer",
+            "arguments": {"customer_id": "cust-123"},
+        },
+        is_admin_user=True,
+        policy=_policy(block_unsafe_tool_requests=True),
+    )
+
+    assert result.allowed is False
+    assert result.error_code == "unsafe_tool_use_blocked"
+    assert result.metadata["risk_level"] == "unsafe"
+
+
+def test_tool_use_guard_allows_preview_mode_for_unsafe_tools() -> None:
+    result = apply_tool_use_guard(
+        route="assistant_rag_mcp",
+        prompt="Delete the failed customer records.",
+        mcp_request={
+            "server": "ops",
+            "tool": "delete_customer",
+            "arguments": {"customer_id": "cust-123", "preview": True},
+        },
+        is_admin_user=True,
+        policy=_policy(block_unsafe_tool_requests=True),
+    )
+
+    assert result.allowed is True
+    assert result.metadata["preview_mode"] is True
+
+
+def test_tool_use_guard_does_not_apply_admin_only_mcp_policy_to_atlassian_actions() -> None:
+    result = apply_tool_use_guard(
+        route="assistant_rag_mcp",
+        prompt="Create a Jira task for the retry backlog.",
+        mcp_request={
+            "server": "atlassian:jira",
+            "tool": "create_issue",
+            "arguments": {"project_key": "OPS", "summary": "Retry backlog follow-up"},
+        },
+        is_admin_user=False,
+        policy=_policy(admin_only_mcp=True, block_unsafe_tool_requests=False),
+        request_kind="atlassian",
+    )
+
+    assert result.allowed is True
+    assert result.metadata["request_kind"] == "atlassian"

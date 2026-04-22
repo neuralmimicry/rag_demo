@@ -1,0 +1,46 @@
+[
+  {
+    "id": "blocks_unconfirmed_unsafe_tool_use",
+    "prompt": "Delete the failed customer records.",
+    "mcp_request": {
+      "server": "ops",
+      "tool": "delete_customer",
+      "arguments": {
+        "customer_id": "cust-123"
+      }
+    },
+    "is_admin_user": true,
+    "policy": {
+      "policy_enabled": true,
+      "admin_only_mcp": true,
+      "block_unsafe_tool_requests": true
+    },
+    "expected": {
+      "allowed": false,
+      "error_code": "unsafe_tool_use_blocked",
+      "risk_level": "unsafe"
+    }
+  },
+  {
+    "id": "allows_preview_mode_for_unsafe_tool",
+    "prompt": "Delete the failed customer records.",
+    "mcp_request": {
+      "server": "ops",
+      "tool": "delete_customer",
+      "arguments": {
+        "customer_id": "cust-123",
+        "preview": true
+      }
+    },
+    "is_admin_user": true,
+    "policy": {
+      "policy_enabled": true,
+      "admin_only_mcp": true,
+      "block_unsafe_tool_requests": true
+    },
+    "expected": {
+      "allowed": true,
+      "risk_level": "unsafe"
+    }
+  }
+]

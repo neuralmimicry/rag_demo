@@ -385,7 +385,7 @@ const CLI_BUBBLES = [
     label: 'LLM Provider',
     type: 'select',
     flag: '--llm-provider',
-    help: 'Override the LLM provider used by run_refiner.py.',
+    help: 'Override the LLM provider used by the refiner.run_refiner workflow router.',
     options: [
       { label: 'OpenAI', value: 'openai' },
       { label: 'Gemini', value: 'gemini' },

@@ -16,7 +16,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from solver_memory import SolverEpisode
+from refiner.solver_memory import SolverEpisode
 
 from central_store.base import clamp_text, coerce_int, jsonb, timestamp
 

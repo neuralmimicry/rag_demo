@@ -3,7 +3,7 @@ import logging
 import os
 from unittest.mock import MagicMock, patch
 
-from llm_providers import OpenAIProvider, _openai_model_supports_reasoning_effort
+from refiner.llm_providers import OpenAIProvider, _openai_model_supports_reasoning_effort
 
 
 def _mock_openai_response(status_code, payload):

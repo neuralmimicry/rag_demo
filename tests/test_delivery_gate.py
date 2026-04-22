@@ -1,5 +1,5 @@
 import json
-from delivery_pipeline import run_delivery_pipeline
+from refiner.delivery_pipeline import run_delivery_pipeline
 
 
 def test_delivery_gate_blocks_deploy_stage(tmp_path):

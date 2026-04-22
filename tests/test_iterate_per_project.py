@@ -1,8 +1,6 @@
 from types import SimpleNamespace as NS
 
-import main as m
-
-
+from refiner import main as m
 def test_iterate_per_project_builds_per_project_jql(monkeypatch, tmp_path):
     # Enable per-project iteration
     monkeypatch.setattr(m, "ITERATE_PER_PROJECT", True, raising=False)
@@ -52,7 +50,7 @@ def test_iterate_per_project_builds_per_project_jql(monkeypatch, tmp_path):
 
 def test_auto_per_project_retry_when_disabled(monkeypatch, tmp_path):
     # Ensure ITERATE_PER_PROJECT is disabled to exercise auto-retry path
-    import main as m
+    from refiner import main as m
     monkeypatch.setattr(m, "ITERATE_PER_PROJECT", False, raising=False)
 
     # Temp cwd to isolate any cache usage/logs

@@ -3,12 +3,12 @@ import os
 import json
 import time
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher, RESEARCH_CACHE_ROOT
+from refiner.topic_researcher import TopicResearcher, RESEARCH_CACHE_ROOT
 
 @pytest.fixture
 def researcher():
-    with patch("topic_researcher.get_provider"):
-        with patch("topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
+    with patch("refiner.topic_researcher.get_provider"):
+        with patch("refiner.topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
             return TopicResearcher(
                 jira_base_url="https://test.atlassian.net",
                 jira_auth=("user", "token"),
@@ -66,7 +66,7 @@ def test_cache_expiration(researcher):
     retrieved = researcher._read_cache(url)
     assert retrieved is None
 
-@patch("topic_researcher.requests.Session")
+@patch("refiner.topic_researcher.requests.Session")
 def test_read_source_uses_cache(mock_session_class, researcher):
     url = "https://example.com/cached-source"
     content = "Fetched from cache"
@@ -83,7 +83,7 @@ def test_read_source_uses_cache(mock_session_class, researcher):
     assert url in researcher.contributing_web
     assert researcher.source_metadata[url]["title"] == "Test Title"
 
-@patch("topic_researcher.requests.Session")
+@patch("refiner.topic_researcher.requests.Session")
 def test_read_source_saves_to_cache(mock_session_class, researcher):
     url = "https://example.com/new-source"
     content = "Freshly fetched content"
@@ -112,7 +112,7 @@ def test_read_source_saves_to_cache(mock_session_class, researcher):
     assert cache_data["content"] == content
     assert cache_data["metadata"]["type"] == "Web"
 
-@patch("topic_researcher._jira_get")
+@patch("refiner.topic_researcher._jira_get")
 def test_read_source_jira_cache(mock_jira_get, researcher):
     url = "https://test.atlassian.net/browse/PROJ-1"
     content = "Jira Issue PROJ-1: Summary\n\nDescription"

@@ -1,5 +1,5 @@
-from llm_providers import get_provider
-from refiner_ai_orchestration import (
+from refiner.llm_providers import get_provider
+from refiner.refiner_ai_orchestration import (
     build_workflow_provider,
     orchestrate_provider_candidates,
     orchestration_status,
@@ -99,8 +99,7 @@ def test_orchestrate_provider_candidates_returns_gail_workflow_provider(monkeypa
 
 def test_orchestration_status_proxies_to_gail(monkeypatch):
     _enable_gail(monkeypatch)
-    import refiner_ai_gail
-
+    from refiner import refiner_ai_gail
     captured = {}
 
     def _fake_gail_status(*, candidate_limit, probe_engines, probe_providers):

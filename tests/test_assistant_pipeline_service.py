@@ -1,5 +1,5 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -9,7 +9,7 @@ from assistant_pipeline import service as assistant_service
 from assistant_pipeline.contracts import ServiceError
 from assistant_pipeline.dependencies import AssistantPipelineDependencies
 from assistant_pipeline.ingestion.artifact_store import write_versioned_index_artifact
-from rag_engine import RagDocument, RagIndex, RagStore
+from refiner.rag_engine import RagDocument, RagIndex, RagStore
 
 
 @dataclass
@@ -88,6 +88,7 @@ class _FakeRagStore:
     def __init__(self, *, root: str = ""):
         self.indexes: Dict[str, _FakeIndex] = {}
         self.saved: List[Dict[str, Any]] = []
+        self.mirrored: List[Dict[str, Any]] = []
         self.deleted: List[Dict[str, Any]] = []
         self.root = root
 
@@ -99,6 +100,11 @@ class _FakeRagStore:
         artifact_path = f"/tmp/{user}/{index.name}.json"
         self.saved.append({"user": user, "index": index, "artifact_path": artifact_path})
         return artifact_path
+
+    def mirror_index_artifact(self, user: str, name: str, artifact_path: str) -> str:
+        active_artifact_path = f"/tmp/{user}/{name}.json"
+        self.mirrored.append({"user": user, "name": name, "artifact_path": active_artifact_path, "mirrored_from": artifact_path})
+        return active_artifact_path
 
     def delete_index(self, user: str, name: str) -> bool:
         self.deleted.append({"user": user, "name": name})
@@ -116,6 +122,7 @@ class _FakeRagMetadataStore:
         self.active_versions: Dict[tuple, Dict[str, Any]] = {}
         self.build_starts: List[Dict[str, Any]] = []
         self.build_failures: List[Dict[str, Any]] = []
+        self.staged_versions: List[Dict[str, Any]] = []
 
     def start_collection_build(self, owner: str, name: str, **kwargs) -> str:
         version_id = kwargs.get("version_id") or f"version-{len(self.build_starts) + 1}"
@@ -127,11 +134,20 @@ class _FakeRagMetadataStore:
         self.build_failures.append({"owner": owner, "name": name, "version_id": version_id, **kwargs})
         return version_id
 
+    def stage_collection_version(self, owner: str, name: str, **kwargs) -> str:
+        version_id = kwargs.get("version_id") or ""
+        self.staged_versions.append({"owner": owner, "name": name, "version_id": version_id, **kwargs})
+        return version_id
+
     def record_collection_version(self, owner: str, name: str, **kwargs) -> str:
         version_id = kwargs.get("version_id") or f"version-{len(self.collection_versions) + 1}"
         entry = {"owner": owner, "name": name, "version_id": version_id, **kwargs}
         self.collection_versions.append(entry)
-        self.active_versions[(owner, name)] = {"active_version_id": version_id}
+        self.active_versions[(owner, name)] = {
+            "active_version_id": version_id,
+            "artifact_path": kwargs.get("artifact_path"),
+            "metadata": kwargs.get("metadata"),
+        }
         return version_id
 
     def get_active_version(self, owner: str, name: str) -> Optional[Dict[str, Any]]:
@@ -287,6 +303,7 @@ def _build_dependencies(
     assistant_memory_references: Optional[List[Dict[str, Any]]] = None,
     allow_assistant_ask_memory: bool = False,
     mcp_result: Optional[Any] = None,
+    atlassian_result: Optional[Any] = None,
     rag_config: Optional[Dict[str, Any]] = None,
     playground_config: Optional[Dict[str, Any]] = None,
     security_config: Optional[Dict[str, Any]] = None,
@@ -297,6 +314,7 @@ def _build_dependencies(
     global_requirements_titles: Optional[List[str]] = None,
     opencode_available: bool = False,
     submit_subtask_error: Optional[Exception] = None,
+    execute_atlassian_error: Optional[Exception] = None,
 ) -> tuple[AssistantPipelineDependencies, Dict[str, Any]]:
     logger = _FakeLogger()
     provider = provider or _FakeProvider()
@@ -366,6 +384,8 @@ def _build_dependencies(
         "retry_enabled": False,
         "max_retry_queries": 3,
         "min_clause_terms": 2,
+        "rerank_enabled": False,
+        "rerank_max_phrase_terms": 6,
         "refuse_on_insufficient": True,
         **(retrieval_config or {}),
     }
@@ -393,8 +413,10 @@ def _build_dependencies(
         "build_document_calls": [],
         "build_index_calls": [],
         "mcp_calls": [],
+        "atlassian_calls": [],
         "estimate_payloads": [],
         "subtask_submit_calls": [],
+        "runtime_telemetry": [],
         "trace_counter": 0,
     }
 
@@ -553,7 +575,10 @@ def _build_dependencies(
         state["resolve_llm_calls"].append(kwargs)
         return dict(settings)
 
-    def _acquire_request_capacity(current_semaphore: _FakeSemaphore, wait_seconds: float) -> bool:
+    def _record_runtime_telemetry(owner: str, event: Dict[str, Any]) -> None:
+        state["runtime_telemetry"].append({"owner": owner, "event": dict(event)})
+
+    def _acquire_request_capacity(current_semaphore: _FakeSemaphore, wait_seconds: float, **kwargs) -> bool:
         if wait_seconds > 0:
             return bool(current_semaphore.acquire(timeout=wait_seconds))
         return bool(current_semaphore.acquire(blocking=False))
@@ -561,6 +586,12 @@ def _build_dependencies(
     def _mcp_execute(*args, **kwargs):
         state["mcp_calls"].append({"args": args, "kwargs": kwargs})
         return mcp_result
+
+    def _execute_atlassian_action(*args, **kwargs):
+        state["atlassian_calls"].append({"args": args, "kwargs": kwargs})
+        if execute_atlassian_error is not None:
+            raise execute_atlassian_error
+        return atlassian_result
 
     def _estimate_job_tokens(job_payload: Dict[str, Any]) -> int:
         state["estimate_payloads"].append(job_payload)
@@ -608,6 +639,7 @@ def _build_dependencies(
         format_skill_brief=_format_skill_brief,
         is_admin_user=lambda current_user: is_admin,
         mcp_execute=_mcp_execute,
+        execute_atlassian_action=_execute_atlassian_action,
         resolve_llm_settings=_resolve_llm_settings,
         build_request_llm_provider=_build_request_llm_provider,
         acquire_request_capacity=_acquire_request_capacity,
@@ -631,6 +663,7 @@ def _build_dependencies(
         estimate_job_tokens=_estimate_job_tokens,
         opencode_available_for_playground=lambda: opencode_available,
         submit_subtask=_submit_subtask,
+        record_runtime_telemetry=_record_runtime_telemetry,
     )
     return deps, state
 
@@ -671,7 +704,7 @@ def test_rag_query_returns_context_and_records_metadata_and_trace() -> None:
             "top_k": 2,
             "match_count": 1,
             "version_id": "version-7",
-            "metadata": {"min_score": 0.1, "conversation_id": None},
+            "metadata": {"min_score": 0.1, "conversation_id": None, "citation_count": 1},
         }
     ]
     assert rag_store.indexes["docs"].search_calls[0]["query"] == "release notes"
@@ -776,6 +809,61 @@ def test_rag_collection_build_returns_ready_payload_and_publishes_versioned_meta
         "coerce_sources",
         "build_documents",
         "build_index",
+        "publish_index",
+        "record_metadata",
+    ]
+
+
+def test_rag_collection_build_stages_publication_before_active_mirror_when_versioned_storage_is_available(tmp_path) -> None:
+    rag_store = RagStore(str(tmp_path / "rag"))
+    metadata_store = _FakeRagMetadataStore()
+    deps, state = _build_dependencies(rag_store=rag_store, rag_metadata_store=metadata_store)
+
+    def _real_build_rag_index(**kwargs):
+        documents = [
+            RagDocument(
+                doc_id=str(getattr(doc, "doc_id", "doc")),
+                source=str(getattr(doc, "source", "source")),
+                text=str(getattr(doc, "text", "")),
+                metadata=dict(getattr(doc, "metadata", {}) or {}),
+            )
+            for doc in kwargs.get("documents") or []
+        ]
+        return RagIndex.build(
+            kwargs.get("name") or "default",
+            documents,
+            chunk_size=int(kwargs.get("chunk_size") or 1200),
+            chunk_overlap=int(kwargs.get("chunk_overlap") or 200),
+            max_chunks=kwargs.get("max_chunks"),
+        )
+
+    deps = replace(deps, build_rag_index=_real_build_rag_index)
+
+    result = assistant_service.rag_collection_build(
+        deps,
+        user="alice",
+        payload={
+            "name": "docs",
+            "_rag_version_id": "version-44",
+            "sources": [{"type": "inline", "content": "Alpha release notes"}],
+        },
+    )
+
+    assert result.payload["status"] == "ready"
+    assert metadata_store.staged_versions[0]["version_id"] == "version-44"
+    assert metadata_store.staged_versions[0]["status"] == "publishing"
+    assert metadata_store.staged_versions[0]["metadata"]["publish_state"] == "staged"
+    assert metadata_store.staged_versions[0]["metadata"]["compatibility_mirror_status"] == "pending"
+    assert metadata_store.collection_versions[0]["artifact_path"] == metadata_store.staged_versions[0]["artifact_path"]
+    assert metadata_store.collection_versions[0]["metadata"]["publish_state"] == "published"
+    assert metadata_store.collection_versions[0]["metadata"]["compatibility_mirror_status"] == "published"
+    assert rag_store.load_index("alice", "docs") is not None
+    assert [span["stage"] for span in state["trace_store"].spans] == [
+        "coerce_sources",
+        "build_documents",
+        "build_index",
+        "save_version_artifact",
+        "stage_publication",
         "publish_index",
         "record_metadata",
     ]
@@ -1039,6 +1127,7 @@ def test_rag_query_uses_semantic_cache_when_enabled() -> None:
 
     assert result.payload["query"] == "What about failures?"
     assert result.payload["context"] == "[Ops 1]\nFailure retries happen after sync."
+    assert result.payload["citations"][0]["chunk_id"] == "chunk-1"
     assert state["semantic_cache_store"].list_calls[0]["route"] == "rag_query"
     assert state["semantic_cache_store"].hit_calls == ["cache-1"]
     assert state["trace_store"].finishes[0]["cache_hit"] is True
@@ -1162,6 +1251,8 @@ def test_assistant_rag_mcp_uses_semantic_cache_when_enabled_and_mcp_is_disabled(
     )
 
     assert result.payload["answer"] == "Check the retry queue after the sync step."
+    assert result.payload["citations"][0]["chunk_id"] == "chunk-9"
+    assert result.payload["citation_audit"]["bound_claim_count"] == 1
     assert state["provider"].calls == []
     assert state["semantic_cache_store"].hit_calls == ["cache-2"]
     assert state["trace_store"].finishes[0]["cache_hit"] is True
@@ -1169,6 +1260,7 @@ def test_assistant_rag_mcp_uses_semantic_cache_when_enabled_and_mcp_is_disabled(
         "input_guard",
         "rewrite_query",
         "cache_lookup",
+        "citation_bind",
         "output_guard",
     ]
 
@@ -1235,23 +1327,219 @@ def test_assistant_rag_mcp_combines_rag_context_tool_output_and_traces() -> None
     assert result.payload["answer"] == "Use the overnight sync window."
     assert result.payload["mcp_result"] == {"status": "ok", "total": 3}
     assert result.payload["rag_matches"][0]["citation"] == "[Ops Guide p.4]"
+    assert result.payload["citation_audit"]["citation_count"] == 1
     assert "preserve the supplied source citation labels" in provider.calls[0]["system"]
     assert "RAG context:\n[Ops Guide p.4]" in provider.calls[0]["messages"][0]["content"]
     assert '"status": "ok"' in provider.calls[0]["messages"][0]["content"]
     assert metadata_store.query_audits[0]["route"] == "assistant_rag_mcp"
     assert metadata_store.query_audits[0]["rewritten_query"] == "How does the customer sync work?"
+    assert metadata_store.query_audits[0]["metadata"]["citation_count"] == 1
+    assert metadata_store.query_audits[0]["metadata"]["citation_bound_claim_count"] == 0
+    assert metadata_store.query_audits[0]["metadata"]["tool_guard_allowed"] is True
     assert state["mcp_calls"][0]["args"][1] == "ops"
+    assert state["runtime_telemetry"][0]["event"]["category"] == "assistant_security"
     assert [call["role"] for call in state["conversation_store"].append_calls] == ["user", "assistant"]
     assert [span["stage"] for span in state["trace_store"].spans] == [
         "input_guard",
         "rewrite_query",
         "route_hints",
         "rag_search",
+        "tool_guard",
         "mcp_call",
         "generate",
+        "citation_bind",
         "output_guard",
     ]
-    assert state["trace_store"].finishes[0]["response_meta"] == {"rag_match_count": 1, "has_mcp": True}
+    assert state["trace_store"].finishes[0]["response_meta"]["rag_match_count"] == 1
+    assert state["trace_store"].finishes[0]["response_meta"]["has_mcp"] is True
+    assert state["trace_store"].finishes[0]["response_meta"]["citation_count"] == 1
+
+
+def test_assistant_rag_mcp_binds_claims_to_retrieved_chunks() -> None:
+    provider = _FakeProvider(
+        response=_FakeLLMResponse(
+            text=(
+                "Customer sync runs nightly [Ops Guide p.4]. "
+                "Failures move to the retry queue [Ops Guide p.7]."
+            )
+        )
+    )
+    rag_store = _FakeRagStore()
+    rag_store.indexes["ops"] = _FakeIndex(
+        "ops",
+        matches=[
+            {
+                "chunk_id": "chunk-sync",
+                "citation": "[Ops Guide p.4]",
+                "text": "Customer sync runs nightly after the ledger checkpoint.",
+                "score": 0.91,
+            },
+            {
+                "chunk_id": "chunk-retry",
+                "citation": "[Ops Guide p.7]",
+                "text": "Failures move to the retry queue for another pass.",
+                "score": 0.88,
+            },
+        ],
+    )
+    metadata_store = _FakeRagMetadataStore()
+    metadata_store.active_versions[("alice", "ops")] = {"active_version_id": "version-15"}
+    deps, state = _build_dependencies(
+        provider=provider,
+        rag_store=rag_store,
+        rag_metadata_store=metadata_store,
+    )
+
+    result = assistant_service.assistant_rag_mcp(
+        deps,
+        user="alice",
+        payload={
+            "prompt": "Explain the sync flow and what happens to failures.",
+            "conversation_id": "conv-citations-1",
+            "rag": {"index": "ops", "top_k": 2},
+        },
+    )
+
+    claim_bindings = {
+        binding["claim_id"]: [citation["chunk_id"] for citation in binding.get("citations") or []]
+        for binding in result.payload["claim_bindings"]
+    }
+    assert [source["chunk_id"] for source in result.payload["citations"]] == ["chunk-sync", "chunk-retry"]
+    assert claim_bindings["claim-001"] == ["chunk-sync"]
+    assert claim_bindings["claim-002"] == ["chunk-retry"]
+    assert result.payload["citation_audit"]["bound_claim_count"] == 2
+    assert metadata_store.query_audits[0]["metadata"]["citation_bound_claim_count"] == 2
+    assert state["trace_store"].spans[-2]["stage"] == "citation_bind"
+
+
+def test_assistant_rag_mcp_blocks_unsafe_tool_use_and_records_runtime_telemetry() -> None:
+    deps, state = _build_dependencies(
+        is_admin=True,
+        security_config={"block_unsafe_tool_requests": True},
+    )
+
+    with pytest.raises(ServiceError) as excinfo:
+        assistant_service.assistant_rag_mcp(
+            deps,
+            user="alice",
+            payload={
+                "prompt": "Delete the failed customer records.",
+                "conversation_id": "conv-tool-1",
+                "mcp": {
+                    "server": "ops",
+                    "tool": "delete_customer",
+                    "arguments": {"customer_id": "cust-123"},
+                },
+            },
+        )
+
+    assert excinfo.value.code == "unsafe_tool_use_blocked"
+    assert excinfo.value.status_code == 409
+    assert state["mcp_calls"] == []
+    assert state["provider"].calls == []
+    assert state["runtime_telemetry"][0]["owner"] == "alice"
+    assert state["runtime_telemetry"][0]["event"]["error_class"] == "unsafe_tool_use_blocked"
+    assert state["runtime_telemetry"][0]["event"]["category"] == "assistant_security"
+    assert [span["stage"] for span in state["trace_store"].spans] == [
+        "input_guard",
+        "route_hints",
+        "tool_guard",
+    ]
+    assert state["trace_store"].spans[-1]["status"] == "blocked"
+    assert state["trace_store"].finishes[0]["error_code"] == "unsafe_tool_use_blocked"
+
+
+def test_assistant_rag_mcp_blocks_unsafe_atlassian_write_without_confirmation() -> None:
+    deps, state = _build_dependencies(
+        security_config={"block_unsafe_tool_requests": True},
+    )
+
+    with pytest.raises(ServiceError) as excinfo:
+        assistant_service.assistant_rag_mcp(
+            deps,
+            user="alice",
+            payload={
+                "prompt": "Create a Jira task for the retry backlog.",
+                "conversation_id": "conv-atlassian-1",
+                "atlassian": {
+                    "product": "jira",
+                    "action": "create_issue",
+                    "arguments": {"project_key": "OPS", "summary": "Retry backlog follow-up"},
+                },
+            },
+        )
+
+    assert excinfo.value.code == "unsafe_tool_use_blocked"
+    assert state["atlassian_calls"] == []
+    assert state["provider"].calls == []
+    assert state["runtime_telemetry"][0]["event"]["category"] == "assistant_security"
+    assert state["runtime_telemetry"][0]["event"]["error_class"] == "unsafe_tool_use_blocked"
+    assert [span["stage"] for span in state["trace_store"].spans] == [
+        "input_guard",
+        "route_hints",
+        "tool_guard",
+    ]
+    assert state["trace_store"].spans[-1]["metadata"]["request_kind"] == "atlassian"
+    assert state["trace_store"].finishes[0]["error_code"] == "unsafe_tool_use_blocked"
+
+
+def test_assistant_rag_mcp_executes_confirmed_atlassian_write_and_records_result() -> None:
+    provider = _FakeProvider(response=_FakeLLMResponse(text="Created Jira issue OPS-321 for the retry backlog."))
+    deps, state = _build_dependencies(
+        provider=provider,
+        security_config={"block_unsafe_tool_requests": True},
+        atlassian_result={
+            "status": "applied",
+            "applied": True,
+            "preview": False,
+            "product": "jira",
+            "action": "create_issue",
+            "instance": "NeuralMimicryJira",
+            "result": {
+                "issue_key": "OPS-321",
+                "issue_id": "10001",
+                "url": "https://neuralmimicry.atlassian.net/browse/OPS-321",
+            },
+        },
+    )
+
+    result = assistant_service.assistant_rag_mcp(
+        deps,
+        user="alice",
+        payload={
+            "prompt": "Create a Jira task for the retry backlog and summarise the outcome.",
+            "conversation_id": "conv-atlassian-2",
+            "atlassian": {
+                "product": "jira",
+                "action": "create_issue",
+                "confirmed": True,
+                "arguments": {"project_key": "OPS", "summary": "Retry backlog follow-up"},
+            },
+        },
+    )
+
+    assert result.payload["atlassian_result"]["result"]["issue_key"] == "OPS-321"
+    assert "Atlassian action result" in provider.calls[0]["messages"][0]["content"]
+    assert '"issue_key": "OPS-321"' in provider.calls[0]["messages"][0]["content"]
+    assert state["atlassian_calls"][0]["args"][0] == "alice"
+    assert state["atlassian_calls"][0]["args"][1]["action"] == "create_issue"
+    assert [event["event"]["category"] for event in state["runtime_telemetry"]] == [
+        "assistant_security",
+        "assistant_integration",
+    ]
+    assert state["runtime_telemetry"][1]["event"]["provider"] == "atlassian:jira"
+    assert state["conversation_store"].append_calls[-1]["metadata"]["has_atlassian_action"] is True
+    assert [span["stage"] for span in state["trace_store"].spans] == [
+        "input_guard",
+        "route_hints",
+        "tool_guard",
+        "atlassian_action",
+        "generate",
+        "citation_bind",
+        "output_guard",
+    ]
+    assert state["trace_store"].finishes[0]["response_meta"]["has_atlassian_action"] is True
+    assert state["trace_store"].finishes[0]["response_meta"]["atlassian_action"] == "create_issue"
 
 
 def test_rag_query_rewrites_follow_up_using_recent_conversation_history() -> None:
@@ -1321,6 +1609,53 @@ def test_rag_query_uses_hybrid_retrieval_and_scopes_cache_entries_when_enabled()
     assert state["trace_store"].spans[1]["stage"] == "rag_search"
     assert state["trace_store"].spans[1]["metadata"]["strategy"] == "dense_only"
     assert "retrieval=hybrid_v1" in state["semantic_cache_store"].upsert_calls[0]["scope_key"]
+
+
+def test_rag_query_reranks_sparse_matches_when_enabled() -> None:
+    rag_store = _FakeRagStore()
+    rag_store.indexes["ops"] = _FakeIndex(
+        "ops",
+        matches=[
+            {
+                "chunk_id": "chunk-1",
+                "source": "ops.md",
+                "citation": "[Ops Guide p.3]",
+                "text": "Retry happens nightly after processing.",
+                "metadata": {},
+                "score": 0.95,
+            },
+            {
+                "chunk_id": "chunk-2",
+                "source": "ops.md",
+                "citation": "[Ops Guide p.7]",
+                "text": "Customer sync failures move to the retry queue for another pass.",
+                "metadata": {"heading_path": ["Customer Sync Failures"]},
+                "score": 0.72,
+            },
+        ],
+    )
+    metadata_store = _FakeRagMetadataStore()
+    metadata_store.active_versions[("alice", "ops")] = {"active_version_id": "version-12"}
+    deps, state = _build_dependencies(
+        rag_store=rag_store,
+        rag_metadata_store=metadata_store,
+        retrieval_config={"rerank_enabled": True},
+    )
+
+    result = assistant_service.rag_query(
+        deps,
+        user="alice",
+        payload={"name": "ops", "query": "customer sync failures retry queue", "top_k": 2, "min_score": 0.0},
+    )
+
+    assert [match["chunk_id"] for match in result.payload["matches"]] == ["chunk-2", "chunk-1"]
+    assert [span["stage"] for span in state["trace_store"].spans] == [
+        "rag_search",
+        "rerank_matches",
+        "output_guard",
+    ]
+    assert state["trace_store"].spans[1]["metadata"]["algorithm"] == "rerank_v1"
+    assert state["trace_store"].finishes[0]["response_meta"]["rerank_used"] is True
 
 
 def test_rag_query_retries_with_decomposed_queries_when_coverage_is_insufficient() -> None:
@@ -1425,6 +1760,7 @@ def test_assistant_rag_mcp_uses_rewritten_retrieval_query_for_follow_up_prompt()
         "route_hints",
         "rag_search",
         "generate",
+        "citation_bind",
         "output_guard",
     ]
 
@@ -1493,5 +1829,6 @@ def test_assistant_rag_mcp_refuses_when_retrieval_coverage_remains_insufficient(
         "rag_retry_search",
         "rag_retry_search",
         "coverage_grade",
+        "citation_bind",
         "output_guard",
     ]

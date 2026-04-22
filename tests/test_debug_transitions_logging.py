@@ -2,9 +2,7 @@ from unittest.mock import Mock
 import os
 import importlib
 
-import main as m
-
-
+from refiner import main as m
 def make_issue_with_two_status_changes():
     issue = Mock()
     issue.changelog = Mock()

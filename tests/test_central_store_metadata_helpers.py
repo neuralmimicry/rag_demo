@@ -392,6 +392,28 @@ def test_postgres_rag_metadata_store_tracks_build_lifecycle_states_without_publi
     assert connection.execute_calls[3][1][3] == "failed"
 
 
+def test_postgres_rag_metadata_store_can_stage_publication_before_final_activation() -> None:
+    connection = _FakeConnection()
+    store = PostgresRagMetadataStore(_FakeStore(connection))
+
+    version_id = store.stage_collection_version(
+        "alice",
+        "docs",
+        version_id="version-stage",
+        status="publishing",
+        artifact_path="/tmp/rag/collections/alice/docs/version-stage/index.json",
+        metadata={"publish_state": "staged"},
+    )
+
+    assert version_id == "version-stage"
+    assert "INSERT INTO nm_rag_collections" in connection.execute_calls[0][0]
+    assert connection.execute_calls[0][1][3] == "publishing"
+    assert "INSERT INTO nm_rag_collection_versions" in connection.execute_calls[1][0]
+    assert "nm_rag_collection_versions.metadata || EXCLUDED.metadata" in connection.execute_calls[1][0]
+    assert connection.execute_calls[1][1][3] == "publishing"
+    assert connection.execute_calls[1][1][4] == "/tmp/rag/collections/alice/docs/version-stage/index.json"
+
+
 def test_postgres_rag_metadata_store_reads_active_version_and_deletes_versions():
     connection = _FakeConnection(
         responses=[

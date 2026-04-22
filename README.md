@@ -48,26 +48,37 @@ In the Continuum deployment, Customers defaults to the shared Postgres tenant se
 - Optionally export environment variables (see below) to supply credentials and overrides.
 
 3) Run (choose a workflow)
-- Default Jira statistics: refiner (or python run_refiner.py)
+- Default Jira statistics: refiner (or python -m refiner.run_refiner)
 - Jira quality analysis: refiner --analyze-jira --projects CAT --output jira_report.html
 - Confluence analysis: refiner --analyze-confluence --space CAT --output confluence_report.html --use-rovo
 - Topic research: refiner --topic-research req.txt --output researched_document.md --llm-provider openai
 - Project solver: refiner --project /path/to/project --llm-provider openai --output project_solution.json
 
 ## Runtime components
-- CLI workflows: `run_refiner.py` / `refiner`
-- Backend UI + JSON API: `python refiner_web.py` (defaults to `127.0.0.1:5001`)
-- Frontend-only helper server: `python frontend_server.py` (defaults to `0.0.0.0:8080`)
+- CLI workflows: `refiner` or `python -m refiner.run_refiner`
+- Backend UI + JSON API: `python -m refiner.refiner_web` (defaults to `127.0.0.1:5001`)
+- Frontend-only helper server: `python -m refiner.frontend_server` (defaults to `0.0.0.0:8080`)
 - Customers identity service: [`../customers`](../customers/README.md) (defaults to `127.0.0.1:5010`)
 - Billing service: [`../billing`](../billing/README.md) (defaults to `127.0.0.1:5020`)
 - Native STT service: [`../nmstt`](../nmstt/README.md) (defaults to `127.0.0.1:7079`)
 
-Useful local URLs after starting `refiner_web.py`:
+Useful local URLs after starting `python -m refiner.refiner_web`:
 - Swagger UI: `http://127.0.0.1:5001/api/docs`
 - OpenAPI JSON: `http://127.0.0.1:5001/api/docs/openapi.json`
 - API health: `http://127.0.0.1:5001/api/health`
 - Public docs health helper: `http://127.0.0.1:5001/health`
 - Version info: `http://127.0.0.1:5001/api/version`
+
+## Package layout
+
+The `refiner/` package now keeps the public entry points stable while the implementation is split into domain packages:
+
+- `refiner/runtime/` - Flask runtime, API wiring, configuration, logging, and environment helpers
+- `refiner/workflows/` - Jira, Confluence, research, delivery, inbox, solver, and reporting workflows
+- `refiner/integrations/` - Atlassian, MCP, platform, search, STT, and VCS adapters
+- `refiner/ai/` - provider adapters, orchestration, model inventory, retrieval, and other AI-focused helpers
+
+Compatibility wrapper modules still exist at the top level under `refiner/` so existing imports such as `refiner.refiner_web` and `python -m refiner.run_refiner` continue to work.
 
 ## Release workflow
 
@@ -79,10 +90,10 @@ GitHub Actions release automation lives in `.github/workflows/build-and-release.
 - manual `workflow_dispatch` runs can package artifacts from any ref.
 - publish steps only run from a `v*` tag ref, either automatically on tag push or manually from `workflow_dispatch`.
 
-`versioning.py` still derives a git-aware runtime build identity for the UI and APIs. That build metadata is exposed alongside `release_version`, but it does not override the packaged release version from `pyproject.toml`.
+`refiner/versioning.py` still derives a git-aware runtime build identity for the UI and APIs. That build metadata is exposed alongside `release_version`, but it does not override the packaged release version from `pyproject.toml`.
 
 ## Web UI + API auth
-The web UI is backed by the same Flask server (`refiner_web.py`). It uses session cookies, with dedicated JSON endpoints for headless or cloud-hosted frontends.
+The web UI is backed by the same Flask server module (`refiner.refiner_web`). It uses session cookies, with dedicated JSON endpoints for headless or cloud-hosted frontends.
 
 ### Current JSON API surface
 - Auth + profile: `/api/setup`, `/api/login`, `/api/logout`, `/api/session`, `/api/profile`, `/api/sso/issue`, `/api/oidc/exchange`
@@ -115,7 +126,7 @@ Refiner now includes lightweight RAG indexing (for unstructured documents) and M
 - `POST /api/rag/query` — retrieve the top matches and a combined context block.
 - `GET /api/rag/indexes` — list your indexes.
 - `DELETE /api/rag/index/<name>` — delete an index.
- - `POST /api/assistant/rag-mcp` — ask a question with optional RAG context and optional MCP tool data.
+ - `POST /api/assistant/rag-mcp` — ask a question with optional RAG context, optional MCP tool data, and optional explicit Jira/Confluence write actions.
 
 RAG indexes are stored per user under `job_data/rag/` and only accept file paths within `REFINER_RAG_ALLOWED_ROOTS` (defaults to the repo root + `job_data`). Chunk sizes and limits can be tuned via:
 - `REFINER_RAG_CHUNK_SIZE` (default 1200 chars)
@@ -135,6 +146,17 @@ RAG indexes are stored per user under `job_data/rag/` and only accept file paths
 
 MCP endpoints are admin-only because they can execute actions in external systems. Store OAuth/Bearer tokens when registering the server; responses mask secrets.
 Raw MCP tokens and custom headers are moved into the encrypted Refiner secret store; the shared Postgres/file registry persists secret references and runtime metadata, not the plaintext secret material.
+
+### Atlassian write actions
+
+`POST /api/assistant/rag-mcp` also accepts an optional `atlassian` object for explicit Jira or Confluence write actions when the user request calls for it.
+
+- supported Jira actions: `create_issue`, `update_issue`, `transition_issue`, `upsert_comment`
+- supported Confluence actions: `create_page`, `update_page`, `upsert_comment`
+- request shape: `product`, `action`, optional `instance`, optional `confirmed`, optional `preview`, and `arguments`
+- instance resolution uses the existing `config.json -> instances` entries and the existing Jira credentials from `JIRA_USERNAME` / `JIRA_PASSWORD`
+- semantic cache stays disabled for live external actions
+- `REFINER_ASSISTANT_BLOCK_UNSAFE_TOOL_REQUESTS=1` requires explicit confirmation unless the request is in preview mode
 
 ### Capability inventory
 - `GET /api/capabilities` — returns a snapshot of detected workflows, features, and API groups.
@@ -234,7 +256,7 @@ For a native `arm64` Ubuntu systemd deployment, use the artifacts in `../nmstt`:
 User-level systemd unit (repo-local paths, no root user required):
 - `nmstt-user.service`
 
-Robust local launcher (STT + `refiner_web.py` with health checks and restart loop):
+Robust local launcher (STT + `python -m refiner.refiner_web` with health checks and restart loop):
 - `./scripts/start_refiner_stack.sh`
 - If no model is found locally, it auto-downloads `ggml-tiny.en.bin` from the official `ggerganov/whisper.cpp` Hugging Face repo.
 - Optional explicit model: `NMSTT_MODEL=/path/to/ggml-*.bin ./scripts/start_refiner_stack.sh`
@@ -512,7 +534,7 @@ The default Jira statistics workflow can (optionally) run discovery, refine your
 
 
 ## Workflow overview
-Workflow selection order (run_refiner.py):
+Workflow selection order (`refiner.run_refiner`):
 1) --topic-research
 2) --delivery
 3) --project
@@ -533,7 +555,7 @@ Summary of workflows:
 
 
 ## Workflow diagrams
-### Workflow selection (run_refiner.py)
+### Workflow selection (`refiner.run_refiner`)
 ```mermaid
 flowchart TD
     A[Start: parse CLI arguments] --> B[Configure logging and environment overrides]
@@ -1284,23 +1306,24 @@ Inputs
 - Install in editable mode: pip install -e .
 - Console entry point: refiner
 - Module entry point: python -m refiner.cli
-- run_refiner.py remains for convenience and defers to the same workflow.
+- Canonical workflow router: `python -m refiner.run_refiner`
+- The `refiner` console script and `python -m refiner.cli` both delegate to the same router.
 
 
 ## Project structure (high level)
-- __init__.py: exposes a minimal API
-- run_refiner.py: unified CLI workflow selector (Jira stats, Jira analysis, Confluence analysis, topic research, project solver)
-- cli.py: console entry point that delegates to run_refiner.run()
-- main.py: orchestrates configuration, discovery, fetching, processing, and outputs for the default Jira statistics workflow
-- jira_analysis.py: Jira project/issue quality analysis and HTML report generation
-- confluence_analysis.py: Confluence space quality analysis and HTML report generation
-- topic_researcher.py: topic research (RAG), document drafting, and references output
-- project_solver.py: requirement extraction, planning, and optional code application
-- agentic_workflow.py: shared plan/act/verify/reflect workflow engine
-- repo_context.py: lightweight repo context indexing for the solver
-- web_research.py: shared web search/fetch/summarise utilities
-- discover_hierarchy.py: probes Confluence/Jira to refine scope and discover fields
-- analyze_issue_transitions.py, get_monthly_worklog_times.py, seconds_to_work_units.py, normalize_name.py, sorting_key.py: helpers
+- refiner/__init__.py: exposes the public package API
+- refiner/run_refiner.py: unified CLI workflow selector (Jira stats, Jira analysis, Confluence analysis, topic research, project solver)
+- refiner/cli.py: console entry point that delegates to run_refiner.run()
+- refiner/main.py: orchestrates configuration, discovery, fetching, processing, and outputs for the default Jira statistics workflow
+- refiner/jira_analysis.py: Jira project/issue quality analysis and HTML report generation
+- refiner/confluence_analysis.py: Confluence space quality analysis and HTML report generation
+- refiner/topic_researcher.py: topic research (RAG), document drafting, and references output
+- refiner/project_solver.py: requirement extraction, planning, and optional code application
+- refiner/agentic_workflow.py: shared plan/act/verify/reflect workflow engine
+- refiner/repo_context.py: lightweight repo context indexing for the solver
+- refiner/web_research.py: shared web search/fetch/summarise utilities
+- refiner/discover_hierarchy.py: probes Confluence/Jira to refine scope and discover fields
+- tests/legacy_root_wrappers/analyze_issue_transitions.py, tests/legacy_root_wrappers/get_monthly_worklog_times.py, tests/legacy_root_wrappers/seconds_to_work_units.py, tests/legacy_root_wrappers/normalize_name.py, tests/legacy_root_wrappers/sorting_key.py: helpers
 - tests/: pytest suite with offline mocks
 
 

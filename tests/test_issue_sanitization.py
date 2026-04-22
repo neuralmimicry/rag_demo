@@ -1,5 +1,5 @@
 import pytest
-from topic_researcher import TopicResearcher
+from refiner.topic_researcher import TopicResearcher
 
 def test_jql_sanitization_quoted_grouping():
     # Setup researcher with mock data

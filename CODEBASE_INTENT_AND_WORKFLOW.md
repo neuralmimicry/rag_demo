@@ -18,55 +18,55 @@ The codebase is built to support two primary operating modes:
 
 ### Entry points
 
-- `run_refiner.py`: unified CLI workflow router.
-- `cli.py`: package entry wrapper that delegates to `run_refiner.run`.
-- `main.py`: default Jira statistics pipeline and shared config/credential helpers.
-- `refiner_web.py`: primary Flask app serving UI + JSON APIs.
-- `frontend_server.py`: optional frontend-only server for static/template hosting.
+- `refiner/run_refiner.py`: unified CLI workflow router.
+- `refiner/cli.py`: package entry wrapper that delegates to `run_refiner.run`.
+- `refiner/main.py`: default Jira statistics pipeline and shared config/credential helpers.
+- `refiner/refiner_web.py`: primary Flask app serving UI + JSON APIs.
+- `refiner/frontend_server.py`: optional frontend-only server for static/template hosting.
 
 ### Core workflow engines
 
-- `topic_researcher.py`: iterative research loop with LLM + Jira/Confluence/Web context.
-- `project_solver.py`: requirement extraction, planning, optional code-edit execution.
-- `delivery_pipeline.py`: multi-stage delivery orchestration with gating.
-- `confluence_analysis.py`: Confluence hierarchy/content analysis.
-- `jira_analysis.py`: Jira issue-quality analysis and reporting.
-- `agentic_workflow.py`: reusable plan -> act -> verify -> reflect orchestration primitives.
+- `refiner/topic_researcher.py`: iterative research loop with LLM + Jira/Confluence/Web context.
+- `refiner/project_solver.py`: requirement extraction, planning, optional code-edit execution.
+- `refiner/delivery_pipeline.py`: multi-stage delivery orchestration with gating.
+- `refiner/confluence_analysis.py`: Confluence hierarchy/content analysis.
+- `refiner/jira_analysis.py`: Jira issue-quality analysis and reporting.
+- `refiner/agentic_workflow.py`: reusable plan -> act -> verify -> reflect orchestration primitives.
 
 ### Integrations and retrieval
 
-- `rag_engine.py`: local chunking + BM25-like retrieval index/storage.
-- `mcp_client.py`: JSON-RPC MCP client and server registry storage.
-- `web_research.py`: search engine abstraction, Google search integration, fetch/content extraction.
-- `llm_providers.py`: provider abstraction and fallback handling.
-- `refiner_ai_orchestration.py`: concurrent provider routing, scoring, and metrics persistence.
-- `refiner_ai_model_inventory.py`: cached local-model capacity/relevance inventory and safe Ollama selection guardrails.
-- `refiner_ai_specialists.py`: specialist-engine registry and concurrent SNN/AER analysis orchestration.
-- `refiner_ai_aarnn.py`: AARNN/SNN engine adapter with HTTP, UDS AER, offline heuristic modes, and generic `snn_aer` specialisation support.
-- `refiner_ai_aer.py`: Python `AER1` encoder/decoder compatible with `aarnn_rust`.
+- `refiner/rag_engine.py`: local chunking + BM25-like retrieval index/storage.
+- `refiner/mcp_client.py`: JSON-RPC MCP client and server registry storage.
+- `refiner/web_research.py`: search engine abstraction, Google search integration, fetch/content extraction.
+- `refiner/llm_providers.py`: provider abstraction and fallback handling.
+- `refiner/refiner_ai_orchestration.py`: concurrent provider routing, scoring, and metrics persistence.
+- `refiner/refiner_ai_model_inventory.py`: cached local-model capacity/relevance inventory and safe Ollama selection guardrails.
+- `refiner/refiner_ai_specialists.py`: specialist-engine registry and concurrent SNN/AER analysis orchestration.
+- `refiner/refiner_ai_aarnn.py`: AARNN/SNN engine adapter with HTTP, UDS AER, offline heuristic modes, and generic `snn_aer` specialisation support.
+- `refiner/refiner_ai_aer.py`: Python `AER1` encoder/decoder compatible with `aarnn_rust`.
 
 ### Security and platform controls
 
-- `security_utils.py`: redaction, URL policy checks, audit event helpers.
+- `refiner/security_utils.py`: redaction, URL policy checks, audit event helpers.
 - `refiner_routes/*.py`: modular route registration for voice, assistant, admin, auth, jobs.
-- `capabilities.py`: runtime capability inventory + skills catalog and selector.
+- `refiner/capabilities.py`: runtime capability inventory + skills catalog and selector.
 
 ## 3) Workflow selection and control flow
 
-The CLI routing logic in `run_refiner.py` selects workflows in this order:
+The CLI routing logic in `refiner/run_refiner.py` selects workflows in this order:
 
 1. `--topic-research` -> topic research workflow.
 2. `--delivery` (or delivery flags) -> delivery pipeline workflow.
 3. `--project` -> project solver workflow.
 4. `--analyze-confluence` -> Confluence analysis workflow.
 5. `--analyze-jira` -> Jira quality workflow.
-6. Default (unless Jira disabled) -> Jira statistics workflow in `main.py`.
+6. Default (unless Jira disabled) -> Jira statistics workflow in `refiner/main.py`.
 
 Each execution path emits structured lifecycle events through `EventEmitter` when enabled (`--emit-events`), including stage updates and completion status.
 
 ## 4) Detailed workflow behavior
 
-### A) Default Jira statistics workflow (`main.py`)
+### A) Default Jira statistics workflow (`refiner/main.py`)
 
 Primary sequence:
 
@@ -86,14 +86,14 @@ Resilience mechanisms:
 
 ### B) Jira/Confluence quality analysis workflows
 
-`run_refiner.py` resolves LLM provider config (including named provider aliases in `config.json`), loads credentials, and dispatches to:
+`refiner/run_refiner.py` resolves LLM provider config (including named provider aliases in `config.json`), loads credentials, and dispatches to:
 
 - `jira_analysis.analyze_jira_and_write_report`.
 - `confluence_analysis.analyze_space_and_write_report`.
 
 Both support dry-run/report-only operation and optional posting behaviors.
 
-### C) Topic research workflow (`topic_researcher.py`)
+### C) Topic research workflow (`refiner/topic_researcher.py`)
 
 Primary sequence:
 
@@ -110,7 +110,7 @@ Cross-cutting controls:
 - Research cache TTL controls.
 - Optional Jira/Confluence disabling while keeping workflow active.
 
-### D) Project solver workflow (`project_solver.py`)
+### D) Project solver workflow (`refiner/project_solver.py`)
 
 Primary sequence:
 
@@ -123,7 +123,7 @@ Primary sequence:
 
 The output includes iteration status, applied steps, and requirement-traceability fields for downstream delivery gating.
 
-### E) Delivery pipeline workflow (`delivery_pipeline.py`)
+### E) Delivery pipeline workflow (`refiner/delivery_pipeline.py`)
 
 Primary sequence:
 
@@ -135,7 +135,7 @@ Primary sequence:
 Optional integration with project-solver fallback can be controlled from CLI flags.
 When solver fallback is used, delivery reports also preserve the solver `ai_orchestration` metadata so model/engine decisions remain traceable through release stages.
 
-## 5) Web/API runtime workflow (`refiner_web.py`)
+## 5) Web/API runtime workflow (`refiner/refiner_web.py`)
 
 The web server acts as a control plane with these major capability groups:
 
@@ -209,9 +209,9 @@ Interpretation:
 
 ## 9) Recommended maintenance workflow
 
-1. Keep `run_refiner.py` as the single workflow routing authority.
-2. Treat `main.py` as the canonical Jira statistics pipeline; avoid duplicating fetch/fallback logic elsewhere.
+1. Keep `refiner/run_refiner.py` as the single workflow routing authority.
+2. Treat `refiner/main.py` as the canonical Jira statistics pipeline; avoid duplicating fetch/fallback logic elsewhere.
 3. Keep route modules (`refiner_routes/*`) thin and business logic in shared modules for testability.
-4. Keep provider selection logic in `refiner_ai_orchestration.py`; do not reintroduce per-module fallback wrappers.
+4. Keep provider selection logic in `refiner/refiner_ai_orchestration.py`; do not reintroduce per-module fallback wrappers.
 5. Expand tests around security boundaries, provider scoring, and neuromorphic routing whenever adding new endpoints or integrations.
 6. Preserve additive auditability (events/logs) for all state-changing API operations.

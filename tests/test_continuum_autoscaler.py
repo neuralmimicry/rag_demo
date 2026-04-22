@@ -1,11 +1,12 @@
 import threading
+from types import SimpleNamespace
 
 import flask
 import pytest
 
 HAS_REAL_FLASK = hasattr(flask.Flask, "test_client")
 if HAS_REAL_FLASK:
-    import refiner_web  # noqa: E402
+    from refiner import refiner_web  # noqa: E402
 
 
 class _FakeQueue:
@@ -17,11 +18,36 @@ class _FakeQueue:
 
 
 class _FakeManager:
-    def __init__(self, *, queue_depth: int, workers: int, statuses: list[str]):
+    if HAS_REAL_FLASK:
+        _owner_key = staticmethod(refiner_web.JobManager._owner_key)
+        _owner_label = staticmethod(refiner_web.JobManager._owner_label)
+        _increment_owner_count = staticmethod(refiner_web.JobManager._increment_owner_count)
+        _top_owner_counts = staticmethod(refiner_web.JobManager._top_owner_counts)
+        _owner_ratio = staticmethod(refiner_web.JobManager._owner_ratio)
+        queue_snapshot = refiner_web.JobManager.queue_snapshot
+
+    def __init__(
+        self,
+        *,
+        queue_depth: int,
+        workers: int,
+        statuses: list[str],
+        owners: list[str] | None = None,
+    ):
         self.queue = _FakeQueue(queue_depth)
         self.lock = threading.Lock()
         self.workers = [object() for _ in range(max(1, workers))]
-        self.jobs = {f"job-{idx}": type("J", (), {"status": status}) for idx, status in enumerate(statuses)}
+        owner_values = list(owners or [])
+        self.jobs = {
+            f"job-{idx}": SimpleNamespace(
+                status=status,
+                owner=owner_values[idx] if idx < len(owner_values) else "",
+            )
+            for idx, status in enumerate(statuses)
+        }
+
+    def list_jobs(self):
+        return list(self.jobs.values())
 
 
 class _FakeResponse:
@@ -187,3 +213,86 @@ def test_autoscaler_handles_continuum_status_errors(monkeypatch):
 
     assert status["last_decision"] == "status_error"
     assert "boom" in (status["last_error"] or "")
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Autoscaler tests require real Flask runtime")
+def test_job_manager_queue_snapshot_reports_owner_distribution():
+    manager = refiner_web.JobManager.__new__(refiner_web.JobManager)
+    manager.lock = threading.Lock()
+    manager.queue = _FakeQueue(4)
+    manager.workers = [object(), object()]
+    manager.jobs = {
+        "job-1": SimpleNamespace(status="queued", owner="alice"),
+        "job-2": SimpleNamespace(status="queued", owner="alice"),
+        "job-3": SimpleNamespace(status="queued", owner="bob"),
+        "job-4": SimpleNamespace(status="running", owner="alice"),
+        "job-5": SimpleNamespace(status="paused", owner=""),
+        "job-6": SimpleNamespace(status="completed", owner="charlie"),
+    }
+
+    snapshot = manager.queue_snapshot(top_limit=2)
+
+    assert snapshot["queue_depth"] == 4
+    assert snapshot["queued"] == 3
+    assert snapshot["running"] == 1
+    assert snapshot["paused"] == 1
+    assert snapshot["workers"] == 2
+    assert snapshot["queued_owner_count"] == 2
+    assert snapshot["running_owner_count"] == 1
+    assert snapshot["paused_owner_count"] == 1
+    assert snapshot["active_owner_count"] == 3
+    assert snapshot["top_queued_owners"] == [
+        {"owner": "alice", "count": 2},
+        {"owner": "bob", "count": 1},
+    ]
+    assert snapshot["top_active_owners"] == [
+        {"owner": "alice", "count": 3},
+        {"owner": "anonymous", "count": 1},
+    ]
+    assert snapshot["queued_owner_skew_ratio"] == pytest.approx(0.667)
+    assert snapshot["running_owner_skew_ratio"] == pytest.approx(1.0)
+    assert snapshot["active_owner_skew_ratio"] == pytest.approx(0.6)
+    assert snapshot["single_owner_queue_pressure"] is False
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Autoscaler tests require real Flask runtime")
+def test_workers_telemetry_payload_exposes_sanitised_job_queue_owner_metrics(monkeypatch):
+    manager = _FakeManager(
+        queue_depth=4,
+        workers=2,
+        statuses=["queued", "queued", "queued", "running"],
+        owners=["alice", "alice", "alice", "bob"],
+    )
+    autoscaler = _build_autoscaler(manager)
+    snapshot = autoscaler._queue_snapshot()
+    autoscaler._update_state(
+        snapshot=snapshot,
+        remote={
+            "desired_replicas": 2,
+            "ready_replicas": 2,
+            "available_replicas": 2,
+            "status": "Running",
+        },
+        decision="steady",
+        error=None,
+    )
+
+    status = autoscaler.status()
+    assert status["snapshot"]["queued_owner_count"] == 1
+    assert status["snapshot"]["active_owner_count"] == 2
+    assert status["snapshot"]["single_owner_queue_pressure"] is True
+    assert "top_queued_owners" not in status["snapshot"]
+    assert status["workers"]["queued_owner_count"] == 1
+    assert status["workers"]["active_owner_count"] == 2
+    assert status["workers"]["queued_owner_skew_ratio"] == pytest.approx(1.0)
+    assert status["workers"]["single_owner_queue_pressure"] is True
+
+    monkeypatch.setattr(refiner_web, "continuum_autoscaler", autoscaler)
+    payload = refiner_web._workers_telemetry_payload(limit=10, refresh=False, include_cluster=False)
+
+    assert payload["job_queue"]["queued_owner_count"] == 1
+    assert payload["job_queue"]["active_owner_count"] == 2
+    assert payload["job_queue"]["single_owner_queue_pressure"] is True
+    assert "top_queued_owners" not in payload["job_queue"]
+    assert payload["summary"]["queued_owner_count"] == 1
+    assert payload["summary"]["queued_owner_skew_ratio"] == pytest.approx(1.0)

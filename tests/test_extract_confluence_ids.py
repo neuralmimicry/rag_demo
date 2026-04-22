@@ -1,6 +1,6 @@
 import pytest
 
-from jira_analysis import _extract_confluence_ids
+from refiner.jira_analysis import _extract_confluence_ids
 
 
 def test_extract_ids_same_host_full_urls():

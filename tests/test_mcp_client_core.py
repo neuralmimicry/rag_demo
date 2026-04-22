@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from mcp_client import MCPClient, MCPServerConfig, MCPServerStore
+from refiner.mcp_client import MCPClient, MCPServerConfig, MCPServerStore
 
 
 class _Resp:

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, Optional
 
 from assistant_pipeline.retrieval.dense_retriever import DenseRetrievalCandidate, search_dense
+from assistant_pipeline.retrieval.match_utils import clone_match, match_field
 from assistant_pipeline.retrieval.sparse_retriever import SparseRetrievalCandidate, search_sparse
 
 _RRF_K = 60.0
@@ -37,44 +37,6 @@ def _int(value: Any, default: int, *, minimum: int = 1, maximum: int = 1000) -> 
     except Exception:
         number = int(default)
     return min(maximum, max(minimum, number))
-
-
-def _field(item: Any, name: str, default: Any = None) -> Any:
-    if isinstance(item, Mapping):
-        return item.get(name, default)
-    return getattr(item, name, default)
-
-
-def _metadata(item: Any) -> Dict[str, Any]:
-    value = _field(item, "metadata", {})
-    return dict(value) if isinstance(value, dict) else {}
-
-
-def _citation(item: Any) -> str:
-    citation = str(_field(item, "citation", "") or _metadata(item).get("citation") or "").strip()
-    return citation or str(_field(item, "source", "") or "source")
-
-
-def _clone_match(template: Any, *, score: float) -> Any:
-    payload = {
-        "chunk_id": str(_field(template, "chunk_id", "") or "").strip(),
-        "source": str(_field(template, "source", "") or "").strip(),
-        "score": float(score),
-        "text": str(_field(template, "text", "") or ""),
-        "metadata": _metadata(template),
-        "citation": _citation(template),
-    }
-    if isinstance(template, Mapping):
-        cloned = dict(template)
-        cloned.update(payload)
-        return cloned
-    match_type = getattr(template, "__class__", None)
-    if match_type is not None:
-        try:
-            return match_type(**payload)
-        except Exception:
-            pass
-    return SimpleNamespace(**payload)
 
 
 @dataclass(frozen=True)
@@ -158,7 +120,7 @@ def _fused_match(
         + _candidate_rank_score(sparse_rank, policy.sparse_weight)
         + _candidate_rank_score(dense_rank, policy.dense_weight)
     )
-    return _clone_match(template, score=round(combined_score, 4))
+    return clone_match(template, score=round(combined_score, 4))
 
 
 def retrieve_matches(index: Any, query_text: str, *, limit: int, min_score: float, policy: HybridRetrievalPolicy) -> HybridRetrievalResult:
@@ -215,7 +177,7 @@ def retrieve_matches(index: Any, query_text: str, *, limit: int, min_score: floa
             max_dense_score=max_dense_score,
             policy=policy,
         )
-        fused_score = float(_field(match, "score", 0.0) or 0.0)
+        fused_score = float(match_field(match, "score", 0.0) or 0.0)
         fused.append((fused_score, chunk_id, match))
     fused.sort(key=lambda item: (-item[0], item[1]))
     limited = [match for _, _, match in fused[: int(limit)]]

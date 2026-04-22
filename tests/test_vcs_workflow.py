@@ -1,4 +1,4 @@
-from vcs_workflow import run_vcs_workflow
+from refiner.vcs_workflow import run_vcs_workflow
 
 
 def test_vcs_workflow_skips_non_repo(tmp_path):

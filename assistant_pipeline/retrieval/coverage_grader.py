@@ -2,36 +2,11 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
-_WORD_RE = re.compile(r"[a-z0-9][a-z0-9_\-/]{2,}")
-_STOPWORDS = {
-    "about",
-    "after",
-    "all",
-    "also",
-    "and",
-    "does",
-    "from",
-    "how",
-    "into",
-    "that",
-    "the",
-    "their",
-    "then",
-    "these",
-    "this",
-    "those",
-    "what",
-    "when",
-    "where",
-    "which",
-    "with",
-    "work",
-}
-_SUFFIXES = ("ingly", "edly", "ing", "ed", "ies", "s")
+from assistant_pipeline.retrieval.match_utils import match_text
+from assistant_pipeline.retrieval.text_utils import retrieval_keywords, retrieval_query_terms
 
 
 def _flag(value: Any, default: bool) -> bool:
@@ -60,59 +35,15 @@ def _int(value: Any, default: int, *, minimum: int = 0, maximum: int = 1000) -> 
     return min(maximum, max(minimum, number))
 
 
-def _text(item: Any) -> str:
-    if isinstance(item, Mapping):
-        return str(item.get("text") or "")
-    return str(getattr(item, "text", "") or "")
-
-
-def _canonical_term(term: str) -> str:
-    cleaned = str(term or "").strip().lower()
-    if len(cleaned) <= 3:
-        return cleaned
-    for suffix in _SUFFIXES:
-        if cleaned.endswith(suffix) and len(cleaned) - len(suffix) >= 3:
-            if suffix == "ies":
-                cleaned = f"{cleaned[:-3]}y"
-            else:
-                cleaned = cleaned[: -len(suffix)]
-            break
-    return cleaned
-
-
-def _query_terms(text: str) -> Tuple[str, ...]:
-    preferred: List[str] = []
-    fallback: List[str] = []
-    seen_preferred = set()
-    seen_fallback = set()
-    for raw in _WORD_RE.findall(str(text or "").strip().lower()):
-        parts = [raw] + [part for part in re.split(r"[-_/]", raw) if len(part) >= 3]
-        for part in parts:
-            canonical = _canonical_term(part)
-            if len(canonical) < 3:
-                continue
-            if canonical not in seen_fallback:
-                fallback.append(canonical)
-                seen_fallback.add(canonical)
-            if canonical in _STOPWORDS or canonical in seen_preferred:
-                continue
-            preferred.append(canonical)
-            seen_preferred.add(canonical)
-    return tuple(preferred or fallback)
-
-
 def _evidence_terms(matches: Sequence[Any]) -> Tuple[str, ...]:
     terms: List[str] = []
     seen = set()
     for match in matches:
-        for raw in _WORD_RE.findall(_text(match).lower()):
-            parts = [raw] + [part for part in re.split(r"[-_/]", raw) if len(part) >= 3]
-            for part in parts:
-                canonical = _canonical_term(part)
-                if len(canonical) < 3 or canonical in seen:
-                    continue
-                terms.append(canonical)
-                seen.add(canonical)
+        for canonical in retrieval_keywords(match_text(match)):
+            if canonical in seen:
+                continue
+            terms.append(canonical)
+            seen.add(canonical)
     return tuple(terms)
 
 
@@ -174,13 +105,13 @@ def grade_retrieval_coverage(
 ) -> RetrievalCoverageGrade:
     """Grade how well retrieved evidence covers the current query."""
 
-    query_terms = _query_terms(query_text)
+    query_terms = retrieval_query_terms(query_text)
     evidence_terms = _evidence_terms(matches)
     evidence_set = set(evidence_terms)
     matched_terms = tuple(term for term in query_terms if term in evidence_set)
     missing_terms = tuple(term for term in query_terms if term not in evidence_set)
     match_count = len(matches)
-    context_chars = sum(len(_text(match).strip()) for match in matches if _text(match).strip())
+    context_chars = sum(len(match_text(match).strip()) for match in matches if match_text(match).strip())
     coverage_ratio = 1.0 if not query_terms and match_count > 0 else 0.0
     if query_terms:
         coverage_ratio = len(matched_terms) / float(len(query_terms))

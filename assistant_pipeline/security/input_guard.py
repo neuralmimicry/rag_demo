@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from security_utils import url_allowed
+from refiner.security_utils import url_allowed
 
 from assistant_pipeline.security.policies import AssistantSecurityPolicy
 

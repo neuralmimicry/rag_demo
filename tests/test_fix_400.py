@@ -1,15 +1,15 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
+from refiner.topic_researcher import TopicResearcher
 
 @pytest.fixture(autouse=True)
 def mock_research_cache(tmp_path):
-    with patch("topic_researcher.RESEARCH_CACHE_ROOT", str(tmp_path)):
+    with patch("refiner.topic_researcher.RESEARCH_CACHE_ROOT", str(tmp_path)):
         yield str(tmp_path)
 
 @pytest.fixture(autouse=True)
 def mock_llm_provider():
-    with patch("topic_researcher.get_provider") as mock_get:
+    with patch("refiner.topic_researcher.get_provider") as mock_get:
         mock_llm = MagicMock()
         mock_llm.get_context_window.return_value = 8192
         mock_llm.estimate_tokens.side_effect = lambda x: len(x) // 4
@@ -119,8 +119,8 @@ def test_sanitize_now_hallucination():
     import re
     assert re.search(r'lastmodified >= "\d{4}-\d{2}-\d{2}"', sanitized["cql"])
 
-@patch('topic_researcher._conf_get')
-@patch('topic_researcher.jira_fetch_issues')
+@patch('refiner.topic_researcher._conf_get')
+@patch('refiner.topic_researcher.jira_fetch_issues')
 def test_report_on_lookup_error(mock_jira_fetch, mock_conf_get, mock_llm_provider, tmp_path):
     # Simulate 400 error for Confluence
     mock_conf_get.side_effect = Exception("400 Client Error: Bad Request")

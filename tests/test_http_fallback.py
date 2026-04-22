@@ -1,9 +1,7 @@
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
-import main as m
-
-
+from refiner import main as m
 class _Resp:
     def __init__(self, status=200, json_data=None, text=""):
         self._status = status

@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from llm_providers import LLMError
+from refiner.llm_providers import LLMError
 
 from assistant_pipeline.cache import (
     lookup_semantic_cache,
@@ -20,7 +20,12 @@ from assistant_pipeline.ingestion.artifact_store import (
     delete_versioned_collection_artifacts,
     load_index_artifact,
     versioned_index_artifact_path,
-    write_versioned_index_artifact,
+)
+from assistant_pipeline.ingestion.publication import (
+    mirror_collection_artifact,
+    record_collection_publication,
+    stage_collection_publication,
+    write_collection_version_artifact,
 )
 from assistant_pipeline.memory.conversation_store import (
     append_turn,
@@ -30,22 +35,27 @@ from assistant_pipeline.memory.conversation_store import (
 )
 from assistant_pipeline.memory.query_rewriter import QueryRewrite, rewrite_query
 from assistant_pipeline.retrieval import (
-    dense_artifact_path_for_index,
+    bind_answer_citations,
+    build_citation_sources,
     grade_retrieval_coverage,
     hybrid_retrieval_policy_from_config,
     hybrid_retrieval_scope_fragment,
     merge_retrieval_matches,
     plan_retrieval_retry,
+    rerank_retrieval_matches,
     retrieval_coverage_policy_from_config,
     retrieval_coverage_scope_fragment,
     retrieval_planner_policy_from_config,
     retrieval_planner_scope_fragment,
+    retrieval_rerank_policy_from_config,
+    retrieval_rerank_scope_fragment,
     retrieve_matches,
 )
 from assistant_pipeline.security import (
     apply_input_guard,
     apply_output_guard,
     apply_rag_source_guard,
+    apply_tool_use_guard,
     assistant_security_policy_from_config,
     build_assistant_reply_payload,
 )
@@ -159,12 +169,17 @@ def _assistant_retrieval_planner_policy(deps: AssistantPipelineDependencies):
     return retrieval_planner_policy_from_config(deps.get_assistant_retrieval_config())
 
 
+def _assistant_retrieval_rerank_policy(deps: AssistantPipelineDependencies):
+    return retrieval_rerank_policy_from_config(deps.get_assistant_retrieval_config())
+
+
 def _assistant_retrieval_scope_fragment(deps: AssistantPipelineDependencies) -> str:
     return ":".join(
         [
             hybrid_retrieval_scope_fragment(_assistant_retrieval_policy(deps)),
             retrieval_coverage_scope_fragment(_assistant_retrieval_coverage_policy(deps)),
             retrieval_planner_scope_fragment(_assistant_retrieval_planner_policy(deps)),
+            retrieval_rerank_scope_fragment(_assistant_retrieval_rerank_policy(deps)),
         ]
     )
 
@@ -438,6 +453,30 @@ def _plan_retrieval_retry(
     return plan
 
 
+def _rerank_retrieval_matches(
+    deps: AssistantPipelineDependencies,
+    trace: TraceRecorder,
+    *,
+    query_text: str,
+    matches: List[Any],
+    stage_name: str,
+    stage_metadata: Optional[Dict[str, Any]] = None,
+):
+    policy = _assistant_retrieval_rerank_policy(deps)
+    stage_started = time.monotonic()
+    result = rerank_retrieval_matches(query_text, matches, policy)
+    if policy.enabled:
+        trace.record_span(
+            stage_name,
+            stage_started,
+            metadata={
+                **result.metadata,
+                **dict(stage_metadata or {}),
+            },
+        )
+    return result
+
+
 def _run_retrieval_loop(
     deps: AssistantPipelineDependencies,
     trace: TraceRecorder,
@@ -458,11 +497,20 @@ def _run_retrieval_loop(
         min_score=min_score,
         rewritten=rewritten,
     )
-    initial_grade = _grade_retrieval_coverage(
+    initial_rerank = _rerank_retrieval_matches(
         deps,
         trace,
         query_text=query_text,
         matches=list(initial.matches),
+        stage_name="rerank_matches",
+        stage_metadata={"phase": "initial"},
+    )
+    initial_matches = list(initial_rerank.matches)
+    initial_grade = _grade_retrieval_coverage(
+        deps,
+        trace,
+        query_text=query_text,
+        matches=initial_matches,
     )
     plan = _plan_retrieval_retry(
         deps,
@@ -472,14 +520,18 @@ def _run_retrieval_loop(
     )
     if not plan.queries:
         return {
-            "matches": list(initial.matches),
+            "matches": initial_matches,
             "grade": initial_grade,
             "initial_grade": initial_grade,
             "retry_queries": (),
             "retried": False,
             "coverage_enabled": coverage_policy.enabled,
+            "rerank_enabled": bool(initial_rerank.metadata.get("enabled")),
+            "rerank_algorithm": str(initial_rerank.metadata.get("algorithm") or "")
+            if bool(initial_rerank.metadata.get("enabled"))
+            else "",
         }
-    retry_match_groups: List[List[Any]] = [list(initial.matches)]
+    retry_match_groups: List[List[Any]] = [initial_matches]
     for retry_index, retry_query in enumerate(plan.queries, start=1):
         retry = _retrieve_rag_matches(
             deps,
@@ -495,21 +547,42 @@ def _run_retrieval_loop(
                 "retry_query_chars": len(retry_query),
             },
         )
-        retry_match_groups.append(list(retry.matches))
+        retry_rerank = _rerank_retrieval_matches(
+            deps,
+            trace,
+            query_text=retry_query,
+            matches=list(retry.matches),
+            stage_name="rerank_retry_matches",
+            stage_metadata={"retry_index": retry_index, "phase": "retry"},
+        )
+        retry_match_groups.append(list(retry_rerank.matches))
     merged_matches = merge_retrieval_matches(retry_match_groups, limit=top_k)
-    final_grade = _grade_retrieval_coverage(
+    merged_rerank = _rerank_retrieval_matches(
         deps,
         trace,
         query_text=query_text,
         matches=merged_matches,
+        stage_name="rerank_merged_matches",
+        stage_metadata={"phase": "merged"},
+    )
+    final_matches = list(merged_rerank.matches)
+    final_grade = _grade_retrieval_coverage(
+        deps,
+        trace,
+        query_text=query_text,
+        matches=final_matches,
     )
     return {
-        "matches": merged_matches,
+        "matches": final_matches,
         "grade": final_grade,
         "initial_grade": initial_grade,
         "retry_queries": tuple(plan.queries),
         "retried": True,
         "coverage_enabled": coverage_policy.enabled,
+        "rerank_enabled": bool(merged_rerank.metadata.get("enabled")),
+        "rerank_algorithm": str(merged_rerank.metadata.get("algorithm") or "")
+        if bool(merged_rerank.metadata.get("enabled"))
+        else "",
     }
 
 
@@ -523,6 +596,11 @@ def _retrieval_loop_metadata(loop_result: Dict[str, Any]) -> Dict[str, Any]:
     if retry_queries:
         metadata["retry_used"] = True
         metadata["retry_query_count"] = len(retry_queries)
+    if bool(loop_result.get("rerank_enabled")):
+        metadata["rerank_used"] = True
+    rerank_algorithm = str(loop_result.get("rerank_algorithm") or "").strip()
+    if rerank_algorithm and rerank_algorithm != "disabled":
+        metadata["rerank_algorithm"] = rerank_algorithm
     return metadata
 
 
@@ -647,10 +725,157 @@ def _build_guarded_reply_payload(
     return result.payload
 
 
+def _record_runtime_telemetry(
+    deps: AssistantPipelineDependencies,
+    *,
+    owner: str,
+    event: Dict[str, Any],
+) -> None:
+    recorder = getattr(deps, "record_runtime_telemetry", None)
+    if recorder is None or not owner or not isinstance(event, dict):
+        return
+    try:
+        recorder(owner, event)
+    except Exception as exc:  # pragma: no cover - best effort only
+        deps.logger.debug("Assistant runtime telemetry skipped for %s: %s", owner, exc)
+
+
+def _record_tool_use_telemetry(
+    deps: AssistantPipelineDependencies,
+    *,
+    owner: str,
+    prompt: str,
+    metadata: Dict[str, Any],
+    allowed: bool,
+    error_code: str = "",
+    error_detail: str = "",
+) -> None:
+    _record_runtime_telemetry(
+        deps,
+        owner=owner,
+        event={
+            "provider": "mcp_guard",
+            "model": str(metadata.get("tool") or "unknown"),
+            "category": "assistant_security",
+            "outcome": "success" if allowed else "error",
+            "latency_ms": 0,
+            "input_chars": len(str(prompt or "")),
+            "error_class": error_code or None,
+            "error_detail": error_detail or None,
+        },
+    )
+
+
+def _record_atlassian_action_telemetry(
+    deps: AssistantPipelineDependencies,
+    *,
+    owner: str,
+    product: str,
+    action: str,
+    latency_ms: int,
+    success: bool,
+    preview_mode: bool,
+    error_code: str = "",
+    error_detail: str = "",
+) -> None:
+    _record_runtime_telemetry(
+        deps,
+        owner=owner,
+        event={
+            "provider": f"atlassian:{product or 'unknown'}",
+            "model": str(action or "unknown"),
+            "category": "assistant_integration",
+            "outcome": "success" if success else "error",
+            "latency_ms": max(0, int(latency_ms)),
+            "input_chars": 0,
+            "error_class": error_code or None,
+            "error_detail": error_detail or None,
+            "preview_mode": bool(preview_mode),
+        },
+    )
+
+
+def _apply_citation_binding(
+    deps: AssistantPipelineDependencies,
+    trace: TraceRecorder,
+    *,
+    route: str,
+    response_payload: Dict[str, Any],
+    rag_matches: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if route != "assistant_rag_mcp":
+        if route == "rag_query" and rag_matches:
+            enriched_payload = dict(response_payload or {})
+            enriched_payload["citations"] = build_citation_sources(rag_matches)
+            return enriched_payload
+        return dict(response_payload or {})
+    binding_started = time.monotonic()
+    enriched_payload = dict(response_payload or {})
+    binding = bind_answer_citations(enriched_payload.get("answer"), rag_matches)
+    enriched_payload["citations"] = binding.citations
+    enriched_payload["claim_bindings"] = binding.claim_bindings
+    enriched_payload["citation_audit"] = dict(binding.metadata or {})
+    trace.record_span("citation_bind", binding_started, metadata=dict(binding.metadata or {}))
+    return enriched_payload
+
+
+def _citation_response_metadata(response_payload: Dict[str, Any]) -> Dict[str, Any]:
+    citations = response_payload.get("citations") if isinstance(response_payload.get("citations"), list) else []
+    metadata: Dict[str, Any] = {}
+    if citations:
+        metadata["citation_count"] = len(citations)
+    citation_audit = response_payload.get("citation_audit")
+    if isinstance(citation_audit, dict):
+        for key, mapped_key in (
+            ("claim_count", "citation_claim_count"),
+            ("bound_claim_count", "citation_bound_claim_count"),
+            ("unbound_claim_count", "citation_unbound_claim_count"),
+            ("binding_coverage_ratio", "citation_binding_coverage_ratio"),
+            ("explicit_citation_claim_count", "citation_explicit_claim_count"),
+        ):
+            if key in citation_audit:
+                metadata[mapped_key] = citation_audit.get(key)
+    return metadata
+
+
+def _tool_guard_response_metadata(result: Any) -> Dict[str, Any]:
+    if result is None:
+        return {}
+    metadata = dict(getattr(result, "metadata", {}) or {})
+    request_kind = str(metadata.get("request_kind") or "mcp").strip().lower() or "mcp"
+    server = str(metadata.get("server") or "")
+    tool = str(metadata.get("tool") or "")
+    return {
+        "tool_request_kind": request_kind,
+        "tool_server": server,
+        "tool_name": tool,
+        "mcp_server": server if request_kind == "mcp" else "",
+        "mcp_tool": tool if request_kind == "mcp" else "",
+        "tool_guard_allowed": bool(getattr(result, "allowed", False)),
+        "tool_guard_risk_level": str(metadata.get("risk_level") or ""),
+        "tool_guard_confirmation_present": bool(metadata.get("confirmation_present")),
+        "tool_guard_preview_mode": bool(metadata.get("preview_mode")),
+    }
+
+
+def _atlassian_action_response_metadata(result: Any) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    return {
+        "has_atlassian_action": True,
+        "atlassian_product": str(result.get("product") or ""),
+        "atlassian_action": str(result.get("action") or ""),
+        "atlassian_preview": bool(result.get("preview")),
+        "atlassian_status": str(result.get("status") or ""),
+        "atlassian_instance": str(result.get("instance") or ""),
+    }
+
+
 def _predict_with_capacity(
     deps: AssistantPipelineDependencies,
     provider: Any,
     *,
+    owner: str,
     messages: List[Dict[str, Any]],
     system: str,
     temperature: Any,
@@ -660,7 +885,8 @@ def _predict_with_capacity(
     runtime = _assistant_runtime(deps)
     capacity = runtime.get("request_capacity")
     wait_seconds = float(runtime.get("capacity_wait_sec") or 0.0)
-    if not deps.acquire_request_capacity(capacity, wait_seconds):
+    acquired = bool(deps.acquire_request_capacity(capacity, wait_seconds, owner=owner))
+    if not acquired:
         raise ServiceError("assistant_capacity_unavailable", status_code=503)
     try:
         return provider.predict(
@@ -676,7 +902,10 @@ def _predict_with_capacity(
         raise ServiceError("llm_request_failed", details=str(exc), status_code=400) from exc
     finally:
         try:
-            capacity.release()
+            if hasattr(capacity, "release_for"):
+                capacity.release_for(owner)
+            else:
+                capacity.release()
         except Exception:
             pass
 
@@ -842,63 +1071,100 @@ def _build_rag_collection(
     chunk_count = len(getattr(index, "chunks", []) or [])
     trace.record_span("build_index", stage_started, metadata={"chunk_count": chunk_count, "version_id": version_id})
 
-    version_artifact_path = ""
-    version_dense_artifact_path = ""
     rag_store = deps.get_rag_store()
-    artifact_root = str(getattr(rag_store, "root", "") or "").strip()
-    if artifact_root:
+    publication_metadata = {
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "max_chunks": max_chunks,
+        "documents": len(docs),
+        "chunks": chunk_count,
+    }
+    publication_paths = write_collection_version_artifact(
+        rag_store,
+        owner=owner,
+        name=name,
+        version_id=version_id,
+        index=index,
+    )
+    if publication_paths.version_artifact_path:
         stage_started = time.monotonic()
-        version_artifact_path = write_versioned_index_artifact(artifact_root, owner, name, version_id, index)
-        version_dense_artifact_path = dense_artifact_path_for_index(version_artifact_path)
         trace.record_span(
             "save_version_artifact",
             stage_started,
             metadata={
-                "artifact_path": version_artifact_path,
-                "dense_artifact_path": version_dense_artifact_path,
+                "artifact_path": publication_paths.version_artifact_path,
+                "dense_artifact_path": publication_paths.version_dense_artifact_path,
                 "version_id": version_id,
             },
         )
+        if metadata_store is not None:
+            stage_started = time.monotonic()
+            staged_metadata = stage_collection_publication(
+                metadata_store,
+                owner=owner,
+                name=name,
+                version_id=version_id,
+                paths=publication_paths,
+                base_metadata=publication_metadata,
+            )
+            trace.record_span(
+                "stage_publication",
+                stage_started,
+                metadata={
+                    "artifact_path": publication_paths.version_artifact_path,
+                    "publish_state": str(staged_metadata.get("publish_state") or ""),
+                    "version_id": version_id,
+                },
+            )
 
     stage_started = time.monotonic()
-    active_artifact_path = rag_store.save_index(owner, index)
-    active_dense_artifact_path = dense_artifact_path_for_index(active_artifact_path)
+    publication_paths = mirror_collection_artifact(
+        rag_store,
+        owner=owner,
+        name=name,
+        index=index,
+        paths=publication_paths,
+    )
     trace.record_span(
         "publish_index",
         stage_started,
-        metadata={"artifact_path": active_artifact_path, "dense_artifact_path": active_dense_artifact_path},
+        metadata={
+            "artifact_path": publication_paths.active_artifact_path,
+            "dense_artifact_path": publication_paths.active_dense_artifact_path,
+            "mirrored_from": publication_paths.version_artifact_path,
+        },
     )
 
     if metadata_store is not None:
         stage_started = time.monotonic()
-        metadata_store.record_collection_version(
-            owner,
-            name,
-            artifact_path=version_artifact_path or active_artifact_path,
+        recorded_metadata = record_collection_publication(
+            metadata_store,
+            owner=owner,
+            name=name,
+            version_id=version_id,
+            paths=publication_paths,
             source_count=len(sources),
             documents=docs,
             chunks=getattr(index, "chunks", []) or [],
-            metadata={
-                "chunk_size": chunk_size,
-                "chunk_overlap": chunk_overlap,
-                "max_chunks": max_chunks,
-                "documents": len(docs),
-                "chunks": chunk_count,
-                "active_artifact_path": active_artifact_path,
-                "active_dense_artifact_path": active_dense_artifact_path,
-                "version_dense_artifact_path": version_dense_artifact_path,
-            },
-            version_id=version_id,
+            base_metadata=publication_metadata,
         )
-        trace.record_span("record_metadata", stage_started, metadata={"document_count": len(docs), "version_id": version_id})
+        trace.record_span(
+            "record_metadata",
+            stage_started,
+            metadata={
+                "document_count": len(docs),
+                "publish_state": str(recorded_metadata.get("publish_state") or ""),
+                "version_id": version_id,
+            },
+        )
 
     return {
         "name": name,
         "documents": len(docs),
         "chunks": chunk_count,
         "version_id": version_id,
-        "artifact_path": version_artifact_path or active_artifact_path,
-        "active_artifact_path": active_artifact_path,
+        "artifact_path": publication_paths.primary_artifact_path,
+        "active_artifact_path": publication_paths.active_artifact_path,
     }
 
 
@@ -1221,11 +1487,19 @@ def rag_query(deps: AssistantPipelineDependencies, *, user: Optional[str], paylo
             query_text=retrieval_query,
         )
         if cache_lookup and cache_lookup.hit is not None:
+            cached_payload = dict(cache_lookup.hit.payload or {})
+            response_payload = _apply_citation_binding(
+                deps,
+                trace,
+                route="rag_query",
+                response_payload=_rag_query_response_from_cache(cached_payload, original_query=query),
+                rag_matches=list(cached_payload.get("matches") or []),
+            )
             response_payload = _guard_output(
                 deps,
                 trace,
                 route="rag_query",
-                response_payload=_rag_query_response_from_cache(cache_lookup.hit.payload, original_query=query),
+                response_payload=response_payload,
             )
             _maybe_record_rag_query(
                 deps,
@@ -1241,6 +1515,7 @@ def rag_query(deps: AssistantPipelineDependencies, *, user: Optional[str], paylo
                     "conversation_id": conversation_id,
                     "cache_hit": True,
                     "cache_similarity": cache_lookup.hit.similarity,
+                    **_citation_response_metadata(response_payload),
                 },
             )
             append_turn(
@@ -1276,16 +1551,24 @@ def rag_query(deps: AssistantPipelineDependencies, *, user: Optional[str], paylo
         )
         matches = list(retrieval_loop.get("matches") or [])
         context = deps.render_rag_context(matches)
-        response_payload = _guard_output(
+        serialized_matches = [deps.serialize_rag_match(match) for match in matches]
+        response_payload = _apply_citation_binding(
             deps,
             trace,
             route="rag_query",
             response_payload={
                 "name": name,
                 "query": query,
-                "matches": [deps.serialize_rag_match(match) for match in matches],
+                "matches": serialized_matches,
                 "context": context,
             },
+            rag_matches=serialized_matches,
+        )
+        response_payload = _guard_output(
+            deps,
+            trace,
+            route="rag_query",
+            response_payload=response_payload,
         )
         _maybe_record_rag_query(
             deps,
@@ -1296,12 +1579,13 @@ def rag_query(deps: AssistantPipelineDependencies, *, user: Optional[str], paylo
             rewritten_query=retrieval_query,
             top_k=top_k,
             match_count=len(matches),
-            metadata={
-                "min_score": min_score,
-                "conversation_id": conversation_id,
-                **_retrieval_loop_metadata(retrieval_loop),
-            },
-        )
+                metadata={
+                    "min_score": min_score,
+                    "conversation_id": conversation_id,
+                    **_retrieval_loop_metadata(retrieval_loop),
+                    **_citation_response_metadata(response_payload),
+                },
+            )
         _store_semantic_cache(
             deps,
             trace,
@@ -1373,13 +1657,16 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
         rag_cfg = payload.get("rag") if isinstance(payload.get("rag"), dict) else {}
         rag_index_name = str(rag_cfg.get("index") or "").strip()
         mcp_cfg = payload.get("mcp") if isinstance(payload.get("mcp"), dict) else {}
+        atlassian_cfg = payload.get("atlassian") if isinstance(payload.get("atlassian"), dict) else {}
+        if mcp_cfg and atlassian_cfg:
+            raise ServiceError("assistant_tool_request_conflict", details="Provide either mcp or atlassian, not both.")
         decision = _resolve_assistant_intent(
             deps,
             trace,
             route="assistant_rag_mcp",
             payload=payload,
             has_rag=bool(rag_index_name),
-            has_mcp=bool(mcp_cfg),
+            has_mcp=bool(mcp_cfg or atlassian_cfg),
         )
         rewrite = _rewrite_retrieval_query(
             deps,
@@ -1423,7 +1710,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
         cache_scope = ""
         cache_query_text = ""
         cache_lookup = None
-        if decision.cacheable and rag_index_name:
+        if decision.cacheable and rag_index_name and not atlassian_cfg:
             cache_scope = _assistant_rag_cache_scope(
                 deps,
                 owner=user,
@@ -1448,11 +1735,19 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                 query_text=cache_query_text,
             )
             if cache_lookup and cache_lookup.hit is not None:
+                cached_payload = dict(cache_lookup.hit.payload or {})
+                response_payload = _apply_citation_binding(
+                    deps,
+                    trace,
+                    route="assistant_rag_mcp",
+                    response_payload=cached_payload,
+                    rag_matches=list(cached_payload.get("rag_matches") or []),
+                )
                 response_payload = _guard_output(
                     deps,
                     trace,
                     route="assistant_rag_mcp",
-                    response_payload=dict(cache_lookup.hit.payload),
+                    response_payload=response_payload,
                     policy=security_policy,
                 )
                 _maybe_record_rag_query(
@@ -1465,11 +1760,13 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                     top_k=top_k,
                     match_count=len(response_payload.get("rag_matches") or []),
                     metadata={
-                        "mcp_enabled": False,
-                        "conversation_id": conversation_id,
-                        "cache_hit": True,
-                        "cache_similarity": cache_lookup.hit.similarity,
-                    },
+                            "mcp_enabled": False,
+                            "atlassian_enabled": False,
+                            "conversation_id": conversation_id,
+                            "cache_hit": True,
+                            "cache_similarity": cache_lookup.hit.similarity,
+                            **_citation_response_metadata(response_payload),
+                        },
                 )
                 append_turn(
                     deps,
@@ -1481,7 +1778,13 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                     provider=str(settings.get("provider") or provider_hint or ""),
                     model=str(settings.get("model") or model_hint or ""),
                     response_payload=response_payload,
-                    metadata={"rag_index": rag_index_name, "has_mcp": False, "cache_hit": True},
+                    metadata={
+                        "rag_index": rag_index_name,
+                        "has_mcp": False,
+                        "has_atlassian_action": False,
+                        "cache_hit": True,
+                        **_citation_response_metadata(response_payload),
+                    },
                 )
                 trace.finish(
                     status="success",
@@ -1491,6 +1794,8 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                     response_meta={
                         "rag_match_count": len(response_payload.get("rag_matches") or []),
                         "has_mcp": False,
+                        "has_atlassian_action": False,
+                        **_citation_response_metadata(response_payload),
                     },
                 )
                 return ServiceResult(response_payload)
@@ -1515,6 +1820,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
         rag_matches: List[Dict[str, Any]] = []
         rag_context = ""
         retrieval_loop_metadata: Dict[str, Any] = {}
+        tool_guard_result = None
         if rag_index_name:
             index = _load_active_rag_index(deps, owner=user, name=rag_index_name)
             if not index:
@@ -1532,26 +1838,11 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
             retrieval_loop_metadata = _retrieval_loop_metadata(retrieval_loop)
             rag_matches = [deps.serialize_rag_match(match) for match in matches]
             rag_context = deps.render_rag_context(matches)
-            _maybe_record_rag_query(
-                deps,
-                owner=user,
-                name=rag_index_name,
-                route="assistant_rag_mcp",
-                query_text=prompt,
-                rewritten_query=rewrite.retrieval_query or prompt,
-                top_k=top_k,
-                match_count=len(matches),
-                metadata={
-                    "mcp_enabled": bool(payload.get("mcp")),
-                    "conversation_id": conversation_id,
-                    **retrieval_loop_metadata,
-                },
-            )
             coverage_policy = _assistant_retrieval_coverage_policy(deps)
-            if coverage_policy.enabled and coverage_policy.refuse_on_insufficient and not mcp_cfg:
+            if coverage_policy.enabled and coverage_policy.refuse_on_insufficient and not mcp_cfg and not atlassian_cfg:
                 grade = retrieval_loop.get("grade")
                 if grade is not None and not bool(getattr(grade, "sufficient", False)):
-                    response_payload = _guard_output(
+                    response_payload = _apply_citation_binding(
                         deps,
                         trace,
                         route="assistant_rag_mcp",
@@ -1560,7 +1851,33 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                             "rag_matches": rag_matches,
                             "mcp_result": None,
                         },
+                        rag_matches=rag_matches,
+                    )
+                    response_payload = _guard_output(
+                        deps,
+                        trace,
+                        route="assistant_rag_mcp",
+                        response_payload=response_payload,
                         policy=security_policy,
+                    )
+                    _maybe_record_rag_query(
+                        deps,
+                        owner=user,
+                        name=rag_index_name,
+                        route="assistant_rag_mcp",
+                        query_text=prompt,
+                        rewritten_query=rewrite.retrieval_query or prompt,
+                        top_k=top_k,
+                        match_count=len(rag_matches),
+                        metadata={
+                            "mcp_enabled": False,
+                            "atlassian_enabled": False,
+                            "conversation_id": conversation_id,
+                            **retrieval_loop_metadata,
+                            "refused": True,
+                            "refusal_reason": "insufficient_retrieval_coverage",
+                            **_citation_response_metadata(response_payload),
+                        },
                     )
                     append_turn(
                         deps,
@@ -1575,8 +1892,10 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                         metadata={
                             "rag_index": rag_index_name,
                             "has_mcp": False,
+                            "has_atlassian_action": False,
                             **retrieval_loop_metadata,
                             "refused": True,
+                            **_citation_response_metadata(response_payload),
                         },
                     )
                     trace.finish(
@@ -1587,16 +1906,17 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                         response_meta={
                             "rag_match_count": len(rag_matches),
                             "has_mcp": False,
+                            "has_atlassian_action": False,
                             **retrieval_loop_metadata,
                             "refused": True,
+                            **_citation_response_metadata(response_payload),
                         },
                     )
                     return ServiceResult(response_payload)
 
         mcp_result = None
+        atlassian_result = None
         if mcp_cfg:
-            if not deps.is_admin_user(user):
-                raise ServiceError("mcp_forbidden", status_code=403)
             server_name = str(mcp_cfg.get("server") or "").strip()
             tool_name = str(mcp_cfg.get("tool") or "").strip()
             if not server_name or not tool_name:
@@ -1604,6 +1924,56 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
             arguments = mcp_cfg.get("arguments")
             if arguments is not None and not isinstance(arguments, dict):
                 raise ServiceError("mcp_invalid_arguments")
+            tool_guard_started = time.monotonic()
+            tool_guard_result = apply_tool_use_guard(
+                route="assistant_rag_mcp",
+                prompt=prompt,
+                mcp_request=mcp_cfg,
+                is_admin_user=deps.is_admin_user(user),
+                policy=security_policy,
+                request_kind="mcp",
+            )
+            trace.record_span(
+                "tool_guard",
+                tool_guard_started,
+                status="blocked" if not tool_guard_result.allowed else "success",
+                metadata=dict(tool_guard_result.metadata or {}),
+            )
+            _record_tool_use_telemetry(
+                deps,
+                owner=user,
+                prompt=prompt,
+                metadata=dict(tool_guard_result.metadata or {}),
+                allowed=tool_guard_result.allowed,
+                error_code=tool_guard_result.error_code,
+                error_detail=tool_guard_result.blocked_reason or "",
+            )
+            if not tool_guard_result.allowed:
+                if rag_index_name:
+                    _maybe_record_rag_query(
+                        deps,
+                        owner=user,
+                        name=rag_index_name,
+                        route="assistant_rag_mcp",
+                        query_text=prompt,
+                        rewritten_query=rewrite.retrieval_query or prompt,
+                        top_k=top_k,
+                        match_count=len(rag_matches),
+                        metadata={
+                            "mcp_enabled": True,
+                            "atlassian_enabled": False,
+                            "conversation_id": conversation_id,
+                            **retrieval_loop_metadata,
+                            "refused": True,
+                            "refusal_reason": tool_guard_result.error_code or "tool_guard_blocked",
+                            **_tool_guard_response_metadata(tool_guard_result),
+                        },
+                    )
+                raise ServiceError(
+                    tool_guard_result.error_code or "tool_guard_blocked",
+                    status_code=403 if tool_guard_result.error_code == "mcp_forbidden" else 409,
+                    details=tool_guard_result.blocked_reason,
+                )
             stage_started = time.monotonic()
             try:
                 mcp_result = deps.mcp_execute(
@@ -1623,6 +1993,138 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                 trace.record_span("mcp_call", stage_started, status="failed", metadata={"server": server_name, "tool": tool_name})
                 raise ServiceError("mcp_request_failed", details=str(exc), status_code=400) from exc
             trace.record_span("mcp_call", stage_started, metadata={"server": server_name, "tool": tool_name})
+        if atlassian_cfg:
+            product = str(atlassian_cfg.get("product") or "").strip().lower()
+            action = str(atlassian_cfg.get("action") or "").strip().lower()
+            if product not in {"jira", "confluence"} or not action:
+                raise ServiceError("atlassian_product_and_action_required")
+            arguments = atlassian_cfg.get("arguments")
+            if arguments is not None and not isinstance(arguments, dict):
+                raise ServiceError("atlassian_invalid_arguments")
+            guard_arguments = dict(arguments or {})
+            if atlassian_cfg.get("preview") or atlassian_cfg.get("dry_run"):
+                guard_arguments.setdefault("preview", True)
+            if deps.execute_atlassian_action is None:
+                raise ServiceError("atlassian_actions_unavailable", status_code=501)
+            guard_request = {
+                "server": f"atlassian:{product}",
+                "tool": action,
+                "arguments": guard_arguments,
+                "confirmed": atlassian_cfg.get("confirmed"),
+                "allow_unsafe": atlassian_cfg.get("allow_unsafe"),
+            }
+            tool_guard_started = time.monotonic()
+            tool_guard_result = apply_tool_use_guard(
+                route="assistant_rag_mcp",
+                prompt=prompt,
+                mcp_request=guard_request,
+                is_admin_user=deps.is_admin_user(user),
+                policy=security_policy,
+                request_kind="atlassian",
+            )
+            trace.record_span(
+                "tool_guard",
+                tool_guard_started,
+                status="blocked" if not tool_guard_result.allowed else "success",
+                metadata=dict(tool_guard_result.metadata or {}),
+            )
+            _record_tool_use_telemetry(
+                deps,
+                owner=user,
+                prompt=prompt,
+                metadata=dict(tool_guard_result.metadata or {}),
+                allowed=tool_guard_result.allowed,
+                error_code=tool_guard_result.error_code,
+                error_detail=tool_guard_result.blocked_reason or "",
+            )
+            if not tool_guard_result.allowed:
+                if rag_index_name:
+                    _maybe_record_rag_query(
+                        deps,
+                        owner=user,
+                        name=rag_index_name,
+                        route="assistant_rag_mcp",
+                        query_text=prompt,
+                        rewritten_query=rewrite.retrieval_query or prompt,
+                        top_k=top_k,
+                        match_count=len(rag_matches),
+                        metadata={
+                            "mcp_enabled": False,
+                            "atlassian_enabled": True,
+                            "conversation_id": conversation_id,
+                            **retrieval_loop_metadata,
+                            "refused": True,
+                            "refusal_reason": tool_guard_result.error_code or "tool_guard_blocked",
+                            **_tool_guard_response_metadata(tool_guard_result),
+                        },
+                    )
+                raise ServiceError(
+                    tool_guard_result.error_code or "tool_guard_blocked",
+                    status_code=409,
+                    details=tool_guard_result.blocked_reason,
+                )
+            stage_started = time.monotonic()
+            preview_mode = bool(
+                atlassian_cfg.get("preview")
+                or atlassian_cfg.get("dry_run")
+                or (tool_guard_result.metadata or {}).get("preview_mode")
+            )
+            try:
+                atlassian_result = deps.execute_atlassian_action(
+                    user,
+                    {
+                        "product": product,
+                        "action": action,
+                        "instance": atlassian_cfg.get("instance"),
+                        "arguments": dict(arguments or {}),
+                        "preview": preview_mode,
+                    },
+                )
+                if not isinstance(atlassian_result, dict):
+                    raise ValueError("Atlassian action executor returned an invalid response payload.")
+            except ServiceError:
+                raise
+            except Exception as exc:
+                latency_ms = max(0, int((time.monotonic() - stage_started) * 1000))
+                _record_atlassian_action_telemetry(
+                    deps,
+                    owner=user,
+                    product=product,
+                    action=action,
+                    latency_ms=latency_ms,
+                    success=False,
+                    preview_mode=preview_mode,
+                    error_code="atlassian_action_failed",
+                    error_detail=str(exc),
+                )
+                trace.record_span(
+                    "atlassian_action",
+                    stage_started,
+                    status="failed",
+                    metadata={"product": product, "action": action, "preview": preview_mode},
+                )
+                raise ServiceError("atlassian_action_failed", details=str(exc), status_code=400) from exc
+            latency_ms = max(0, int((time.monotonic() - stage_started) * 1000))
+            _record_atlassian_action_telemetry(
+                deps,
+                owner=user,
+                product=product,
+                action=action,
+                latency_ms=latency_ms,
+                success=True,
+                preview_mode=bool((atlassian_result or {}).get("preview")),
+            )
+            trace.record_span(
+                "atlassian_action",
+                stage_started,
+                metadata={
+                    "product": product,
+                    "action": action,
+                    "preview": bool((atlassian_result or {}).get("preview")),
+                    "status": str((atlassian_result or {}).get("status") or ""),
+                    "instance": str((atlassian_result or {}).get("instance") or ""),
+                },
+            )
 
         try:
             provider = deps.build_request_llm_provider(
@@ -1645,12 +2147,15 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
             user_blocks.append(f"RAG context:\n{rag_context}")
         if mcp_result is not None:
             user_blocks.append(f"MCP result:\n{deps.json_dumps(mcp_result, ensure_ascii=True)}")
+        if atlassian_result is not None:
+            user_blocks.append(f"Atlassian action result:\n{deps.json_dumps(atlassian_result, ensure_ascii=True)}")
         user_text = "\n\n".join(user_blocks)
 
         stage_started = time.monotonic()
         response = _predict_with_capacity(
             deps,
             provider,
+            owner=user,
             messages=[{"role": "user", "content": user_text}],
             system=system,
             temperature=payload.get("temperature", 0.2),
@@ -1668,7 +2173,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
             },
         )
         answer = str(getattr(response, "text", "") or "")
-        response_payload = _guard_output(
+        response_payload = _apply_citation_binding(
             deps,
             trace,
             route="assistant_rag_mcp",
@@ -1676,9 +2181,37 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                 "answer": answer,
                 "rag_matches": rag_matches,
                 "mcp_result": mcp_result,
+                "atlassian_result": atlassian_result,
             },
+            rag_matches=rag_matches,
+        )
+        response_payload = _guard_output(
+            deps,
+            trace,
+            route="assistant_rag_mcp",
+            response_payload=response_payload,
             policy=security_policy,
         )
+        if rag_index_name:
+            _maybe_record_rag_query(
+                deps,
+                owner=user,
+                name=rag_index_name,
+                route="assistant_rag_mcp",
+                query_text=prompt,
+                rewritten_query=rewrite.retrieval_query or prompt,
+                top_k=top_k,
+                match_count=len(rag_matches),
+                metadata={
+                    "mcp_enabled": bool(mcp_cfg),
+                    "atlassian_enabled": bool(atlassian_cfg),
+                    "conversation_id": conversation_id,
+                    **retrieval_loop_metadata,
+                    **_tool_guard_response_metadata(tool_guard_result),
+                    **_atlassian_action_response_metadata(atlassian_result),
+                    **_citation_response_metadata(response_payload),
+                },
+            )
         _store_semantic_cache(
             deps,
             trace,
@@ -1694,6 +2227,8 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                 "prompt_profile": decision.prompt_profile,
                 "provider": str(getattr(response, "provider", None) or settings.get("provider") or ""),
                 "model": str(getattr(response, "model", None) or settings.get("model") or ""),
+                **_atlassian_action_response_metadata(atlassian_result),
+                **_citation_response_metadata(response_payload),
             },
         )
         append_turn(
@@ -1706,14 +2241,25 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
             provider=str(getattr(response, "provider", None) or settings.get("provider") or ""),
             model=str(getattr(response, "model", None) or settings.get("model") or ""),
             response_payload=response_payload,
-            metadata={"rag_index": rag_index_name, "has_mcp": bool(mcp_result)},
+            metadata={
+                "rag_index": rag_index_name,
+                "has_mcp": bool(mcp_result),
+                **_atlassian_action_response_metadata(atlassian_result),
+                **_citation_response_metadata(response_payload),
+            },
         )
         trace.finish(
             status="success",
             provider=str(getattr(response, "provider", None) or settings.get("provider") or ""),
             model=str(getattr(response, "model", None) or settings.get("model") or ""),
             cache_hit=False,
-            response_meta={"rag_match_count": len(rag_matches), "has_mcp": bool(mcp_result), **retrieval_loop_metadata},
+            response_meta={
+                "rag_match_count": len(rag_matches),
+                "has_mcp": bool(mcp_result),
+                **_atlassian_action_response_metadata(atlassian_result),
+                **retrieval_loop_metadata,
+                **_citation_response_metadata(response_payload),
+            },
         )
         return ServiceResult(response_payload)
     except ServiceError as exc:
@@ -1976,6 +2522,7 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
         response = _predict_with_capacity(
             deps,
             provider,
+            owner=user,
             messages=chat_messages,
             system=system,
             temperature=payload.get("temperature", 0.2),
@@ -2215,6 +2762,7 @@ def assistant_form_fill(deps: AssistantPipelineDependencies, *, user: Optional[s
         response = _predict_with_capacity(
             deps,
             provider,
+            owner=user,
             messages=[{"role": "user", "content": deps.json_dumps(user_text)}],
             system=system,
             temperature=payload.get("temperature", 0.2),
@@ -2413,6 +2961,7 @@ def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str],
         response = _predict_with_capacity(
             deps,
             provider,
+            owner=user,
             messages=[{"role": "user", "content": deps.json_dumps(user_text)}],
             system=system,
             temperature=payload.get("temperature", 0.2),

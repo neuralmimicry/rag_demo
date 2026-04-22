@@ -1,7 +1,7 @@
 import pytest
 import requests
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
+from refiner.topic_researcher import TopicResearcher
 
 
 @pytest.fixture
@@ -12,8 +12,8 @@ def mock_llm():
     return llm
 
 
-@patch("topic_researcher.get_provider")
-@patch("topic_researcher.requests.Session")
+@patch("refiner.topic_researcher.get_provider")
+@patch("refiner.topic_researcher.requests.Session")
 def test_fetch_url_403_with_llm_advice(mock_session_class, mock_get_provider, mock_llm):
     mock_get_provider.return_value = mock_llm
 
@@ -49,8 +49,8 @@ def test_fetch_url_403_with_llm_advice(mock_session_class, mock_get_provider, mo
     assert kwargs["cookies"]["accepted"] == "true"
 
 
-@patch("topic_researcher.get_provider")
-@patch("topic_researcher.requests.Session")
+@patch("refiner.topic_researcher.get_provider")
+@patch("refiner.topic_researcher.requests.Session")
 def test_fetch_url_405_retry(mock_session_class, mock_get_provider, mock_llm):
     mock_get_provider.return_value = mock_llm
 
@@ -79,7 +79,7 @@ def test_fetch_url_405_retry(mock_session_class, mock_get_provider, mock_llm):
     assert mock_session.get.call_count == 2
 
 
-@patch("topic_researcher.get_provider")
+@patch("refiner.topic_researcher.get_provider")
 def test_read_source_uses_youtube_transcript(mock_get_provider, mock_llm):
     mock_get_provider.return_value = mock_llm
 
@@ -89,15 +89,15 @@ def test_read_source_uses_youtube_transcript(mock_get_provider, mock_llm):
         llm_provider="openai"
     )
 
-    with patch("topic_researcher.fetch_youtube_transcript", return_value=("Fetched transcript", {"caption_lang": "en"})) as mock_fetch:
+    with patch("refiner.topic_researcher.fetch_youtube_transcript", return_value=("Fetched transcript", {"caption_lang": "en"})) as mock_fetch:
         content = researcher._read_source("https://youtu.be/VTtC8tAzsOo")
 
     assert content == "Fetched transcript"
     mock_fetch.assert_called_once()
 
 
-@patch("topic_researcher.get_provider")
-@patch("topic_researcher.requests.Session")
+@patch("refiner.topic_researcher.get_provider")
+@patch("refiner.topic_researcher.requests.Session")
 def test_read_source_integration(mock_session_class, mock_get_provider, mock_llm):
     mock_get_provider.return_value = mock_llm
 
