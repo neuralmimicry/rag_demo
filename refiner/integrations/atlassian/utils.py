@@ -75,7 +75,7 @@ class AtlassianClient:
     base_url: str
     auth: Tuple[str, str]
     timeout: int = 30
-    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    user_agent: str = "neuralmimicry-atlassian-client/1.0"
 
     @property
     def headers(self) -> Dict[str, str]:
@@ -85,6 +85,12 @@ class AtlassianClient:
             "User-Agent": self.user_agent
         }
 
+    @property
+    def write_headers(self) -> Dict[str, str]:
+        headers = dict(self.headers)
+        headers["X-Atlassian-Token"] = "no-check"
+        return headers
+
     def get(self, path: str, params: Optional[dict] = None) -> Dict[str, Any]:
         url = self.base_url.rstrip("/") + path
         resp = requests.get(url, params=params or {}, headers=self.headers, auth=self.auth, timeout=self.timeout)
@@ -93,7 +99,14 @@ class AtlassianClient:
 
     def post(self, path: str, payload: Dict[str, Any], params: Optional[dict] = None) -> Dict[str, Any]:
         url = self.base_url.rstrip("/") + path
-        resp = requests.post(url, auth=self.auth, data=json.dumps(payload), headers=self.headers, params=params, timeout=self.timeout)
+        resp = requests.post(
+            url,
+            auth=self.auth,
+            json=payload,
+            headers=self.write_headers,
+            params=params,
+            timeout=self.timeout,
+        )
         if resp.status_code >= 400:
             logger.debug(f"POST {url} failed ({resp.status_code}): {resp.text[:500]}")
         resp.raise_for_status()
@@ -101,29 +114,32 @@ class AtlassianClient:
 
     def put(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = self.base_url.rstrip("/") + path
-        resp = requests.put(url, auth=self.auth, data=json.dumps(payload), headers=self.headers, timeout=self.timeout)
+        resp = requests.put(
+            url,
+            auth=self.auth,
+            json=payload,
+            headers=self.write_headers,
+            timeout=self.timeout,
+        )
         resp.raise_for_status()
         return resp.json() if resp.text else {}
 
 class JiraClient(AtlassianClient):
     def fetch_issues(self, jql: str, limit: int = 100) -> List[IssueInfo]:
         """Fetch issues using JQL with pagination."""
-        start_at = 0
+        next_page_token: Optional[str] = None
         all_issues = []
         while len(all_issues) < limit:
             chunk_size = min(100, limit - len(all_issues))
-            payload = {
+            params = {
                 "jql": jql,
-                "startAt": start_at,
                 "maxResults": chunk_size,
-                "fields": ["summary", "issuetype", "status", "priority", "labels", "assignee", "updated", "created", "description", "reporter", "comment", "parent"]
+                "fields": "summary,issuetype,status,priority,labels,assignee,updated,created,description,reporter,comment,parent",
             }
-            # Try POST /search first
-            try:
-                data = self.post("/rest/api/2/search", payload)
-            except Exception:
-                # Fallback to GET /search
-                data = self.get("/rest/api/2/search", params={"jql": jql, "startAt": start_at, "maxResults": chunk_size, "fields": "summary,issuetype,status,priority,labels,assignee,updated,created,description,reporter,comment,parent"})
+            if next_page_token:
+                params["nextPageToken"] = next_page_token
+
+            data = self.get("/rest/api/3/search/jql", params=params)
             
             issues = data.get("issues", [])
             if not issues:
@@ -132,9 +148,9 @@ class JiraClient(AtlassianClient):
             for it in issues:
                 all_issues.append(self._map_issue(it))
             
-            if len(issues) < chunk_size:
+            next_page_token = str(data.get("nextPageToken") or "").strip() or None
+            if not next_page_token and len(issues) < chunk_size:
                 break
-            start_at += len(issues)
         
         return all_issues[:limit]
 
@@ -253,18 +269,41 @@ class JiraClient(AtlassianClient):
             "url": f"{self.base_url.rstrip('/')}/browse/{str(issue_key or '').strip()}",
         }
 
+    def _comment_document(self, body: str) -> Dict[str, Any]:
+        paragraphs = []
+        for line in str(body or "").splitlines():
+            line = str(line)
+            if line:
+                paragraphs.append(
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": line}],
+                    }
+                )
+            else:
+                paragraphs.append({"type": "paragraph", "content": []})
+        if not paragraphs:
+            paragraphs.append({"type": "paragraph", "content": []})
+        return {"type": "doc", "version": 1, "content": paragraphs}
+
     def upsert_comment(self, issue_key: str, marker_id: str, body: str) -> Dict[str, Any]:
-        path = f"/rest/api/2/issue/{issue_key}/comment"
-        # Search for existing comment with marker
+        path = f"/rest/api/3/issue/{issue_key}/comment"
         comments = self.get(path).get("comments", [])
-        existing = next((c for c in comments if marker_id in (c.get("body") or "")), None)
+        existing = None
+        for comment in comments:
+            raw = comment.get("body")
+            raw_text = json.dumps(raw) if isinstance(raw, (dict, list)) else str(raw)
+            if marker_id in raw_text:
+                existing = comment
+                break
         
         full_body = f"{body}\n\n[marker:{marker_id}]"
+        payload = {"body": self._comment_document(full_body)}
         if existing:
-            self.put(f"{path}/{existing['id']}", {"body": full_body})
+            self.put(f"{path}/{existing['id']}", payload)
             return {"action": "updated", "comment_id": str(existing.get("id") or "").strip()}
         else:
-            created = self.post(path, {"body": full_body})
+            created = self.post(path, payload)
             return {"action": "created", "comment_id": str(created.get("id") or "").strip()}
 
 class ConfluenceClient(AtlassianClient):
@@ -282,8 +321,8 @@ class ConfluenceClient(AtlassianClient):
         resp = requests.post(
             url,
             auth=self.auth,
-            data=json.dumps(payload),
-            headers=self.headers,
+            json=payload,
+            headers=self.write_headers,
             params=params,
             timeout=self.timeout,
         )
@@ -294,7 +333,13 @@ class ConfluenceClient(AtlassianClient):
 
     def put(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = self._api_base_url().rstrip("/") + path
-        resp = requests.put(url, auth=self.auth, data=json.dumps(payload), headers=self.headers, timeout=self.timeout)
+        resp = requests.put(
+            url,
+            auth=self.auth,
+            json=payload,
+            headers=self.write_headers,
+            timeout=self.timeout,
+        )
         resp.raise_for_status()
         return resp.json() if resp.text else {}
 
