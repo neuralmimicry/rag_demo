@@ -5,6 +5,7 @@ No heavy SDK dependencies; uses requests to call HTTP endpoints.
 
 Environment variables:
 - OPENAI_API_KEY
+- NVIDIA_API_KEY
 - GEMINI_API_KEY
 - OLLAMA_BASE_URL (optional, defaults to http://localhost:11434)
 OpenAI timeout overrides (optional):
@@ -180,6 +181,17 @@ def _normalize_openai_model_name(model: Optional[str]) -> str:
         if prefix == "openai" and remainder.strip():
             return remainder.strip()
     return cleaned
+
+
+def _normalize_openai_base_url(value: Optional[str], default: str) -> str:
+    cleaned = str(value or default).strip()
+    if not cleaned:
+        cleaned = default
+    return cleaned.rstrip("/")
+
+
+def _openai_compatible_endpoint(base_url: str, path: str) -> str:
+    return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
 def _openai_model_supports_reasoning_effort(model: Optional[str]) -> bool:
@@ -1176,16 +1188,97 @@ def _is_cached_content_error(resp: requests.Response) -> bool:
     return False
 
 
+def _extract_async_request_id(data: Any) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    for key in ("requestId", "request_id", "id"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _poll_openai_compatible_status(
+    *,
+    provider: str,
+    base_url: str,
+    request_id: str,
+    headers: Dict[str, str],
+    timeout: Optional[object],
+    session: Optional[requests.Session],
+    max_retries: Optional[int],
+) -> Dict[str, Any]:
+    poll_interval = max(0.5, _env_float("OPENAI_BACKGROUND_POLL_INTERVAL_SECONDS", 10.0))
+    started = time.time()
+    hard_timeout = 2 * (
+        timeout[1] if isinstance(timeout, tuple) and len(timeout) > 1 else int(timeout or _env_int("LLM_TIMEOUT_SECONDS", 180))
+    )
+    status_url = _openai_compatible_endpoint(base_url, f"status/{request_id}")
+    while True:
+        if time.time() - started > hard_timeout:
+            raise LLMError(f"{provider} async status polling timed out after {hard_timeout}s")
+        resp = _http_get(
+            status_url,
+            headers=headers,
+            timeout=timeout,
+            session=session,
+            max_retries=max_retries,
+        )
+        if resp.status_code == 202:
+            time.sleep(poll_interval)
+            continue
+        if resp.status_code >= 300:
+            raise LLMError(f"{provider} async status error {resp.status_code}: {resp.text[:200]}")
+        return resp.json()
+
+
 class OpenAIProvider(LLMProvider):
-    def __init__(self, model: Optional[str] = None, inter_request_gap: float = 0.0, api_key: Optional[str] = None):
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        inter_request_gap: float = 0.0,
+        api_key: Optional[str] = None,
+        *,
+        base_url: Optional[str] = None,
+        provider_name: str = "openai",
+        api_key_env: str = "OPENAI_API_KEY",
+        model_env: str = "OPENAI_MODEL",
+        default_model_env: str = "OPENAI_DEFAULT_MODEL",
+        base_url_env: str = "OPENAI_BASE_URL",
+        default_base_url: str = "https://api.openai.com/v1",
+        default_model: str = "gpt-4o-mini",
+        supports_responses: Optional[bool] = None,
+        supports_transcriptions: Optional[bool] = None,
+        supports_prompt_cache: Optional[bool] = None,
+        supports_service_tier: Optional[bool] = None,
+        async_status_enabled: Optional[bool] = None,
+    ):
         super().__init__(inter_request_gap=inter_request_gap)
-        self.name = "openai"
-        self.default_model = os.getenv("OPENAI_DEFAULT_MODEL", "gpt-4o-mini")
-        self.model = model or os.getenv("OPENAI_MODEL", self.default_model)
+        self.name = str(provider_name or "openai").strip().lower() or "openai"
+        self.default_model = os.getenv(default_model_env, default_model)
+        self.model = model or os.getenv(model_env, self.default_model)
+        self.base_url = _normalize_openai_base_url(
+            base_url or os.getenv(base_url_env),
+            default_base_url,
+        )
         self.api_key_source = "param" if api_key else "env"
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.api_key = api_key or os.getenv(api_key_env)
         if not self.api_key:
-            raise LLMError("OPENAI_API_KEY not set")
+            raise LLMError(f"{api_key_env} not set")
+        default_openai_cloud = self.name == "openai" and self.base_url == "https://api.openai.com/v1"
+        self.supports_responses = default_openai_cloud if supports_responses is None else bool(supports_responses)
+        self.supports_transcriptions = (
+            default_openai_cloud if supports_transcriptions is None else bool(supports_transcriptions)
+        )
+        self.supports_prompt_cache = (
+            default_openai_cloud if supports_prompt_cache is None else bool(supports_prompt_cache)
+        )
+        self.supports_service_tier = (
+            default_openai_cloud if supports_service_tier is None else bool(supports_service_tier)
+        )
+        self.async_status_enabled = (
+            (self.name != "openai") if async_status_enabled is None else bool(async_status_enabled)
+        )
         self._session = requests.Session()
         self._unsupported_reasoning_logged = set()
 
@@ -1207,8 +1300,8 @@ class OpenAIProvider(LLMProvider):
                 self.model,
             )
             self._unsupported_reasoning_logged.add(self.model)
-        use_responses = responses_forced or bool(effective_effort)
-        service_tier = _openai_service_tier("responses" if use_responses else "chat")
+        use_responses = self.supports_responses and (responses_forced or bool(effective_effort))
+        service_tier = _openai_service_tier("responses" if use_responses else "chat") if self.supports_service_tier else None
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         base_timeout = timeout or _env_int("OPENAI_TIMEOUT_SECONDS", _env_int("LLM_TIMEOUT_SECONDS", 180))
         if effective_effort in {"high", "xhigh"}:
@@ -1220,7 +1313,7 @@ class OpenAIProvider(LLMProvider):
         total_chars = _total_input_chars(messages, system)
         estimated_tokens = _estimate_tokens_from_chars(total_chars)
         if use_responses:
-            url = "https://api.openai.com/v1/responses"
+            url = _openai_compatible_endpoint(self.base_url, "responses")
             max_tokens_override = max_tokens
             effort_override = effective_effort
             empty_retry_used = False
@@ -1341,14 +1434,14 @@ class OpenAIProvider(LLMProvider):
                     payload["reasoning"] = {"effort": effort_override}
                 if max_tokens_override:
                     payload["max_output_tokens"] = max_tokens_override
-                if service_tier:
+                if service_tier and self.supports_service_tier:
                     payload["service_tier"] = service_tier
                 if background_enabled:
                     payload["background"] = True
                     payload["store"] = True
                 if effort_override in (None, "", "none"):
                     payload["temperature"] = temperature
-                if not use_replay and not disable_prompt_cache:
+                if self.supports_prompt_cache and not use_replay and not disable_prompt_cache:
                     cache_key = _build_prompt_cache_key(system, messages, model=self.model, kind="responses")
                     if cache_key:
                         payload["prompt_cache_key"] = cache_key
@@ -1401,7 +1494,26 @@ class OpenAIProvider(LLMProvider):
                         )
                     raise
                 latency_ms = int((time.time() - start) * 1000)
-                if resp.status_code >= 300:
+                if resp.status_code == 202 and self.async_status_enabled:
+                    try:
+                        accepted = resp.json()
+                    except Exception as exc:
+                        raise LLMError(f"{self.name} async response was not valid JSON: {exc}")
+                    request_id = _extract_async_request_id(accepted)
+                    if not request_id:
+                        raise LLMError(f"{self.name} async response missing request id")
+                    data = _poll_openai_compatible_status(
+                        provider=self.name,
+                        base_url=self.base_url,
+                        request_id=request_id,
+                        headers=headers,
+                        timeout=openai_timeout,
+                        session=self._session,
+                        max_retries=openai_max_retries,
+                    )
+                    if isinstance(data, dict) and data.get("model"):
+                        self.model = str(data.get("model"))
+                elif resp.status_code >= 300:
                     if (
                         effort_override
                         and not reasoning_retry_used
@@ -1456,7 +1568,8 @@ class OpenAIProvider(LLMProvider):
                         self.model = self.default_model
                         continue
                     raise LLMError(f"OpenAI error {resp.status_code}: {resp.text[:200]}")
-                data = resp.json()
+                else:
+                    data = resp.json()
                 if isinstance(data, dict) and data.get("error"):
                     raise LLMError(f"OpenAI responses error: {data.get('error')}")
                 if background_enabled and isinstance(data, dict):
@@ -1606,7 +1719,7 @@ class OpenAIProvider(LLMProvider):
                 logger.debug(f"OpenAI Response (responses): {text[:500]}...")
                 return LLMResponse(text=text, raw=data, latency_ms=latency_ms, provider=self.name, model=self.model)
 
-        url = "https://api.openai.com/v1/chat/completions"
+        url = _openai_compatible_endpoint(self.base_url, "chat/completions")
         if system:
             messages = [{"role": "system", "content": system}] + messages
 
@@ -1618,16 +1731,17 @@ class OpenAIProvider(LLMProvider):
             }
             if max_tokens:
                 payload["max_tokens"] = max_tokens
-            if service_tier:
+            if service_tier and self.supports_service_tier:
                 payload["service_tier"] = service_tier
-            cache_key = _build_prompt_cache_key(system, messages, model=self.model, kind="chat")
-            if cache_key:
-                payload["prompt_cache_key"] = cache_key
-            cache_retention = _normalize_prompt_cache_retention(
-                os.getenv("OPENAI_PROMPT_CACHE_RETENTION") or os.getenv("PROMPT_CACHE_RETENTION")
-            )
-            if cache_retention:
-                payload["prompt_cache_retention"] = cache_retention
+            if self.supports_prompt_cache:
+                cache_key = _build_prompt_cache_key(system, messages, model=self.model, kind="chat")
+                if cache_key:
+                    payload["prompt_cache_key"] = cache_key
+                cache_retention = _normalize_prompt_cache_retention(
+                    os.getenv("OPENAI_PROMPT_CACHE_RETENTION") or os.getenv("PROMPT_CACHE_RETENTION")
+                )
+                if cache_retention:
+                    payload["prompt_cache_retention"] = cache_retention
             issues = _validate_openai_chat_payload(payload)
             issues.extend(_check_openai_payload_semantics(payload, kind="chat"))
             if issues:
@@ -1667,10 +1781,29 @@ class OpenAIProvider(LLMProvider):
                         "OpenAI request (chat) failed: %s | summary=%s",
                         exc,
                         _summarize_openai_payload(payload, kind="chat"),
-                    )
+                        )
                 raise
             latency_ms = int((time.time() - start) * 1000)
-            if resp.status_code >= 300:
+            if resp.status_code == 202 and self.async_status_enabled:
+                try:
+                    accepted = resp.json()
+                except Exception as exc:
+                    raise LLMError(f"{self.name} async response was not valid JSON: {exc}")
+                request_id = _extract_async_request_id(accepted)
+                if not request_id:
+                    raise LLMError(f"{self.name} async response missing request id")
+                data = _poll_openai_compatible_status(
+                    provider=self.name,
+                    base_url=self.base_url,
+                    request_id=request_id,
+                    headers=headers,
+                    timeout=openai_timeout,
+                    session=self._session,
+                    max_retries=openai_max_retries,
+                )
+                if isinstance(data, dict) and data.get("model"):
+                    self.model = str(data.get("model"))
+            elif resp.status_code >= 300:
                 if attempt == 0 and _is_model_not_found(resp) and self.model != self.default_model:
                     logger.warning(
                         "OpenAI model not found (%s); falling back to default model %s.",
@@ -1680,7 +1813,8 @@ class OpenAIProvider(LLMProvider):
                     self.model = self.default_model
                     continue
                 raise LLMError(f"OpenAI error {resp.status_code}: {resp.text[:200]}")
-            data = resp.json()
+            else:
+                data = resp.json()
             _log_token_usage(self.name, self.model, _extract_openai_usage(data))
             text = ""
             try:
@@ -1702,7 +1836,9 @@ class OpenAIProvider(LLMProvider):
             return LLMResponse(text=text, raw=data, latency_ms=latency_ms, provider=self.name, model=self.model)
 
     def transcribe(self, file_path: str, timeout: Optional[int] = None) -> str:
-        url = "https://api.openai.com/v1/audio/transcriptions"
+        if not self.supports_transcriptions:
+            raise LLMError(f"{self.name} does not support audio transcription in Refiner")
+        url = _openai_compatible_endpoint(self.base_url, "audio/transcriptions")
         headers = {"Authorization": f"Bearer {self.api_key}"}
         # Note: requests handles multipart/form-data when files is provided
         tmt = timeout or _env_int("LLM_TIMEOUT_SECONDS", 60)
@@ -1717,22 +1853,78 @@ class OpenAIProvider(LLMProvider):
             raise LLMError(f"OpenAI transcription failed: {e}")
 
     def health_check(self, timeout: Optional[int] = None) -> Dict[str, Any]:
-        url = "https://api.openai.com/v1/models"
+        url = _openai_compatible_endpoint(self.base_url, "models")
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        payload = {}
+        timeout_value = _openai_timeout_tuple(timeout or _env_int("LLM_TIMEOUT_SECONDS", 60))
         start = time.time()
         try:
-            resp = _http_post(
+            resp = _http_get(
                 url,
                 headers=headers,
-                json_payload=payload,
-                timeout=_openai_timeout_tuple(timeout or _env_int("LLM_TIMEOUT_SECONDS", 60)),
+                timeout=timeout_value,
                 session=self._session,
                 max_retries=_env_optional_int("OPENAI_MAX_RETRIES"),
             )
             latency_ms = int((time.time() - start) * 1000)
             ok = resp.status_code < 300
-            return {"ok": ok, "status_code": resp.status_code, "latency_ms": latency_ms, "message": "ok" if ok else resp.text[:200]}
+            if ok or self.name == "openai":
+                return {
+                    "ok": ok,
+                    "status_code": resp.status_code,
+                    "latency_ms": latency_ms,
+                    "message": "ok" if ok else resp.text[:200],
+                }
+            probe_url = _openai_compatible_endpoint(self.base_url, "chat/completions")
+            probe_payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+                "temperature": 0.0,
+            }
+            start = time.time()
+            probe = _http_post(
+                probe_url,
+                headers=headers,
+                json_payload=probe_payload,
+                timeout=timeout_value,
+                session=self._session,
+                max_retries=_env_optional_int("OPENAI_MAX_RETRIES"),
+            )
+            latency_ms = int((time.time() - start) * 1000)
+            if probe.status_code == 202 and self.async_status_enabled:
+                try:
+                    accepted = probe.json()
+                except Exception as exc:
+                    raise LLMError(f"{self.name} async health probe was not valid JSON: {exc}")
+                request_id = _extract_async_request_id(accepted)
+                if not request_id:
+                    return {
+                        "ok": False,
+                        "status_code": probe.status_code,
+                        "latency_ms": latency_ms,
+                        "message": "async health probe missing request id",
+                    }
+                data = _poll_openai_compatible_status(
+                    provider=self.name,
+                    base_url=self.base_url,
+                    request_id=request_id,
+                    headers=headers,
+                    timeout=timeout_value,
+                    session=self._session,
+                    max_retries=_env_optional_int("OPENAI_MAX_RETRIES"),
+                )
+                return {
+                    "ok": True,
+                    "status_code": 200,
+                    "latency_ms": latency_ms,
+                    "message": str(data.get("status") or "ok"),
+                }
+            return {
+                "ok": probe.status_code < 300,
+                "status_code": probe.status_code,
+                "latency_ms": latency_ms,
+                "message": "ok" if probe.status_code < 300 else _extract_error_message(probe)[:200],
+            }
         except Exception as e:
             latency_ms = int((time.time() - start) * 1000)
             return {"ok": False, "status_code": None, "latency_ms": latency_ms, "message": str(e)}
@@ -1752,6 +1944,8 @@ class OpenAIProvider(LLMProvider):
                 return 16385
             return 4096
         if "o1-" in model:
+            return 128000
+        if any(token in model for token in ("moonshotai/", "kimi", "minimaxai/", "minimax", "deepseek-ai/", "deepseek", "z-ai/", "glm")):
             return 128000
         return super().get_context_window()
 
@@ -2254,6 +2448,8 @@ def get_provider(name: Optional[str], model: Optional[str] = None, base_url: Opt
     if not name:
         return None
     name = name.lower().strip()
+    if name in ("nim", "nvidia_nim"):
+        name = "nvidia"
     try:
         from refiner.refiner_ai_gail import build_direct_provider as _build_gail_direct_provider, gail_enabled as _gail_enabled
 
@@ -2270,6 +2466,25 @@ def get_provider(name: Optional[str], model: Optional[str] = None, base_url: Opt
         logger.debug("Gail direct-provider bridge unavailable, falling back to local providers: %s", exc)
     if name in ("openai", "chatgpt", "gpt"):
         return OpenAIProvider(model=model, inter_request_gap=inter_request_gap, **kwargs)
+    if name in ("nvidia",):
+        return OpenAIProvider(
+            model=model,
+            inter_request_gap=inter_request_gap,
+            base_url=base_url,
+            provider_name="nvidia",
+            api_key_env="NVIDIA_API_KEY",
+            model_env="NVIDIA_MODEL",
+            default_model_env="NVIDIA_DEFAULT_MODEL",
+            base_url_env="NVIDIA_BASE_URL",
+            default_base_url="https://integrate.api.nvidia.com/v1",
+            default_model="moonshotai/kimi-k2-instruct-0905",
+            supports_responses=False,
+            supports_transcriptions=False,
+            supports_prompt_cache=False,
+            supports_service_tier=False,
+            async_status_enabled=True,
+            **kwargs,
+        )
     if name in ("gemini", "google"):
         return GeminiProvider(model=model, inter_request_gap=inter_request_gap, **kwargs)
     if name in ("ollama",):

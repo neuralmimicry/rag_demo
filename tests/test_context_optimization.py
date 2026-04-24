@@ -23,6 +23,20 @@ def test_gemini_context_window():
         p2 = GeminiProvider(model="gemini-1.5-pro")
         assert p2.get_context_window() == 2000000
 
+
+def test_nvidia_provider_defaults_and_context_window():
+    with patch.dict(os.environ, {"NVIDIA_API_KEY": "test"}, clear=True):
+        p = get_provider("nvidia", model="moonshotai/kimi-k2-instruct-0905")
+        assert isinstance(p, OpenAIProvider)
+        assert p.name == "nvidia"
+        assert p.base_url == "https://integrate.api.nvidia.com/v1"
+        assert p.get_context_window() == 128000
+
+        alias = get_provider("nim", model="deepseek-ai/deepseek-v3.2")
+        assert isinstance(alias, OpenAIProvider)
+        assert alias.name == "nvidia"
+        assert alias.get_context_window() == 128000
+
 @patch("requests.post")
 def test_ollama_context_window(mock_post):
     # Mock /api/show response

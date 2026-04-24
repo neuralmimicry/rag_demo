@@ -9540,23 +9540,29 @@ def _resolve_llm_settings(
     if preferred_provider:
         match = next((p for p in providers if p.get("name") == preferred_provider), None)
         if match:
-            provider_type = match.get("type") or preferred_provider
+            provider_type = _normalize_llm_provider_type(match.get("type") or preferred_provider) or preferred_provider
             model = model or match.get("model")
             base_url = match.get("base_url")
         else:
-            provider_type = preferred_provider
+            provider_type = _normalize_llm_provider_type(preferred_provider) or preferred_provider
 
     if not provider_type:
         if env.get("OPENAI_API_KEY"):
             provider_type = "openai"
+        elif env.get("NVIDIA_API_KEY"):
+            provider_type = "nvidia"
         elif env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY") or env.get("GOOGLE_GENERATIVE_AI_API_KEY"):
             provider_type = "gemini"
         else:
             provider_type = "ollama"
 
-    if provider_type in {"gpt", "chatgpt", "openai"}:
+    provider_type = _normalize_llm_provider_type(provider_type) or provider_type
+
+    if provider_type == "openai":
         api_key = env.get("OPENAI_API_KEY")
-    elif provider_type in {"gemini", "google"}:
+    elif provider_type == "nvidia":
+        api_key = env.get("NVIDIA_API_KEY")
+    elif provider_type == "gemini":
         api_key = (
             env.get("GEMINI_API_KEY")
             or env.get("GOOGLE_API_KEY")
@@ -9566,7 +9572,10 @@ def _resolve_llm_settings(
         api_key = None
 
     if not base_url:
-        base_url = env.get("OLLAMA_BASE_URL") if provider_type == "ollama" else None
+        if provider_type == "ollama":
+            base_url = env.get("OLLAMA_BASE_URL")
+        elif provider_type == "nvidia":
+            base_url = env.get("NVIDIA_BASE_URL")
 
     return {
         "provider": provider_type,
@@ -9582,11 +9591,24 @@ def _resolve_llm_settings(
     }
 
 
-def _api_key_for_provider_type(provider_type: Optional[str], env: Dict[str, str]) -> Optional[str]:
+def _normalize_llm_provider_type(provider_type: Optional[str]) -> Optional[str]:
     lowered = str(provider_type or "").strip().lower()
-    if lowered in {"gpt", "chatgpt", "openai"}:
+    if lowered in {"gpt", "chatgpt"}:
+        return "openai"
+    if lowered == "google":
+        return "gemini"
+    if lowered in {"nim", "nvidia_nim"}:
+        return "nvidia"
+    return lowered or None
+
+
+def _api_key_for_provider_type(provider_type: Optional[str], env: Dict[str, str]) -> Optional[str]:
+    lowered = _normalize_llm_provider_type(provider_type)
+    if lowered == "openai":
         return env.get("OPENAI_API_KEY")
-    if lowered in {"gemini", "google"}:
+    if lowered == "nvidia":
+        return env.get("NVIDIA_API_KEY")
+    if lowered == "gemini":
         return (
             env.get("GEMINI_API_KEY")
             or env.get("GOOGLE_API_KEY")
@@ -9599,14 +9621,20 @@ def _fallback_llm_settings(user: str, primary: Dict[str, Any]) -> Dict[str, Any]
     env = build_effective_llm_env(_get_secret_store(user).get_env(), process_env=os.environ)
     cfg = _load_llm_config()
     providers = cfg.get("llm_providers") if isinstance(cfg.get("llm_providers"), list) else []
-    primary_provider = str(primary.get("provider") or "").strip().lower()
+    primary_provider = (
+        _normalize_llm_provider_type(primary.get("provider"))
+        or str(primary.get("provider") or "").strip().lower()
+    )
     primary_model = str(primary.get("model") or "").strip()
 
     for item in providers:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "").strip()
-        provider_type = str(item.get("type") or item.get("provider") or name).strip()
+        provider_type = (
+            _normalize_llm_provider_type(item.get("type") or item.get("provider") or name)
+            or str(item.get("type") or item.get("provider") or name).strip()
+        )
         model = str(item.get("model") or "").strip()
         if not provider_type:
             continue
@@ -9614,10 +9642,13 @@ def _fallback_llm_settings(user: str, primary: Dict[str, Any]) -> Dict[str, Any]
         same_model = not primary_model or model == primary_model
         if same_provider and same_model:
             continue
+        base_url = item.get("base_url")
+        if not base_url and provider_type == "nvidia":
+            base_url = env.get("NVIDIA_BASE_URL")
         return {
             "provider": provider_type,
             "model": model or None,
-            "base_url": item.get("base_url"),
+            "base_url": base_url,
             "api_key": _api_key_for_provider_type(provider_type, env),
         }
     return {"provider": None, "model": None, "base_url": None, "api_key": None}

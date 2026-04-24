@@ -6635,6 +6635,8 @@ def _query_opencode_plan(
     if llm_api_key and llm_provider:
         if llm_provider in ("openai", "gpt", "chatgpt"):
             env.setdefault("OPENAI_API_KEY", llm_api_key)
+        elif llm_provider in ("nvidia", "nim", "nvidia_nim"):
+            env.setdefault("NVIDIA_API_KEY", llm_api_key)
         elif llm_provider in ("gemini", "google"):
             env.setdefault("GEMINI_API_KEY", llm_api_key)
     try:
