@@ -61,6 +61,10 @@ def get_llm_credentials(name: Optional[str] = None, provider_type: str = "openai
             key = os.getenv(f"OPENAI_API_KEY_{suffix}")
             if key:
                 return key
+        elif pt in ("nvidia", "nim", "nvidia_nim"):
+            key = os.getenv(f"NVIDIA_API_KEY_{suffix}")
+            if key:
+                return key
         elif pt in ("gemini", "google"):
             key = os.getenv(f"GEMINI_API_KEY_{suffix}")
             if key:
@@ -77,6 +81,8 @@ def get_llm_credentials(name: Optional[str] = None, provider_type: str = "openai
     pt = str(provider_type).lower()
     if pt in ("openai", "gpt", "chatgpt"):
         return os.getenv("OPENAI_API_KEY")
+    elif pt in ("nvidia", "nim", "nvidia_nim"):
+        return os.getenv("NVIDIA_API_KEY")
     elif pt in ("gemini", "google"):
         return os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_ACCESS_TOKEN") or os.getenv("GOOGLE_ACCESS_TOKEN")
     elif pt == "ollama":

@@ -31,6 +31,25 @@ def test_get_provider_returns_gail_direct_provider_when_enabled(monkeypatch):
     assert provider.gail_base_url == "https://gail.internal.example"
 
 
+def test_get_provider_returns_gail_nvidia_provider_when_enabled(monkeypatch):
+    _enable_gail(monkeypatch)
+
+    provider = get_provider(
+        "nim",
+        model="moonshotai/kimi-k2-instruct-0905",
+        api_key="nvapi-test",
+        base_url="https://integrate.api.nvidia.com/v1",
+    )
+
+    assert provider is not None
+    assert provider.__class__.__name__ == "GailProvider"
+    assert provider.gail_mode == "direct"
+    assert provider.gail_source_provider == "nvidia"
+    assert provider.gail_source_model == "moonshotai/kimi-k2-instruct-0905"
+    assert provider.gail_source_api_key == "nvapi-test"
+    assert provider.gail_source_base_url == "https://integrate.api.nvidia.com/v1"
+
+
 def test_build_workflow_provider_uses_gail_and_normalizes_provider_credentials(monkeypatch):
     _enable_gail(monkeypatch)
 

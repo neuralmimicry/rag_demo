@@ -315,6 +315,8 @@ def _run_confluence_analysis(
     if llm_api_key:
         if llm_provider in ("openai", "gpt", "chatgpt"):
             os.environ["OPENAI_API_KEY"] = llm_api_key
+        elif llm_provider in ("nvidia", "nim", "nvidia_nim"):
+            os.environ["NVIDIA_API_KEY"] = llm_api_key
         elif llm_provider in ("gemini", "google"):
             os.environ["GEMINI_API_KEY"] = llm_api_key
 
@@ -411,6 +413,8 @@ def _run_jira_analysis(
     if llm_api_key:
         if llm_provider in ("openai", "gpt", "chatgpt"):
             os.environ["OPENAI_API_KEY"] = llm_api_key
+        elif llm_provider in ("nvidia", "nim", "nvidia_nim"):
+            os.environ["NVIDIA_API_KEY"] = llm_api_key
         elif llm_provider in ("gemini", "google"):
             os.environ["GEMINI_API_KEY"] = llm_api_key
 

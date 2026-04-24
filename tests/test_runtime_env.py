@@ -70,6 +70,21 @@ def test_build_effective_llm_env_uses_process_defaults_when_secret_missing():
     assert env["OLLAMA_DEFAULT_MODEL"] == "llama3.2"
 
 
+def test_build_effective_llm_env_includes_nvidia_defaults():
+    env = build_effective_llm_env(
+        {},
+        process_env={
+            "NVIDIA_API_KEY": "nvapi-test",
+            "NVIDIA_BASE_URL": "https://integrate.api.nvidia.com/v1",
+            "NVIDIA_DEFAULT_MODEL": "moonshotai/kimi-k2-instruct-0905",
+        },
+    )
+
+    assert env["NVIDIA_API_KEY"] == "nvapi-test"
+    assert env["NVIDIA_BASE_URL"] == "https://integrate.api.nvidia.com/v1"
+    assert env["NVIDIA_DEFAULT_MODEL"] == "moonshotai/kimi-k2-instruct-0905"
+
+
 def test_build_effective_llm_env_replaces_cluster_local_secret_base_url():
     env = build_effective_llm_env(
         {"OLLAMA_BASE_URL": "http://ollama.ollama.svc.cluster.local:11434"},

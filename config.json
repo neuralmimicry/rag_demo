@@ -19,6 +19,30 @@
       "name": "GeminiFallback",
       "type": "gemini",
       "model": "gemini-1.5-flash"
+    },
+    {
+      "name": "NVIDIAKimiResearch",
+      "type": "nvidia",
+      "model": "moonshotai/kimi-k2-instruct-0905",
+      "base_url": "https://integrate.api.nvidia.com/v1"
+    },
+    {
+      "name": "NVIDIAMiniMaxPlanner",
+      "type": "nvidia",
+      "model": "minimaxai/minimax-m2.7",
+      "base_url": "https://integrate.api.nvidia.com/v1"
+    },
+    {
+      "name": "NVIDIADeepSeekReasoner",
+      "type": "nvidia",
+      "model": "deepseek-ai/deepseek-v3.2",
+      "base_url": "https://integrate.api.nvidia.com/v1"
+    },
+    {
+      "name": "NVIDIAGLMGeneralist",
+      "type": "nvidia",
+      "model": "z-ai/glm-4.7",
+      "base_url": "https://integrate.api.nvidia.com/v1"
     }
   ],
   "ai_orchestration": {
@@ -43,6 +67,42 @@
         "roles": ["researcher", "reviewer"],
         "specialties": ["research", "citations", "long_context"],
         "weight": 0.3
+      },
+      {
+        "name": "NVIDIAKimiResearch",
+        "provider": "nvidia",
+        "model": "moonshotai/kimi-k2-instruct-0905",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "roles": ["researcher", "assistant"],
+        "specialties": ["research", "long_context", "reasoning", "code"],
+        "weight": 0.22
+      },
+      {
+        "name": "NVIDIAMiniMaxPlanner",
+        "provider": "nvidia",
+        "model": "minimaxai/minimax-m2.7",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "roles": ["planner", "assistant"],
+        "specialties": ["planning", "reasoning", "agentic", "code"],
+        "weight": 0.2
+      },
+      {
+        "name": "NVIDIADeepSeekReasoner",
+        "provider": "nvidia",
+        "model": "deepseek-ai/deepseek-v3.2",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "roles": ["planner", "reviewer", "assistant"],
+        "specialties": ["reasoning", "analysis", "review", "code"],
+        "weight": 0.18
+      },
+      {
+        "name": "NVIDIAGLMGeneralist",
+        "provider": "nvidia",
+        "model": "z-ai/glm-4.7",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "roles": ["reviewer", "assistant"],
+        "specialties": ["summary", "reasoning", "long_context", "analysis"],
+        "weight": 0.16
       },
       {
         "name": "LocalDraft",
