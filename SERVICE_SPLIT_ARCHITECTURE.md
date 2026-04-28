@@ -145,7 +145,7 @@ Persistence defaults:
 ### Refiner internal accounting
 
 1. Refiner estimates work, reserves tokens, debits on execution, and releases unused reservations
-2. For those non-browser operations Refiner calls Billing internal endpoints with an app token
+2. For those non-browser operations Refiner calls Billing internal endpoints with its own Customers-issued service-account bearer token
 3. Billing writes the mutation to nmchain
 4. nmchain keeps the authoritative ledger trail for later audit
 
@@ -162,7 +162,7 @@ Persistence defaults:
 - The public frontend must not need a second backend hostname because of the split
 - Refiner remains the compatibility gateway for the existing website/API contract
 - Billing dashboard HTML, assets, and JSON must remain proxyable through Refiner so the commercial site never needs a direct Billing origin
-- Internal service-to-service calls use app tokens where mutation or privileged lookup is involved
+- Internal service-to-service calls use Customers-issued service-account bearer tokens where mutation or privileged lookup is involved
 - Customers remains the truth for identity
 - Billing remains the truth for balance mutation orchestration
 - nmchain remains the audit ledger of record

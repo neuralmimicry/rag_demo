@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="rag-api-base" content="{{ api_base or '' }}">
-  <title>Refiner Setup · Neuralmimicry</title>
+  <title>Refiner Register · Neuralmimicry</title>
   <link rel="icon" href="/public/favicon.ico">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
@@ -52,12 +52,12 @@
         </div>
         <p class="eyebrow">Neuralmimicry</p>
       </div>
-      <h1>Refiner Setup</h1>
-      <p class="subtitle">Create the first administrator account for the Refiner Control Room.</p>
+      <h1>Create an account</h1>
+      <p class="subtitle">Create your account for the Refiner Control Room.</p>
       <p id="authError" class="auth-error" {% if not error %}hidden{% endif %}>{{ error }}</p>
       <form
         id="authForm"
-        data-auth="setup"
+        data-auth="register"
         data-next="{{ next_path or '/' }}"
         data-password-min-length="{{ password_min_length }}"
         data-passkeys-supported="{{ 'true' if passkeys_supported else 'false' }}"
@@ -65,12 +65,12 @@
         class="auth-form"
       >
         <div class="field">
-          <label for="username">Administrator username</label>
+          <label for="username">Username</label>
           <input id="username" name="username" type="text" required>
         </div>
         <div class="field">
-          <label for="email">Notification email (optional)</label>
-          <input id="email" name="email" type="email" autocomplete="email" placeholder="you@example.com">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
         </div>
         <div class="field">
           <label for="password">Password</label>
@@ -80,8 +80,9 @@
           <label for="confirm">Confirm password</label>
           <input id="confirm" name="confirm" type="password" required>
         </div>
-        <button type="submit" class="primary">Create administrator</button>
+        <button type="submit" class="primary">Create account</button>
       </form>
+      <p class="subtitle auth-footnote">Already have an account? <a class="inline-link" href="{{ url_for('login', next=(next_path or '/')) }}">Sign in</a>.</p>
     </section>
   </main>
   <script src="/static/auth.js"></script>

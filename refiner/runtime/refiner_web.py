@@ -1345,6 +1345,7 @@ OIDC_EXCHANGE_ENABLED = _env_flag(
     _env_flag("NM_OIDC_EXCHANGE_ENABLED", OIDC_ENABLED),
 )
 PASSWORD_MIN_LEN = int(os.getenv("REFINER_PASSWORD_MIN_LENGTH", "12"))
+SELF_REGISTRATION_ENABLED = _env_flag("REFINER_SELF_REGISTRATION_ENABLED", False)
 LOGIN_WINDOW_SEC = int(os.getenv("REFINER_LOGIN_WINDOW_SEC", "300"))
 LOGIN_MAX_ATTEMPTS = int(os.getenv("REFINER_LOGIN_MAX_ATTEMPTS", "10"))
 
@@ -8481,16 +8482,240 @@ def _normalize_identity_active_team(value: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+SERVICE_ACCESS_NONE = "none"
+SERVICE_ACCESS_REQUEST = "request"
+SERVICE_ACCESS_OBSERVE = "observe"
+SERVICE_ACCESS_USE = "use"
+SERVICE_ACCESS_CONTROL = "control"
+
+SERVICE_ACCESS_ORDER = {
+    SERVICE_ACCESS_NONE: 0,
+    SERVICE_ACCESS_REQUEST: 1,
+    SERVICE_ACCESS_OBSERVE: 2,
+    SERVICE_ACCESS_USE: 3,
+    SERVICE_ACCESS_CONTROL: 4,
+}
+
+SERVICE_ACCESS_PUBLIC_DEFAULTS = {
+    "refiner": SERVICE_ACCESS_REQUEST,
+    "billing": SERVICE_ACCESS_NONE,
+    "continuum": SERVICE_ACCESS_OBSERVE,
+    "tracey": SERVICE_ACCESS_OBSERVE,
+    "aarnn": SERVICE_ACCESS_REQUEST,
+    "webots": SERVICE_ACCESS_REQUEST,
+    "gail": SERVICE_ACCESS_NONE,
+    "nmstt": SERVICE_ACCESS_NONE,
+    "conductor": SERVICE_ACCESS_NONE,
+    "customers": SERVICE_ACCESS_NONE,
+    "nmchain": SERVICE_ACCESS_NONE,
+}
+
+SERVICE_ACCESS_AUTHENTICATED_DEFAULTS = {
+    "refiner": SERVICE_ACCESS_USE,
+    "billing": SERVICE_ACCESS_USE,
+    "aarnn": SERVICE_ACCESS_REQUEST,
+    "webots": SERVICE_ACCESS_REQUEST,
+}
+
+
+def _normalize_service_access_level(value: Any, *, default: str = SERVICE_ACCESS_NONE) -> str:
+    cleaned = str(value or default).strip().lower() or default
+    if cleaned not in SERVICE_ACCESS_ORDER:
+        return default
+    return cleaned
+
+
+def _service_access_at_least(current: Any, required: Any) -> bool:
+    current_level = _normalize_service_access_level(current)
+    required_level = _normalize_service_access_level(required)
+    return SERVICE_ACCESS_ORDER[current_level] >= SERVICE_ACCESS_ORDER[required_level]
+
+
+def _max_service_access_level(*values: Any) -> str:
+    best = SERVICE_ACCESS_NONE
+    for value in values:
+        candidate = _normalize_service_access_level(value)
+        if SERVICE_ACCESS_ORDER[candidate] > SERVICE_ACCESS_ORDER[best]:
+            best = candidate
+    return best
+
+
+def _normalize_service_access_entry(
+    service_key: Any,
+    raw_entry: Any,
+    *,
+    default_public_level: str = SERVICE_ACCESS_NONE,
+    default_access_level: str = SERVICE_ACCESS_NONE,
+) -> Optional[Dict[str, Any]]:
+    cleaned_service_key = str(service_key or "").strip().lower()
+    if not cleaned_service_key:
+        return None
+    if isinstance(raw_entry, dict):
+        payload = dict(raw_entry)
+    else:
+        payload = {}
+        if raw_entry is not None:
+            payload["access_level"] = raw_entry
+    public_access_level = _normalize_service_access_level(
+        payload.get("public_access_level") or default_public_level,
+        default=SERVICE_ACCESS_NONE,
+    )
+    access_level = _normalize_service_access_level(
+        payload.get("access_level") or payload.get("level") or default_access_level,
+        default=SERVICE_ACCESS_NONE,
+    )
+    visible_access_level = _normalize_service_access_level(
+        payload.get("visible_access_level"),
+        default=_max_service_access_level(access_level, public_access_level),
+    )
+    can_request = payload.get("can_request")
+    can_observe = payload.get("can_observe")
+    can_use = payload.get("can_use")
+    can_control = payload.get("can_control")
+    return {
+        **payload,
+        "service_key": cleaned_service_key,
+        "access_level": access_level,
+        "public_access_level": public_access_level,
+        "visible_access_level": visible_access_level,
+        "visible": bool(payload.get("visible")) or visible_access_level != SERVICE_ACCESS_NONE,
+        "can_request": can_request if isinstance(can_request, bool) else _service_access_at_least(visible_access_level, SERVICE_ACCESS_REQUEST),
+        "can_observe": can_observe if isinstance(can_observe, bool) else _service_access_at_least(visible_access_level, SERVICE_ACCESS_OBSERVE),
+        "can_use": can_use if isinstance(can_use, bool) else _service_access_at_least(access_level, SERVICE_ACCESS_USE),
+        "can_control": can_control if isinstance(can_control, bool) else _service_access_at_least(access_level, SERVICE_ACCESS_CONTROL),
+    }
+
+
+def _default_identity_service_access(payload: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    identity = dict(payload or {})
+    authenticated = bool(identity.get("authenticated", True))
+    identity_type = str(identity.get("identity_type") or "").strip().lower() or None
+    default_role = "service_account" if identity_type == "service_account" else "user"
+    role = str(identity.get("role") or default_role).strip().lower() or default_role
+    groups = _normalize_identity_groups(identity.get("groups"))
+    is_service_account = identity_type == "service_account" or role == "service_account"
+    is_admin = role == "admin" or "admin" in groups
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for service_key, public_access_level in SERVICE_ACCESS_PUBLIC_DEFAULTS.items():
+        granted_access_level = SERVICE_ACCESS_NONE
+        if is_admin:
+            granted_access_level = SERVICE_ACCESS_CONTROL
+        elif authenticated and not is_service_account:
+            granted_access_level = _normalize_service_access_level(
+                SERVICE_ACCESS_AUTHENTICATED_DEFAULTS.get(service_key),
+                default=SERVICE_ACCESS_NONE,
+            )
+        entry = _normalize_service_access_entry(
+            service_key,
+            {},
+            default_public_level=public_access_level,
+            default_access_level=granted_access_level,
+        )
+        if entry:
+            resolved[service_key] = entry
+    return resolved
+
+
+def _resolve_identity_service_access(payload: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    identity = dict(payload or {})
+    resolved = _default_identity_service_access(identity)
+    raw_service_access = identity.get("service_access")
+    if isinstance(raw_service_access, dict):
+        items = list(raw_service_access.items())
+    elif isinstance(raw_service_access, list):
+        items = []
+        for entry in raw_service_access:
+            if not isinstance(entry, dict):
+                continue
+            service_key = entry.get("service_key") or entry.get("key")
+            items.append((service_key, entry))
+    else:
+        items = []
+    for service_key, raw_entry in items:
+        cleaned_service_key = str(service_key or "").strip().lower()
+        if not cleaned_service_key:
+            continue
+        normalized = _normalize_service_access_entry(
+            cleaned_service_key,
+            raw_entry,
+            default_public_level=_normalize_service_access_level(
+                (resolved.get(cleaned_service_key) or {}).get("public_access_level")
+                or SERVICE_ACCESS_PUBLIC_DEFAULTS.get(cleaned_service_key),
+                default=SERVICE_ACCESS_NONE,
+            ),
+            default_access_level=(resolved.get(cleaned_service_key) or {}).get("access_level", SERVICE_ACCESS_NONE),
+        )
+        if normalized:
+            resolved[cleaned_service_key] = normalized
+    return resolved
+
+
+def _identity_service_access_entry(identity: Optional[Dict[str, Any]], service_key: str) -> Dict[str, Any]:
+    cleaned_service_key = str(service_key or "").strip().lower()
+    if not cleaned_service_key:
+        return {
+            "service_key": "",
+            "access_level": SERVICE_ACCESS_NONE,
+            "public_access_level": SERVICE_ACCESS_NONE,
+            "visible_access_level": SERVICE_ACCESS_NONE,
+            "visible": False,
+            "can_request": False,
+            "can_observe": False,
+            "can_use": False,
+            "can_control": False,
+        }
+    services = _resolve_identity_service_access(identity)
+    entry = services.get(cleaned_service_key)
+    if entry:
+        return entry
+    fallback = _normalize_service_access_entry(
+        cleaned_service_key,
+        {},
+        default_public_level=SERVICE_ACCESS_PUBLIC_DEFAULTS.get(cleaned_service_key, SERVICE_ACCESS_NONE),
+        default_access_level=SERVICE_ACCESS_NONE,
+    )
+    return fallback or {
+        "service_key": cleaned_service_key,
+        "access_level": SERVICE_ACCESS_NONE,
+        "public_access_level": SERVICE_ACCESS_NONE,
+        "visible_access_level": SERVICE_ACCESS_NONE,
+        "visible": False,
+        "can_request": False,
+        "can_observe": False,
+        "can_use": False,
+        "can_control": False,
+    }
+
+
+def _identity_has_service_access(identity: Optional[Dict[str, Any]], service_key: str, minimum: str) -> bool:
+    entry = _identity_service_access_entry(identity, service_key)
+    required = _normalize_service_access_level(minimum)
+    if required == SERVICE_ACCESS_REQUEST:
+        return bool(entry.get("can_request"))
+    if required == SERVICE_ACCESS_OBSERVE:
+        return bool(entry.get("can_observe"))
+    if required == SERVICE_ACCESS_USE:
+        return bool(entry.get("can_use"))
+    if required == SERVICE_ACCESS_CONTROL:
+        return bool(entry.get("can_control"))
+    return False
+
+
 def _normalize_auth_identity(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not isinstance(payload, dict):
         return None
     user = str(payload.get("user") or "").strip()
     if not user:
         return None
-    role = str(payload.get("role") or user_store.get_role(user) or "user").strip().lower() or "user"
+    identity_type = str(payload.get("identity_type") or "").strip().lower() or None
+    default_role = "service_account" if identity_type == "service_account" else (user_store.get_role(user) or "user")
+    role = str(payload.get("role") or default_role).strip().lower() or default_role
     groups = _normalize_identity_groups(payload.get("groups"))
-    if role and role not in groups:
+    if role and role != "service_account" and role not in groups:
         groups.insert(0, role)
+    group_memberships = payload.get("group_memberships") if isinstance(payload.get("group_memberships"), list) else []
+    manageable_groups = _normalize_identity_groups(payload.get("manageable_groups"))
+    visible_groups = _normalize_identity_groups(payload.get("visible_groups")) or list(groups)
     active_team = _normalize_identity_active_team(payload.get("active_team"))
     team_tree = payload.get("team_tree") if isinstance(payload.get("team_tree"), list) else []
     try:
@@ -8501,16 +8726,43 @@ def _normalize_auth_identity(payload: Optional[Dict[str, Any]]) -> Optional[Dict
         pending_invitation_count = int(payload.get("pending_invitation_count") or 0)
     except Exception:
         pending_invitation_count = 0
+    service_access = _resolve_identity_service_access(
+        {
+            **payload,
+            "authenticated": bool(payload.get("authenticated", True)),
+            "role": role,
+            "groups": groups,
+        }
+    )
+    visible_services = sorted(
+        {
+            str(item).strip().lower()
+            for item in payload.get("visible_services", [])
+            if str(item).strip()
+        }
+        | {
+            service_key
+            for service_key, entry in service_access.items()
+            if bool(entry.get("visible"))
+        }
+    )
     return {
         **payload,
         "authenticated": bool(payload.get("authenticated", True)),
+        "identity_type": identity_type,
         "user": user,
         "role": role,
         "groups": groups,
+        "group_memberships": group_memberships,
+        "manageable_groups": manageable_groups,
+        "visible_groups": visible_groups,
+        "can_manage_access": bool(payload.get("can_manage_access")) or bool(manageable_groups),
         "active_team": active_team,
         "team_count": max(0, team_count),
         "pending_invitation_count": max(0, pending_invitation_count),
         "team_tree": team_tree,
+        "service_access": service_access,
+        "visible_services": visible_services,
         "is_admin": role == "admin" or "admin" in groups,
     }
 
@@ -8610,21 +8862,55 @@ def _update_user_settings(user: str, raw_settings: Any) -> Dict[str, Any]:
 
 def _local_identity_payload(user: str, *, include_directory: bool = False) -> Dict[str, Any]:
     role = str(user_store.get_role(user) or "user").strip().lower() or "user"
-    payload: Dict[str, Any] = {
+    base_payload: Dict[str, Any] = {
         "authenticated": True,
         "user": user,
         "role": role,
         "groups": [role] if role else [],
+        "group_memberships": [],
+        "manageable_groups": ["admin"] if role == "admin" else [],
+        "visible_groups": [role] if role else [],
+        "can_manage_access": role == "admin",
+    }
+    service_access = _resolve_identity_service_access(base_payload)
+    payload: Dict[str, Any] = {
+        **base_payload,
         "email": user_store.get_email(user),
         "active_team": None,
         "team_count": 0,
         "pending_invitation_count": 0,
         "is_admin": role == "admin",
+        "service_access": service_access,
+        "visible_services": sorted(
+            service_key
+            for service_key, entry in service_access.items()
+            if bool(entry.get("visible"))
+        ),
         "settings": _user_settings(user),
     }
     if include_directory:
         payload["team_tree"] = access_store.tree_all() if payload["is_admin"] else access_store.tree_for_user(user)
     return payload
+
+
+def _refiner_auth_config_payload() -> Dict[str, Any]:
+    has_users = user_store.has_users()
+    local_auth_available = AUTH_MODE != "oidc"
+    return {
+        "service": "refiner",
+        "auth_mode": AUTH_MODE,
+        "oidc_enabled": OIDC_ENABLED,
+        "oidc_button_label": OIDC_BUTTON_LABEL,
+        "password_min_length": PASSWORD_MIN_LEN,
+        "has_users": has_users,
+        "setup_allowed": local_auth_available,
+        "setup_available": local_auth_available and not has_users,
+        "local_login_enabled": local_auth_available and has_users,
+        "self_registration_enabled": local_auth_available and has_users and SELF_REGISTRATION_ENABLED,
+        "team_provisioning_available": False,
+        "totp_supported": False,
+        "passkeys_supported": False,
+    }
 
 
 def _team_tree_role(team_id: Optional[str], nodes: Optional[List[Dict[str, Any]]]) -> Optional[str]:
@@ -10087,6 +10373,8 @@ def _is_admin_user(user: Optional[str]) -> bool:
         return False
     identity = _current_auth_profile() or _current_auth_identity()
     if isinstance(identity, dict) and str(identity.get("user") or "").strip() == user:
+        if _identity_has_service_access(identity, "refiner", SERVICE_ACCESS_CONTROL):
+            return True
         return bool(identity.get("is_admin"))
     return _user_role(user) == "admin"
 
@@ -12617,17 +12905,30 @@ def _require_login() -> Optional[Response]:
         return None
     if path in {
         "/login",
+        "/register",
         "/auth/external-login",
         "/sso",
         "/oidc/login",
         "/oidc/callback",
         "/setup",
+        "/api/auth/config",
         "/api/login",
+        "/api/login/mfa/totp",
         "/api/logout",
         "/api/oidc/exchange",
+        "/api/register",
         "/api/session",
         "/api/setup",
+        "/api/passkeys/authenticate/options",
+        "/api/passkeys/authenticate/verify",
+        "/api/profile/mfa/totp/start",
+        "/api/profile/mfa/totp/verify",
+        "/api/profile/mfa/totp/disable",
+        "/api/profile/passkeys/register/options",
+        "/api/profile/passkeys/register/verify",
     } or path.startswith("/api/health"):
+        return None
+    if path.startswith("/api/profile/passkeys/"):
         return None
     if path.startswith("/api/voice/") and not path.startswith("/api/voice/tokens"):
         return None
@@ -12646,6 +12947,20 @@ def _require_login() -> Optional[Response]:
         if AUTH_MODE == "oidc":
             return redirect(url_for("oidc_login"))
         return redirect(url_for("login"))
+    identity = _current_auth_profile() or _current_auth_identity()
+    if not _identity_has_service_access(identity, "refiner", SERVICE_ACCESS_USE):
+        if is_api:
+            return (
+                jsonify(
+                    {
+                        "error": "forbidden",
+                        "service": "refiner",
+                        "required_access": SERVICE_ACCESS_USE,
+                    }
+                ),
+                403,
+            )
+        return make_response("Forbidden", 403)
     return None
 
 
@@ -12811,6 +13126,65 @@ def login() -> Response:
         oidc_label=OIDC_BUTTON_LABEL,
         local_enabled=user_store.has_users(),
         next_path=next_path,
+        self_registration_enabled=bool(SELF_REGISTRATION_ENABLED and user_store.has_users()),
+        password_min_length=PASSWORD_MIN_LEN,
+        passkeys_supported=False,
+    )
+
+
+def register() -> Response:
+    """Render or serve the self-registration route."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    next_path = _safe_next_path(request.args.get("next") or session.get("login_next"))
+    if AUTH_MODE == "oidc":
+        return redirect(url_for("login", next=next_path))
+    if not SELF_REGISTRATION_ENABLED:
+        return redirect(url_for("login", next=next_path))
+    if not user_store.has_users():
+        return redirect(url_for("setup", next=next_path))
+    error = None
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = (request.form.get("password") or "").strip()
+        confirm = (request.form.get("confirm") or "").strip()
+        email = (request.form.get("email") or "").strip()
+        if not email:
+            error = "Email is required."
+        elif not username or not password:
+            error = "Username and password are required."
+        elif not USERNAME_RE.match(username):
+            error = "Username must be 3-32 chars (letters, numbers, underscore, dash)."
+        elif not EMAIL_RE.match(email):
+            error = "Enter a valid email address."
+        elif len(password) < PASSWORD_MIN_LEN:
+            error = f"Password must be at least {PASSWORD_MIN_LEN} characters."
+        elif confirm and password != confirm:
+            error = "Passwords do not match."
+        elif user_store.get_user(username):
+            error = "That username is already in use."
+        else:
+            user_store.create_user(username, password, role="user", email=email)
+            session["user"] = username
+            session.pop("login_next", None)
+            _record_identity_event(
+                username,
+                role=user_store.get_role(username),
+                email=user_store.get_email(username),
+                provider="register",
+                meta={"source": "register_form"},
+            )
+            _record_login_event(username, auth_mode="register", provider="local", meta={"source": "register_form"})
+            _audit_event("register", actor=username, status="success")
+            return redirect(next_path)
+    return render_template(
+        "register.html",
+        error=error,
+        api_base=API_BASE,
+        site_base=SITE_BASE,
+        next_path=next_path,
+        password_min_length=PASSWORD_MIN_LEN,
+        passkeys_supported=False,
     )
 
 
@@ -13153,6 +13527,13 @@ def api_login() -> Response:
     )
 
 
+def api_login_mfa_totp() -> Response:
+    """API endpoint for TOTP login completion."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
 def api_setup() -> Response:
     """API endpoint for setup."""
     if _customers_enabled():
@@ -13211,6 +13592,79 @@ def api_setup() -> Response:
         ),
         201,
     )
+
+
+def api_register() -> Response:
+    """API endpoint for self-service user registration."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    if AUTH_MODE == "oidc":
+        return jsonify({"error": "oidc_required"}), 403
+    if not SELF_REGISTRATION_ENABLED:
+        return jsonify({"error": "registration_not_allowed"}), 403
+    if not user_store.has_users():
+        return jsonify({"error": "setup_required"}), 400
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+    username = (payload.get("username") or "").strip()
+    password = (payload.get("password") or "").strip()
+    confirm = (payload.get("confirm") or "").strip()
+    email = (payload.get("email") or "").strip()
+    if not email:
+        return jsonify({"error": "email_required", "details": "Email is required."}), 400
+    if not username or not password:
+        return jsonify({"error": "username_and_password_required"}), 400
+    if not USERNAME_RE.match(username):
+        return jsonify(
+            {
+                "error": "invalid_username",
+                "details": "Username must be 3-32 chars (letters, numbers, underscore, dash).",
+            }
+        ), 400
+    if not EMAIL_RE.match(email):
+        return jsonify({"error": "invalid_email", "details": "Enter a valid email address."}), 400
+    if len(password) < PASSWORD_MIN_LEN:
+        return jsonify(
+            {"error": "password_too_short", "details": f"Password must be at least {PASSWORD_MIN_LEN} characters."}
+        ), 400
+    if confirm and password != confirm:
+        return jsonify({"error": "password_mismatch", "details": "Passwords do not match."}), 400
+    if user_store.get_user(username):
+        return jsonify({"error": "user_exists", "details": "That username is already in use."}), 409
+    user_store.create_user(username, password, role="user", email=email)
+    session["user"] = username
+    session.pop("login_next", None)
+    _record_identity_event(
+        username,
+        role=user_store.get_role(username),
+        email=user_store.get_email(username),
+        provider="register",
+        meta={"source": "api_register"},
+    )
+    _record_login_event(username, auth_mode="register", provider="local", meta={"source": "api_register"})
+    _audit_event("api_register", actor=username, status="success")
+    sso_token = _issue_sso_token(username)
+    access_token_payload = _issue_access_token_payload(username, source="api_register")
+    return (
+        jsonify(
+            {
+                "status": "ok",
+                **_local_identity_payload(username, include_directory=False),
+                "sso_token": sso_token,
+                "sso_expires_in": SSO_TTL_SECONDS,
+                **access_token_payload,
+            }
+        ),
+        201,
+    )
+
+
+def api_auth_config() -> Response:
+    """Public auth capability metadata for SPA consumers."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify(_refiner_auth_config_payload())
 
 
 def api_sso_issue() -> Response:
@@ -13310,6 +13764,62 @@ def api_profile() -> Response:
 
 def api_profile_password() -> Response:
     """API endpoint for profile password changes."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_profile_mfa_totp_start() -> Response:
+    """API endpoint for starting TOTP enrolment."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_profile_mfa_totp_verify() -> Response:
+    """API endpoint for verifying TOTP enrolment."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_profile_mfa_totp_disable() -> Response:
+    """API endpoint for disabling TOTP."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_profile_passkeys_register_options() -> Response:
+    """API endpoint for starting passkey registration."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_profile_passkeys_register_verify() -> Response:
+    """API endpoint for verifying passkey registration."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_profile_passkey_delete(credential_id: str) -> Response:
+    """API endpoint for deleting a passkey."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_passkeys_authenticate_options() -> Response:
+    """API endpoint for starting passkey authentication."""
+    if _customers_enabled():
+        return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
+    return jsonify({"error": "not_available"}), 404
+
+
+def api_passkeys_authenticate_verify() -> Response:
+    """API endpoint for completing passkey authentication."""
     if _customers_enabled():
         return _proxy_service_request(CUSTOMERS_API_BASE, CUSTOMERS_TIMEOUT)
     return jsonify({"error": "not_available"}), 404
@@ -14638,6 +15148,8 @@ def setup() -> Response:
         api_base=API_BASE,
         site_base=SITE_BASE,
         next_path=next_path,
+        password_min_length=PASSWORD_MIN_LEN,
+        passkeys_supported=False,
     )
 
 
@@ -17855,6 +18367,7 @@ if hasattr(app, "add_url_rule"):
     register_auth_routes(
         app,
         login=login,
+        register=register,
         external_login=external_login,
         oidc_login=oidc_login,
         oidc_callback=oidc_callback,
@@ -17862,13 +18375,24 @@ if hasattr(app, "add_url_rule"):
         sso_login=sso_login,
         logout=logout,
         api_login=api_login,
+        api_login_mfa_totp=api_login_mfa_totp,
         api_setup=api_setup,
+        api_register=api_register,
+        api_auth_config=api_auth_config,
         api_sso_issue=api_sso_issue,
         api_logout=api_logout,
         api_session=api_session,
         api_authz_nginx=api_authz_nginx,
         api_profile=api_profile,
         api_profile_password=api_profile_password,
+        api_profile_mfa_totp_start=api_profile_mfa_totp_start,
+        api_profile_mfa_totp_verify=api_profile_mfa_totp_verify,
+        api_profile_mfa_totp_disable=api_profile_mfa_totp_disable,
+        api_profile_passkeys_register_options=api_profile_passkeys_register_options,
+        api_profile_passkeys_register_verify=api_profile_passkeys_register_verify,
+        api_profile_passkey_delete=api_profile_passkey_delete,
+        api_passkeys_authenticate_options=api_passkeys_authenticate_options,
+        api_passkeys_authenticate_verify=api_passkeys_authenticate_verify,
         api_users=api_users,
         api_user_password=api_user_password,
     )
