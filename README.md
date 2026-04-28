@@ -96,7 +96,7 @@ GitHub Actions release automation lives in `.github/workflows/build-and-release.
 The web UI is backed by the same Flask server module (`refiner.refiner_web`). It uses session cookies, with dedicated JSON endpoints for headless or cloud-hosted frontends.
 
 ### Current JSON API surface
-- Auth + profile: `/api/setup`, `/api/login`, `/api/logout`, `/api/session`, `/api/profile`, `/api/sso/issue`, `/api/oidc/exchange`
+- Auth + profile: `/api/setup`, `/api/register`, `/api/login`, `/api/login/mfa/totp`, `/api/logout`, `/api/session`, `/api/profile`, `/api/profile/password`, `/api/profile/mfa/totp/*`, `/api/profile/passkeys/register/*`, `/api/profile/passkeys/<credential_id>`, `/api/passkeys/authenticate/*`, `/api/sso/issue`, `/api/oidc/exchange`
 - Assistant + planning: `/api/assistant/requirements`, `/api/assistant/form-fill`, `/api/assistant/rag-mcp`, `/api/playground/plan`
 - Voice + capture: `/api/voice/tokens`, `/api/voice/capture`, `/api/voice/siri`, `/api/voice/alexa`, `/api/voice/google`, `/api/voice/stt`
 - Jobs + workspaces: `/api/jobs`, `/api/jobs/estimate`, `/api/jobs/<job_id>/workspace`, `/api/jobs/<job_id>/editor/*`, `/api/jobs/<job_id>/logs`, `/api/jobs/<job_id>/actions`, `/api/jobs/<job_id>/transfer`, `/api/jobs/<job_id>/archive`
@@ -181,14 +181,22 @@ See [REFINER_AI_ORCHESTRATION.md](REFINER_AI_ORCHESTRATION.md) for the workflow-
 
 ### API auth endpoints
 - `POST /api/login` with JSON `{ "username": "...", "password": "..." }` sets the session cookie.
+- `POST /api/login/mfa/totp` completes a pending authenticator-app sign-in challenge after password verification.
 - `POST /api/logout` clears the session cookie.
-- `GET /api/session` returns `{ authenticated, user, role }`.
+- `GET /api/session` returns the shared identity contract, including `groups`, `group_memberships`, `manageable_groups`, `visible_groups`, `can_manage_access`, `service_access`, and `visible_services`.
 - `POST /api/setup` creates the first admin account (only allowed when no users exist).
+- `POST /api/register` creates a self-service local account when self-registration is enabled.
+- `POST /api/profile/mfa/totp/start`, `/verify`, and `/disable` manage authenticator-app 2FA for Customers-backed local accounts.
+- `POST /api/profile/passkeys/register/options`, `POST /api/profile/passkeys/register/verify`, `DELETE /api/profile/passkeys/<credential_id>`, `POST /api/passkeys/authenticate/options`, and `POST /api/passkeys/authenticate/verify` manage passkey enrolment and passkey sign-in for Customers-backed local accounts.
 - `POST /api/sso/issue` issues a short-lived, one-time SSO token (requires an authenticated session).
 - `GET /sso?token=...&next=/` exchanges the SSO token for a first-party session and redirects.
 - `POST /api/oidc/exchange` exchanges an OIDC authorisation code (PKCE) or `id_token` for a Refiner session and SSO token.
 
-The web login and setup pages now call these endpoints directly.
+The web login, registration, and setup pages now call these endpoints directly.
+
+When Customers-backed auth is enabled, Refiner requires `service_access.refiner.can_use` for authenticated product access and treats `service_access.refiner.can_control` as admin-equivalent for dashboard controls and admin routes.
+Customers-issued service-account bearer tokens are supported for backend calls, but they keep only their explicit groups and public visibility. Refiner does not grant service accounts the human `refiner:use` fallback, so `service_access.refiner` must be issued explicitly.
+When Customers-backed auth is enabled, the browser sign-in and registration flow also exposes optional authenticator-app 2FA enrolment and passkey registration/sign-in through the proxied Customers routes.
 
 ### Cross-origin setup (cloud frontend + public backend)
 Set these environment variables on the backend:

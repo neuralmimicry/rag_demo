@@ -3109,6 +3109,131 @@ function buildTeamIndex(tree) {
   return { list, index };
 }
 
+const SERVICE_ACCESS_NONE = 'none';
+const SERVICE_ACCESS_REQUEST = 'request';
+const SERVICE_ACCESS_OBSERVE = 'observe';
+const SERVICE_ACCESS_USE = 'use';
+const SERVICE_ACCESS_CONTROL = 'control';
+
+const SERVICE_ACCESS_ORDER = {
+  [SERVICE_ACCESS_NONE]: 0,
+  [SERVICE_ACCESS_REQUEST]: 1,
+  [SERVICE_ACCESS_OBSERVE]: 2,
+  [SERVICE_ACCESS_USE]: 3,
+  [SERVICE_ACCESS_CONTROL]: 4,
+};
+
+const SERVICE_ACCESS_PUBLIC_DEFAULTS = {
+  refiner: SERVICE_ACCESS_REQUEST,
+  billing: SERVICE_ACCESS_NONE,
+  continuum: SERVICE_ACCESS_OBSERVE,
+  tracey: SERVICE_ACCESS_OBSERVE,
+  aarnn: SERVICE_ACCESS_REQUEST,
+  webots: SERVICE_ACCESS_REQUEST,
+};
+
+const SERVICE_ACCESS_AUTHENTICATED_DEFAULTS = {
+  refiner: SERVICE_ACCESS_USE,
+  billing: SERVICE_ACCESS_USE,
+  aarnn: SERVICE_ACCESS_REQUEST,
+  webots: SERVICE_ACCESS_REQUEST,
+};
+
+function normalizeServiceAccessLevel(value, fallback = SERVICE_ACCESS_NONE) {
+  const cleaned = String(value || fallback).trim().toLowerCase() || fallback;
+  return Object.prototype.hasOwnProperty.call(SERVICE_ACCESS_ORDER, cleaned) ? cleaned : fallback;
+}
+
+function accessLevelAtLeast(current, required) {
+  return SERVICE_ACCESS_ORDER[normalizeServiceAccessLevel(current)] >= SERVICE_ACCESS_ORDER[normalizeServiceAccessLevel(required)];
+}
+
+function maxServiceAccessLevel(...levels) {
+  return levels.reduce((best, candidate) => (
+    SERVICE_ACCESS_ORDER[normalizeServiceAccessLevel(candidate)] > SERVICE_ACCESS_ORDER[best]
+      ? normalizeServiceAccessLevel(candidate)
+      : best
+  ), SERVICE_ACCESS_NONE);
+}
+
+function findExplicitServiceAccess(profile, serviceKey) {
+  if (!profile || typeof profile !== 'object') return null;
+  if (profile.service_access && typeof profile.service_access === 'object' && !Array.isArray(profile.service_access)) {
+    return profile.service_access[serviceKey] || null;
+  }
+  if (!Array.isArray(profile.service_access)) return null;
+  return profile.service_access.find((entry) => (
+    String(entry?.service_key || entry?.key || '').trim().toLowerCase() === serviceKey
+  )) || null;
+}
+
+function normalizeServiceAccessEntry(serviceKey, entry, defaultPublicLevel = SERVICE_ACCESS_NONE, defaultAccessLevel = SERVICE_ACCESS_NONE) {
+  const payload = entry && typeof entry === 'object' ? { ...entry } : {};
+  if (!payload.access_level && typeof entry === 'string') {
+    payload.access_level = entry;
+  }
+  const publicAccessLevel = normalizeServiceAccessLevel(
+    payload.public_access_level ?? defaultPublicLevel,
+    SERVICE_ACCESS_NONE,
+  );
+  const accessLevel = normalizeServiceAccessLevel(
+    payload.access_level ?? payload.level ?? defaultAccessLevel,
+    SERVICE_ACCESS_NONE,
+  );
+  const visibleAccessLevel = normalizeServiceAccessLevel(
+    payload.visible_access_level,
+    maxServiceAccessLevel(accessLevel, publicAccessLevel),
+  );
+  return {
+    ...payload,
+    service_key: serviceKey,
+    access_level: accessLevel,
+    public_access_level: publicAccessLevel,
+    visible_access_level: visibleAccessLevel,
+    visible: Boolean(payload.visible) || visibleAccessLevel !== SERVICE_ACCESS_NONE,
+    can_request: typeof payload.can_request === 'boolean'
+      ? payload.can_request
+      : accessLevelAtLeast(visibleAccessLevel, SERVICE_ACCESS_REQUEST),
+    can_observe: typeof payload.can_observe === 'boolean'
+      ? payload.can_observe
+      : accessLevelAtLeast(visibleAccessLevel, SERVICE_ACCESS_OBSERVE),
+    can_use: typeof payload.can_use === 'boolean'
+      ? payload.can_use
+      : accessLevelAtLeast(accessLevel, SERVICE_ACCESS_USE),
+    can_control: typeof payload.can_control === 'boolean'
+      ? payload.can_control
+      : accessLevelAtLeast(accessLevel, SERVICE_ACCESS_CONTROL),
+  };
+}
+
+function getServiceAccess(profile = currentProfile, serviceKey) {
+  const cleanedServiceKey = String(serviceKey || '').trim().toLowerCase();
+  if (!cleanedServiceKey) {
+    return normalizeServiceAccessEntry('', {}, SERVICE_ACCESS_NONE, SERVICE_ACCESS_NONE);
+  }
+  const groups = normalizedIdentityGroups(profile);
+  const authenticated = Boolean(profile?.authenticated ?? profile?.user);
+  const isAdmin = profile?.is_admin === true || groups.includes('admin');
+  const defaultPublicLevel = normalizeServiceAccessLevel(
+    SERVICE_ACCESS_PUBLIC_DEFAULTS[cleanedServiceKey],
+    SERVICE_ACCESS_NONE,
+  );
+  const defaultAccessLevel = isAdmin
+    ? SERVICE_ACCESS_CONTROL
+    : authenticated
+      ? normalizeServiceAccessLevel(
+        SERVICE_ACCESS_AUTHENTICATED_DEFAULTS[cleanedServiceKey],
+        SERVICE_ACCESS_NONE,
+      )
+      : SERVICE_ACCESS_NONE;
+  return normalizeServiceAccessEntry(
+    cleanedServiceKey,
+    findExplicitServiceAccess(profile, cleanedServiceKey),
+    defaultPublicLevel,
+    defaultAccessLevel,
+  );
+}
+
 function normalizedIdentityGroups(profile = currentProfile) {
   const normalized = [];
   const seen = new Set();
@@ -3127,6 +3252,7 @@ function normalizedIdentityGroups(profile = currentProfile) {
 }
 
 function isAdminIdentity(profile = currentProfile) {
+  if (getServiceAccess(profile, 'refiner').can_control) return true;
   if (profile?.is_admin === true) return true;
   return normalizedIdentityGroups(profile).includes('admin');
 }
