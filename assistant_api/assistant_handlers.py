@@ -22,9 +22,9 @@ def _json_response(payload, status_code: int = 200) -> Response:
 def build_assistant_handlers(deps: AssistantPipelineDependencies) -> HandlerMap:
     """Build thin Flask handlers that delegate to the assistant pipeline."""
 
-    def assistant_rag_mcp() -> Response:
+    def _invoke(service_fn) -> Response:
         try:
-            result = assistant_service.assistant_rag_mcp(
+            result = service_fn(
                 deps,
                 user=deps.current_user(),
                 payload=load_json_object(),
@@ -32,48 +32,32 @@ def build_assistant_handlers(deps: AssistantPipelineDependencies) -> HandlerMap:
             return _json_response(result.payload, result.status_code)
         except ServiceError as exc:
             return _json_response(exc.to_payload(), exc.status_code)
+
+    def assistant_rag_mcp() -> Response:
+        return _invoke(assistant_service.assistant_rag_mcp)
 
     def assistant_requirements() -> Response:
-        try:
-            result = assistant_service.assistant_requirements(
-                deps,
-                user=deps.current_user(),
-                payload=load_json_object(),
-            )
-            return _json_response(result.payload, result.status_code)
-        except ServiceError as exc:
-            return _json_response(exc.to_payload(), exc.status_code)
+        return _invoke(assistant_service.assistant_requirements)
 
     def assistant_form_fill() -> Response:
-        try:
-            result = assistant_service.assistant_form_fill(
-                deps,
-                user=deps.current_user(),
-                payload=load_json_object(),
-            )
-            return _json_response(result.payload, result.status_code)
-        except ServiceError as exc:
-            return _json_response(exc.to_payload(), exc.status_code)
+        return _invoke(assistant_service.assistant_form_fill)
 
     def playground_plan() -> Response:
-        try:
-            result = assistant_service.playground_plan(
-                deps,
-                user=deps.current_user(),
-                payload=load_json_object(),
-            )
-            return _json_response(result.payload, result.status_code)
-        except ServiceError as exc:
-            return _json_response(exc.to_payload(), exc.status_code)
+        return _invoke(assistant_service.playground_plan)
+
+    def execution_plan() -> Response:
+        return _invoke(assistant_service.execution_plan)
 
     assistant_rag_mcp.__name__ = "assistant_rag_mcp"
     assistant_requirements.__name__ = "assistant_requirements"
     assistant_form_fill.__name__ = "assistant_form_fill"
     playground_plan.__name__ = "playground_plan"
+    execution_plan.__name__ = "execution_plan"
 
     return {
         "assistant_rag_mcp": assistant_rag_mcp,
         "assistant_requirements": assistant_requirements,
         "assistant_form_fill": assistant_form_fill,
         "playground_plan": playground_plan,
+        "execution_plan": execution_plan,
     }

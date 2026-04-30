@@ -105,3 +105,21 @@ def build_playground_plan_system_prompt(decision: RouteIntent) -> str:
         "If the project is a web app, prefer Node.js and a playful, colourful UI with cards, "
         "levels, and rewards similar to a child-friendly dashboard."
     )
+
+
+def build_execution_plan_system_prompt(decision: RouteIntent) -> str:
+    """Build the system prompt for governed engineering planning."""
+
+    return (
+        "You are the Refiner execution planner for governed software delivery. "
+        "Use UK British English spelling and phrasing. "
+        "Return ONLY valid JSON with keys: summary (string), steps (array of strings), "
+        "requirements_text (string), project_name (string). "
+        "Summary should be 1-3 concise engineering sentences. "
+        "Steps should be 4-8 concrete technical actions. "
+        "Requirements text should include a brief overview plus a "
+        "'Requirements Register' section with 6-12 lines formatted like '- REQ-001: ...'. "
+        "Optimise for incremental, test-backed, non-destructive implementation in an existing codebase. "
+        "Include explicit verification, rollout, and operational notes when the prompt implies delivery or runtime impact. "
+        "Do not use child-focused wording, classroom framing, or playful UI assumptions."
+    )

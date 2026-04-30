@@ -129,6 +129,22 @@ def resolve_route_intent(
             },
         )
 
+    if route_name == "execution_plan":
+        intent_id = "execution_plan:governed_change" if policy.enabled else "execution_plan"
+        return RouteIntent(
+            route=route_name,
+            intent_id=intent_id,
+            prompt_profile="execution_planner",
+            workflow="execution_plan",
+            role="planner",
+            cacheable=False,
+            metadata={
+                "routing_enabled": policy.enabled,
+                "governed_execution": True,
+                "project_run": True,
+            },
+        )
+
     if route_name == "assistant_rag_mcp":
         if has_mcp and has_rag:
             prompt_profile = "rag_mcp_live"

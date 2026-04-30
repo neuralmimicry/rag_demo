@@ -225,6 +225,18 @@
       }
     ]
   },
+  "github_actions": {
+    "enabled": true,
+    "require_success": true,
+    "workflow_file": "ci.yml",
+    "remote": "origin",
+    "default_branch": "main",
+    "token_env_fallbacks": [
+      "GITHUB_TOKEN",
+      "GH_TOKEN",
+      "X_GITHUB_TOKEN"
+    ]
+  },
   "platform": {
     "auto": true,
     "preferred_order": [

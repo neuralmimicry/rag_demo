@@ -243,7 +243,7 @@ For `assistant_rag_mcp` and future tool-enabled intents:
 
 ### Structured-output path
 
-For `assistant_form_fill` and `playground_plan`:
+For `assistant_form_fill`, `playground_plan`, and `execution_plan`:
 
 - use intent-specific prompt profiles
 - keep schema validation strict
@@ -369,6 +369,7 @@ Boundary rules:
 | `assistant_requirements` marketing | optional | knowledge-source lookup | no | text | yes |
 | `assistant_form_fill` | optional | episodic hints only | no | strict JSON | limited |
 | `playground_plan` | usually no | episodic hints only | no | strict JSON | yes |
+| `execution_plan` | usually no | episodic hints only | no | strict JSON | yes |
 | `rag_query` | yes | hybrid required | no | structured retrieval payload | yes |
 | `assistant_rag_mcp` without MCP | yes | hybrid when requested | no | text + citations | yes |
 | `assistant_rag_mcp` with MCP | yes | optional | yes | text + citations when retrieval used | no |
@@ -379,7 +380,7 @@ Current implementation note:
 - semantic cache lookup/store is active only on `rag_query` and `assistant_rag_mcp` without MCP, and only when the rollout flag is enabled
 - hybrid retrieval is active only on `rag_query` and `assistant_rag_mcp` when RAG is used and the rollout flag is enabled
 - retrieval coverage grading and one retry/decomposition pass are active only on `rag_query` and RAG-enabled `assistant_rag_mcp` when the rollout flags are enabled
-- `assistant_requirements`, `assistant_form_fill`, and `playground_plan` now use routed prompt profiles but do not yet write to the semantic cache
+- `assistant_requirements`, `assistant_form_fill`, `playground_plan`, and `execution_plan` now use routed prompt profiles but do not yet write to the semantic cache
 
 ## Storage Model
 
@@ -580,7 +581,7 @@ Make the first routing cleanup:
 | --- | --- | --- |
 | `/api/admin/assistant/conversations*`, `/api/admin/assistant/traces*` | `assistant_api/admin_handlers.py` | Admin-only HTTP wrappers over central-store read helpers |
 | `rag_indexes`, `rag_index_create`, `rag_index_delete`, `rag_query` | `assistant_api/rag_handlers.py` | HTTP wrappers only |
-| `assistant_rag_mcp`, `assistant_requirements`, `assistant_form_fill`, `playground_plan` | `assistant_api/assistant_handlers.py` | Thin HTTP wrappers calling `assistant_pipeline.service` |
+| `assistant_rag_mcp`, `assistant_requirements`, `assistant_form_fill`, `playground_plan`, `execution_plan` | `assistant_api/assistant_handlers.py` | Thin HTTP wrappers calling `assistant_pipeline.service` |
 | `_coerce_rag_sources`, `_build_rag_documents` | `assistant_pipeline/ingestion/source_loader.py` | Shared source normalization and loading |
 | versioned collection artefact paths and writes | `assistant_pipeline/ingestion/artifact_store.py` | Immutable version payloads under `job_data/rag/collections/...` |
 | staged/final collection publication orchestration | `assistant_pipeline/ingestion/publication.py` | Coordinates immutable writes, legacy mirroring, and Postgres publication states |

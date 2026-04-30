@@ -19,6 +19,7 @@ def test_voice_and_assistant_routes_are_registered():
     assert "/api/assistant/requirements" in rules
     assert "/api/assistant/form-fill" in rules
     assert "/api/playground/plan" in rules
+    assert "/api/execution/plan" in rules
     assert "/api/rag/indexes" in rules
     assert "/api/rag/index" in rules
     assert "/api/rag/index/<name>" in rules

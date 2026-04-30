@@ -143,6 +143,23 @@ from refiner.versioning import get_public_version_info, get_version_info
 from refiner.refiner_ai_orchestration import build_workflow_provider, orchestration_status
 from refiner.refiner_ai_model_inventory import AIModelInventoryMonitor
 from refiner.integrations.atlassian.actions import execute_atlassian_action as _execute_atlassian_action_impl
+from refiner.integrations.platform.continuum_client import (
+    ContinuumClientConfig,
+    continuum_enabled as _continuum_enabled_impl,
+    continuum_headers as _continuum_headers_impl,
+    continuum_json_payload as _continuum_json_payload_impl,
+    continuum_request as _continuum_request_impl,
+    continuum_ready as _continuum_ready_impl,
+    friendly_continuum_error as _friendly_continuum_error_impl,
+    workspace_action_create as _workspace_action_create_impl,
+    workspace_action_refresh as _workspace_action_refresh_impl,
+    workspace_template_vars as _workspace_template_vars_impl,
+)
+from refiner.runtime.continuum_autoscaler import (
+    ContinuumQueueAutoscaler as _ContinuumQueueAutoscalerImpl,
+    continuum_cluster_snapshot as _continuum_cluster_snapshot_impl,
+    workers_telemetry_payload as _workers_telemetry_payload_impl,
+)
 
 logger = logging.getLogger(__name__)
 try:
@@ -726,20 +743,33 @@ class _SafeFormatDict(dict):
         return ""
 
 
+def _continuum_client_config() -> ContinuumClientConfig:
+    """Resolve the current Continuum client configuration from runtime globals."""
+
+    return ContinuumClientConfig(
+        api_base=CONTINUUM_API_BASE,
+        auth_token=CONTINUUM_AUTH_TOKEN,
+        timeout=CONTINUUM_TIMEOUT,
+        vm_region=CONTINUUM_VM_REGION,
+        vm_sku=CONTINUUM_VM_SKU,
+        vm_os=CONTINUUM_VM_OS,
+        vm_public_key_id=CONTINUUM_VM_PUBLIC_KEY_ID,
+        vm_init_script=CONTINUUM_VM_INIT_SCRIPT,
+        ide_url_template=CONTINUUM_IDE_URL_TEMPLATE,
+        preview_url_template=CONTINUUM_PREVIEW_URL_TEMPLATE,
+    )
+
+
 def _continuum_enabled() -> bool:
-    return bool(CONTINUUM_API_BASE)
+    return _continuum_enabled_impl(_continuum_client_config())
 
 
 def _continuum_ready() -> bool:
-    return bool(CONTINUUM_API_BASE and CONTINUUM_VM_PUBLIC_KEY_ID)
+    return _continuum_ready_impl(_continuum_client_config())
 
 
 def _continuum_headers() -> Dict[str, str]:
-    headers: Dict[str, str] = {"Accept": "application/json"}
-    if CONTINUUM_AUTH_TOKEN:
-        headers["Authorization"] = f"Bearer {CONTINUUM_AUTH_TOKEN}"
-        headers["X-NMC-Token"] = CONTINUUM_AUTH_TOKEN
-    return headers
+    return _continuum_headers_impl(_continuum_client_config())
 
 
 def _http_request_with_retry(
@@ -811,23 +841,11 @@ def _format_workspace_template(template: str, values: Dict[str, Any]) -> str:
 
 
 def _workspace_template_vars(job: "Job", vm_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    repo_info = job.repo_info if isinstance(job.repo_info, dict) else {}
-    vm_data = vm_data or {}
-    return {
-        "job_id": job.job_id,
-        "project_name": job.project_name or "",
-        "owner": job.owner or "",
-        "repo": repo_info.get("repo") or "",
-        "repo_url": repo_info.get("repo_url") or repo_info.get("clone_url") or "",
-        "branch": repo_info.get("branch") or "",
-        "fork_org": repo_info.get("fork_org") or "",
-        "fork_repo": repo_info.get("fork_repo") or "",
-        "vm_id": vm_data.get("id") or "",
-        "vm_name": vm_data.get("name") or "",
-        "vm_region": vm_data.get("region") or CONTINUUM_VM_REGION,
-        "vm_sku": vm_data.get("sku") or CONTINUUM_VM_SKU,
-        "vm_status": vm_data.get("status") or "",
-    }
+    return _workspace_template_vars_impl(
+        job,
+        config=_continuum_client_config(),
+        vm_data=vm_data,
+    )
 
 
 def _continuum_request(
@@ -838,48 +856,23 @@ def _continuum_request(
     timeout_sec: Optional[float] = None,
     retries: Optional[int] = None,
 ) -> requests.Response:
-    url = f"{CONTINUUM_API_BASE}{path}"
-    timeout = CONTINUUM_TIMEOUT if timeout_sec is None else timeout_sec
-    return _http_request_with_retry(
+    return _continuum_request_impl(
+        _continuum_client_config(),
+        http_request=_http_request_with_retry,
         method=method,
-        url=url,
-        headers=_continuum_headers(),
+        path=path,
         json_body=json_body,
-        timeout=timeout,
+        timeout_sec=timeout_sec,
         retries=retries,
     )
 
 
 def _continuum_json_payload(response: requests.Response, *, operation: str) -> Dict[str, Any]:
-    status_code = int(getattr(response, "status_code", 500) or 500)
-    ok = bool(getattr(response, "ok", 200 <= status_code < 300))
-    if not ok:
-        raise RuntimeError(f"{operation} returned status {status_code}.")
-    try:
-        payload = response.json() if getattr(response, "content", None) else {}
-    except Exception as exc:
-        raise RuntimeError(f"{operation} returned invalid JSON: {exc}") from exc
-    if not isinstance(payload, dict) or not payload.get("success"):
-        detail = payload.get("message") if isinstance(payload, dict) else "request failed"
-        raise RuntimeError(f"{operation} failed: {detail}")
-    data = payload.get("data")
-    return data if isinstance(data, dict) else {}
+    return _continuum_json_payload_impl(response, operation=operation)
 
 
 def _friendly_continuum_error(message: Optional[str]) -> str:
-    text = (message or "").strip()
-    if not text:
-        return "Continuum is temporarily unavailable. Showing last known worker state."
-    lowered = text.lower()
-    if "timed out" in lowered or "timeout" in lowered:
-        return "Continuum timed out. Showing last known worker state while retrying."
-    if "connection refused" in lowered or "failed to establish" in lowered or "name or service not known" in lowered:
-        return "Cannot reach Continuum right now. Showing last known worker state."
-    if "401" in lowered or "403" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
-        return "Continuum authentication failed. Showing cached worker state."
-    if "invalid json" in lowered:
-        return "Continuum returned an invalid response. Showing last known worker state."
-    return "Continuum communication is degraded. Showing last known worker state."
+    return _friendly_continuum_error_impl(message)
 
 
 def _editor_allowed(job: "Job") -> bool:
@@ -7865,8 +7858,8 @@ def _job_queue_snapshot(
     }
 
 
-class ContinuumQueueAutoscaler:
-    """Scale Refiner workers via Continuum when queue pressure exceeds local capacity."""
+class ContinuumQueueAutoscaler(_ContinuumQueueAutoscalerImpl):
+    """Compatibility wrapper bound to the Refiner runtime helper surface."""
 
     def __init__(
         self,
@@ -7885,354 +7878,33 @@ class ContinuumQueueAutoscaler:
         namespace: str = CONTINUUM_AUTOSCALE_NAMESPACE,
         deployment: str = CONTINUUM_AUTOSCALE_DEPLOYMENT,
     ):
-        self.manager = manager
-        self.enabled = bool(enabled)
-        self.poll_sec = max(1.0, float(poll_sec))
-        self.min_replicas = max(0, int(min_replicas))
-        self.max_replicas = max(self.min_replicas, int(max_replicas))
-        self.backlog_per_replica = max(1, int(backlog_per_replica))
-        self.scale_up_step = max(1, int(scale_up_step))
-        self.scale_down_step = max(1, int(scale_down_step))
-        self.idle_sec = max(0.0, float(idle_sec))
-        self.cooldown_sec = max(0.0, float(cooldown_sec))
-        self.timeout_sec = max(1.0, float(timeout_sec))
-        self.namespace = (namespace or "refiner").strip() or "refiner"
-        self.deployment = (deployment or "refiner").strip() or "refiner"
-        self._wake_event = threading.Event()
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
-        self._idle_since: Optional[float] = None
-        self._last_scale_at: Optional[str] = None
-        self._last_scale_ts: float = 0.0
-        self._last_decision: str = "init"
-        self._last_error: Optional[str] = None
-        self._last_snapshot: Dict[str, Any] = {"queue_depth": 0, "queued": 0, "running": 0, "paused": 0, "workers": 0}
-        self._last_remote: Dict[str, Any] = {}
-        self._history: Deque[Dict[str, Any]] = deque(maxlen=CONTINUUM_AUTOSCALE_HISTORY_MAX)
-        self._continuum_failures: int = 0
-        self._continuum_last_success_at: Optional[str] = None
-        self._continuum_last_failure_at: Optional[str] = None
-
-    @staticmethod
-    def _safe_int(value: Any, default: int = 0) -> int:
-        try:
-            return int(value)
-        except Exception:
-            return default
-
-    def _record_continuum_success(self) -> None:
-        with self._lock:
-            self._continuum_failures = 0
-            self._continuum_last_success_at = _now_iso()
-
-    def _record_continuum_failure(self) -> None:
-        with self._lock:
-            self._continuum_failures += 1
-            self._continuum_last_failure_at = _now_iso()
-
-    def start(self) -> None:
-        if not self.enabled or not _continuum_enabled():
-            return
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, name="continuum-queue-autoscaler", daemon=True)
-        self._thread.start()
-        self.notify_queue_change()
-
-    def stop(self, timeout: float = 1.0) -> None:
-        self._stop_event.set()
-        self._wake_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=max(0.1, float(timeout)))
-
-    def notify_queue_change(self) -> None:
-        self._wake_event.set()
-
-    def _safe_float(self, value: Any, default: float = 0.0) -> float:
-        try:
-            return float(value)
-        except Exception:
-            return default
-
-    def _worker_metrics(self, snapshot: Dict[str, Any], remote: Dict[str, Any], decision: str) -> Dict[str, Any]:
-        workers_per_replica = max(1, self._safe_int(snapshot.get("workers"), 1))
-        running_jobs = max(0, self._safe_int(snapshot.get("running"), 0))
-        queued_jobs = max(0, self._safe_int(snapshot.get("queued"), 0))
-        queue_depth = max(0, self._safe_int(snapshot.get("queue_depth"), queued_jobs))
-        queued_owner_count = max(0, self._safe_int(snapshot.get("queued_owner_count"), 0))
-        running_owner_count = max(0, self._safe_int(snapshot.get("running_owner_count"), 0))
-        paused_owner_count = max(0, self._safe_int(snapshot.get("paused_owner_count"), 0))
-        active_owner_count = max(0, self._safe_int(snapshot.get("active_owner_count"), 0))
-        desired_replicas = max(self.min_replicas, self._safe_int(remote.get("desired_replicas"), self.min_replicas))
-        ready_replicas = max(0, self._safe_int(remote.get("ready_replicas"), 0))
-        available_replicas = max(0, self._safe_int(remote.get("available_replicas"), 0))
-        max_workers_capacity = max(self.min_replicas, self.max_replicas) * workers_per_replica
-        target_workers = desired_replicas * workers_per_replica
-        online_workers = ready_replicas * workers_per_replica
-        available_workers = max(0, online_workers - running_jobs)
-        in_use_workers = min(running_jobs, online_workers)
-        scaling_gap = max(0, target_workers - online_workers)
-        status_raw = str(remote.get("status") or "Unknown")
-        status_normalized = status_raw.strip().lower()
-        degraded = status_normalized in {"degraded", "unavailable", "failed", "error"}
-        scale_up_active = decision.startswith("scale_up")
-        failed_workers = scaling_gap if degraded and not scale_up_active else 0
-        coming_online_workers = max(0, scaling_gap - failed_workers)
-        queue_pressure = 0.0
-        if online_workers > 0:
-            queue_pressure = min(500.0, round((queue_depth / float(online_workers)) * 100.0, 2))
-        utilization_pct = 0.0
-        if max_workers_capacity > 0:
-            utilization_pct = min(100.0, round((in_use_workers / float(max_workers_capacity)) * 100.0, 2))
-        queued_owner_skew_ratio = min(1.0, max(0.0, round(self._safe_float(snapshot.get("queued_owner_skew_ratio"), 0.0), 3)))
-        running_owner_skew_ratio = min(
-            1.0,
-            max(0.0, round(self._safe_float(snapshot.get("running_owner_skew_ratio"), 0.0), 3)),
+        super().__init__(
+            manager,
+            enabled=enabled,
+            poll_sec=poll_sec,
+            min_replicas=min_replicas,
+            max_replicas=max_replicas,
+            backlog_per_replica=backlog_per_replica,
+            scale_up_step=scale_up_step,
+            scale_down_step=scale_down_step,
+            idle_sec=idle_sec,
+            cooldown_sec=cooldown_sec,
+            timeout_sec=timeout_sec,
+            namespace=namespace,
+            deployment=deployment,
+            history_max=CONTINUUM_AUTOSCALE_HISTORY_MAX,
+            continuum_enabled=lambda: _continuum_enabled(),
+            continuum_request=lambda method, path, **kwargs: _continuum_request(method, path, **kwargs),
+            continuum_json_payload=lambda response, *, operation: _continuum_json_payload(response, operation=operation),
+            friendly_continuum_error=lambda message: _friendly_continuum_error(message),
+            now_iso=lambda: _now_iso(),
+            logger=logger,
+            job_queue_snapshot=lambda manager, top_limit=3, include_owner_lists=False: _job_queue_snapshot(
+                manager,
+                top_limit=top_limit,
+                include_owner_lists=include_owner_lists,
+            ),
         )
-        active_owner_skew_ratio = min(
-            1.0,
-            max(0.0, round(self._safe_float(snapshot.get("active_owner_skew_ratio"), 0.0), 3)),
-        )
-        return {
-            "workers_per_replica": workers_per_replica,
-            "max_workers_capacity": max_workers_capacity,
-            "target_workers": target_workers,
-            "online_workers": online_workers,
-            "available_workers": available_workers,
-            "in_use_workers": in_use_workers,
-            "coming_online_workers": coming_online_workers,
-            "failed_workers": failed_workers,
-            "queue_depth": queue_depth,
-            "queued_jobs": queued_jobs,
-            "running_jobs": running_jobs,
-            "desired_replicas": desired_replicas,
-            "ready_replicas": ready_replicas,
-            "available_replicas": available_replicas,
-            "status": status_raw or "Unknown",
-            "utilization_pct": utilization_pct,
-            "queue_pressure_pct": queue_pressure,
-            "queued_owner_count": queued_owner_count,
-            "running_owner_count": running_owner_count,
-            "paused_owner_count": paused_owner_count,
-            "active_owner_count": active_owner_count,
-            "queued_owner_skew_ratio": queued_owner_skew_ratio,
-            "running_owner_skew_ratio": running_owner_skew_ratio,
-            "active_owner_skew_ratio": active_owner_skew_ratio,
-            "single_owner_queue_pressure": bool(snapshot.get("single_owner_queue_pressure")),
-        }
-
-    def history(self, limit: int = 120) -> List[Dict[str, Any]]:
-        with self._lock:
-            items = list(self._history)
-        if limit <= 0:
-            return []
-        return items[-limit:]
-
-    def status(self) -> Dict[str, Any]:
-        with self._lock:
-            snapshot = dict(self._last_snapshot)
-            remote = dict(self._last_remote)
-            decision = self._last_decision
-            error = self._last_error
-            last_scale_at = self._last_scale_at
-            continuum_failures = int(self._continuum_failures or 0)
-            continuum_last_success_at = self._continuum_last_success_at
-            continuum_last_failure_at = self._continuum_last_failure_at
-        worker_metrics = self._worker_metrics(snapshot, remote, decision)
-        degraded = continuum_failures > 0 or (decision.endswith("_error") if isinstance(decision, str) else False)
-        message = _friendly_continuum_error(error) if degraded else ""
-        return {
-            "enabled": self.enabled,
-            "continuum_configured": _continuum_enabled(),
-            "running": bool(self._thread and self._thread.is_alive()),
-            "poll_sec": self.poll_sec,
-            "cooldown_sec": self.cooldown_sec,
-            "idle_sec": self.idle_sec,
-            "min_replicas": self.min_replicas,
-            "max_replicas": self.max_replicas,
-            "backlog_per_replica": self.backlog_per_replica,
-            "namespace": self.namespace,
-            "deployment": self.deployment,
-            "last_decision": decision,
-            "last_scale_at": last_scale_at,
-            "last_error": error,
-            "snapshot": snapshot,
-            "remote": remote,
-            "workers": worker_metrics,
-            "continuum": {
-                "degraded": degraded,
-                "consecutive_failures": continuum_failures,
-                "last_success_at": continuum_last_success_at,
-                "last_failure_at": continuum_last_failure_at,
-                "message": message,
-            },
-        }
-
-    def evaluate_once(self) -> None:
-        if not self.enabled:
-            self._update_state(decision="disabled", error=None)
-            return
-        if not _continuum_enabled():
-            self._update_state(decision="continuum_unconfigured", error=None)
-            return
-        snapshot = self._queue_snapshot()
-        now_ts = time.time()
-        active = snapshot["queue_depth"] > 0 or snapshot["running"] > 0 or snapshot["paused"] > 0
-        if active:
-            self._idle_since = None
-        elif self._idle_since is None:
-            self._idle_since = now_ts
-
-        try:
-            remote = self._fetch_remote_status()
-        except Exception as exc:
-            self._record_continuum_failure()
-            message = str(exc)
-            logger.warning("Continuum autoscaler status fetch failed: %s", message)
-            self._update_state(snapshot=snapshot, decision="status_error", error=message)
-            return
-        self._record_continuum_success()
-
-        current_replicas = max(0, self._safe_int(remote.get("desired_replicas"), self.min_replicas))
-
-        if current_replicas < self.min_replicas:
-            target = self.min_replicas
-            if target > current_replicas and not self._cooldown_active(now_ts):
-                if self._apply_scale(target, reason="enforce_min_replicas", snapshot=snapshot):
-                    return
-
-        should_scale_up = snapshot["queue_depth"] > 0 and snapshot["running"] >= snapshot["workers"]
-        if should_scale_up and current_replicas < self.max_replicas:
-            if self._cooldown_active(now_ts):
-                self._update_state(snapshot=snapshot, remote=remote, decision="cooldown", error=None)
-                return
-            queued_units = int(math.ceil(snapshot["queue_depth"] / float(self.backlog_per_replica)))
-            increment = max(self.scale_up_step, queued_units)
-            target = min(self.max_replicas, current_replicas + increment)
-            if target > current_replicas and self._apply_scale(target, reason="scale_up_queue_backlog", snapshot=snapshot):
-                return
-
-        idle_for = (now_ts - self._idle_since) if self._idle_since is not None else 0.0
-        should_scale_down = (
-            self._idle_since is not None
-            and idle_for >= self.idle_sec
-            and current_replicas > self.min_replicas
-        )
-        if should_scale_down:
-            if self._cooldown_active(now_ts):
-                self._update_state(snapshot=snapshot, remote=remote, decision="cooldown", error=None)
-                return
-            target = max(self.min_replicas, current_replicas - self.scale_down_step)
-            if target < current_replicas and self._apply_scale(target, reason="scale_down_idle", snapshot=snapshot):
-                return
-
-        decision = "steady"
-        if should_scale_up and current_replicas >= self.max_replicas:
-            decision = "at_max_replicas"
-        elif should_scale_down and current_replicas <= self.min_replicas:
-            decision = "at_min_replicas"
-        self._update_state(snapshot=snapshot, remote=remote, decision=decision, error=None)
-
-    def _loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self.evaluate_once()
-            except Exception as exc:
-                logger.warning("Continuum autoscaler loop error: %s", exc)
-                self._update_state(decision="loop_error", error=str(exc))
-            self._wake_event.wait(timeout=self.poll_sec)
-            self._wake_event.clear()
-
-    def _queue_snapshot(self) -> Dict[str, Any]:
-        return _job_queue_snapshot(self.manager, top_limit=3, include_owner_lists=False)
-
-    def _fetch_remote_status(self) -> Dict[str, Any]:
-        params = urlencode({"namespace": self.namespace, "deployment": self.deployment})
-        path = "/k8s/refiner/status"
-        if params:
-            path = f"{path}?{params}"
-        response = _continuum_request("GET", path, timeout_sec=self.timeout_sec)
-        data = _continuum_json_payload(response, operation="Continuum refiner status")
-        return {
-            "namespace": data.get("namespace") or self.namespace,
-            "deployment": data.get("deployment") or self.deployment,
-            "observed": bool(data.get("observed")),
-            "healthy": bool(data.get("healthy")),
-            "desired_replicas": max(0, self._safe_int(data.get("desired_replicas"), self.min_replicas)),
-            "ready_replicas": max(0, self._safe_int(data.get("ready_replicas"), 0)),
-            "available_replicas": max(0, self._safe_int(data.get("available_replicas"), 0)),
-            "status": (data.get("status") or "").strip() or "Unknown",
-        }
-
-    def _request_scale(self, replicas: int) -> Dict[str, Any]:
-        target = max(self.min_replicas, min(self.max_replicas, int(replicas)))
-        response = _continuum_request(
-            "POST",
-            "/k8s/refiner/scale",
-            json_body={"namespace": self.namespace, "deployment": self.deployment, "replicas": target},
-            timeout_sec=self.timeout_sec,
-        )
-        data = _continuum_json_payload(response, operation="Continuum refiner scale")
-        return {
-            "namespace": data.get("namespace") or self.namespace,
-            "deployment": data.get("deployment") or self.deployment,
-            "observed": bool(data.get("observed", True)),
-            "healthy": bool(data.get("healthy", False)),
-            "desired_replicas": max(0, self._safe_int(data.get("desired_replicas"), target)),
-            "ready_replicas": max(0, self._safe_int(data.get("ready_replicas"), 0)),
-            "available_replicas": max(0, self._safe_int(data.get("available_replicas"), 0)),
-            "status": (data.get("status") or "").strip() or "Unknown",
-        }
-
-    def _cooldown_active(self, now_ts: float) -> bool:
-        if self.cooldown_sec <= 0:
-            return False
-        return self._last_scale_ts > 0 and (now_ts - self._last_scale_ts) < self.cooldown_sec
-
-    def _apply_scale(self, target: int, *, reason: str, snapshot: Dict[str, int]) -> bool:
-        try:
-            remote = self._request_scale(target)
-        except Exception as exc:
-            self._record_continuum_failure()
-            message = str(exc)
-            logger.warning("Continuum autoscaler scale request failed: %s", message)
-            self._update_state(snapshot=snapshot, decision=f"{reason}_error", error=message)
-            return False
-        self._record_continuum_success()
-        now_ts = time.time()
-        self._last_scale_ts = now_ts
-        self._last_scale_at = _now_iso()
-        self._update_state(snapshot=snapshot, remote=remote, decision=reason, error=None)
-        return True
-
-    def _update_state(
-        self,
-        *,
-        snapshot: Optional[Dict[str, Any]] = None,
-        remote: Optional[Dict[str, Any]] = None,
-        decision: Optional[str] = None,
-        error: Optional[str] = None,
-    ) -> None:
-        with self._lock:
-            if snapshot is not None:
-                self._last_snapshot = dict(snapshot)
-            if remote is not None:
-                self._last_remote = dict(remote)
-            if decision:
-                self._last_decision = decision
-            self._last_error = error
-            metrics = self._worker_metrics(self._last_snapshot, self._last_remote, self._last_decision)
-            self._history.append(
-                {
-                    "timestamp_ms": int(time.time() * 1000),
-                    "captured_at": _now_iso(),
-                    "decision": self._last_decision,
-                    "error": self._last_error,
-                    "workers": metrics,
-                }
-            )
 
 
 continuum_autoscaler: Optional[ContinuumQueueAutoscaler] = None
@@ -8252,52 +7924,13 @@ def _continuum_autoscaler_status() -> Dict[str, Any]:
 
 
 def _continuum_cluster_snapshot(timeout_sec: float) -> Optional[Dict[str, Any]]:
-    if not _continuum_enabled():
-        return None
-    try:
-        response = _continuum_request("GET", "/k8s/list", timeout_sec=timeout_sec, retries=1)
-        data = _continuum_json_payload(response, operation="Continuum k8s list")
-    except Exception as exc:
-        return {"error": str(exc)}
-    clusters = data.get("clusters") if isinstance(data, dict) else None
-    if not isinstance(clusters, list):
-        return {"error": "missing cluster data"}
-    selected: Optional[Dict[str, Any]] = None
-    for cluster in clusters:
-        if not isinstance(cluster, dict):
-            continue
-        cluster_id = str(cluster.get("id") or "").strip().lower()
-        cluster_name = str(cluster.get("name") or "").strip().lower()
-        if cluster_id == "k8s-local-refiner" or cluster_name == "refiner-local":
-            selected = cluster
-            break
-    if not selected:
-        for cluster in clusters:
-            if isinstance(cluster, dict):
-                selected = cluster
-                break
-    if not selected:
-        return {"error": "no clusters reported"}
-    payload: Dict[str, Any] = {
-        "id": selected.get("id"),
-        "name": selected.get("name"),
-        "region": selected.get("region"),
-        "status": selected.get("status"),
-        "total_nodes": _safe_int(selected.get("total_nodes")),
-        "ready_nodes": _safe_int(selected.get("ready_nodes")),
-    }
-    refiner = selected.get("refiner")
-    if isinstance(refiner, dict):
-        payload["refiner"] = {
-            "observed": bool(refiner.get("observed")),
-            "healthy": bool(refiner.get("healthy")),
-            "namespace": refiner.get("namespace"),
-            "deployment": refiner.get("deployment"),
-            "desired_replicas": _safe_int(refiner.get("desired_replicas")),
-            "ready_replicas": _safe_int(refiner.get("ready_replicas")),
-            "available_replicas": _safe_int(refiner.get("available_replicas")),
-        }
-    return payload
+    return _continuum_cluster_snapshot_impl(
+        timeout_sec=timeout_sec,
+        continuum_enabled=lambda: _continuum_enabled(),
+        continuum_request=lambda method, path, **kwargs: _continuum_request(method, path, **kwargs),
+        continuum_json_payload=lambda response, *, operation: _continuum_json_payload(response, operation=operation),
+        safe_int=lambda value, default=0: _safe_int(value, default),
+    )
 
 
 def _workers_telemetry_payload(
@@ -8306,79 +7939,21 @@ def _workers_telemetry_payload(
     refresh: bool = False,
     include_cluster: bool = False,
 ) -> Dict[str, Any]:
-    autoscaler = continuum_autoscaler
-    if not autoscaler:
-        return {
-            "ok": True,
-            "degraded": False,
-            "message": "",
-            "warnings": [],
-            "autoscaler": {"enabled": False, "running": False, "continuum_configured": _continuum_enabled()},
-            "summary": {},
-            "job_queue": {},
-            "history": [],
-        }
-    warnings: List[str] = []
-    if refresh:
-        try:
-            autoscaler.evaluate_once()
-        except Exception as exc:
-            logger.warning("Workers telemetry refresh failed: %s", exc)
-            warnings.append(_friendly_continuum_error(str(exc)))
-    try:
-        status = autoscaler.status()
-    except Exception as exc:
-        logger.warning("Workers telemetry status snapshot failed: %s", exc)
-        status = {
-            "enabled": bool(getattr(autoscaler, "enabled", False)),
-            "continuum_configured": _continuum_enabled(),
-            "running": bool(getattr(autoscaler, "_thread", None)),
-            "continuum": {
-                "degraded": True,
-                "consecutive_failures": 0,
-                "last_success_at": None,
-                "last_failure_at": _now_iso(),
-                "message": _friendly_continuum_error(str(exc)),
-            },
-        }
-        warnings.append(_friendly_continuum_error(str(exc)))
-    try:
-        timeline = autoscaler.history(limit=max(1, min(limit, CONTINUUM_AUTOSCALE_HISTORY_MAX)))
-    except Exception as exc:
-        logger.warning("Workers telemetry history snapshot failed: %s", exc)
-        timeline = []
-        warnings.append("Workers timeline is temporarily unavailable.")
-    continuum_state = status.get("continuum") if isinstance(status, dict) else {}
-    degraded = bool(continuum_state.get("degraded")) if isinstance(continuum_state, dict) else False
-    continuum_message = ""
-    if isinstance(continuum_state, dict):
-        continuum_message = str(continuum_state.get("message") or "").strip()
-    if continuum_message and continuum_message not in warnings:
-        warnings.append(continuum_message)
-    payload: Dict[str, Any] = {
-        "ok": not degraded,
-        "degraded": degraded,
-        "message": continuum_message,
-        "warnings": warnings,
-        "autoscaler": status,
-        "summary": status.get("workers") or {},
-        "job_queue": _serialise_job_queue_snapshot(status.get("snapshot"), include_owner_lists=False),
-        "history": timeline,
-    }
-    if include_cluster:
-        cluster = _continuum_cluster_snapshot(timeout_sec=autoscaler.timeout_sec)
-        payload["continuum_cluster"] = cluster
-        if isinstance(cluster, dict) and cluster.get("error"):
-            degraded = True
-            cluster_warning = _friendly_continuum_error(str(cluster.get("error")))
-            if cluster_warning not in warnings:
-                warnings.append(cluster_warning)
-    payload["degraded"] = degraded
-    payload["ok"] = not degraded
-    payload["warnings"] = warnings
-    if degraded and not payload.get("message"):
-        payload["message"] = warnings[0] if warnings else _friendly_continuum_error(None)
-    return payload
+    return _workers_telemetry_payload_impl(
+        autoscaler=continuum_autoscaler,
+        limit=limit,
+        refresh=refresh,
+        include_cluster=include_cluster,
+        continuum_enabled=lambda: _continuum_enabled(),
+        friendly_continuum_error=lambda message: _friendly_continuum_error(message),
+        continuum_cluster_snapshot=lambda timeout: _continuum_cluster_snapshot(timeout),
+        now_iso=lambda: _now_iso(),
+        logger=logger,
+        serialise_job_queue_snapshot=lambda snapshot, include_owner_lists=False: _serialise_job_queue_snapshot(
+            snapshot,
+            include_owner_lists=include_owner_lists,
+        ),
+    )
 
 
 access_store = AccessStore(ACCESS_STORE_PATH)
@@ -14149,7 +13724,7 @@ def api_subtasks() -> Response:
 
     payload = request.get_json(force=True, silent=True) or {}
     action = str(payload.get("action") or "").strip()
-    if action not in {"todo_execute", "assistant_requirements", "playground_plan", "submit_job"}:
+    if action not in {"todo_execute", "assistant_requirements", "playground_plan", "execution_plan", "submit_job"}:
         return jsonify({"error": "invalid_action"}), 400
     subtask_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else None
     if subtask_payload is None:
@@ -16030,60 +15605,19 @@ def _workspace_task_links(job_id: str, task_id: str) -> Dict[str, str]:
 
 
 def _workspace_action_refresh(job: Job, *, timeout_sec: Optional[float] = None) -> Dict[str, Any]:
-    now = _now_iso()
-    workspace_env = job.workspace_env if isinstance(job.workspace_env, dict) else {}
-    if workspace_env.get("provider") != "continuum" or not workspace_env.get("vm_id"):
-        workspace_env["updated_at"] = now
-        job.workspace_env = workspace_env
-        job.persist(force=True)
-        return {"status": "refreshed", "workspace": workspace_env}
-    if not _continuum_enabled():
-        raise JobActionExecutionError(
-            "continuum_unavailable",
-            "Continuum API base is not configured.",
-            status_code=400,
-        )
-    vm_id = str(workspace_env.get("vm_id") or "").strip()
-    request_timeout = max(1.0, min(CONTINUUM_TIMEOUT, timeout_sec or CONTINUUM_TIMEOUT))
-    try:
-        resp = _continuum_request("GET", f"/vm/get/{vm_id}", timeout_sec=request_timeout)
-    except Exception as exc:
-        raise JobActionExecutionError("continuum_error", str(exc), status_code=502) from exc
-    status_code = int(getattr(resp, "status_code", 500) or 500)
-    ok = bool(getattr(resp, "ok", 200 <= status_code < 300))
-    if not ok:
-        raise JobActionExecutionError(
-            "continuum_error",
-            f"Continuum returned {status_code}.",
-            status_code=502,
-        )
-    try:
-        data = resp.json() if getattr(resp, "content", None) else {}
-    except Exception as exc:
-        raise JobActionExecutionError("continuum_error", str(exc), status_code=502) from exc
-    if not isinstance(data, dict) or not data.get("success"):
-        details = data.get("message") if isinstance(data, dict) else None
-        raise JobActionExecutionError("continuum_error", details or "Continuum call failed.", status_code=502)
-    vm_data = data.get("data") or {}
-    if isinstance(vm_data, dict):
-        vm_data = dict(vm_data)
-        vm_data.pop("initScript", None)
-    template_vars = _workspace_template_vars(job, vm_data)
-    ide_url = _format_workspace_template(CONTINUUM_IDE_URL_TEMPLATE, template_vars) or workspace_env.get("ide_url")
-    preview_url = _format_workspace_template(CONTINUUM_PREVIEW_URL_TEMPLATE, template_vars) or workspace_env.get("preview_url")
-    workspace_env.update(
-        {
-            "status": vm_data.get("status") or workspace_env.get("status") or "provisioning",
-            "ide_url": ide_url or "",
-            "preview_url": preview_url or "",
-            "updated_at": now,
-            "details": data.get("message") or workspace_env.get("details"),
-            "vm": vm_data,
-        }
+    return _workspace_action_refresh_impl(
+        job,
+        config=_continuum_client_config(),
+        now_iso=lambda: _now_iso(),
+        request=lambda method, path, **kwargs: _continuum_request(method, path, **kwargs),
+        format_workspace_template=_format_workspace_template,
+        error_factory=lambda code, details, status_code: JobActionExecutionError(
+            code,
+            details,
+            status_code=status_code,
+        ),
+        timeout_sec=timeout_sec,
     )
-    job.workspace_env = workspace_env
-    job.persist(force=True)
-    return {"status": "refreshed", "workspace": workspace_env}
 
 
 def _workspace_action_create(
@@ -16092,80 +15626,21 @@ def _workspace_action_create(
     *,
     timeout_sec: Optional[float] = None,
 ) -> Dict[str, Any]:
-    if not _continuum_ready():
-        missing = []
-        if not CONTINUUM_API_BASE:
-            missing.append("CONTINUUM_API_BASE")
-        if not CONTINUUM_VM_PUBLIC_KEY_ID:
-            missing.append("CONTINUUM_VM_PUBLIC_KEY_ID")
-        detail = "Continuum not configured." if not missing else f"Missing: {', '.join(missing)}"
-        raise JobActionExecutionError("continuum_unavailable", detail, status_code=400)
-    now = _now_iso()
-    workspace_env = job.workspace_env if isinstance(job.workspace_env, dict) else {}
-    force_create = _is_truthy(payload.get("force"))
-    if workspace_env.get("provider") == "continuum" and workspace_env.get("vm_id") and not force_create:
-        return {"status": "exists", "workspace": workspace_env}
-
-    vm_name = str(payload.get("name") or f"refiner-{job.job_id[:8]}").strip()
-    init_script = (payload.get("init_script") or CONTINUUM_VM_INIT_SCRIPT or "").strip()
-    template_vars = _workspace_template_vars(job, {})
-    init_script = _format_workspace_template(init_script, template_vars) if init_script else ""
-    vm_request = {
-        "name": vm_name,
-        "sku": str(payload.get("sku") or CONTINUUM_VM_SKU).strip(),
-        "region": str(payload.get("region") or CONTINUUM_VM_REGION).strip(),
-        "osImage": str(payload.get("os_image") or CONTINUUM_VM_OS).strip(),
-        "publicKeyId": str(payload.get("public_key_id") or CONTINUUM_VM_PUBLIC_KEY_ID).strip(),
-        "initScript": init_script,
-    }
-    job.append_log(f"Requesting Continuum workspace: {vm_request['name']} ({vm_request['region']})")
-    request_timeout = max(1.0, min(CONTINUUM_TIMEOUT, timeout_sec or CONTINUUM_TIMEOUT))
-    try:
-        resp = _continuum_request(
-            "POST",
-            "/vm/create",
-            json_body=vm_request,
-            timeout_sec=request_timeout,
-        )
-    except Exception as exc:
-        raise JobActionExecutionError("continuum_error", str(exc), status_code=502) from exc
-    status_code = int(getattr(resp, "status_code", 500) or 500)
-    ok = bool(getattr(resp, "ok", 200 <= status_code < 300))
-    if not ok:
-        raise JobActionExecutionError(
-            "continuum_error",
-            f"Continuum returned {status_code}.",
-            status_code=502,
-        )
-    try:
-        data = resp.json() if getattr(resp, "content", None) else {}
-    except Exception as exc:
-        raise JobActionExecutionError("continuum_error", str(exc), status_code=502) from exc
-    if not isinstance(data, dict) or not data.get("success"):
-        details = data.get("message") if isinstance(data, dict) else None
-        raise JobActionExecutionError("continuum_error", details or "Continuum call failed.", status_code=502)
-    vm_data = data.get("data") or {}
-    if isinstance(vm_data, dict):
-        vm_data = dict(vm_data)
-        vm_data.pop("initScript", None)
-    template_vars = _workspace_template_vars(job, vm_data)
-    ide_url = _format_workspace_template(CONTINUUM_IDE_URL_TEMPLATE, template_vars)
-    preview_url = _format_workspace_template(CONTINUUM_PREVIEW_URL_TEMPLATE, template_vars)
-    workspace_env = {
-        "provider": "continuum",
-        "status": vm_data.get("status") or "provisioning",
-        "vm_id": vm_data.get("id") or "",
-        "ide_url": ide_url,
-        "preview_url": preview_url,
-        "requested_at": now,
-        "updated_at": now,
-        "details": data.get("message") or "Continuum workspace created",
-        "vm": vm_data,
-    }
-    job.workspace_env = workspace_env
-    job.persist(force=True)
-    job.append_log(f"Continuum workspace created: {workspace_env.get('vm_id') or '--'}.")
-    return {"status": "created", "workspace": workspace_env}
+    return _workspace_action_create_impl(
+        job,
+        payload,
+        config=_continuum_client_config(),
+        now_iso=lambda: _now_iso(),
+        is_truthy=_is_truthy,
+        request=lambda method, path, **kwargs: _continuum_request(method, path, **kwargs),
+        format_workspace_template=_format_workspace_template,
+        error_factory=lambda code, details, status_code: JobActionExecutionError(
+            code,
+            details,
+            status_code=status_code,
+        ),
+        timeout_sec=timeout_sec,
+    )
 
 
 def _invoke_internal_post_json(
@@ -16263,6 +15738,13 @@ def _execute_todo_route(
                 handler=playground_plan,
                 payload=route_payload,
             )
+        elif workflow == "execution_plan":
+            response = _invoke_internal_post_json(
+                user=owner,
+                path="/api/execution/plan",
+                handler=execution_plan,
+                payload=route_payload,
+            )
         else:
             raise SubtaskExecutionError("unsupported_todo_route", f"Unsupported TODO assistant workflow: {workflow or '--'}", status_code=400)
         result = {
@@ -16349,6 +15831,14 @@ def _execute_subtask(task: Subtask) -> Dict[str, Any]:
             user=task.owner,
             path="/api/playground/plan",
             handler=playground_plan,
+            payload=payload,
+        )
+        return {"action": task.action, "response": response}
+    if task.action == "execution_plan":
+        response = _invoke_internal_post_json(
+            user=task.owner,
+            path="/api/execution/plan",
+            handler=execution_plan,
             payload=payload,
         )
         return {"action": task.action, "response": response}
@@ -18335,6 +17825,12 @@ def playground_plan() -> Response:
     return _EXTRACTED_ASSISTANT_HANDLERS["playground_plan"]()
 
 
+def execution_plan() -> Response:
+    """Handle the execution plan route via the extracted assistant pipeline."""
+
+    return _EXTRACTED_ASSISTANT_HANDLERS["execution_plan"]()
+
+
 def _sse(entry: Dict[str, Any]) -> str:
     payload = json.dumps(entry)
     return f"data: {payload}\n\n"
@@ -18412,6 +17908,7 @@ if hasattr(app, "add_url_rule"):
         assistant_requirements=assistant_requirements,
         assistant_form_fill=assistant_form_fill,
         playground_plan=playground_plan,
+        execution_plan=execution_plan,
     )
     register_rag_routes(
         app,

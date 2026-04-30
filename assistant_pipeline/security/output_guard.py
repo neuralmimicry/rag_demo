@@ -133,7 +133,7 @@ def _validate_output_shape(route: str, payload: Dict[str, Any]) -> None:
                     payload={"details": f"{route} suggestions entries must include a field_id string."},
                 )
         return
-    if route == "playground_plan":
+    if route in {"playground_plan", "execution_plan"}:
         for key in ("summary", "project_name", "requirements_text", "provider", "model"):
             _require_string(route, payload, key)
         _require_list(route, payload, "steps")

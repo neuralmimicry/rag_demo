@@ -60,6 +60,38 @@ class _PlaygroundProvider:
         )
 
 
+class _ExecutionPlanProvider:
+    def __init__(self):
+        self.calls = []
+
+    def predict(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            text=json.dumps(
+                {
+                    "summary": "Stabilise the delivery verification path for the existing service.",
+                    "steps": [
+                        "Audit the affected execution seam.",
+                        "Extract the verification helpers.",
+                        "Update docs and tests.",
+                        "Run the targeted checks.",
+                    ],
+                    "requirements_text": (
+                        "Overview: Stabilise the release gate.\n\n"
+                        "Requirements Register:\n"
+                        "- REQ-001: Fix the failing verification path.\n"
+                        "- REQ-002: Preserve rollout metadata.\n"
+                        "- REQ-003: Add or update targeted tests.\n"
+                        "- REQ-004: Document the execution boundary.\n"
+                    ),
+                    "project_name": "Release Stabiliser",
+                }
+            ),
+            provider="fake_provider",
+            model="fake_model",
+        )
+
+
 class _AskProvider:
     def __init__(self):
         self.calls = []
@@ -246,6 +278,54 @@ def test_playground_plan_uses_and_records_memory(monkeypatch, tmp_path):
         "Design a bright home screen.",
         "Add a short activity flow.",
         "Store a simple score locally.",
+    ]
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_execution_plan_uses_and_records_memory(monkeypatch, tmp_path):
+    provider = _ExecutionPlanProvider()
+    _setup_authenticated_user(monkeypatch, tmp_path)
+    monkeypatch.setattr(refiner_web, "get_provider", lambda *args, **kwargs: provider)
+
+    scope = refiner_web._assistant_memory_scope("execution_plan")
+    store = refiner_web._assistant_memory_store("integration_tester")
+    store.record(
+        SolverEpisode(
+            episode_id="ep-1",
+            source_path=scope,
+            iteration=1,
+            created_at="2026-04-14T01:00:00Z",
+            outcome="success",
+            summary="Stabilised a release gate while preserving rollout notes.",
+            requirement_ids=["REQ-001"],
+            notes=["prompt: stabilise release gate", "context: rollout metadata"],
+            metadata={
+                "project_name": "Gate Keeper",
+                "steps": ["Tighten verification", "Preserve rollout notes"],
+            },
+        )
+    )
+
+    with refiner_web.app.test_client() as client:
+        response = client.post("/api/execution/plan", json={"prompt": "Stabilise the release gate."})
+
+    assert response.status_code == 200
+    data = response.get_json()
+    request_payload = json.loads(provider.calls[0]["messages"][0]["content"])
+    assert request_payload["reference_patterns"][0]["project_name"] == "Gate Keeper"
+    assert request_payload["constraints"]["verification"] == "required"
+    assert data["job_payload"]["source"] == "execution"
+    assert "governed software delivery" in provider.calls[0]["system"]
+    assert "School Monitor" not in provider.calls[0]["system"]
+
+    episodes = refiner_web._assistant_memory_store("integration_tester").snapshot(source_path=scope)
+    assert len(episodes) == 2
+    assert episodes[-1].metadata["project_name"] == "Release Stabiliser"
+    assert episodes[-1].metadata["steps"] == [
+        "Audit the affected execution seam.",
+        "Extract the verification helpers.",
+        "Update docs and tests.",
+        "Run the targeted checks.",
     ]
 
 

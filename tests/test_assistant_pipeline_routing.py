@@ -2,6 +2,7 @@ from assistant_pipeline.routing import (
     assistant_routing_policy_from_config,
     build_assistant_rag_mcp_system_prompt,
     build_assistant_requirements_system_prompt,
+    build_execution_plan_system_prompt,
     resolve_route_intent,
 )
 
@@ -69,3 +70,20 @@ def test_prompt_profiles_preserve_existing_instruction_shapes() -> None:
     assert "Capabilities summary" in req_prompt
     assert "preserve the supplied source citation labels" in rag_prompt
     assert "Relevant skills:" in rag_prompt
+
+
+def test_execution_plan_route_uses_governed_prompt_profile() -> None:
+    policy = assistant_routing_policy_from_config({"enabled": True})
+
+    decision = resolve_route_intent(
+        route="execution_plan",
+        payload={"prompt": "Stabilise the release gate."},
+        policy=policy,
+    )
+    prompt = build_execution_plan_system_prompt(decision)
+
+    assert decision.intent_id == "execution_plan:governed_change"
+    assert decision.prompt_profile == "execution_planner"
+    assert decision.metadata["governed_execution"] is True
+    assert "governed software delivery" in prompt
+    assert "School Monitor" not in prompt

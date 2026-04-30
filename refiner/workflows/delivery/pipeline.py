@@ -19,6 +19,9 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from refiner.agentic_workflow import AgenticWorkflow, PhaseResult
 from refiner.logging_utils import UK_TZ, UK_DATETIME_FORMAT
@@ -68,6 +71,7 @@ class PipelineConfig:
     approvals: Dict[str, str] = field(default_factory=dict)
     versioning: Dict[str, Any] = field(default_factory=dict)
     vcs: Dict[str, Any] = field(default_factory=dict)
+    github_actions: Dict[str, Any] = field(default_factory=dict)
     platform: Dict[str, Any] = field(default_factory=dict)
     solver_fallback: Dict[str, Any] = field(default_factory=dict)
     solver_gate: str = "block_deploy"
@@ -141,6 +145,7 @@ def load_pipeline_config(path: str) -> PipelineConfig:
         approvals=raw.get("approvals") or {},
         versioning=raw.get("versioning") or {},
         vcs=raw.get("vcs") or {},
+        github_actions=raw.get("github_actions") or {},
         platform=raw.get("platform") or {},
         solver_fallback=raw.get("solver_fallback") or {},
         solver_gate=str(raw.get("solver_gate") or "block_deploy").strip().lower(),
@@ -1320,6 +1325,202 @@ def _is_deploy_stage(stage: PipelineStage) -> bool:
     return kind in deploy_kinds
 
 
+def _is_production_rollout_stage(stage: PipelineStage) -> bool:
+    kind = (stage.kind or stage.name or "").strip().lower()
+    return kind in {"deploy", "delivery", "release", "production", "prod"}
+
+
+def _git_output(project_root: str, args: List[str]) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", project_root, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    output = (result.stdout or "").strip()
+    return output or None
+
+
+def _pipeline_current_branch(project_root: str) -> Optional[str]:
+    return _git_output(project_root, ["rev-parse", "--abbrev-ref", "HEAD"])
+
+
+def _pipeline_remote_url(project_root: str, remote: str) -> Optional[str]:
+    if not remote:
+        return None
+    return _git_output(project_root, ["remote", "get-url", remote])
+
+
+def _parse_github_repo_url(repo_url: str) -> Optional[Tuple[str, str]]:
+    trimmed = (repo_url or "").strip().rstrip("/")
+    if not trimmed:
+        return None
+
+    if trimmed.startswith("git@"):
+        _, _, path = trimmed.partition(":")
+    elif trimmed.startswith("https://") or trimmed.startswith("http://"):
+        _, _, remainder = trimmed.partition("://")
+        _, _, path = remainder.partition("/")
+    else:
+        return None
+
+    owner, _, repo = path.partition("/")
+    repo = repo.strip().removesuffix(".git")
+    owner = owner.strip()
+    if not owner or not repo:
+        return None
+    return owner, repo
+
+
+def _github_actions_token(cfg: Dict[str, Any]) -> Optional[str]:
+    env_names: List[str] = []
+    token_env = str(cfg.get("token_env") or "").strip()
+    if token_env:
+        env_names.append(token_env)
+    env_names.extend(
+        [
+            str(name).strip()
+            for name in (cfg.get("token_env_fallbacks") or ["GITHUB_TOKEN", "GH_TOKEN", "X_GITHUB_TOKEN"])
+            if str(name).strip()
+        ]
+    )
+    for name in env_names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _github_actions_report(project_root: str, cfg: Dict[str, Any], allow_run: bool) -> Dict[str, Any]:
+    enabled = bool(cfg.get("enabled", False))
+    required = bool(cfg.get("require_success", enabled))
+    workflow_file = str(cfg.get("workflow_file") or "ci.yml").strip() or "ci.yml"
+    report: Dict[str, Any] = {
+        "enabled": enabled,
+        "required": required,
+        "checked": False,
+        "workflow_file": workflow_file,
+        "owner": None,
+        "repo": None,
+        "branch": None,
+        "succeeded": None,
+        "reason": "GitHub Actions gate disabled",
+        "run": None,
+    }
+    if not enabled:
+        return report
+    if not allow_run:
+        report["reason"] = "GitHub Actions gate not queried during dry-run"
+        return report
+
+    remote = str(cfg.get("remote") or "origin").strip() or "origin"
+    repo_url = str(cfg.get("repo_url") or "").strip() or (_pipeline_remote_url(project_root, remote) or "")
+    owner = str(cfg.get("owner") or "").strip()
+    repo = str(cfg.get("repo") or "").strip()
+    if (not owner or not repo) and repo_url:
+        parsed = _parse_github_repo_url(repo_url)
+        if parsed:
+            owner, repo = parsed
+    branch = (
+        str(cfg.get("branch") or "").strip()
+        or _pipeline_current_branch(project_root)
+        or str(cfg.get("default_branch") or "").strip()
+        or "main"
+    )
+    report["owner"] = owner or None
+    report["repo"] = repo or None
+    report["branch"] = branch or None
+    if not owner or not repo or not branch:
+        report["checked"] = True
+        report["succeeded"] = False
+        report["reason"] = "production rollout requires GitHub repository and branch context for GitHub Actions verification"
+        return report
+
+    api_base_url = str(cfg.get("api_base_url") or "https://api.github.com").rstrip("/")
+    query = urllib.parse.urlencode(
+        {"branch": branch, "status": "completed", "per_page": 1},
+        quote_via=urllib.parse.quote,
+    )
+    url = f"{api_base_url}/repos/{owner}/{repo}/actions/workflows/{workflow_file}/runs?{query}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "refiner-delivery-pipeline",
+    }
+    token = _github_actions_token(cfg)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers, method="GET")
+
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        message = ""
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+            message = str(payload.get("message") or payload.get("error") or "")
+        except Exception:
+            payload = {}
+        report["checked"] = True
+        report["succeeded"] = False
+        if exc.code == 404:
+            report["reason"] = (
+                f"GitHub Actions workflow {workflow_file} is missing or has no completed runs for "
+                f"{owner}/{repo} on branch {branch}"
+            )
+        else:
+            detail = message or str(exc)
+            report["reason"] = f"unable to verify GitHub Actions workflow {workflow_file}: {detail}"
+        return report
+    except Exception as exc:
+        report["checked"] = True
+        report["succeeded"] = False
+        report["reason"] = f"unable to verify GitHub Actions workflow {workflow_file}: {exc}"
+        return report
+
+    workflow_runs = payload.get("workflow_runs") or []
+    report["checked"] = True
+    if not workflow_runs:
+        report["succeeded"] = False
+        report["reason"] = (
+            f"GitHub Actions workflow {workflow_file} has no completed runs for "
+            f"{owner}/{repo} on branch {branch}"
+        )
+        return report
+
+    run = workflow_runs[0]
+    conclusion = str(run.get("conclusion") or "").strip().lower()
+    succeeded = conclusion == "success"
+    report["succeeded"] = succeeded
+    report["run"] = {
+        "id": run.get("id"),
+        "name": run.get("name"),
+        "status": run.get("status"),
+        "conclusion": run.get("conclusion"),
+        "html_url": run.get("html_url"),
+        "run_number": run.get("run_number"),
+        "head_sha": run.get("head_sha"),
+        "event": run.get("event"),
+        "updated_at": run.get("updated_at"),
+    }
+    if succeeded:
+        report["reason"] = (
+            f"GitHub Actions workflow {workflow_file} succeeded for {owner}/{repo} on branch {branch}"
+        )
+    else:
+        report["reason"] = (
+            f"GitHub Actions workflow {workflow_file} concluded with "
+            f"{conclusion or 'unknown'} for {owner}/{repo} on branch {branch}"
+        )
+    return report
+
+
 def _is_security_stage(stage: PipelineStage) -> bool:
     kind = (stage.kind or stage.name or "").strip().lower()
     return kind == "security" or "security" in kind or "security" in (stage.name or "").lower()
@@ -1530,6 +1731,7 @@ def run_delivery_pipeline(
         approvals_dir=approvals_dir,
     )
     vcs_details = vcs_result.details
+    github_actions_report = _github_actions_report(project_root, config.github_actions or {}, allow_run)
 
     if vcs_result.status in {"failed", "blocked"}:
         report = {
@@ -1557,6 +1759,7 @@ def run_delivery_pipeline(
                 "attempts": [],
                 "attempt_count": 0,
             },
+            "github_actions": github_actions_report,
             "ai_orchestration": _summarize_solver_ai(solver_ai_orchestration),
             "stages": [],
             "workflow": None,
@@ -1646,6 +1849,24 @@ def run_delivery_pipeline(
             stage_solver_attempts: List[Dict[str, Any]] = []
             stage_rag_info: Dict[str, Any] = {}
             stage_mcp_results: List[Dict[str, Any]] = []
+            workspace = None
+            artifacts = []
+        elif (
+            allow_run
+            and github_actions_report.get("enabled")
+            and github_actions_report.get("required")
+            and _is_production_rollout_stage(stage)
+            and github_actions_report.get("succeeded") is not True
+        ):
+            stage_status = "blocked"
+            blocked = True
+            phase_result = PhaseResult.halt("github actions gate")
+            stage_notes.append(str(github_actions_report.get("reason") or "GitHub Actions gate failed"))
+            command_results = []
+            stage_recoveries = []
+            stage_solver_attempts = []
+            stage_rag_info = {}
+            stage_mcp_results = []
             workspace = None
             artifacts = []
         elif allow_run and stage.requires_approval and not approval_present:
@@ -2023,6 +2244,7 @@ def run_delivery_pipeline(
             "solver_attempts": stage_solver_attempts,
             "rag": stage_rag_info,
             "mcp_calls": stage_mcp_results,
+            "github_actions": github_actions_report if _is_production_rollout_stage(stage) else {},
             "remediation": {
                 "commands": stage.remediation,
                 "results": remediation_results,
@@ -2089,6 +2311,7 @@ def run_delivery_pipeline(
             "attempts": solver_fallback_log,
             "attempt_count": len(solver_fallback_log),
         },
+        "github_actions": github_actions_report,
         "ai_orchestration": _summarize_solver_ai(solver_ai_orchestration, solver_fallback_log),
         "rag": rag_meta,
         "mcp": {"servers": mcp_server_masks},

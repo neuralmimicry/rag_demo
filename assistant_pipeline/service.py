@@ -5,7 +5,7 @@ from __future__ import annotations
 import queue
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from refiner.llm_providers import LLMError
 
@@ -64,6 +64,7 @@ from assistant_pipeline.routing import (
     build_assistant_form_fill_system_prompt,
     build_assistant_rag_mcp_system_prompt,
     build_assistant_requirements_system_prompt,
+    build_execution_plan_system_prompt,
     build_playground_plan_system_prompt,
     resolve_route_intent,
 )
@@ -2856,7 +2857,189 @@ def assistant_form_fill(deps: AssistantPipelineDependencies, *, user: Optional[s
         raise
 
 
-def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str], payload: Dict[str, Any]) -> ServiceResult:
+def _playground_plan_user_text(prompt: str, memory_references: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build the prompt payload for the quick playground planner."""
+
+    user_text: Dict[str, Any] = {
+        "prompt": prompt,
+        "constraints": {
+            "speed": "quick",
+            "scope": "small",
+        },
+    }
+    if memory_references:
+        user_text["reference_patterns"] = memory_references
+    return user_text
+
+
+def _execution_plan_user_text(prompt: str, memory_references: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build the prompt payload for governed engineering planning."""
+
+    user_text: Dict[str, Any] = {
+        "prompt": prompt,
+        "constraints": {
+            "scope": "governed_change",
+            "verification": "required",
+            "rollout": "consider_when_relevant",
+        },
+    }
+    if memory_references:
+        user_text["reference_patterns"] = memory_references
+    return user_text
+
+
+def _fallback_playground_requirements_text(*, summary: str, prompt: str, steps: List[str]) -> str:
+    """Build a minimal playground requirements register when the model omits one."""
+
+    steps_block = "\n".join([f"- {step}" for step in steps]) if steps else ""
+    return (
+        f"{summary or prompt}\n\nKey Features:\n{steps_block}\n\nRequirements Register:\n"
+        "- REQ-001: Provide a simple web app\n"
+        "- REQ-002: Keep the scope small and fast to build\n"
+        "- REQ-003: Include clear, child-friendly UI copy\n"
+        "- REQ-004: Add basic navigation between screens\n"
+        "- REQ-005: Provide simple progress feedback\n"
+        "- REQ-006: Use a clean, responsive layout\n"
+    )
+
+
+def _fallback_execution_requirements_text(*, summary: str, prompt: str, steps: List[str]) -> str:
+    """Build a governed engineering requirements register when the model omits one."""
+
+    steps_block = "\n".join([f"- {step}" for step in steps]) if steps else "- Capture the smallest viable implementation slice."
+    return (
+        f"Overview: {summary or prompt}\n\nImplementation Notes:\n{steps_block}\n\nRequirements Register:\n"
+        "- REQ-001: Implement the scoped change described in the request.\n"
+        "- REQ-002: Preserve existing behaviour unless the change explicitly alters it.\n"
+        "- REQ-003: Add or update automated tests covering the changed path.\n"
+        "- REQ-004: Keep documentation and inline code comments aligned with the implementation.\n"
+        "- REQ-005: Avoid unrelated file churn and destructive operations.\n"
+        "- REQ-006: Run verification and report the outcome.\n"
+        "- REQ-007: Preserve rollout and operational safety notes where the change affects delivery or runtime behaviour.\n"
+    )
+
+
+def _effective_requirement_count(
+    deps: AssistantPipelineDependencies,
+    *,
+    requirements_text: str,
+    steps: List[str],
+) -> int:
+    """Estimate the amount of project-solver effort implied by the plan."""
+
+    req_count = sum(1 for line in requirements_text.splitlines() if line.strip().startswith("- REQ-"))
+    if req_count <= 0:
+        req_count = max(1, len(steps)) if steps else 6
+    requirements_lower = requirements_text.lower()
+    global_titles = deps.global_requirements_titles()
+    global_detected = "global requirement" in requirements_lower or "global-" in requirements_lower
+    if not global_detected and global_titles:
+        global_detected = any(title in requirements_lower for title in global_titles)
+    if not global_detected:
+        req_count += deps.global_requirements_count()
+    return req_count
+
+
+def _normalise_project_plan_response(
+    deps: AssistantPipelineDependencies,
+    *,
+    parsed: Dict[str, Any],
+    prompt: str,
+    default_project_name: str,
+    fallback_requirements_builder: Callable[..., str],
+) -> Dict[str, Any]:
+    """Normalise LLM planner JSON into the stable response contract."""
+
+    summary = deps.to_uk_english(str(parsed.get("summary") or "").strip())
+    steps_raw = parsed.get("steps") or []
+    steps = [
+        deps.to_uk_english(str(item).strip())
+        for item in steps_raw
+        if isinstance(item, (str, int, float)) and str(item).strip()
+    ]
+    requirements_text = deps.to_uk_english(str(parsed.get("requirements_text") or "").strip())
+    project_name = str(parsed.get("project_name") or "").strip()
+
+    if not project_name:
+        project_name = (summary or prompt).strip()
+    project_name = project_name[:60] if project_name else default_project_name
+
+    if not requirements_text:
+        requirements_text = deps.to_uk_english(
+            fallback_requirements_builder(summary=summary, prompt=prompt, steps=steps)
+        )
+
+    return {
+        "summary": summary,
+        "steps": steps,
+        "requirements_text": requirements_text,
+        "project_name": project_name,
+        "req_count": _effective_requirement_count(deps, requirements_text=requirements_text, steps=steps),
+    }
+
+
+def _build_project_solver_job_payload(
+    deps: AssistantPipelineDependencies,
+    *,
+    payload: Dict[str, Any],
+    settings: Dict[str, Any],
+    provider_hint: Any,
+    model_hint: Any,
+    reasoning_effort: str,
+    project_name: str,
+    requirements_text: str,
+    req_count: int,
+    source: str,
+) -> Dict[str, Any]:
+    """Build the downstream `project_solver` payload shared by plan routes."""
+
+    planner_cfg = dict(deps.get_playground_config() or {})
+    project_iterations = min(
+        int(planner_cfg.get("project_max_iterations") or 12),
+        max(int(planner_cfg.get("project_min_iterations") or 1), req_count),
+    )
+    job_payload = {
+        "workflow": "project_solver",
+        "project_name": project_name,
+        "requirements_text": requirements_text,
+        "project_run": True,
+        "project_max_steps": int(planner_cfg.get("project_max_steps") or 0),
+        "project_iterations": project_iterations,
+        "llm_provider": settings.get("provider") or provider_hint,
+        "llm_model": settings.get("model") or model_hint,
+        "llm_reasoning_effort": reasoning_effort,
+        "llm_temperature": 0.2,
+        "llm_max_tokens": int(planner_cfg.get("llm_max_tokens") or 0),
+        "disable_jira": True,
+        "disable_confluence": True,
+        "action_plan": False,
+        "dry_run": False,
+        "token_scope": "personal",
+        "source": source,
+    }
+    codingagent = payload.get("codingagent")
+    if codingagent:
+        job_payload["codingagent"] = codingagent
+    elif deps.opencode_available_for_playground():
+        job_payload["codingagent"] = "opencode"
+    return job_payload
+
+
+def _structured_project_plan(
+    deps: AssistantPipelineDependencies,
+    *,
+    user: Optional[str],
+    payload: Dict[str, Any],
+    route: str,
+    conversation_mode: str,
+    source: str,
+    default_project_name: str,
+    system_builder: Callable[[Any], str],
+    user_text_builder: Callable[[str, List[Dict[str, Any]]], Dict[str, Any]],
+    fallback_requirements_builder: Callable[..., str],
+) -> ServiceResult:
+    """Execute a structured planning route that feeds `project_solver`."""
+
     if not user:
         raise ServiceError("unauthorized", status_code=401)
     prompt = str(payload.get("prompt") or "").strip()
@@ -2864,8 +3047,8 @@ def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str],
     trace = TraceRecorder(
         deps,
         owner=user,
-        route="playground_plan",
-        intent="playground_plan",
+        route=route,
+        intent=route,
         conversation_id=conversation_id,
         request_meta={"prompt_chars": len(prompt)},
     )
@@ -2877,7 +3060,7 @@ def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str],
         input_result = _guard_input(
             deps,
             trace,
-            route="playground_plan",
+            route=route,
             payload=payload,
             text_fields=("prompt",),
             policy=security_policy,
@@ -2889,20 +3072,20 @@ def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str],
             deps,
             owner=user,
             conversation_id=conversation_id,
-            route="playground_plan",
+            route=route,
             title=prompt[:120],
-            metadata={"mode": "playground"},
+            metadata={"mode": conversation_mode},
         )
         append_turn(
             deps,
             owner=user,
             conversation_id=conversation_id,
             role="user",
-            route="playground_plan",
+            route=route,
             content=prompt,
             prompt_text=prompt,
             request_payload=payload,
-            metadata={"mode": "playground"},
+            metadata={"mode": conversation_mode},
         )
 
         provider_hint = payload.get("provider") or payload.get("llm_provider")
@@ -2922,14 +3105,14 @@ def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str],
         decision = _resolve_assistant_intent(
             deps,
             trace,
-            route="playground_plan",
+            route=route,
             payload=payload,
         )
         try:
             provider = deps.build_request_llm_provider(
                 user,
                 settings,
-                workflow="playground_plan",
+                workflow=route,
                 role="planner",
             )
         except Exception as exc:
@@ -2937,9 +3120,7 @@ def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str],
         if not provider:
             raise ServiceError("llm_unavailable", status_code=400)
 
-        system = build_playground_plan_system_prompt(decision)
-
-        assistant_memory_scope = deps.assistant_memory_scope("playground_plan")
+        assistant_memory_scope = deps.assistant_memory_scope(route)
         memory_references: List[Dict[str, Any]] = []
         if assistant_memory_enabled:
             memory_references = deps.assistant_memory_reference_payload(
@@ -2947,15 +3128,7 @@ def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str],
                 scope=assistant_memory_scope,
                 query_text=deps.assistant_memory_query_text(prompt=prompt),
             )
-        user_text: Dict[str, Any] = {
-            "prompt": prompt,
-            "constraints": {
-                "speed": "quick",
-                "scope": "small",
-            },
-        }
-        if memory_references:
-            user_text["reference_patterns"] = memory_references
+        user_text = user_text_builder(prompt, memory_references)
 
         stage_started = time.monotonic()
         response = _predict_with_capacity(
@@ -2963,7 +3136,7 @@ def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str],
             provider,
             owner=user,
             messages=[{"role": "user", "content": deps.json_dumps(user_text)}],
-            system=system,
+            system=system_builder(decision),
             temperature=payload.get("temperature", 0.2),
             max_tokens=payload.get("max_tokens", 900),
             reasoning_effort=reasoning_effort,
@@ -2981,95 +3154,48 @@ def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str],
         if not isinstance(parsed, dict):
             raise ServiceError("invalid_llm_response", payload={"details": str(getattr(response, "text", ""))[:400]})
 
-        summary = str(parsed.get("summary") or "").strip()
-        steps_raw = parsed.get("steps") or []
-        steps = [str(item).strip() for item in steps_raw if isinstance(item, (str, int, float)) and str(item).strip()]
-        requirements_text = str(parsed.get("requirements_text") or "").strip()
-        project_name = str(parsed.get("project_name") or "").strip()
-
-        summary = deps.to_uk_english(summary)
-        steps = [deps.to_uk_english(step) for step in steps]
-        requirements_text = deps.to_uk_english(requirements_text)
-
-        if not project_name:
-            project_name = (summary or prompt).strip()
-        project_name = project_name[:60] if project_name else "Playground Project"
-
-        if not requirements_text:
-            steps_block = "\n".join([f"- {step}" for step in steps]) if steps else ""
-            requirements_text = (
-                f"{summary or prompt}\n\nKey Features:\n{steps_block}\n\nRequirements Register:\n"
-                "- REQ-001: Provide a simple web app\n"
-                "- REQ-002: Keep the scope small and fast to build\n"
-                "- REQ-003: Include clear, child-friendly UI copy\n"
-                "- REQ-004: Add basic navigation between screens\n"
-                "- REQ-005: Provide simple progress feedback\n"
-                "- REQ-006: Use a clean, responsive layout\n"
-            )
-            requirements_text = deps.to_uk_english(requirements_text)
-
-        req_count = sum(1 for line in requirements_text.splitlines() if line.strip().startswith("- REQ-"))
-        if req_count <= 0:
-            req_count = max(1, len(steps)) if steps else 6
-        requirements_lower = requirements_text.lower()
-        global_titles = deps.global_requirements_titles()
-        global_detected = "global requirement" in requirements_lower or "global-" in requirements_lower
-        if not global_detected and global_titles:
-            global_detected = any(title in requirements_lower for title in global_titles)
-        if not global_detected:
-            req_count += deps.global_requirements_count()
-
-        playground_cfg = dict(deps.get_playground_config() or {})
-        project_iterations = min(
-            int(playground_cfg.get("project_max_iterations") or 12),
-            max(int(playground_cfg.get("project_min_iterations") or 1), req_count),
+        plan_details = _normalise_project_plan_response(
+            deps,
+            parsed=parsed,
+            prompt=prompt,
+            default_project_name=default_project_name,
+            fallback_requirements_builder=fallback_requirements_builder,
         )
-        job_payload = {
-            "workflow": "project_solver",
-            "project_name": project_name,
-            "requirements_text": requirements_text,
-            "project_run": True,
-            "project_max_steps": int(playground_cfg.get("project_max_steps") or 0),
-            "project_iterations": project_iterations,
-            "llm_provider": settings.get("provider") or provider_hint,
-            "llm_model": settings.get("model") or model_hint,
-            "llm_reasoning_effort": reasoning_effort,
-            "llm_temperature": 0.2,
-            "llm_max_tokens": int(playground_cfg.get("llm_max_tokens") or 0),
-            "disable_jira": True,
-            "disable_confluence": True,
-            "action_plan": False,
-            "dry_run": False,
-            "token_scope": "personal",
-            "source": "playground",
-        }
-        codingagent = payload.get("codingagent")
-        if codingagent:
-            job_payload["codingagent"] = codingagent
-        elif deps.opencode_available_for_playground():
-            job_payload["codingagent"] = "opencode"
+        job_payload = _build_project_solver_job_payload(
+            deps,
+            payload=payload,
+            settings=settings,
+            provider_hint=provider_hint,
+            model_hint=model_hint,
+            reasoning_effort=reasoning_effort,
+            project_name=plan_details["project_name"],
+            requirements_text=plan_details["requirements_text"],
+            req_count=int(plan_details["req_count"]),
+            source=source,
+        )
         token_estimate = deps.estimate_job_tokens(job_payload)
+        reply_text = f"{plan_details['summary']}\n\n{plan_details['requirements_text']}".strip()
         if assistant_memory_enabled:
             deps.record_assistant_memory(
                 user,
                 scope=assistant_memory_scope,
                 prompt_text=prompt,
-                requirements_text=requirements_text,
-                reply_text=f"{summary}\n\n{requirements_text}".strip(),
-                project_name=project_name,
-                steps=steps,
-                extra_notes=[f"project_name: {project_name}"] if project_name else None,
+                requirements_text=plan_details["requirements_text"],
+                reply_text=reply_text,
+                project_name=plan_details["project_name"],
+                steps=plan_details["steps"],
+                extra_notes=[f"project_name: {plan_details['project_name']}"] if plan_details["project_name"] else None,
             )
 
         response_payload = _guard_output(
             deps,
             trace,
-            route="playground_plan",
+            route=route,
             response_payload={
-                "summary": summary,
-                "steps": steps,
-                "project_name": project_name,
-                "requirements_text": requirements_text,
+                "summary": plan_details["summary"],
+                "steps": plan_details["steps"],
+                "project_name": plan_details["project_name"],
+                "requirements_text": plan_details["requirements_text"],
                 "job_payload": job_payload,
                 "token_estimate": token_estimate,
                 "provider": str(getattr(response, "provider", None) or settings.get("provider") or ""),
@@ -3082,23 +3208,57 @@ def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str],
             owner=user,
             conversation_id=conversation_id,
             role="assistant",
-            route="playground_plan",
-            content=f"{summary}\n\n{requirements_text}".strip(),
+            route=route,
+            content=reply_text,
             provider=str(getattr(response, "provider", None) or settings.get("provider") or ""),
             model=str(getattr(response, "model", None) or settings.get("model") or ""),
             response_payload=response_payload,
-            metadata={"project_name": project_name},
+            metadata={"project_name": plan_details["project_name"], "mode": conversation_mode},
         )
         trace.finish(
             status="success",
             provider=str(getattr(response, "provider", None) or settings.get("provider") or ""),
             model=str(getattr(response, "model", None) or settings.get("model") or ""),
-            response_meta={"project_name": project_name, "token_estimate": token_estimate},
+            response_meta={"project_name": plan_details["project_name"], "token_estimate": token_estimate},
         )
         return ServiceResult(response_payload)
     except ServiceError as exc:
         trace.finish(status="failed", error_code=exc.code, error_detail=exc.details or str(exc))
         raise
     except Exception as exc:
-        trace.finish(status="failed", error_code="playground_plan_failed", error_detail=str(exc))
+        trace.finish(status="failed", error_code=f"{route}_failed", error_detail=str(exc))
         raise
+
+
+def playground_plan(deps: AssistantPipelineDependencies, *, user: Optional[str], payload: Dict[str, Any]) -> ServiceResult:
+    """Build a lightweight project-solver plan for the playground UI."""
+
+    return _structured_project_plan(
+        deps,
+        user=user,
+        payload=payload,
+        route="playground_plan",
+        conversation_mode="playground",
+        source="playground",
+        default_project_name="Playground Project",
+        system_builder=build_playground_plan_system_prompt,
+        user_text_builder=_playground_plan_user_text,
+        fallback_requirements_builder=_fallback_playground_requirements_text,
+    )
+
+
+def execution_plan(deps: AssistantPipelineDependencies, *, user: Optional[str], payload: Dict[str, Any]) -> ServiceResult:
+    """Build a governed engineering plan for Conductor and other executor clients."""
+
+    return _structured_project_plan(
+        deps,
+        user=user,
+        payload=payload,
+        route="execution_plan",
+        conversation_mode="execution",
+        source="execution",
+        default_project_name="Execution Plan",
+        system_builder=build_execution_plan_system_prompt,
+        user_text_builder=_execution_plan_user_text,
+        fallback_requirements_builder=_fallback_execution_requirements_text,
+    )

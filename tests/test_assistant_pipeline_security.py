@@ -143,6 +143,27 @@ def test_output_guard_rejects_invalid_structured_payload_shape() -> None:
     assert "suggestions" in excinfo.value.to_payload()["details"]
 
 
+def test_output_guard_rejects_invalid_execution_plan_shape() -> None:
+    with pytest.raises(ServiceError) as excinfo:
+        apply_output_guard(
+            route="execution_plan",
+            response_payload={
+                "summary": "Plan",
+                "project_name": "Release Stabiliser",
+                "requirements_text": "Overview",
+                "steps": "bad",
+                "job_payload": {},
+                "token_estimate": 1,
+                "provider": "fake",
+                "model": "fake-model",
+            },
+            policy=_policy(),
+        )
+
+    assert excinfo.value.code == "invalid_output_payload"
+    assert "steps" in excinfo.value.to_payload()["details"]
+
+
 def test_tool_use_guard_blocks_unsafe_requests_without_confirmation() -> None:
     result = apply_tool_use_guard(
         route="assistant_rag_mcp",
