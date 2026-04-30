@@ -10,6 +10,7 @@ from assistant_pipeline.routing.prompt_profiles import (
     build_assistant_form_fill_system_prompt,
     build_assistant_rag_mcp_system_prompt,
     build_assistant_requirements_system_prompt,
+    build_execution_plan_system_prompt,
     build_playground_plan_system_prompt,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "build_assistant_form_fill_system_prompt",
     "build_assistant_rag_mcp_system_prompt",
     "build_assistant_requirements_system_prompt",
+    "build_execution_plan_system_prompt",
     "build_playground_plan_system_prompt",
 ]

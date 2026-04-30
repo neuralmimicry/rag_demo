@@ -1,4 +1,5 @@
 import json
+import refiner.delivery_pipeline as delivery_pipeline
 from refiner.delivery_pipeline import run_delivery_pipeline
 
 
@@ -38,3 +39,109 @@ def test_delivery_gate_blocks_deploy_stage(tmp_path):
     assert report["status"] == "blocked"
     assert report["stages"][0]["status"] in {"ok", "no_op", "planned"}
     assert report["stages"][1]["status"] == "blocked"
+
+
+def test_delivery_gate_blocks_production_rollout_without_successful_github_actions(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "README.md").write_text("demo", encoding="utf-8")
+
+    pipeline_cfg = {
+        "github_actions": {
+            "enabled": True,
+            "require_success": True,
+            "owner": "neuralmimicry",
+            "repo": "demo",
+            "branch": "main",
+            "workflow_file": "ci.yml",
+        },
+        "stages": [
+            {"name": "deploy", "kind": "deploy", "commands": []},
+        ],
+    }
+    config_path = project_root / "pipeline.json"
+    config_path.write_text(json.dumps(pipeline_cfg), encoding="utf-8")
+
+    monkeypatch.setattr(
+        delivery_pipeline,
+        "_github_actions_report",
+        lambda *args, **kwargs: {
+            "enabled": True,
+            "required": True,
+            "checked": True,
+            "workflow_file": "ci.yml",
+            "owner": "neuralmimicry",
+            "repo": "demo",
+            "branch": "main",
+            "succeeded": False,
+            "reason": "GitHub Actions workflow ci.yml concluded with failure for neuralmimicry/demo on branch main",
+            "run": {"conclusion": "failure"},
+        },
+    )
+
+    report_path = tmp_path / "report.json"
+    exit_code = run_delivery_pipeline(
+        str(project_root),
+        config_path=str(config_path),
+        output_path=str(report_path),
+        allow_run=True,
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 2
+    assert report["status"] == "blocked"
+    assert report["github_actions"]["succeeded"] is False
+    assert report["stages"][0]["status"] == "blocked"
+
+
+def test_delivery_gate_allows_production_rollout_with_successful_github_actions(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "README.md").write_text("demo", encoding="utf-8")
+
+    pipeline_cfg = {
+        "github_actions": {
+            "enabled": True,
+            "require_success": True,
+            "owner": "neuralmimicry",
+            "repo": "demo",
+            "branch": "main",
+            "workflow_file": "ci.yml",
+        },
+        "stages": [
+            {"name": "deploy", "kind": "deploy", "commands": []},
+        ],
+    }
+    config_path = project_root / "pipeline.json"
+    config_path.write_text(json.dumps(pipeline_cfg), encoding="utf-8")
+
+    monkeypatch.setattr(
+        delivery_pipeline,
+        "_github_actions_report",
+        lambda *args, **kwargs: {
+            "enabled": True,
+            "required": True,
+            "checked": True,
+            "workflow_file": "ci.yml",
+            "owner": "neuralmimicry",
+            "repo": "demo",
+            "branch": "main",
+            "succeeded": True,
+            "reason": "GitHub Actions workflow ci.yml succeeded for neuralmimicry/demo on branch main",
+            "run": {"conclusion": "success"},
+        },
+    )
+
+    report_path = tmp_path / "report.json"
+    exit_code = run_delivery_pipeline(
+        str(project_root),
+        config_path=str(config_path),
+        output_path=str(report_path),
+        allow_run=True,
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert report["status"] == "success"
+    assert report["github_actions"]["succeeded"] is True
+    assert report["stages"][0]["status"] == "no_op"

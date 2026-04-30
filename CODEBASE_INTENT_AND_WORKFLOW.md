@@ -50,6 +50,14 @@ The codebase is built to support two primary operating modes:
 - `refiner/security_utils.py`: redaction, URL policy checks, audit event helpers.
 - `refiner_routes/*.py`: modular route registration for voice, assistant, admin, auth, jobs.
 - `refiner/capabilities.py`: runtime capability inventory + skills catalog and selector.
+- `refiner/integrations/platform/continuum_client.py`: extracted Continuum transport, response parsing, and workspace VM helpers.
+- `refiner/runtime/continuum_autoscaler.py`: extracted Continuum autoscaler and worker-telemetry helpers.
+
+### Lifecycle ownership
+
+- Refiner owns code/build/test/iterate workflows, execution-facing planning, workspaces, and the public API contract.
+- Conductor owns plan/govern workflows, backlog policy, approvals, and cross-service execution control.
+- Continuum owns release/operate surfaces, platform scaling, deployment/runtime state, and workspace infrastructure APIs.
 
 ## 3) Workflow selection and control flow
 
@@ -148,7 +156,7 @@ The web server acts as a control plane with these major capability groups:
   - Workspace/session collaboration helpers.
   - Job action task queue for side-actions.
 - Assistant endpoints:
-  - Requirements drafting/form-fill and planning helpers.
+  - Requirements drafting/form-fill and planning helpers, including the governed `/api/execution/plan` surface used by Conductor.
   - RAG + MCP assistant fusion endpoint.
 - Voice/STT:
   - Voice token and provider-specific endpoints (Siri/Alexa/Google).
@@ -173,6 +181,8 @@ Primary runtime data root: `job_data/` (configurable via env). Key stores includ
 - MCP server registry entries.
 
 Most mutable stores are JSON/JSONL files with explicit locking or atomic-write patterns where needed.
+
+Continuum-specific HTTP transport, autoscaling, and workspace VM orchestration now live in dedicated modules. `refiner/refiner_web.py` keeps compatibility wrappers so the deployed surface and the existing test monkeypatches stay stable while the lifecycle boundary moves out of the monolithic runtime file.
 
 ## 7) Safety, security, and robustness mechanisms
 

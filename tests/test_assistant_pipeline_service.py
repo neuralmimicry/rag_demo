@@ -1033,6 +1033,65 @@ def test_playground_plan_uses_memory_and_builds_job_payload() -> None:
     }
 
 
+def test_execution_plan_uses_governed_prompt_and_builds_job_payload() -> None:
+    provider = _FakeProvider(
+        response=_FakeLLMResponse(
+            text=json.dumps(
+                {
+                    "summary": "Stabilise the release verification path for the existing delivery service.",
+                    "steps": [
+                        "Audit the failing execution and verification seam.",
+                        "Extract the delivery gate helpers into a dedicated module.",
+                        "Update the affected tests and documentation.",
+                        "Run the targeted verification suite.",
+                    ],
+                    "requirements_text": (
+                        "Overview: Stabilise the release gate.\n\n"
+                        "Requirements Register:\n"
+                        "- REQ-001: Fix the failing release verification path.\n"
+                        "- REQ-002: Keep rollout metadata intact.\n"
+                        "- REQ-003: Add or update targeted tests.\n"
+                        "- REQ-004: Document the changed execution seam.\n"
+                    ),
+                    "project_name": "Release Stabiliser",
+                }
+            )
+        )
+    )
+    deps, state = _build_dependencies(
+        provider=provider,
+        assistant_memory_references=[
+            {
+                "project_name": "Gate Keeper",
+                "steps": ["Tighten verification", "Preserve rollout notes"],
+            }
+        ],
+        opencode_available=True,
+    )
+
+    result = assistant_service.execution_plan(
+        deps,
+        user="alice",
+        payload={"prompt": "Stabilise the release gate.", "conversation_id": "conv-exec-1"},
+    )
+
+    request_payload = json.loads(provider.calls[0]["messages"][0]["content"])
+    assert request_payload["constraints"]["verification"] == "required"
+    assert request_payload["reference_patterns"][0]["project_name"] == "Gate Keeper"
+    assert result.payload["project_name"] == "Release Stabiliser"
+    assert result.payload["job_payload"]["source"] == "execution"
+    assert result.payload["job_payload"]["codingagent"] == "opencode"
+    assert result.payload["job_payload"]["project_iterations"] == 4
+    assert result.payload["token_estimate"] == 321
+    assert "governed software delivery" in provider.calls[0]["system"]
+    assert "School Monitor" not in provider.calls[0]["system"]
+    assert state["memory_records"][0]["project_name"] == "Release Stabiliser"
+    assert state["trace_store"].finishes[0]["response_meta"] == {
+        "project_name": "Release Stabiliser",
+        "token_estimate": 321,
+    }
+
+
 def test_assistant_requirements_redacts_reply_text_when_output_policy_is_enabled() -> None:
     provider = _FakeProvider(response=_FakeLLMResponse(text="Email alice@example.com or call +44 7712 345678."))
     deps, state = _build_dependencies(

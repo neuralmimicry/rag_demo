@@ -26,6 +26,8 @@ The public frontend still talks only to `https://api.neuralmimicry.ai`, but Refi
 - Token balances, payment capture, and ledger/account APIs: [`../billing`](../billing/README.md)
 - Speech-to-text and gesture planning: [`../nmstt`](../nmstt/README.md)
 - Auditable identity/payment/token event ledger: [`../nmchain`](../nmchain)
+- Estate planning, approvals, and governed execution control: [`../conductor`](../conductor/README.md)
+- Release/operate surfaces, worker scaling, workspace infrastructure, and platform telemetry: [`../nmc`](../nmc/README.md)
 
 Internal routing still follows the same edge path:
 
@@ -36,6 +38,12 @@ Internal routing still follows the same edge path:
 
 Detailed service boundaries and interaction flows are documented in [SERVICE_SPLIT_ARCHITECTURE.md](SERVICE_SPLIT_ARCHITECTURE.md).
 In the Continuum deployment, Customers defaults to the shared Postgres tenant service for identity records, Refiner job/workspace data is expected on the NFS-backed `continuum-shared` storage class, and `nmstt` model assets are likewise expected on shared NFS-backed storage.
+
+Lifecycle ownership follows the current delivery split:
+
+- Refiner owns code/build/test/iterate workflows and the public execution-facing API surface.
+- Conductor owns plan/govern workflows, staged approvals, and estate-wide execution control.
+- Continuum owns release/operate surfaces, deployment/runtime scale, and workspace/platform APIs.
 
 
 ## Quickstart
@@ -97,7 +105,7 @@ The web UI is backed by the same Flask server module (`refiner.refiner_web`). It
 
 ### Current JSON API surface
 - Auth + profile: `/api/setup`, `/api/register`, `/api/login`, `/api/login/mfa/totp`, `/api/logout`, `/api/session`, `/api/profile`, `/api/profile/password`, `/api/profile/mfa/totp/*`, `/api/profile/passkeys/register/*`, `/api/profile/passkeys/<credential_id>`, `/api/passkeys/authenticate/*`, `/api/sso/issue`, `/api/oidc/exchange`
-- Assistant + planning: `/api/assistant/requirements`, `/api/assistant/form-fill`, `/api/assistant/rag-mcp`, `/api/playground/plan`
+- Assistant + planning: `/api/assistant/requirements`, `/api/assistant/form-fill`, `/api/assistant/rag-mcp`, `/api/playground/plan`, `/api/execution/plan`
 - Voice + capture: `/api/voice/tokens`, `/api/voice/capture`, `/api/voice/siri`, `/api/voice/alexa`, `/api/voice/google`, `/api/voice/stt`
 - Jobs + workspaces: `/api/jobs`, `/api/jobs/estimate`, `/api/jobs/<job_id>/workspace`, `/api/jobs/<job_id>/editor/*`, `/api/jobs/<job_id>/logs`, `/api/jobs/<job_id>/actions`, `/api/jobs/<job_id>/transfer`, `/api/jobs/<job_id>/archive`
 - Inbox automation: `/api/todos`, `/api/todos/next`, `/api/todos/<todo_id>/route`, `/api/todos/<todo_id>/schedule`, `/api/schedules`, `/api/subtasks`
