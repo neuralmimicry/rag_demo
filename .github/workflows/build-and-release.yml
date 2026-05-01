@@ -54,21 +54,22 @@ jobs:
       - name: Use runner Python runtime
         run: python3 --version
 
-      - name: Ensure pip is available
+      - name: Ensure Python tooling is available
         run: |
           python3 -m pip --version || (
             sudo apt-get update &&
-            sudo apt-get install -y --no-install-recommends python3-pip
+            sudo apt-get install -y --no-install-recommends python3-pip python3-venv
           )
 
       - name: Install Dependencies
         run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -r requirements.txt
-          python3 -m pip install -e .
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -m pip install -e .
 
       - name: Run Test Suite
-        run: python3 -m pytest -q
+        run: .venv/bin/python -m pytest -q
 
   stt-rust:
     name: STT Rust Build/Test
@@ -121,18 +122,19 @@ jobs:
       - name: Use runner Python runtime
         run: python3 --version
 
-      - name: Ensure pip is available
+      - name: Ensure Python tooling is available
         run: |
           python3 -m pip --version || (
             sudo apt-get update &&
-            sudo apt-get install -y --no-install-recommends python3-pip
+            sudo apt-get install -y --no-install-recommends python3-pip python3-venv
           )
 
       - name: Install Build Tooling
         run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -r requirements.txt
-          python3 -m pip install build twine
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -m pip install build twine
 
       - name: Compute artifact metadata
         id: meta
