@@ -9,6 +9,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   verify:
@@ -21,16 +22,10 @@ jobs:
         runner_arch: [X64, ARM64]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            pyproject.toml
+      - name: Use runner Python runtime
+        run: python3 --version
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -38,16 +33,16 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang cmake pkg-config
+          sudo apt-get install -y --no-install-recommends clang cmake pkg-config python3-pip
 
       - name: Install Python dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -e .
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+          python3 -m pip install -e .
 
       - name: Run Python tests
-        run: pytest -q
+        run: python3 -m pytest -q
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2

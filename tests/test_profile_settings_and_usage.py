@@ -380,6 +380,7 @@ def test_admin_ai_orchestration_endpoint_supports_probe_and_limit(monkeypatch):
         }
 
     monkeypatch.setattr(refiner_web, "_current_user", lambda: "alice")
+    monkeypatch.setattr(refiner_web.user_store, "has_users", lambda: True)
     monkeypatch.setattr(refiner_web, "_is_admin_user", lambda _user: True)
     monkeypatch.setattr(refiner_web, "orchestration_status", _fake_orchestration_status)
     monkeypatch.setattr(
