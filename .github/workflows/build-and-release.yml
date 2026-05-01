@@ -71,8 +71,8 @@ jobs:
       - name: Run Test Suite
         run: .venv/bin/python -m pytest -q
 
-  stt-rust:
-    name: STT Rust Build/Test
+  nmstt-rust:
+    name: nmstt Rust Build/Test
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 30
 
@@ -80,30 +80,66 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Detect nmstt Rust crate
+        id: nmstt_crate
+        run: |
+          candidates=()
+          if [[ -n "${NMSTT_DIR:-}" ]]; then
+            candidates+=("${NMSTT_DIR}")
+          fi
+          if [[ -n "${GITHUB_WORKSPACE:-}" ]]; then
+            candidates+=("${GITHUB_WORKSPACE}/../nmstt")
+            candidates+=("$(dirname "${GITHUB_WORKSPACE}")/nmstt")
+          fi
+          candidates+=("/home/pbisaacs/Developer/neuralmimicry/nmstt")
+
+          for candidate in "${candidates[@]}"; do
+            if [[ -f "${candidate}/Cargo.toml" ]]; then
+              resolved="$(cd "${candidate}" && pwd)"
+              echo "path=${resolved}" >> "$GITHUB_OUTPUT"
+              echo "manifest=${resolved}/Cargo.toml" >> "$GITHUB_OUTPUT"
+              echo "present=true" >> "$GITHUB_OUTPUT"
+              echo "Using nmstt crate at ${resolved}"
+              exit 0
+            fi
+          done
+
+          echo "path=" >> "$GITHUB_OUTPUT"
+          echo "manifest=" >> "$GITHUB_OUTPUT"
+          echo "present=false" >> "$GITHUB_OUTPUT"
+          echo "No nmstt crate detected on this runner."
+
       - name: Setup Rust Toolchain
+        if: steps.nmstt_crate.outputs.present == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Native Build Dependencies
+        if: steps.nmstt_crate.outputs.present == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config clang
+          sudo apt-get install -y cmake pkg-config clang libclang-dev
 
       - name: Cache Rust Artifacts
+        if: steps.nmstt_crate.outputs.present == 'true'
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: stt_rust
 
-      - name: Build STT Rust Crate
-        run: cargo build --locked --manifest-path stt_rust/Cargo.toml
+      - name: Build nmstt Rust Crate
+        if: steps.nmstt_crate.outputs.present == 'true'
+        run: cargo build --locked --manifest-path "${{ steps.nmstt_crate.outputs.manifest }}"
 
-      - name: Test STT Rust Crate
-        run: cargo test --locked --manifest-path stt_rust/Cargo.toml --all-targets
+      - name: Test nmstt Rust Crate
+        if: steps.nmstt_crate.outputs.present == 'true'
+        run: cargo test --locked --manifest-path "${{ steps.nmstt_crate.outputs.manifest }}" --all-targets
+
+      - name: Skip nmstt Rust Crate checks
+        if: steps.nmstt_crate.outputs.present != 'true'
+        run: echo "No nmstt Cargo.toml was detected on this runner; skipping Rust service build/test."
 
   package-release:
     name: Package Release
     needs:
       - test
-      - stt-rust
+      - nmstt-rust
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
     if: >-
