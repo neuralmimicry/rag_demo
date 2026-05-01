@@ -38,6 +38,8 @@ def test_job_workspace_create_enqueues_background_task(monkeypatch):
     job.workspace_env = {}
 
     _setup_workspace_auth(monkeypatch, job)
+    monkeypatch.setattr(refiner_web, "CONTINUUM_API_BASE", "http://continuum.local")
+    monkeypatch.setattr(refiner_web, "CONTINUUM_VM_PUBLIC_KEY_ID", "pk-123")
     monkeypatch.setattr(refiner_web, "_continuum_ready", lambda: True)
     monkeypatch.setattr(refiner_web, "_continuum_enabled", lambda: True)
     monkeypatch.setattr(refiner_web, "CONTINUUM_IDE_URL_TEMPLATE", "https://ide.local/{vm_id}")

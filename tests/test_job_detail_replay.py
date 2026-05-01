@@ -48,6 +48,7 @@ def test_job_detail_includes_solver_replay_analysis(monkeypatch, tmp_path):
     )
 
     monkeypatch.setattr(refiner_web, "_current_user", lambda: "integration_tester")
+    monkeypatch.setattr(refiner_web.user_store, "has_users", lambda: True)
     monkeypatch.setattr(refiner_web, "_can_view_job", lambda user, current_job: True)
     monkeypatch.setattr(refiner_web, "_is_admin_user", lambda user: True)
     monkeypatch.setattr(refiner_web, "_redact_log_entries", lambda logs, is_admin: logs)
