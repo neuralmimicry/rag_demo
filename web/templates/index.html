@@ -132,6 +132,26 @@
         <div><span>Subtasks active</span><strong id="subtaskInflight">--</strong></div>
       </div>
     </div>
+    <div class="status-card llm-telemetry-summary" id="llmTelemetrySummary" hidden>
+      <div class="llm-telemetry-head">
+        <div class="workers-head">
+          <span class="label">LLM Telemetry</span>
+          <button type="button" class="ghost workers-detail-btn" id="llmTelemetryOpen">Drill Down</button>
+        </div>
+        <span class="value" id="llmTelemetryRequests">--</span>
+        <div class="llm-telemetry-meta">
+          <span id="llmTelemetryWindow">Window: --</span>
+          <span id="llmTelemetryRetention">Retention: --</span>
+        </div>
+      </div>
+      <div class="llm-telemetry-grid">
+        <div><span>Success rate</span><strong id="llmTelemetrySuccessRate">--</strong></div>
+        <div><span>Quota errors</span><strong id="llmTelemetryQuotaErrors">--</strong></div>
+        <div><span>Avg latency</span><strong id="llmTelemetryLatency">--</strong></div>
+        <div><span>Janitor</span><strong id="llmTelemetryJanitor">--</strong></div>
+      </div>
+      <div id="llmTelemetryInlineStatus" class="status-banner" hidden></div>
+    </div>
   </section>
 
   <main class="control-grid">
@@ -604,7 +624,7 @@
             </div>
 
             <div class="field">
-              <label for="extraArgs" class="has-tip" data-tooltip="Raw CLI arguments passed to run_refiner.py. Use this for anything not covered above.">Extra CLI Args (optional)</label>
+              <label for="extraArgs" class="has-tip" data-tooltip="Raw CLI arguments passed to the refiner.run_refiner workflow router. Use this for anything not covered above.">Extra CLI Args (optional)</label>
               <input id="extraArgs" type="text" placeholder="--llm-timeout 120 --post-comments">
             </div>
 
@@ -675,10 +695,79 @@
             </form>
           </div>
 
+          <div class="credential-panel settings-panel">
+            <div class="card-header">
+              <h3 class="has-tip" data-tooltip="Profile-backed defaults applied by assistant flows and job submission when workflow fields are left blank.">Execution Defaults</h3>
+              <p>Control your default LLM settings, assistant behaviour, and solver safety mode without editing raw API payloads.</p>
+            </div>
+            <p id="llmDefaultsSummary" class="subtitle settings-summary">Loading profile-backed defaults...</p>
+            <form id="profileSettingsForm" class="secret-form settings-form" autocomplete="off">
+              <div class="field grid-2">
+                <div>
+                  <label for="defaultLlmProvider">Default LLM Provider</label>
+                  <select id="defaultLlmProvider">
+                    <option value="">Use config default</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="gemini">Gemini</option>
+                    <option value="ollama">Ollama</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="defaultLlmModel">Default LLM Model</label>
+                  <input id="defaultLlmModel" type="text" placeholder="gpt-5.2-codex">
+                </div>
+              </div>
+              <div class="field grid-2">
+                <div>
+                  <label for="defaultReasoningEffort">Default Reasoning Effort</label>
+                  <select id="defaultReasoningEffort">
+                    <option value="none">None</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="xhigh">XHigh</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="defaultAssistantProfile">Assistant Default Profile</label>
+                  <select id="defaultAssistantProfile">
+                    <option value="requirements">Requirements</option>
+                    <option value="marketing">Marketing</option>
+                  </select>
+                </div>
+              </div>
+              <div class="field grid-2">
+                <div>
+                  <label for="solverPolicyMode">Solver Command Policy</label>
+                  <select id="solverPolicyMode">
+                    <option value="standard">Standard</option>
+                    <option value="strict">Strict</option>
+                  </select>
+                  <p class="subtitle settings-note">Strict mode blocks all non-verification and non-read-only VCS solver commands.</p>
+                </div>
+                <div class="settings-checks">
+                  <label class="check">
+                    <input id="assistantUseMemory" type="checkbox" checked>
+                    Use assistant memory by default
+                  </label>
+                  <label class="check">
+                    <input id="showSolverReplay" type="checkbox" checked>
+                    Show solver replay panels in job detail
+                  </label>
+                </div>
+              </div>
+              <div id="profileSettingsStatus" class="status-banner" hidden></div>
+              <div class="actions">
+                <button type="button" id="saveProfileSettings" class="primary">Save Defaults</button>
+                <button type="button" id="revertProfileSettings" class="ghost">Revert</button>
+              </div>
+            </form>
+          </div>
+
           <div class="cli-builder">
             <div class="card-header">
               <h3 class="has-tip" data-tooltip="Click a bubble to open a pop-up with choices. Your selections build a CLI args string you can apply below.">CLI Args Builder</h3>
-              <p>Click bubbles to add flags and options. This helps build accurate run_refiner.py arguments.</p>
+              <p>Click bubbles to add flags and options. This helps build accurate `refiner.run_refiner` arguments.</p>
             </div>
             <div class="bubble-row" id="cliBubbles"></div>
             <div id="bubblePopover" class="bubble-popover" hidden>
@@ -816,6 +905,95 @@
         <button type="button" class="ghost" id="transferModalCancel">Cancel</button>
         <button type="button" class="primary" id="transferModalConfirm">Confirm</button>
       </div>
+    </div>
+  </div>
+
+  <div id="llmTelemetryModal" class="modal" data-open="false" aria-hidden="true" hidden>
+    <div class="modal-content llm-telemetry-modal-content">
+      <div class="modal-header">
+        <h3>LLM Request Telemetry</h3>
+        <button type="button" id="llmTelemetryModalClose" class="ghost">Close</button>
+      </div>
+      <p class="subtitle" id="llmTelemetryModalSubtitle">Aggregated request telemetry from Postgres. Raw event lines remain in per-job <code>events.jsonl</code> files on shared job storage.</p>
+      <div class="telemetry-filter-grid">
+        <div class="field">
+          <label for="llmTelemetryScopeFilter">Scope</label>
+          <select id="llmTelemetryScopeFilter">
+            <option value="">All scopes</option>
+            <option value="team">Team</option>
+            <option value="user">User</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="llmTelemetrySubjectFilter">Subject</label>
+          <input id="llmTelemetrySubjectFilter" type="text" placeholder="team-123 or alice">
+        </div>
+        <div class="field">
+          <label for="llmTelemetryHoursFilter">Window</label>
+          <select id="llmTelemetryHoursFilter">
+            <option value="24">24 hours</option>
+            <option value="72" selected>72 hours</option>
+            <option value="168">7 days</option>
+            <option value="720">30 days</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="llmTelemetryProviderFilter">Provider</label>
+          <input id="llmTelemetryProviderFilter" type="text" placeholder="openai">
+        </div>
+        <div class="field">
+          <label for="llmTelemetryModelFilter">Model</label>
+          <input id="llmTelemetryModelFilter" type="text" placeholder="gpt-5.4">
+        </div>
+        <div class="field">
+          <label for="llmTelemetryCategoryFilter">Category</label>
+          <input id="llmTelemetryCategoryFilter" type="text" placeholder="codingagent">
+        </div>
+      </div>
+      <div class="assistant-actions">
+        <button type="button" class="ghost" id="llmTelemetryModalApply">Apply Filters</button>
+        <button type="button" class="ghost" id="llmTelemetryModalRefresh">Refresh</button>
+      </div>
+      <div class="admin-status-grid llm-telemetry-stats" id="llmTelemetryModalStats"></div>
+      <div class="llm-telemetry-section">
+        <div class="section-title">Top Provider / Model Groups</div>
+        <div class="telemetry-table-wrap">
+          <table class="telemetry-table">
+            <thead>
+              <tr>
+                <th>Provider</th>
+                <th>Model</th>
+                <th>Category</th>
+                <th>Requests</th>
+                <th>Success</th>
+                <th>Quota</th>
+                <th>Avg Latency</th>
+                <th>Last Event</th>
+              </tr>
+            </thead>
+            <tbody id="llmTelemetryGroupsBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="llm-telemetry-section">
+        <div class="section-title">Top Subjects</div>
+        <div class="telemetry-table-wrap">
+          <table class="telemetry-table">
+            <thead>
+              <tr>
+                <th>Scope</th>
+                <th>Subject</th>
+                <th>Requests</th>
+                <th>Success</th>
+                <th>Errors</th>
+                <th>Last Event</th>
+              </tr>
+            </thead>
+            <tbody id="llmTelemetrySubjectsBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div id="llmTelemetryModalStatus" class="status-banner" hidden></div>
     </div>
   </div>
 

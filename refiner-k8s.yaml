@@ -172,7 +172,7 @@ spec:
       volumes:
         - name: job-data
           persistentVolumeClaim:
-            claimName: refiner-job-data
+            claimName: refiner-job-data-shared
 ---
 apiVersion: v1
 kind: Service
@@ -194,7 +194,7 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: refiner-job-data
+  name: refiner-job-data-shared
   namespace: refiner
   labels:
     app.kubernetes.io/name: refiner
@@ -202,7 +202,8 @@ metadata:
     nmc.neuralmimicry.ai/workload: refiner
 spec:
   accessModes:
-    - ReadWriteOnce
+    - ReadWriteMany
+  storageClassName: continuum-shared
   resources:
     requests:
-      storage: 10Gi
+      storage: 20Gi

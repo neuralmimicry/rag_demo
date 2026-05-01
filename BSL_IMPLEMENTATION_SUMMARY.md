@@ -6,7 +6,7 @@ The STT service now properly handles British Sign Language (BSL) grammar, which 
 
 ## What Was Implemented
 
-### 1. BSL Text Transformation (`stt_rust/src/main.rs`)
+### 1. BSL Text Transformation (`../nmstt/src/main.rs`)
 
 Added `transform_to_bsl_order()` function that transforms English text to BSL grammar:
 
@@ -81,7 +81,7 @@ All tests pass ✓
 
 ### 5. API Documentation Updates
 
-Updated `stt_rust/openapi_stt.yaml`:
+Updated `../nmstt/openapi_stt.yaml`:
 - Added `bsl_text` field to `TranscribeResponse` schema
 - Added `bsl_text` field to `GesturePlanResponse` schema
 - Documented BSL grammar transformations
@@ -166,7 +166,7 @@ Created `BSL_INTEGRATION_GUIDE.md` with:
 
 ### Modified
 ```
-stt_rust/src/main.rs
+../nmstt/src/main.rs
   - Added transform_to_bsl_order() function
   - Updated SttResponse struct (added bsl_text field)
   - Updated GesturePlanResponse struct (added bsl_text field)
@@ -174,7 +174,7 @@ stt_rust/src/main.rs
   - Modified plan_gesture_motion() to use BSL text for timeline
   - Added 6 unit tests for BSL transformations
 
-stt_rust/openapi_stt.yaml
+../nmstt/openapi_stt.yaml
   - Added bsl_text field documentation
   - Documented BSL grammar rules
   - Added transformation examples
@@ -200,7 +200,7 @@ BSL_IMPLEMENTATION_SUMMARY.md
 ### Run Tests
 
 ```bash
-cd stt_rust
+cd /home/pbisaacs/Developer/neuralmimicry/nmstt
 cargo test bsl -- --nocapture
 ```
 
@@ -265,7 +265,7 @@ curl -X POST http://localhost:7079/gesture-plan \
 
 Run tests to verify implementation:
 ```bash
-cd stt_rust
+cd /home/pbisaacs/Developer/neuralmimicry/nmstt
 cargo test
 ```
 

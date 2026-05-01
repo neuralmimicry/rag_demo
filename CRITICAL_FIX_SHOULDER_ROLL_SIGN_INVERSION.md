@@ -38,7 +38,7 @@ pose.right_shoulder_roll += 0.44; // Making it POSITIVE → more down/back
 
 ## The Fix
 
-**File**: `/home/pbisaacs/Developer/neuralmimicry/rag_demo/stt_rust/src/main.rs`
+**File**: `/home/pbisaacs/Developer/neuralmimicry/nmstt/src/main.rs`
 
 ### Change 1: BSL Rest Pose (lines 914-915)
 ```rust
@@ -82,7 +82,7 @@ pose.right_shoulder_roll -= blend.shoulder_roll * intensity * right_bias;
 
 ### Test Results
 ```bash
-cd /home/pbisaacs/Developer/neuralmimicry/rag_demo/stt_rust
+cd /home/pbisaacs/Developer/neuralmimicry/nmstt
 cargo test
 ```
 **Output**: ✅ All 12 tests passing
@@ -108,7 +108,7 @@ cargo build --release
 
 1. **Restart STT Service**:
    ```bash
-   cd /home/pbisaacs/Developer/neuralmimicry/rag_demo/stt_rust
+   cd /home/pbisaacs/Developer/neuralmimicry/nmstt
    cargo build --release
    # Then restart the service with the new binary
    ```
@@ -139,7 +139,7 @@ After fix:
 
 ## Related Files
 
-- Backend pose generation: `stt_rust/src/main.rs` (lines 907-942, 1297-1304)
+- Backend pose generation: `../nmstt/src/main.rs` (lines 907-942, 1297-1304)
 - Frontend pose mapping: `ChatOfficeEnvironment.jsx` (lines 803-855)
 - Previous intensity fix: `BSL_ARM_MOVEMENT_FIX.md`
 - Complete implementation: `BSL_IMPLEMENTATION_SUMMARY.md`

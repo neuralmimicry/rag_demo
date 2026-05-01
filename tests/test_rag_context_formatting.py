@@ -1,5 +1,5 @@
 import pytest
-from rag_engine import RagMatch
+from refiner.rag_engine import RagMatch
 
 refiner_web = pytest.importorskip("refiner_web", exc_type=ImportError)
 

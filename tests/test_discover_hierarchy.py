@@ -1,9 +1,7 @@
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-import discover_hierarchy as dh
-
-
+from refiner import discover_hierarchy as dh
 def test_keywords_cql_builds_query():
     cql = dh._keywords_cql(["CTO", "DNP"])  # noqa: SLF001 accessing internal for test
     assert 'title ~ "CTO"' in cql and 'text ~ "DNP"' in cql
@@ -92,7 +90,7 @@ def test_load_discovery_config_env_overrides(monkeypatch):
     assert dc.enabled is True and dc.keywords == ["X", "Y"]
 
 
-@patch("discover_hierarchy.requests.get")
+@patch("refiner.discover_hierarchy.requests.get")
 def test_discover_hierarchy_smoke(requests_get):
     # Mock Confluence response
     requests_get.return_value = Mock(

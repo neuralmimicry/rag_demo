@@ -1,9 +1,7 @@
 import csv
 from types import SimpleNamespace as NS
 
-import main as m
-
-
+from refiner import main as m
 def make_epic(epic_key: str, epic_name_field_id: str, epic_name_value: str):
     # Epic issue carrying the custom Epic Name field (no summary provided)
     fields = NS(

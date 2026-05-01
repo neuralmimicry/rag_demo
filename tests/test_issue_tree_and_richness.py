@@ -1,8 +1,8 @@
 import pytest
 import datetime as dt
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
-from atlassian_utils import IssueInfo
+from refiner.topic_researcher import TopicResearcher
+from refiner.atlassian_utils import IssueInfo
 
 @pytest.fixture
 def mock_llm():
@@ -13,9 +13,9 @@ def mock_llm():
 
 @pytest.fixture
 def researcher(mock_llm):
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
-        with patch("topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
-            with patch("topic_researcher.TopicResearcher._fetch_available_containers"):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
+        with patch("refiner.topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
+            with patch("refiner.topic_researcher.TopicResearcher._fetch_available_containers"):
                 r = TopicResearcher(
                     jira_base_url="https://test.atlassian.net",
                     jira_auth=("user", "token"),
@@ -48,7 +48,7 @@ def test_evaluate_issue_richness(researcher):
     assert "Minimal information" in evaluation["observations"]
     assert "Potentially stale" in evaluation["observations"]
 
-@patch("topic_researcher.jira_fetch_issues")
+@patch("refiner.topic_researcher.jira_fetch_issues")
 def test_fetch_issue_tree(mock_jira_fetch, researcher):
     # Mock parent issue
     parent_issue = MagicMock(spec=IssueInfo)
@@ -82,7 +82,7 @@ def test_fetch_issue_tree(mock_jira_fetch, researcher):
     
     assert mock_jira_fetch.call_count == 2
 
-@patch("topic_researcher.jira_fetch_issues")
+@patch("refiner.topic_researcher.jira_fetch_issues")
 def test_execute_jql_with_context(mock_jira_fetch, researcher):
     issue = MagicMock(spec=IssueInfo)
     issue.key = "ISSUE-1"

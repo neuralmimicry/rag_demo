@@ -1,23 +1,23 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
+from refiner.topic_researcher import TopicResearcher
 
 @pytest.fixture(autouse=True)
 def mock_research_cache(tmp_path):
-    with patch("topic_researcher.RESEARCH_CACHE_ROOT", str(tmp_path)):
+    with patch("refiner.topic_researcher.RESEARCH_CACHE_ROOT", str(tmp_path)):
         yield str(tmp_path)
 
 @pytest.fixture
 def mock_llm_provider():
-    with patch("topic_researcher.get_provider") as mock_get:
+    with patch("refiner.topic_researcher.get_provider") as mock_get:
         mock_llm = MagicMock()
         mock_llm.get_context_window.return_value = 8192
         mock_llm.estimate_tokens.side_effect = lambda x: len(x) // 4
         mock_get.return_value = mock_llm
         yield mock_llm
 
-@patch('topic_researcher._conf_get')
-@patch('topic_researcher.jira_fetch_issues')
+@patch('refiner.topic_researcher._conf_get')
+@patch('refiner.topic_researcher.jira_fetch_issues')
 def test_link_following_jira_to_confluence(mock_jira_fetch, mock_conf_get, mock_llm_provider):
     # 1. Setup mocks
     researcher = TopicResearcher(jira_base_url="https://test.atlassian.net", jira_auth=("u", "p"), llm_provider="openai")

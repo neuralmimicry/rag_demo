@@ -1,0 +1,27 @@
+[
+  {
+    "id": "rewrites_follow_up_query",
+    "query": "What about failures?",
+    "history": [
+      {
+        "role": "user",
+        "content": "How does the customer sync work?"
+      }
+    ],
+    "expected": {
+      "rewritten": true,
+      "retrieval_query": "How does the customer sync work What about failures?",
+      "reason": "follow_up_rewritten"
+    }
+  },
+  {
+    "id": "keeps_standalone_query_unchanged",
+    "query": "How does the customer sync work?",
+    "history": [],
+    "expected": {
+      "rewritten": false,
+      "retrieval_query": "How does the customer sync work?",
+      "reason": "no_history"
+    }
+  }
+]

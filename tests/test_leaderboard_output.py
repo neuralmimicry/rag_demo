@@ -1,9 +1,7 @@
 import csv
 from pathlib import Path
 
-import main as m
-
-
+from refiner import main as m
 def test_leaderboard_output_writes_csv(tmp_path: Path, monkeypatch):
     out = tmp_path / "leaderboard.csv"
     # Redirect output path

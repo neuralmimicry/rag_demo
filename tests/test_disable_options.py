@@ -1,10 +1,10 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
-from discover_hierarchy import discover_hierarchy
+from refiner.topic_researcher import TopicResearcher
+from refiner.discover_hierarchy import discover_hierarchy
 
 def test_topic_researcher_disable_jira():
-    with patch('topic_researcher._jira_get') as mock_jira_get:
+    with patch('refiner.topic_researcher._jira_get') as mock_jira_get:
         researcher = TopicResearcher(
             jira_base_url="https://test.atlassian.net",
             jira_auth=("user", "pass"),
@@ -15,7 +15,7 @@ def test_topic_researcher_disable_jira():
         mock_jira_get.assert_not_called()
 
 def test_topic_researcher_disable_confluence():
-    with patch('topic_researcher._conf_get') as mock_conf_get:
+    with patch('refiner.topic_researcher._conf_get') as mock_conf_get:
         researcher = TopicResearcher(
             jira_base_url="https://test.atlassian.net",
             jira_auth=("user", "pass"),
@@ -27,8 +27,8 @@ def test_topic_researcher_disable_confluence():
 
 def test_discover_hierarchy_disable_all():
     mock_jira_client = MagicMock()
-    with patch('discover_hierarchy._probe_confluence') as mock_probe_conf, \
-         patch('discover_hierarchy._probe_jira') as mock_probe_jira:
+    with patch('refiner.discover_hierarchy._probe_confluence') as mock_probe_conf, \
+         patch('refiner.discover_hierarchy._probe_jira') as mock_probe_jira:
         
         config = {"discovery": {"enabled": True}}
         discover_hierarchy(
@@ -44,8 +44,8 @@ def test_discover_hierarchy_disable_all():
         mock_probe_jira.assert_not_called()
 
 def test_topic_researcher_execute_queries_respects_flags():
-    with patch('topic_researcher._jira_get') as mock_jira_get, \
-         patch('topic_researcher._conf_get') as mock_conf_get:
+    with patch('refiner.topic_researcher._jira_get') as mock_jira_get, \
+         patch('refiner.topic_researcher._conf_get') as mock_conf_get:
         
         researcher = TopicResearcher(
             jira_base_url="https://test.atlassian.net",

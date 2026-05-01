@@ -1,4 +1,4 @@
-from stt_gesture_planner import plan_stt_avatar_motion, sanitize_gesture_mode
+from refiner.stt_gesture_planner import plan_stt_avatar_motion, sanitize_gesture_mode
 
 
 def _max_abs_pose_value(payload, key: str) -> float:

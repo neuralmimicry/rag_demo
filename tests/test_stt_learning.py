@@ -1,6 +1,6 @@
 import os
 
-from stt_learning import SttLearningStore
+from refiner.stt_learning import SttLearningStore
 
 
 def _write(path: str, content: str) -> None:

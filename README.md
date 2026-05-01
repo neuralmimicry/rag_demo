@@ -10,10 +10,40 @@ Key aspects:
 - Multi-workflow CLI: a single entry point drives Jira statistics, Jira quality analysis, Confluence space analysis, topic research, and project solving.
 - Project solver: scan a local folder for requirement signals, derive a plan with an LLM, and optionally apply file edits/run commands.
 - Agentic workflows: explicit plan → act → verify → reflect loops, verification-first execution, and role-based LLM overrides for planning/review.
+- Concurrent AI orchestration: LLM-backed workflows can now fan out across multiple provider/model candidates per role, score the responses, and retain rolling health/quality telemetry for future routing decisions.
+- Neuromorphic specialist support: Refiner can attach multiple concurrent SNN/AER specialist engines for neuromorphic tasks, keep an AARNN path available by default, and use offline AER translation when a live runtime is not present.
 - Refinement principle: every run should improve the solution in a measurable, qualitative, and quantifiable way, with attention to efficiency and performance where applicable. This principle is core to the Refiner name.
 - Reuse & traceability: generated/updated modules are intended to be modular, tracked against requirement IDs, and paired with tests/examples to aid cross-project reuse.
 - Privacy for reuse: reusable modules must be scrubbed of user/company-identifying information to prevent cross-project leakage.
 - Codebase intent/workflow reference: see [CODEBASE_INTENT_AND_WORKFLOW.md](CODEBASE_INTENT_AND_WORKFLOW.md).
+- AI orchestration details: see [REFINER_AI_ORCHESTRATION.md](REFINER_AI_ORCHESTRATION.md).
+
+## Platform split
+Refiner is now the orchestration and public-API gateway layer in a split multi-service platform.
+The public frontend still talks only to `https://api.neuralmimicry.ai`, but Refiner now delegates specific responsibilities to dedicated sibling projects:
+
+- Authentication, registration, sessions, profile management, and voice-token ownership: [`../customers`](../customers/README.md)
+- Token balances, payment capture, and ledger/account APIs: [`../billing`](../billing/README.md)
+- Speech-to-text and gesture planning: [`../nmstt`](../nmstt/README.md)
+- Auditable identity/payment/token event ledger: [`../nmchain`](../nmchain)
+- Estate planning, approvals, and governed execution control: [`../conductor`](../conductor/README.md)
+- Release/operate surfaces, worker scaling, workspace infrastructure, and platform telemetry: [`../nmc`](../nmc/README.md)
+
+Internal routing still follows the same edge path:
+
+- public site: `https://neuralmimicry.ai`
+- API host: `https://api.neuralmimicry.ai`
+- first internal hop: `vega.neuralmimicry.ai`
+- onward service routing: `spirit.neuralmimicry.ai` and the Continuum tenant workloads
+
+Detailed service boundaries and interaction flows are documented in [SERVICE_SPLIT_ARCHITECTURE.md](SERVICE_SPLIT_ARCHITECTURE.md).
+In the Continuum deployment, Customers defaults to the shared Postgres tenant service for identity records, Refiner job/workspace data is expected on the NFS-backed `continuum-shared` storage class, and `nmstt` model assets are likewise expected on shared NFS-backed storage.
+
+Lifecycle ownership follows the current delivery split:
+
+- Refiner owns code/build/test/iterate workflows and the public execution-facing API surface.
+- Conductor owns plan/govern workflows, staged approvals, and estate-wide execution control.
+- Continuum owns release/operate surfaces, deployment/runtime scale, and workspace/platform APIs.
 
 
 ## Quickstart
@@ -26,24 +56,37 @@ Key aspects:
 - Optionally export environment variables (see below) to supply credentials and overrides.
 
 3) Run (choose a workflow)
-- Default Jira statistics: refiner (or python run_refiner.py)
+- Default Jira statistics: refiner (or python -m refiner.run_refiner)
 - Jira quality analysis: refiner --analyze-jira --projects CAT --output jira_report.html
 - Confluence analysis: refiner --analyze-confluence --space CAT --output confluence_report.html --use-rovo
 - Topic research: refiner --topic-research req.txt --output researched_document.md --llm-provider openai
 - Project solver: refiner --project /path/to/project --llm-provider openai --output project_solution.json
 
 ## Runtime components
-- CLI workflows: `run_refiner.py` / `refiner`
-- Backend UI + JSON API: `python refiner_web.py` (defaults to `127.0.0.1:5001`)
-- Frontend-only helper server: `python frontend_server.py` (defaults to `0.0.0.0:8080`)
-- Native STT sidecar: [`stt_rust/`](stt_rust/README.md) (defaults to `127.0.0.1:7079`)
+- CLI workflows: `refiner` or `python -m refiner.run_refiner`
+- Backend UI + JSON API: `python -m refiner.refiner_web` (defaults to `127.0.0.1:5001`)
+- Frontend-only helper server: `python -m refiner.frontend_server` (defaults to `0.0.0.0:8080`)
+- Customers identity service: [`../customers`](../customers/README.md) (defaults to `127.0.0.1:5010`)
+- Billing service: [`../billing`](../billing/README.md) (defaults to `127.0.0.1:5020`)
+- Native STT service: [`../nmstt`](../nmstt/README.md) (defaults to `127.0.0.1:7079`)
 
-Useful local URLs after starting `refiner_web.py`:
+Useful local URLs after starting `python -m refiner.refiner_web`:
 - Swagger UI: `http://127.0.0.1:5001/api/docs`
 - OpenAPI JSON: `http://127.0.0.1:5001/api/docs/openapi.json`
 - API health: `http://127.0.0.1:5001/api/health`
 - Public docs health helper: `http://127.0.0.1:5001/health`
 - Version info: `http://127.0.0.1:5001/api/version`
+
+## Package layout
+
+The `refiner/` package now keeps the public entry points stable while the implementation is split into domain packages:
+
+- `refiner/runtime/` - Flask runtime, API wiring, configuration, logging, and environment helpers
+- `refiner/workflows/` - Jira, Confluence, research, delivery, inbox, solver, and reporting workflows
+- `refiner/integrations/` - Atlassian, MCP, platform, search, STT, and VCS adapters
+- `refiner/ai/` - provider adapters, orchestration, model inventory, retrieval, and other AI-focused helpers
+
+Compatibility wrapper modules still exist at the top level under `refiner/` so existing imports such as `refiner.refiner_web` and `python -m refiner.run_refiner` continue to work.
 
 ## Release workflow
 
@@ -55,21 +98,33 @@ GitHub Actions release automation lives in `.github/workflows/build-and-release.
 - manual `workflow_dispatch` runs can package artifacts from any ref.
 - publish steps only run from a `v*` tag ref, either automatically on tag push or manually from `workflow_dispatch`.
 
-`versioning.py` still derives a git-aware runtime build identity for the UI and APIs. That build metadata is exposed alongside `release_version`, but it does not override the packaged release version from `pyproject.toml`.
+`refiner/versioning.py` still derives a git-aware runtime build identity for the UI and APIs. That build metadata is exposed alongside `release_version`, but it does not override the packaged release version from `pyproject.toml`.
 
 ## Web UI + API auth
-The web UI is backed by the same Flask server (`refiner_web.py`). It uses session cookies, with dedicated JSON endpoints for headless or cloud-hosted frontends.
+The web UI is backed by the same Flask server module (`refiner.refiner_web`). It uses session cookies, with dedicated JSON endpoints for headless or cloud-hosted frontends.
 
 ### Current JSON API surface
-- Auth + profile: `/api/setup`, `/api/login`, `/api/logout`, `/api/session`, `/api/profile`, `/api/sso/issue`, `/api/oidc/exchange`
-- Assistant + planning: `/api/assistant/requirements`, `/api/assistant/form-fill`, `/api/assistant/rag-mcp`, `/api/playground/plan`
+- Auth + profile: `/api/setup`, `/api/register`, `/api/login`, `/api/login/mfa/totp`, `/api/logout`, `/api/session`, `/api/profile`, `/api/profile/password`, `/api/profile/mfa/totp/*`, `/api/profile/passkeys/register/*`, `/api/profile/passkeys/<credential_id>`, `/api/passkeys/authenticate/*`, `/api/sso/issue`, `/api/oidc/exchange`
+- Assistant + planning: `/api/assistant/requirements`, `/api/assistant/form-fill`, `/api/assistant/rag-mcp`, `/api/playground/plan`, `/api/execution/plan`
 - Voice + capture: `/api/voice/tokens`, `/api/voice/capture`, `/api/voice/siri`, `/api/voice/alexa`, `/api/voice/google`, `/api/voice/stt`
 - Jobs + workspaces: `/api/jobs`, `/api/jobs/estimate`, `/api/jobs/<job_id>/workspace`, `/api/jobs/<job_id>/editor/*`, `/api/jobs/<job_id>/logs`, `/api/jobs/<job_id>/actions`, `/api/jobs/<job_id>/transfer`, `/api/jobs/<job_id>/archive`
 - Inbox automation: `/api/todos`, `/api/todos/next`, `/api/todos/<todo_id>/route`, `/api/todos/<todo_id>/schedule`, `/api/schedules`, `/api/subtasks`
 - Access + collaboration: `/api/projects`, `/api/teams`, `/api/teams/<team_id>/tokens`, `/api/access/tree`, `/api/sessions`, `/api/sessions/<session_id>/stream`
-- Admin + operations: `/api/health`, `/api/version`, `/api/capabilities`, `/api/admin/stats`, `/api/workers/telemetry`, `/api/audit`, `/api/secrets`, `/api/github/tree`
+- Admin + operations: `/api/health`, `/api/version`, `/api/capabilities`, `/api/admin/stats`, `/api/admin/ai-orchestration`, `/api/workers/telemetry`, `/api/audit`, `/api/secrets`, `/api/github/tree`
 
 For the detailed route inventory and example payloads, see [API_DOCS_README.md](API_DOCS_README.md) and [`openapi_refiner.yaml`](openapi_refiner.yaml).
+
+When `REFINER_CUSTOMERS_API_BASE` is configured, the auth/profile/voice-token routes above are proxied to Customers so the public contract remains stable while the identity implementation lives in the separate service.
+
+`GET /api/profile` now returns the current user's notification email plus validated profile-backed defaults for:
+- LLM provider/model/reasoning effort,
+- assistant profile + assistant memory,
+- solver command policy mode, and
+- UI replay visibility.
+
+`POST /api/profile` can update either the email, the settings block, or both in one request. In local/Postgres-backed mode these settings are stored under the user's metadata record; the Control Room Global Settings tab now exposes them directly.
+
+When Refiner is running on the shared Continuum stack, job-scoped `token_usage` and `llm_request` events are still mirrored into each job's `events.jsonl` artifact under the NFS-backed job workspace, while aggregated provider latency/success telemetry is rolled up hourly in the shared Postgres control-plane store. Admin operators can inspect the recent aggregate through `GET /api/admin/stats` under the `llm_request_telemetry` field.
 
 ## RAG + MCP integrations
 Refiner now includes lightweight RAG indexing (for unstructured documents) and MCP connectivity (for structured, action-oriented external systems).
@@ -79,7 +134,7 @@ Refiner now includes lightweight RAG indexing (for unstructured documents) and M
 - `POST /api/rag/query` — retrieve the top matches and a combined context block.
 - `GET /api/rag/indexes` — list your indexes.
 - `DELETE /api/rag/index/<name>` — delete an index.
- - `POST /api/assistant/rag-mcp` — ask a question with optional RAG context and optional MCP tool data.
+ - `POST /api/assistant/rag-mcp` — ask a question with optional RAG context, optional MCP tool data, and optional explicit Jira/Confluence write actions.
 
 RAG indexes are stored per user under `job_data/rag/` and only accept file paths within `REFINER_RAG_ALLOWED_ROOTS` (defaults to the repo root + `job_data`). Chunk sizes and limits can be tuned via:
 - `REFINER_RAG_CHUNK_SIZE` (default 1200 chars)
@@ -98,21 +153,58 @@ RAG indexes are stored per user under `job_data/rag/` and only accept file paths
 - `POST /api/mcp/servers/<name>/resource` — read a resource by URI.
 
 MCP endpoints are admin-only because they can execute actions in external systems. Store OAuth/Bearer tokens when registering the server; responses mask secrets.
+Raw MCP tokens and custom headers are moved into the encrypted Refiner secret store; the shared Postgres/file registry persists secret references and runtime metadata, not the plaintext secret material.
+
+### Atlassian write actions
+
+`POST /api/assistant/rag-mcp` also accepts an optional `atlassian` object for explicit Jira or Confluence write actions when the user request calls for it.
+
+- supported Jira actions: `create_issue`, `update_issue`, `transition_issue`, `upsert_comment`
+- supported Confluence actions: `create_page`, `update_page`, `upsert_comment`
+- request shape: `product`, `action`, optional `instance`, optional `confirmed`, optional `preview`, and `arguments`
+- instance resolution uses the existing `config.json -> instances` entries and the existing Jira credentials from `JIRA_USERNAME` / `JIRA_PASSWORD`
+- semantic cache stays disabled for live external actions
+- `REFINER_ASSISTANT_BLOCK_UNSAFE_TOOL_REQUESTS=1` requires explicit confirmation unless the request is in preview mode
 
 ### Capability inventory
 - `GET /api/capabilities` — returns a snapshot of detected workflows, features, and API groups.
 - Add `?refresh=1` to rescan the codebase.
 
+## AI orchestration
+
+Refiner now includes a shared orchestration layer for LLM-backed workflows:
+
+- shared provider registry and rolling quality/latency tracking,
+- concurrent planner/researcher/reviewer fan-out across configured candidates,
+- JSON-aware response scoring for structured routes such as playground planning and form-fill,
+- optional configured specialisation weights/roles in `config.json -> ai_orchestration`, and
+- concurrent SNN/AER specialist-engine profiles for neuromorphic tasks, with an AARNN fallback path auto-attached when no explicit AARNN engine is configured.
+
+The default metrics file is `job_data/ai/provider_metrics.json`.
+Operator-facing orchestration status is exposed through `GET /api/health` and `GET /api/admin/stats`, and delivery pipeline reports now preserve project-solver orchestration metadata under `ai_orchestration`.
+For deeper operator inspection, `GET /api/admin/ai-orchestration` returns the provider registry, engine registry, and condensed candidate metrics used by the admin dashboard panel.
+The admin dashboard panel supports client-side filtering, per-section sorting, and JSON/CSV export of the current visible orchestration view.
+Engine registry entries can mix AARNN and other `snn_aer`-style specialist runtimes concurrently alongside the LLM registry.
+See [REFINER_AI_ORCHESTRATION.md](REFINER_AI_ORCHESTRATION.md) for the workflow-by-workflow breakdown and specialist-engine configuration.
+
 ### API auth endpoints
 - `POST /api/login` with JSON `{ "username": "...", "password": "..." }` sets the session cookie.
+- `POST /api/login/mfa/totp` completes a pending authenticator-app sign-in challenge after password verification.
 - `POST /api/logout` clears the session cookie.
-- `GET /api/session` returns `{ authenticated, user, role }`.
+- `GET /api/session` returns the shared identity contract, including `groups`, `group_memberships`, `manageable_groups`, `visible_groups`, `can_manage_access`, `service_access`, and `visible_services`.
 - `POST /api/setup` creates the first admin account (only allowed when no users exist).
+- `POST /api/register` creates a self-service local account when self-registration is enabled.
+- `POST /api/profile/mfa/totp/start`, `/verify`, and `/disable` manage authenticator-app 2FA for Customers-backed local accounts.
+- `POST /api/profile/passkeys/register/options`, `POST /api/profile/passkeys/register/verify`, `DELETE /api/profile/passkeys/<credential_id>`, `POST /api/passkeys/authenticate/options`, and `POST /api/passkeys/authenticate/verify` manage passkey enrolment and passkey sign-in for Customers-backed local accounts.
 - `POST /api/sso/issue` issues a short-lived, one-time SSO token (requires an authenticated session).
 - `GET /sso?token=...&next=/` exchanges the SSO token for a first-party session and redirects.
 - `POST /api/oidc/exchange` exchanges an OIDC authorisation code (PKCE) or `id_token` for a Refiner session and SSO token.
 
-The web login and setup pages now call these endpoints directly.
+The web login, registration, and setup pages now call these endpoints directly.
+
+When Customers-backed auth is enabled, Refiner requires `service_access.refiner.can_use` for authenticated product access and treats `service_access.refiner.can_control` as admin-equivalent for dashboard controls and admin routes.
+Customers-issued service-account bearer tokens are supported for backend calls, but they keep only their explicit groups and public visibility. Refiner does not grant service accounts the human `refiner:use` fallback, so `service_access.refiner` must be issued explicitly.
+When Customers-backed auth is enabled, the browser sign-in and registration flow also exposes optional authenticator-app 2FA enrolment and passkey registration/sign-in through the proxied Customers routes.
 
 ### Cross-origin setup (cloud frontend + public backend)
 Set these environment variables on the backend:
@@ -121,7 +213,7 @@ Set these environment variables on the backend:
 - `REFINER_TRUST_PROXY`: set to `1` if TLS is terminated by a proxy/load balancer.
 - `REFINER_HOST`: set to `0.0.0.0` for public bind.
 
-Cookies default to `SameSite=None` + `Secure` when CORS is enabled. Use `REFINER_COOKIE_SAMESITE` / `REFINER_SECURE_COOKIES` to override.
+Cookies default to `SameSite=None` + `Secure` when CORS is enabled, and the session cookie name defaults to `nm_refiner_session`. Use `REFINER_SESSION_COOKIE_NAME`, `REFINER_COOKIE_SAMESITE`, or `REFINER_SECURE_COOKIES` to override.
 
 For OIDC SPA flows, add the frontend callback URL to `REFINER_OIDC_ALLOWED_REDIRECT_URIS` so `/api/oidc/exchange` can reuse the same redirect URI used during authorisation.
 
@@ -144,13 +236,13 @@ On the frontend, set the API base:
    - `REFINER_ENFORCE_HTTPS=1`
    - `REFINER_TRUST_PROXY=1` (if TLS terminates upstream)
    - `REFINER_CORS_ORIGINS=https://your-frontend.example,https://your-amplify-branch.amplifyapp.com`
-   - `REFINER_COOKIE_SAMESITE=None` and `REFINER_SECURE_COOKIES=1`
+   - `REFINER_SESSION_COOKIE_NAME=nm_refiner_session`, `REFINER_COOKIE_SAMESITE=None`, and `REFINER_SECURE_COOKIES=1`
    - Serve the API host with a publicly trusted TLS certificate (for example via cert-manager + `letsencrypt-prod`). Browsers reject self-signed certs with `ERR_CERT_AUTHORITY_INVALID`.
 3) Point the frontend at the backend origin using `rag-api-base` or `window.__RAG_API_BASE` (for this website: `https://api.neuralmimicry.ai`, not `/auth`).
 4) Bootstrap the first user with `POST /api/setup`, then log in with `POST /api/login`.
 
 ### Voice STT (native arm64, on-prem)
-Refiner supports an on-prem speech-to-text path for `/api/voice/stt` using the Rust service in [`stt_rust/`](stt_rust/README.md), so browser audio can be transcribed locally without cloud STT vendors.
+Refiner supports an on-prem speech-to-text path for `/api/voice/stt` using the standalone Rust service in [`../nmstt`](../nmstt/README.md), so browser audio can be transcribed locally without cloud STT vendors.
 
 Recommended backend env:
 - `REFINER_STT_BACKEND=server`
@@ -158,6 +250,9 @@ Recommended backend env:
 - `REFINER_STT_SERVER_TIMEOUT=25`
 - `REFINER_STT_SERVER_PREPROCESS=0` (skip ffmpeg-style preprocess in server mode)
 - `REFINER_STT_SERVER_SEND_PROMPT=0` (default `0`, keep prompt hints local unless explicitly required)
+
+For the split Continuum deployment, point `REFINER_STT_SERVER_URL` at the tenant service:
+`http://nmstt.nmstt.svc.cluster.local:7079`.
 
 Privacy-safe STT learning (optional, enabled by default):
 - `REFINER_STT_LEARNING_ENABLED=1`
@@ -170,19 +265,19 @@ seeded site content. By default these hints are used locally (not retransmitted 
 Set `REFINER_STT_SERVER_SEND_PROMPT=1` only when remote prompt hints are required.
 For command backend parity, include `{prompt}` in `REFINER_STT_ARGS` if your STT CLI supports prompt hints.
 
-For a native `arm64` Ubuntu systemd deployment, use:
-- `stt_rust/refiner-stt.service`
-- `stt_rust/native_arm64_46core.env` (preset tuned for 46 cores)
+For a native `arm64` Ubuntu systemd deployment, use the artifacts in `../nmstt`:
+- `nmstt.service`
+- `native_arm64_46core.env` (preset tuned for 46 cores)
 
 User-level systemd unit (repo-local paths, no root user required):
-- `stt_rust/refiner-stt-user.service`
+- `nmstt-user.service`
 
-Robust local launcher (STT + `refiner_web.py` with health checks and restart loop):
+Robust local launcher (STT + `python -m refiner.refiner_web` with health checks and restart loop):
 - `./scripts/start_refiner_stack.sh`
 - If no model is found locally, it auto-downloads `ggml-tiny.en.bin` from the official `ggerganov/whisper.cpp` Hugging Face repo.
-- Optional explicit model: `STT_MODEL=/path/to/ggml-*.bin ./scripts/start_refiner_stack.sh`
-- Optional profile override: `STT_MODEL_PROFILE=base.en ./scripts/start_refiner_stack.sh`
-- Optional URL override: `STT_MODEL_URL=https://.../ggml-model.bin ./scripts/start_refiner_stack.sh`
+- Optional explicit model: `NMSTT_MODEL=/path/to/ggml-*.bin ./scripts/start_refiner_stack.sh`
+- Optional profile override: `NMSTT_MODEL_PROFILE=base.en ./scripts/start_refiner_stack.sh`
+- Optional URL override: `NMSTT_MODEL_URL=https://.../ggml-model.bin ./scripts/start_refiner_stack.sh`
 - One-shot mode (no restart loop): `./scripts/start_refiner_stack.sh --once`
 
 ### Prometheus/Grafana metrics
@@ -216,9 +311,14 @@ User email configuration:
 - API jobs can provide `notify_email` in the job payload to override per job.
 
 ### Token ledger & billing integration
-Refiner exposes a token ledger used by the commercial portal.
+Refiner exposes the same token ledger contract used by the commercial portal, but the implementation can now be delegated to Billing.
 
 Key endpoints:
+- `GET /billing` — customer billing dashboard HTML proxied to Billing.
+- `GET /billing/admin` — admin billing dashboard HTML proxied to Billing.
+- `GET /billing/assets/<filename>` — Billing dashboard assets proxied through the public API host.
+- `GET /api/billing/dashboard/customer` — customer dashboard JSON sourced from Billing and nmchain.
+- `GET /api/billing/dashboard/admin` — admin portfolio/anomaly dashboard JSON sourced from Billing and nmchain.
 - `GET /api/tokens` — current balance, reserved, in‑use, capacity, and low threshold.
 - `POST /api/tokens` — actions: `review`, `add`, `cashout`, `sync` (balance reconciliation).
 - `GET /api/tokens/ledger` — recent ledger entries for audit.
@@ -235,14 +335,15 @@ Notes:
   - `REFINER_CHAIN_API_TOKEN=<refiner-app-token>`
   - `REFINER_CHAIN_APP_ID=refiner`
 - When `REFINER_CHAIN_API_BASE` is configured, Refiner mirrors successful local/OIDC/SSO logins to `nmchain` and routes token top-up, grant, cashout, refund, reservation, release, debit, and sync writes through the chain-backed ledger.
+- When `REFINER_BILLING_API_BASE` is configured, Refiner proxies browser token routes and Billing Intelligence dashboard routes to Billing and uses Billing's internal account/event/payment APIs for service-side accounting.
 
 ### Container build and deployment (Podman + Kubernetes)
 The `Containerfile` is now aligned for both local container runtime use and Kubernetes:
 - non-root runtime user (`uid/gid 10001`)
 - writable job-data volume at `/app/job_data`
 - built-in healthcheck against `/api/health`
-- built-in Rust STT binary for the managed stack launcher
-- explicit entrypoint modes: `full` (managed STT + `refiner_web.py`), `backend` (backend only, for external STT), `frontend`, `tests`, `smoke`, `cli`
+- external `nmstt` integration for the managed stack launcher
+- explicit entrypoint modes: `full` (Refiner plus external/local `nmstt` resolution), `backend` (backend only), `frontend`, `tests`, `smoke`, `cli`
 
 #### 1) Build image locally
 Refiner stamps runtime build metadata from explicit build args, so the Control Room build version can show as `x.y.zzzz` and change on every commit without copying `.git` into the build context. Official release tags and Python package artifacts still follow `pyproject.toml`.
@@ -272,8 +373,8 @@ Frontend helper mode:
 
 Default/full mode:
 - `podman run --rm -p 5001:5001 -v "$(pwd)/job_data:/app/job_data:Z" refiner:latest`
-- This starts the same managed STT + `refiner_web.py` stack as `./scripts/start_refiner_stack.sh`.
-- If no STT model is present, the container auto-downloads it into `/app/job_data/models`.
+- This starts the same `./scripts/start_refiner_stack.sh` workflow as the repo checkout.
+- Provide `REFINER_STT_SERVER_URL` for the normal split deployment path, or mount a sibling `../nmstt` checkout if you want the launcher to start a local `nmstt` process.
 
 Run full automated test suite inside the image:
 - `podman run --rm refiner:latest tests`
@@ -449,7 +550,7 @@ The default Jira statistics workflow can (optionally) run discovery, refine your
 
 
 ## Workflow overview
-Workflow selection order (run_refiner.py):
+Workflow selection order (`refiner.run_refiner`):
 1) --topic-research
 2) --delivery
 3) --project
@@ -470,7 +571,7 @@ Summary of workflows:
 
 
 ## Workflow diagrams
-### Workflow selection (run_refiner.py)
+### Workflow selection (`refiner.run_refiner`)
 ```mermaid
 flowchart TD
     A[Start: parse CLI arguments] --> B[Configure logging and environment overrides]
@@ -1159,6 +1260,7 @@ Inputs
 - If the solver workspace exists (explicit or implied), its files are scanned as their own requirement sources and TODO/FIXME notes there are treated as requirements.
 - If a previous solver output JSON exists, the solver resumes from the last incomplete requirement source instead of restarting; completed sources are skipped and prior action logs are reused.
 - Failed commands trigger an automatic debug/retry cycle with a recovery plan.
+- Recent replay data now feeds compact operational guidance back into prompt construction so repeated verification failures, unstable command shapes, and prompt-budget omissions are surfaced before the next iteration.
 - Optional web research augments planning with external guidance when search credentials are available; results are injected into prompts and recorded in the output.
 
 #### Output
@@ -1200,6 +1302,8 @@ Inputs
 - The solver passes through existing `OPENAI_API_KEY`/`GEMINI_API_KEY` values to OpenCode when available.
 - If `OPENCODE_COMMAND_TEMPLATE` is not set, the solver defaults to `opencode run --format json --file <prompt>`, and you can set `OPENCODE_MODEL` to choose a provider/model.
 - `OPENCODE_MODEL` should be in `provider/model` form (e.g., `openai/gpt-4o`, `anthropic/claude-sonnet-4-5`).
+- `SOLVER_EPISODIC_MEMORY_LIMIT` / `SOLVER_EPISODIC_MEMORY_MAX_CHARS` tune how much durable solver-memory context is injected per requirement source.
+- `SOLVER_FEEDBACK_MEMORY_LIMIT` / `SOLVER_FEEDBACK_MAX_CHARS` tune how much replay-derived operational guidance is injected alongside that memory.
 - Configure providers with `opencode auth login` and verify with `opencode auth list` (see `opencode.txt` or opencode.ai/docs).
 
 #### Settings
@@ -1218,23 +1322,24 @@ Inputs
 - Install in editable mode: pip install -e .
 - Console entry point: refiner
 - Module entry point: python -m refiner.cli
-- run_refiner.py remains for convenience and defers to the same workflow.
+- Canonical workflow router: `python -m refiner.run_refiner`
+- The `refiner` console script and `python -m refiner.cli` both delegate to the same router.
 
 
 ## Project structure (high level)
-- __init__.py: exposes a minimal API
-- run_refiner.py: unified CLI workflow selector (Jira stats, Jira analysis, Confluence analysis, topic research, project solver)
-- cli.py: console entry point that delegates to run_refiner.run()
-- main.py: orchestrates configuration, discovery, fetching, processing, and outputs for the default Jira statistics workflow
-- jira_analysis.py: Jira project/issue quality analysis and HTML report generation
-- confluence_analysis.py: Confluence space quality analysis and HTML report generation
-- topic_researcher.py: topic research (RAG), document drafting, and references output
-- project_solver.py: requirement extraction, planning, and optional code application
-- agentic_workflow.py: shared plan/act/verify/reflect workflow engine
-- repo_context.py: lightweight repo context indexing for the solver
-- web_research.py: shared web search/fetch/summarise utilities
-- discover_hierarchy.py: probes Confluence/Jira to refine scope and discover fields
-- analyze_issue_transitions.py, get_monthly_worklog_times.py, seconds_to_work_units.py, normalize_name.py, sorting_key.py: helpers
+- refiner/__init__.py: exposes the public package API
+- refiner/run_refiner.py: unified CLI workflow selector (Jira stats, Jira analysis, Confluence analysis, topic research, project solver)
+- refiner/cli.py: console entry point that delegates to run_refiner.run()
+- refiner/main.py: orchestrates configuration, discovery, fetching, processing, and outputs for the default Jira statistics workflow
+- refiner/jira_analysis.py: Jira project/issue quality analysis and HTML report generation
+- refiner/confluence_analysis.py: Confluence space quality analysis and HTML report generation
+- refiner/topic_researcher.py: topic research (RAG), document drafting, and references output
+- refiner/project_solver.py: requirement extraction, planning, and optional code application
+- refiner/agentic_workflow.py: shared plan/act/verify/reflect workflow engine
+- refiner/repo_context.py: lightweight repo context indexing for the solver
+- refiner/web_research.py: shared web search/fetch/summarise utilities
+- refiner/discover_hierarchy.py: probes Confluence/Jira to refine scope and discover fields
+- tests/legacy_root_wrappers/analyze_issue_transitions.py, tests/legacy_root_wrappers/get_monthly_worklog_times.py, tests/legacy_root_wrappers/seconds_to_work_units.py, tests/legacy_root_wrappers/normalize_name.py, tests/legacy_root_wrappers/sorting_key.py: helpers
 - tests/: pytest suite with offline mocks
 
 

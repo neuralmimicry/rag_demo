@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher, GoogleSearchEngine
+from refiner.topic_researcher import TopicResearcher, GoogleSearchEngine
 
 @pytest.fixture
 def mock_llm():
@@ -12,8 +12,8 @@ def mock_llm():
 
 @pytest.fixture
 def researcher(mock_llm):
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
-        with patch("topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
+        with patch("refiner.topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
             return TopicResearcher(
                 jira_base_url="https://test.atlassian.net",
                 jira_auth=("user", "token"),
@@ -41,8 +41,8 @@ def test_google_search_engine_success():
     assert results[0]["title"] == "Result 1"
     assert results[0]["url"] == "https://example.com/1"
 
-@patch("topic_researcher.jira_fetch_issues")
-@patch("topic_researcher._conf_get")
+@patch("refiner.topic_researcher.jira_fetch_issues")
+@patch("refiner.topic_researcher._conf_get")
 def test_execute_queries_with_google_search(mock_conf, mock_jira, researcher):
     mock_jira.return_value = []
     mock_conf.return_value = {"results": []}

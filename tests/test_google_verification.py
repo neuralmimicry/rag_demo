@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher, GoogleSearchEngine, MockSearchEngine
+from refiner.topic_researcher import TopicResearcher, GoogleSearchEngine, MockSearchEngine
 import requests
 
 @pytest.fixture
@@ -40,8 +40,8 @@ def test_google_search_verify_failure():
         assert "Invalid API key" in msg
 
 def test_topic_researcher_fallback_on_verify_failure(mock_llm):
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
-        with patch("topic_researcher.GoogleSearchEngine.verify", return_value=(False, "Unauthorized")):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
+        with patch("refiner.topic_researcher.GoogleSearchEngine.verify", return_value=(False, "Unauthorized")):
             researcher = TopicResearcher(
                 jira_base_url="https://test.atlassian.net",
                 jira_auth=("user", "token"),
@@ -53,8 +53,8 @@ def test_topic_researcher_fallback_on_verify_failure(mock_llm):
             assert isinstance(researcher.search_engine, MockSearchEngine)
 
 def test_topic_researcher_success_on_verify(mock_llm):
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
-        with patch("topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
+        with patch("refiner.topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
             researcher = TopicResearcher(
                 jira_base_url="https://test.atlassian.net",
                 jira_auth=("user", "token"),

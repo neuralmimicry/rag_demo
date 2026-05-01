@@ -55,7 +55,15 @@
           <p class="subtitle">Enter your credentials to access the Refiner Control Room.</p>
           <p id="authError" class="auth-error" {% if not error %}hidden{% endif %}>{{ error }}</p>
           {% if local_enabled %}
-          <form id="authForm" data-auth="login" data-next="{{ next_path or '/' }}" method="post" class="auth-form">
+          <form
+            id="authForm"
+            data-auth="login"
+            data-next="{{ next_path or '/' }}"
+            data-password-min-length="{{ password_min_length }}"
+            data-passkeys-supported="{{ 'true' if passkeys_supported else 'false' }}"
+            method="post"
+            class="auth-form"
+          >
             <div class="field">
               <label for="username">Username</label>
               <input id="username" name="username" type="text" required>
@@ -64,7 +72,7 @@
               <label for="password">Password</label>
               <input id="password" name="password" type="password" required>
             </div>
-            <button type="submit" class="primary">Login</button>
+            <button type="submit" class="primary">Sign in</button>
           </form>
           {% endif %}
           {% if oidc_enabled %}
@@ -72,6 +80,9 @@
           <div class="auth-divider">or</div>
           {% endif %}
           <a class="primary auth-oidc" href="{{ url_for('oidc_login', next=(next_path or '/')) }}">{{ oidc_label }}</a>
+          {% endif %}
+          {% if self_registration_enabled %}
+          <p class="subtitle auth-footnote">Need an account? <a class="inline-link" href="{{ url_for('register', next=(next_path or '/')) }}">Create one</a>.</p>
           {% endif %}
         </div>
       </div>

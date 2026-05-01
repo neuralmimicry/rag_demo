@@ -19,6 +19,10 @@ if [ -z "${REFINER_FRONTEND_PORT:-}" ] && [ -n "${PORT:-}" ]; then
   export REFINER_FRONTEND_PORT="$PORT"
 fi
 
+BACKEND_MODULE="${REFINER_BACKEND_MODULE:-refiner.refiner_web}"
+FRONTEND_MODULE="${REFINER_FRONTEND_MODULE:-refiner.frontend_server}"
+CLI_MODULE="${REFINER_CLI_MODULE:-refiner.run_refiner}"
+
 gpu_status="not_detected"
 gpu_source="none"
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -46,22 +50,29 @@ echo "Refiner: GPU detection=${gpu_status} source=${gpu_source}"
 
 case "$mode" in
   backend)
-    exec python refiner_web.py "$@"
+    exec python -m "$BACKEND_MODULE" "$@"
     ;;
   frontend)
-    exec python frontend_server.py "$@"
+    exec python -m "$FRONTEND_MODULE" "$@"
     ;;
   tests|test|suite)
+    if [ ! -d tests ]; then
+      echo "Tests are not bundled in this runtime image." >&2
+      exit 1
+    fi
     if [ "$#" -gt 0 ]; then
       exec pytest "$@"
     fi
     exec pytest tests
     ;;
   smoke)
-    exec python -m py_compile refiner_web.py run_refiner.py "$@"
+    if [ -f refiner/refiner_web.py ] && [ -f refiner/run_refiner.py ]; then
+      exec python -m py_compile refiner/refiner_web.py refiner/run_refiner.py "$@"
+    fi
+    exec python -c 'from refiner import refiner_web, run_refiner'
     ;;
   cli)
-    exec python run_refiner.py "$@"
+    exec python -m "$CLI_MODULE" "$@"
     ;;
   full|combined|stack)
     exec ./scripts/start_refiner_stack.sh "$@"

@@ -2,7 +2,7 @@ import pytest
 import json
 import os
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher, RESEARCH_CACHE_ROOT
+from refiner.topic_researcher import TopicResearcher, RESEARCH_CACHE_ROOT
 
 @pytest.fixture
 def mock_llm():
@@ -13,10 +13,10 @@ def mock_llm():
 
 @pytest.fixture
 def researcher(mock_llm, tmp_path):
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
-        with patch("topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
+        with patch("refiner.topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
             # Redirect cache to tmp_path
-            with patch("topic_researcher.RESEARCH_CACHE_ROOT", str(tmp_path)):
+            with patch("refiner.topic_researcher.RESEARCH_CACHE_ROOT", str(tmp_path)):
                 r = TopicResearcher(
                     jira_base_url="https://test.atlassian.net",
                     jira_auth=("user", "token"),
@@ -30,9 +30,9 @@ def test_name_cache_persistence(mock_llm, tmp_path):
     cache_dir = tmp_path / ".research_cache"
     cache_dir.mkdir()
     
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
-        with patch("topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
-            with patch("topic_researcher.RESEARCH_CACHE_ROOT", str(cache_dir)):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
+        with patch("refiner.topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
+            with patch("refiner.topic_researcher.RESEARCH_CACHE_ROOT", str(cache_dir)):
                 r = TopicResearcher(
                     jira_base_url="https://test.atlassian.net",
                     jira_auth=("user", "token"),

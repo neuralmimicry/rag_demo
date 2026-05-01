@@ -58,6 +58,26 @@ def register_jobs_routes(app, handlers: Dict[str, Callable]) -> None:
         methods=["PATCH", "DELETE"],
     )
     app.add_url_rule(
+        "/api/teams/<team_id>/invite",
+        view_func=handlers["api_team_invite"],
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/api/team-invitations/<membership_id>/accept",
+        view_func=handlers["api_team_invitation_accept"],
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/api/team-invitations/<membership_id>/reject",
+        view_func=handlers["api_team_invitation_reject"],
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/api/teams/<team_id>/leave",
+        view_func=handlers["api_team_leave"],
+        methods=["POST"],
+    )
+    app.add_url_rule(
         "/api/teams/<team_id>/tokens",
         view_func=handlers["api_team_tokens"],
         methods=["GET", "POST"],
@@ -86,15 +106,6 @@ def register_jobs_routes(app, handlers: Dict[str, Callable]) -> None:
         view_func=handlers["export_requirements"],
         methods=["POST"],
     )
-
-    app.add_url_rule("/api/rag/indexes", view_func=handlers["rag_indexes"], methods=["GET"])
-    app.add_url_rule("/api/rag/index", view_func=handlers["rag_index_create"], methods=["POST"])
-    app.add_url_rule(
-        "/api/rag/index/<name>",
-        view_func=handlers["rag_index_delete"],
-        methods=["DELETE"],
-    )
-    app.add_url_rule("/api/rag/query", view_func=handlers["rag_query"], methods=["POST"])
 
     app.add_url_rule("/api/mcp/servers", view_func=handlers["mcp_servers"], methods=["GET", "POST"])
     app.add_url_rule(
@@ -206,6 +217,11 @@ def register_jobs_routes(app, handlers: Dict[str, Callable]) -> None:
         methods=["POST"],
     )
 
+    app.add_url_rule("/billing", view_func=handlers["billing_dashboard"])
+    app.add_url_rule("/billing/admin", view_func=handlers["billing_dashboard_admin"])
+    app.add_url_rule("/billing/assets/<path:filename>", view_func=handlers["billing_dashboard_asset"])
+    app.add_url_rule("/api/billing/dashboard/customer", view_func=handlers["billing_dashboard_customer"])
+    app.add_url_rule("/api/billing/dashboard/admin", view_func=handlers["billing_dashboard_admin_data"])
     app.add_url_rule("/api/tokens", view_func=handlers["tokens"], methods=["GET", "POST"])
     app.add_url_rule("/api/tokens/ledger", view_func=handlers["tokens_ledger"])
     app.add_url_rule("/api/secrets", view_func=handlers["secrets"], methods=["GET", "POST"])

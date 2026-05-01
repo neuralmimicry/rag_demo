@@ -3,9 +3,7 @@ import builtins
 from datetime import datetime
 from unittest.mock import Mock, patch
 
-import main as m
-
-
+from refiner import main as m
 def test_seconds_to_work_units():
     assert m.seconds_to_work_units(0) == 0
     assert m.seconds_to_work_units(14399) == 0

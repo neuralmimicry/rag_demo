@@ -1,7 +1,7 @@
 import pytest
 import json
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
+from refiner.topic_researcher import TopicResearcher
 
 @pytest.fixture
 def mock_llm():
@@ -13,9 +13,9 @@ def mock_llm():
 
 @pytest.fixture
 def researcher(mock_llm):
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
-        with patch("topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
-            with patch("topic_researcher.TopicResearcher._fetch_available_containers"):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
+        with patch("refiner.topic_researcher.GoogleSearchEngine.verify", return_value=(True, "Success")):
+            with patch("refiner.topic_researcher.TopicResearcher._fetch_available_containers"):
                 r = TopicResearcher(
                     jira_base_url="https://test.atlassian.net",
                     jira_auth=("user", "token"),

@@ -1,7 +1,7 @@
 import pytest
 import os
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
+from refiner.topic_researcher import TopicResearcher
 
 @pytest.fixture
 def mock_llm():
@@ -12,7 +12,7 @@ def mock_llm():
 
 @pytest.fixture
 def researcher(mock_llm):
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
         return TopicResearcher(
             jira_base_url="https://test.atlassian.net",
             jira_auth=("user", "token"),
@@ -48,8 +48,8 @@ def test_bibliography_preserves_locator_hints(researcher):
 
     assert "[System Spec](https://example.com/spec.pdf) (pages 1-3)" in bib
 
-@patch("topic_researcher.jira_fetch_issues")
-@patch("topic_researcher._conf_get")
+@patch("refiner.topic_researcher.jira_fetch_issues")
+@patch("refiner.topic_researcher._conf_get")
 def test_bibliography_saving_in_run(mock_conf_get, mock_jira_fetch, researcher, tmp_path, mock_llm):
     # Setup mocks for run
     mock_llm.predict.side_effect = [

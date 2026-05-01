@@ -1,10 +1,10 @@
 import flask
 import pytest
-from thought_inbox import build_route_suggestion, build_thought_item, merge_duplicate_capture, score_query_match
+from refiner.thought_inbox import build_route_suggestion, build_thought_item, merge_duplicate_capture, score_query_match
 
 HAS_REAL_FLASK = hasattr(flask.Flask, "test_client")
 if HAS_REAL_FLASK:
-    import refiner_web  # noqa: E402
+    from refiner import refiner_web  # noqa: E402
 
 
 def _setup_authenticated_user(monkeypatch, username="alice"):

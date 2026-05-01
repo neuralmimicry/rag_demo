@@ -2,9 +2,7 @@ import json
 import os
 import time
 
-import main as m
-
-
+from refiner import main as m
 def test_cache_compaction_dedups_and_trims(tmp_path, monkeypatch):
     # Point cache file to a temp location
     cache_path = tmp_path / ".issues_cache.jsonl"

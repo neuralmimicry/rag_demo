@@ -1,15 +1,15 @@
 # Refiner API Documentation
 
 Refiner exposes three HTTP surfaces:
-- `refiner_web.py`: the main backend and Control Room UI (`127.0.0.1:5001` by default)
-- `frontend_server.py`: an optional frontend-only shell (`0.0.0.0:8080` by default)
-- `stt_rust`: an optional Rust speech-to-text service (`127.0.0.1:7079` by default)
+- `python -m refiner.refiner_web`: the main backend and Control Room UI (`127.0.0.1:5001` by default)
+- `python -m refiner.frontend_server`: an optional frontend-only shell (`0.0.0.0:8080` by default)
+- `nmstt`: the standalone speech-to-text and gesture-planning service (`127.0.0.1:7079` by default)
 
-This document tracks the backend routes that are actually registered today. The matching backend OpenAPI spec lives in `openapi_refiner.yaml`, and the STT service spec lives in `stt_rust/openapi_stt.yaml`.
+This document tracks the backend routes that are actually registered today. The matching backend OpenAPI spec lives in `openapi_refiner.yaml`, and the speech-service spec lives in `../nmstt/openapi_stt.yaml`.
 
 ## Backend docs endpoints
 
-Starting the backend with `python refiner_web.py` registers the documentation helper routes from `api_docs.py`.
+Starting the backend with `python -m refiner.refiner_web` registers the documentation helper routes from `refiner/api_docs.py`.
 
 Public routes:
 - `GET /api/docs` - Swagger UI shell for the backend OpenAPI spec
@@ -24,7 +24,7 @@ Backend routes that are always part of the Flask app:
 
 Notes:
 - The Swagger UI HTML is served locally, but the Swagger assets are loaded from jsDelivr at runtime.
-- If you embed `refiner_web.app` in another runner instead of launching `python refiner_web.py`, call `api_docs.add_api_documentation_support(app, ...)` yourself if you want `/api/docs` and `/health`.
+- If you embed `refiner.refiner_web.app` in another runner instead of launching `python -m refiner.refiner_web`, call `refiner.api_docs.add_api_documentation_support(app, ...)` yourself if you want `/api/docs` and `/health`.
 
 ## Authentication model
 
@@ -33,7 +33,7 @@ Primary backend auth is session-cookie based:
 - `POST /api/login` starts a session and also returns a short-lived SSO token.
 - `POST /api/logout` clears the current session.
 - `GET /api/session` reports whether the caller is authenticated.
-- `GET/POST /api/profile` reads or updates the current user's email.
+- `GET/POST /api/profile` reads or updates the current user's email plus profile-backed settings defaults for LLM, assistant, solver, and replay UI behaviour.
 
 Optional auth paths:
 - `POST /api/sso/issue` issues a one-time SSO token for the current session.
@@ -51,14 +51,15 @@ Voice and STT routes support additional auth patterns:
 - `GET /api/health` - backend health summary with workers, queue depth, scheduler, SSO store state, and STT learning status
 - `GET /api/version` - public version payload
 - `GET /api/capabilities` - current capability inventory for authenticated users
-- `GET /api/admin/stats` - admin-only usage and worker summary
+- `GET /api/admin/stats` - admin-only usage and worker summary, including recent `llm_request_telemetry` rollups when the shared Postgres control-plane store is enabled
+- `GET /api/admin/ai-orchestration` - admin-only AI orchestration drill-down, including provider registry entries, specialist engines, cached local-model inventory/download shortlist, and condensed candidate metrics; accepts `probe_engines=1` and `limit=<n>`
 - `GET /api/workers/telemetry` - worker/autoscaler telemetry for the Control Room
 - `GET /api/audit` - admin-only audit trail
 
 ### Assistant and planning
 - `POST /api/assistant/requirements` - requirements chat/drafting assistant; supports `mode`, `prompt`, `requirements_text`, `messages`, provider/model overrides, and gesture metadata
 - `POST /api/assistant/form-fill` - returns JSON suggestions for structured form fields
-- `POST /api/assistant/rag-mcp` - combines LLM prompting with optional RAG matches and an optional MCP tool call
+- `POST /api/assistant/rag-mcp` - combines LLM prompting with optional RAG matches, an optional MCP tool call, and an optional explicit Jira/Confluence write action
 - `POST /api/playground/plan` - returns a child-friendly build plan plus a ready-to-submit `job_payload`
 
 ### Voice and speech
@@ -144,6 +145,12 @@ Routed TODOs can currently submit jobs or invoke assistant workflows such as `/a
 - `POST /api/mcp/servers/<name>/call` - invoke a tool
 - `GET /api/mcp/servers/<name>/resources` - list resources
 - `POST /api/mcp/servers/<name>/resource` - fetch one resource by URI
+
+For `POST /api/assistant/rag-mcp`, the optional `atlassian` request object supports:
+- Jira: `create_issue`, `update_issue`, `transition_issue`, `upsert_comment`
+- Confluence: `create_page`, `update_page`, `upsert_comment`
+
+Write actions reuse the configured `config.json -> instances` Atlassian endpoints plus the existing Jira environment credentials, run through the same tool guard used for MCP, and support `confirmed` or `preview` execution modes.
 
 ### Tokens, refunds, secrets, and GitHub helpers
 - `GET/POST /api/tokens` - inspect or mutate a user's token balance (`review`, `add`, `cashout`, `grant`, `sync`)
@@ -290,34 +297,34 @@ curl -X POST http://127.0.0.1:5001/api/requirements/export \
   -o requirements_register.csv
 ```
 
-## STT service quick reference
+## nmstt quick reference
 
-The Rust STT service is documented separately in `stt_rust/README.md` and `stt_rust/openapi_stt.yaml`.
+The standalone speech service is documented separately in `../nmstt/README.md` and `../nmstt/openapi_stt.yaml`.
 
-Current Rust routes:
+Current `nmstt` routes:
 - `GET /health`
 - `POST /transcribe`
 - `POST /gesture-plan`
 
-The backend uses that service when `REFINER_STT_BACKEND=server` and `REFINER_STT_SERVER_URL` are configured.
+The backend uses that service when `REFINER_STT_SERVER_URL` is configured. `REFINER_STT_BACKEND=server` remains supported, but Refiner now infers server mode automatically when a speech-service URL is present.
 
 ## Verification
 
 Useful checks after updating backend routes or docs:
 
 ```bash
-python run_refiner.py --help
-python refiner_web.py
+python -m refiner.run_refiner --help
+python -m refiner.refiner_web
 curl http://127.0.0.1:5001/api/docs/openapi.json
 curl http://127.0.0.1:5001/api/health
 ```
 
 Relevant tests:
-- `tests/test_api_docs.py`
+- `tests/test_refiner/api_docs.py`
 - `tests/test_route_registration.py`
 - `tests/test_stt_server_resilience.py`
 - `tests/test_assistant_bsl_integration.py`
 
 ## Scope note
 
-`openapi_refiner.yaml` now describes the current backend route families and representative request/response shapes. The Markdown inventory above is the authoritative quick reference for the full route surface exposed by `refiner_routes/` and `refiner_web.py`.
+`openapi_refiner.yaml` now describes the current backend route families and representative request/response shapes. The Markdown inventory above is the authoritative quick reference for the full route surface exposed by `refiner_routes/` and the `refiner.refiner_web` backend module.

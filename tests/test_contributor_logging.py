@@ -1,11 +1,11 @@
 import pytest
 import logging
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
+from refiner.topic_researcher import TopicResearcher
 
-@patch("topic_researcher.get_provider")
-@patch("topic_researcher.jira_fetch_issues")
-@patch("topic_researcher._conf_get")
+@patch("refiner.topic_researcher.get_provider")
+@patch("refiner.topic_researcher.jira_fetch_issues")
+@patch("refiner.topic_researcher._conf_get")
 def test_contributor_logging(mock_conf_get, mock_jira_fetch, mock_get_provider, caplog):
     # Setup mocks
     mock_llm = MagicMock()
@@ -71,9 +71,9 @@ def test_contributor_logging(mock_conf_get, mock_jira_fetch, mock_get_provider, 
     if os.path.exists("test_out.md"):
         os.remove("test_out.md")
 
-@patch("topic_researcher.get_provider")
-@patch("topic_researcher._jira_get")
-@patch("topic_researcher._conf_get")
+@patch("refiner.topic_researcher.get_provider")
+@patch("refiner.topic_researcher._jira_get")
+@patch("refiner.topic_researcher._conf_get")
 def test_contributor_logging_from_source_urls(mock_conf_get, mock_jira_get, mock_get_provider, caplog):
     # Setup mocks
     mock_llm = MagicMock()
@@ -129,9 +129,9 @@ def test_contributor_logging_from_source_urls(mock_conf_get, mock_jira_get, mock
     if os.path.exists("test_out_urls.md"):
         os.remove("test_out_urls.md")
 
-@patch("topic_researcher.get_provider")
-@patch("topic_researcher.jira_fetch_issues")
-@patch("topic_researcher._conf_get")
+@patch("refiner.topic_researcher.get_provider")
+@patch("refiner.topic_researcher.jira_fetch_issues")
+@patch("refiner.topic_researcher._conf_get")
 def test_contributor_logging_from_fallback(mock_conf_get, mock_jira_fetch, mock_get_provider, caplog):
     # Setup mocks
     mock_llm = MagicMock()

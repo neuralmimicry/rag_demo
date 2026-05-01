@@ -11,7 +11,7 @@ The BSL gesture generation in the STT Rust service was **correctly generating** 
 ### Technical Details
 
 **Backend (STT Rust Service)** - ✅ Working Correctly
-- Location: `stt_rust/src/main.rs`
+- Location: `../nmstt/src/main.rs`
 - BSL templates defined with strong movement values (lines 1152-1236):
   - `greeting`: shoulder_pitch: 0.46, shoulder_roll: 0.68, elbow: 0.22
   - `question`: shoulder_pitch: 0.38, shoulder_roll: 0.56, elbow: 0.20
@@ -80,7 +80,7 @@ This ensures BSL signing movements are **clearly visible** and **stronger than g
 
 ### Backend Tests
 ```bash
-cd /home/pbisaacs/Developer/neuralmimicry/rag_demo/stt_rust
+cd /home/pbisaacs/Developer/neuralmimicry/nmstt
 cargo test bsl
 ```
 **Result**: ✅ All 5 BSL tests passing
@@ -152,10 +152,10 @@ This creates a clear distinction and ensures each mode serves its purpose.
 
 ## Related Files
 
-- Backend gesture generation: `stt_rust/src/main.rs` (lines 1438-1521)
+- Backend gesture generation: `../nmstt/src/main.rs` (lines 1438-1521)
 - Frontend motion extraction: `AIChatWidget.jsx` (lines 518-556)
 - Frontend motion playback: `AIChatWidget.jsx` (lines 757-806)
-- BSL text transformation: `stt_rust/src/main.rs` (lines 1355-1435)
+- BSL text transformation: `../nmstt/src/main.rs` (lines 1355-1435)
 - Frontend BSL text display: `AIChatWidget.jsx` (lines 2347-2361)
 
 ## Deployment
