@@ -1,10 +1,10 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from topic_researcher import TopicResearcher
+from refiner.topic_researcher import TopicResearcher
 
 @pytest.fixture
 def researcher():
-    with patch("topic_researcher.get_provider"):
+    with patch("refiner.topic_researcher.get_provider"):
         r = TopicResearcher(
             jira_base_url="https://test.atlassian.net",
             jira_auth=("user", "pass"),

@@ -1,6 +1,6 @@
 import datetime as dt
 
-from confluence_analysis import PageInfo, filter_pages_by_max_depth, compute_hierarchy_metrics
+from refiner.confluence_analysis import PageInfo, filter_pages_by_max_depth, compute_hierarchy_metrics
 
 
 def _page(id: str, title: str, depth: int, parent: str | None, children: list[str] | None = None):
@@ -84,7 +84,7 @@ def test_unknown_depth_pages_are_not_dropped():
     pages = build_tree()
     # Find c2 and append unknown child
     c2 = next(p for p in pages if p.id == "c2")
-    from confluence_analysis import PageInfo
+    from refiner.confluence_analysis import PageInfo
     u = PageInfo(
         id="u",
         title="unknown",

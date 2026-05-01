@@ -1,6 +1,5 @@
 def test_jira_fetch_issues_rest_pagination(monkeypatch):
-    import jira_analysis as ja
-
+    from refiner import jira_analysis as ja
     # Force REST path with page_size=100
     monkeypatch.setattr(ja, "_get_search_config", lambda: (False, 100))
 

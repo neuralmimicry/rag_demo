@@ -1,9 +1,9 @@
 import json
 from unittest.mock import MagicMock, patch
 
-import project_solver
-import web_research as wr
-from topic_researcher import (
+from refiner import project_solver
+from refiner import web_research as wr
+from refiner.topic_researcher import (
     BraveSearchEngine,
     DuckDuckGoSearchEngine,
     TavilySearchEngine,
@@ -30,7 +30,7 @@ def test_duckduckgo_search_engine_parses_html_results():
     """
     engine = wr.DuckDuckGoSearchEngine(timeout=5, max_results=5)
 
-    with patch("web_research.requests.post", return_value=_Response(status_code=200, text=html)):
+    with patch("refiner.web_research.requests.post", return_value=_Response(status_code=200, text=html)):
         results = engine.search("example query")
 
     assert results == [
@@ -52,7 +52,7 @@ def test_brave_search_engine_normalizes_results():
         }
     }
 
-    with patch("web_research.requests.get", return_value=_Response(status_code=200, payload=payload)):
+    with patch("refiner.web_research.requests.get", return_value=_Response(status_code=200, payload=payload)):
         results = engine.search("example query")
 
     assert results == [
@@ -72,7 +72,7 @@ def test_tavily_search_engine_normalizes_results():
         ]
     }
 
-    with patch("web_research.requests.post", return_value=_Response(status_code=200, payload=payload)):
+    with patch("refiner.web_research.requests.post", return_value=_Response(status_code=200, payload=payload)):
         results = engine.search("example query")
 
     assert results == [
@@ -119,7 +119,7 @@ def test_topic_researcher_supports_multi_provider_search_configs():
     mock_llm.get_context_window.return_value = 8192
     mock_llm.predict.return_value.text = ""
 
-    with patch("topic_researcher.get_provider", return_value=mock_llm):
+    with patch("refiner.topic_researcher.get_provider", return_value=mock_llm):
         researcher = TopicResearcher(
             jira_base_url="https://test.atlassian.net",
             jira_auth=("user", "token"),

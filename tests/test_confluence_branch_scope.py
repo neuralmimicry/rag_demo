@@ -1,6 +1,6 @@
 import datetime as dt
 
-from confluence_analysis import PageInfo, scope_pages_from_starting_depth, compute_hierarchy_metrics
+from refiner.confluence_analysis import PageInfo, scope_pages_from_starting_depth, compute_hierarchy_metrics
 
 
 def _page(id: str, title: str, depth: int | None, parent: str | None, children: list[str] | None = None):

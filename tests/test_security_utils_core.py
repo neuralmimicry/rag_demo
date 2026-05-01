@@ -1,8 +1,6 @@
 import json
 
-import security_utils as su
-
-
+from refiner import security_utils as su
 def test_redact_text_masks_known_secret_shapes():
     text = "API_KEY=abc123 sk-abcdefabcdefabcdef token=ghp_abcdefghijklmnopqrstuvwxyz"
     redacted = su.redact_text(text)

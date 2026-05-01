@@ -1,9 +1,7 @@
 import csv
 from types import SimpleNamespace as NS
 
-import main as m
-
-
+from refiner import main as m
 def make_issue(project_key="PRJ", epic_link=None, status_name="In Progress", done=False,
                assignee="Alice", created="2025-01-01", updated="2025-01-02",
                resolutiondate=None, duedate=None, progress=None, updater="Bob"):

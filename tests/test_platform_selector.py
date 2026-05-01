@@ -1,4 +1,4 @@
-from platform_selector import select_platform
+from refiner.platform_selector import select_platform
 
 
 def test_platform_selector_defaults_to_local(tmp_path, monkeypatch):

@@ -1,0 +1,46 @@
+[
+  {
+    "id": "binds_explicit_and_overlap_claims",
+    "answer": "Customer sync runs nightly [Ops Guide p.4]. Failures move to the retry queue.",
+    "matches": [
+      {
+        "chunk_id": "chunk-sync",
+        "source": "ops.md",
+        "citation": "[Ops Guide p.4]",
+        "text": "Customer sync runs nightly after the ledger checkpoint.",
+        "metadata": {
+          "heading_path": ["Operations", "Customer Sync"],
+          "page_start": 4,
+          "page_end": 4,
+          "block_start": 1,
+          "block_end": 2
+        },
+        "score": 0.91
+      },
+      {
+        "chunk_id": "chunk-retry",
+        "source": "ops.md",
+        "citation": "[Ops Guide p.7]",
+        "text": "Failures move to the retry queue for another pass.",
+        "metadata": {
+          "heading_path": ["Operations", "Failure Handling"],
+          "page_start": 7,
+          "page_end": 7,
+          "block_start": 2,
+          "block_end": 3
+        },
+        "score": 0.88
+      }
+    ],
+    "expected": {
+      "citation_count": 2,
+      "claim_count": 2,
+      "bound_claim_count": 2,
+      "binding_coverage_ratio": 1.0,
+      "bindings": {
+        "claim-001": ["chunk-sync"],
+        "claim-002": ["chunk-retry"]
+      }
+    }
+  }
+]

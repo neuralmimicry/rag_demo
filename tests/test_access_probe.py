@@ -1,8 +1,6 @@
 from types import SimpleNamespace as NS
 
-import main as m
-
-
+from refiner import main as m
 def test_project_access_probe_filters_projects(monkeypatch, tmp_path):
     # Isolate any caches
     monkeypatch.chdir(tmp_path)

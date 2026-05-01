@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="rag-api-base" content="{{ api_base or '' }}">
+  <title>Refiner Register · Neuralmimicry</title>
+  <link rel="icon" href="/public/favicon.ico">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="bg">
+    <span class="orb orb-1"></span>
+    <span class="orb orb-2"></span>
+  </div>
+  <header class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-nav-brand" href="{{ site_base }}/" aria-label="Neuralmimicry main site">
+        <img class="site-nav-logo" src="/public/neuralmimicryicon512.png" alt="">
+        <span>Neuralmimicry</span>
+      </a>
+      <div class="site-nav-links">
+        <a href="{{ site_base }}/">Home</a>
+        <a href="{{ site_base }}/about">About</a>
+        <a href="{{ site_base }}/solutions">Solutions</a>
+        <a href="{{ site_base }}/news">News</a>
+        <a href="{{ site_base }}/github">GitHub</a>
+        <a href="{{ site_base }}/team">Team</a>
+        <a href="{{ site_base }}/careers">Careers</a>
+      </div>
+      <div class="site-nav-actions">
+        <a class="site-nav-link" href="{{ site_base }}/contact">Contact</a>
+        <a class="site-nav-link site-nav-cta" href="{{ site_base }}/subscribe">Subscribe</a>
+      </div>
+    </div>
+    <div class="site-utility">
+      <a href="{{ site_base }}/accessibility">Accessibility</a>
+      <span>|</span>
+      <a href="{{ site_base }}/privacy">Privacy</a>
+      <span>|</span>
+      <a href="{{ site_base }}/terms">Terms</a>
+      <span>|</span>
+      <a href="{{ site_base }}/contact">Contact</a>
+    </div>
+  </header>
+  <main class="auth">
+    <section class="card auth-card">
+      <div class="brand auth-brand">
+        <div class="brand-logos">
+          <img class="brand-icon" src="/public/neuralmimicryicon512.png" alt="Neuralmimicry icon">
+          <img class="brand-product" src="/public/nmrefiner.png" alt="Refiner logo">
+        </div>
+        <p class="eyebrow">Neuralmimicry</p>
+      </div>
+      <h1>Create an account</h1>
+      <p class="subtitle">Create your account for the Refiner Control Room.</p>
+      <p id="authError" class="auth-error" {% if not error %}hidden{% endif %}>{{ error }}</p>
+      <form
+        id="authForm"
+        data-auth="register"
+        data-next="{{ next_path or '/' }}"
+        data-password-min-length="{{ password_min_length }}"
+        data-passkeys-supported="{{ 'true' if passkeys_supported else 'false' }}"
+        method="post"
+        class="auth-form"
+      >
+        <div class="field">
+          <label for="username">Username</label>
+          <input id="username" name="username" type="text" required>
+        </div>
+        <div class="field">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" required>
+        </div>
+        <div class="field">
+          <label for="confirm">Confirm password</label>
+          <input id="confirm" name="confirm" type="password" required>
+        </div>
+        <button type="submit" class="primary">Create account</button>
+      </form>
+      <p class="subtitle auth-footnote">Already have an account? <a class="inline-link" href="{{ url_for('login', next=(next_path or '/')) }}">Sign in</a>.</p>
+    </section>
+  </main>
+  <script src="/static/auth.js"></script>
+</body>
+</html>

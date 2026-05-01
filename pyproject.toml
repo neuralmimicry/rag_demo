@@ -29,7 +29,7 @@ refiner = "refiner.cli:main"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["refiner"]
 
-[tool.setuptools.package-dir]
-"refiner" = "."
+[tool.setuptools.packages.find]
+include = ["refiner*", "assistant_api*", "assistant_pipeline*", "central_store*", "refiner_routes*", "docx*", "odf*"]
+exclude = ["tests*", "job_data*"]

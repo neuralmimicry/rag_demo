@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.runner_arch }})
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_arch: [X64, ARM64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Detect nmstt Rust crate
+        id: nmstt_crate
+        run: |
+          candidates=()
+          if [[ -n "${NMSTT_DIR:-}" ]]; then
+            candidates+=("${NMSTT_DIR}")
+          fi
+          if [[ -n "${GITHUB_WORKSPACE:-}" ]]; then
+            candidates+=("${GITHUB_WORKSPACE}/../nmstt")
+            candidates+=("$(dirname "${GITHUB_WORKSPACE}")/nmstt")
+          fi
+          candidates+=("/home/pbisaacs/Developer/neuralmimicry/nmstt")
+
+          for candidate in "${candidates[@]}"; do
+            if [[ -f "${candidate}/Cargo.toml" ]]; then
+              resolved="$(cd "${candidate}" && pwd)"
+              echo "path=${resolved}" >> "$GITHUB_OUTPUT"
+              echo "manifest=${resolved}/Cargo.toml" >> "$GITHUB_OUTPUT"
+              echo "present=true" >> "$GITHUB_OUTPUT"
+              echo "Using nmstt crate at ${resolved}"
+              exit 0
+            fi
+          done
+
+          echo "path=" >> "$GITHUB_OUTPUT"
+          echo "manifest=" >> "$GITHUB_OUTPUT"
+          echo "present=false" >> "$GITHUB_OUTPUT"
+          echo "No nmstt crate detected on this runner."
+
+      - name: Use runner Python runtime
+        run: python3 --version
+
+      - name: Setup Rust
+        if: steps.nmstt_crate.outputs.present == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang cmake libclang-dev pkg-config python3-pip python3-venv
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -m pip install -e .
+
+      - name: Run Python tests
+        run: .venv/bin/python -m pytest -q
+
+      - name: Cache Rust artifacts
+        if: steps.nmstt_crate.outputs.present == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run nmstt Rust tests
+        if: steps.nmstt_crate.outputs.present == 'true'
+        run: cargo test --locked --manifest-path "${{ steps.nmstt_crate.outputs.manifest }}" --all-targets
+
+      - name: Skip nmstt Rust tests
+        if: steps.nmstt_crate.outputs.present != 'true'
+        run: echo "No nmstt Cargo.toml was detected on this runner; skipping Rust service tests."

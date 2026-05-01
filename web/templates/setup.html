@@ -53,15 +53,23 @@
         <p class="eyebrow">Neuralmimicry</p>
       </div>
       <h1>Refiner Setup</h1>
-      <p class="subtitle">Create the first admin account for the Refiner Control Room.</p>
+      <p class="subtitle">Create the first administrator account for the Refiner Control Room.</p>
       <p id="authError" class="auth-error" {% if not error %}hidden{% endif %}>{{ error }}</p>
-      <form id="authForm" data-auth="setup" data-next="{{ next_path or '/' }}" method="post" class="auth-form">
+      <form
+        id="authForm"
+        data-auth="setup"
+        data-next="{{ next_path or '/' }}"
+        data-password-min-length="{{ password_min_length }}"
+        data-passkeys-supported="{{ 'true' if passkeys_supported else 'false' }}"
+        method="post"
+        class="auth-form"
+      >
         <div class="field">
-          <label for="username">Admin Username</label>
+          <label for="username">Administrator username</label>
           <input id="username" name="username" type="text" required>
         </div>
         <div class="field">
-          <label for="email">Notification Email (optional)</label>
+          <label for="email">Notification email (optional)</label>
           <input id="email" name="email" type="email" autocomplete="email" placeholder="you@example.com">
         </div>
         <div class="field">
@@ -69,10 +77,10 @@
           <input id="password" name="password" type="password" required>
         </div>
         <div class="field">
-          <label for="confirm">Confirm Password</label>
+          <label for="confirm">Confirm password</label>
           <input id="confirm" name="confirm" type="password" required>
         </div>
-        <button type="submit" class="primary">Create Admin</button>
+        <button type="submit" class="primary">Create administrator</button>
       </form>
     </section>
   </main>

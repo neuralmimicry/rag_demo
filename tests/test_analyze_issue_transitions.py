@@ -2,9 +2,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
-import main as m
-
-
+from refiner import main as m
 def test_analyze_issue_transitions_within_office_hours():
     issue = Mock()
     issue.changelog = Mock()

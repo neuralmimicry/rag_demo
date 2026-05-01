@@ -2,8 +2,7 @@ import types
 
 
 def test_confluence_fetch_space_pages_paginates_beyond_50(monkeypatch):
-    import confluence_analysis as ca
-
+    from refiner import confluence_analysis as ca
     # Force page size to 50 and high max_items via config
     def fake_load_config():
         return {
@@ -37,7 +36,7 @@ def test_confluence_fetch_space_pages_paginates_beyond_50(monkeypatch):
             })
         return {"results": results, "size": size}
 
-    monkeypatch.setattr("main.load_config", fake_load_config)
+    monkeypatch.setattr("refiner.main.load_config", fake_load_config)
     monkeypatch.setattr(ca, "_conf_get", fake_conf_get)
 
     pages = ca.fetch_space_pages("https://example.atlassian.net", ("u", "p"), "SPC")

@@ -6,9 +6,7 @@ import flask
 import pytest
 import requests
 
-import api_docs
-
-
+from refiner import api_docs
 HAS_REAL_FLASK = hasattr(flask.Flask, "test_client")
 
 
@@ -31,7 +29,7 @@ def test_public_health_does_not_reimport_refiner_web(monkeypatch) -> None:
     real_import = builtins.__import__
 
     def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "refiner_web":
+        if name in {"refiner_web", "refiner.refiner_web"}:
             raise AssertionError("health route should not import refiner_web")
         return real_import(name, globals, locals, fromlist, level)
 

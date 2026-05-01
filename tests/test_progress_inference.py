@@ -1,9 +1,7 @@
 import csv
 from types import SimpleNamespace as NS
 
-import main as m
-
-
+from refiner import main as m
 def make_issue(project_key="PRJ", updated="2025-03-01T10:00:00.000+0000", progress=(20, 100), epic_link=None):
     status = NS(statusCategory=NS(key="indeterminate"))
     project = NS(key=project_key, name=f"{project_key} Name")

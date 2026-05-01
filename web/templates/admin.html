@@ -119,6 +119,117 @@
       </div>
     </section>
 
+    <section class="card admin-ai admin-wide">
+      <div class="card-header admin-card-header-actions">
+        <div>
+          <h2>AI Orchestration</h2>
+          <p>Provider registry, specialist engines, local model inventory, and rolling candidate telemetry.</p>
+        </div>
+        <div class="assistant-actions admin-inline-actions">
+          <label class="admin-checkbox" for="aiOrchestrationProbe">
+            <input id="aiOrchestrationProbe" type="checkbox">
+            <span>Probe engines</span>
+          </label>
+          <button type="button" class="ghost" id="aiOrchestrationRefresh">Refresh</button>
+        </div>
+      </div>
+      <span class="status-banner" id="aiOrchestrationStatus" hidden></span>
+      <div class="admin-ai-toolbar">
+        <div class="field">
+          <label for="aiOrchestrationSearch">Search</label>
+          <input id="aiOrchestrationSearch" type="search" placeholder="Search providers, models, roles, specialties, engines, or candidate IDs">
+        </div>
+        <div class="field">
+          <label for="aiOrchestrationRuntimeFilter">Runtime State</label>
+          <select id="aiOrchestrationRuntimeFilter">
+            <option value="all">All states</option>
+            <option value="ok">Healthy / available</option>
+            <option value="degraded">Degraded / unavailable</option>
+          </select>
+        </div>
+        <div class="assistant-actions admin-inline-actions admin-ai-export-actions">
+          <button type="button" class="ghost" id="aiOrchestrationExportJson">Export JSON</button>
+          <button type="button" class="ghost" id="aiOrchestrationExportCsv">Export CSV</button>
+        </div>
+      </div>
+      <div id="aiOrchestrationSummary" class="admin-status-grid"></div>
+      <div class="admin-ai-layout">
+        <section class="admin-ai-section">
+          <div class="admin-section-head">
+            <div>
+              <div class="admin-section-title">Configured Providers</div>
+              <div class="subtitle" id="aiProviderMeta">--</div>
+            </div>
+            <label class="admin-inline-field" for="aiProviderSort">
+              <span>Sort</span>
+              <select id="aiProviderSort">
+                <option value="weight_desc">Weight</option>
+                <option value="preferred_first">Preferred first</option>
+                <option value="name_asc">Name A-Z</option>
+                <option value="provider_asc">Provider / model</option>
+              </select>
+            </label>
+          </div>
+          <div id="aiProviderList" class="admin-list"></div>
+        </section>
+        <section class="admin-ai-section">
+          <div class="admin-section-head">
+            <div>
+              <div class="admin-section-title">Engines</div>
+              <div class="subtitle" id="aiEngineMeta">--</div>
+            </div>
+            <label class="admin-inline-field" for="aiEngineSort">
+              <span>Sort</span>
+              <select id="aiEngineSort">
+                <option value="availability_desc">Availability</option>
+                <option value="latency_asc">Latency</option>
+                <option value="name_asc">Name A-Z</option>
+                <option value="type_asc">Type</option>
+              </select>
+            </label>
+          </div>
+          <div id="aiEngineList" class="admin-list"></div>
+        </section>
+        <section class="admin-ai-section">
+          <div class="admin-section-head">
+            <div>
+              <div class="admin-section-title">Local Model Inventory</div>
+              <div class="subtitle" id="aiModelMeta">--</div>
+            </div>
+            <label class="admin-inline-field" for="aiModelSort">
+              <span>Sort</span>
+              <select id="aiModelSort">
+                <option value="ready_desc">Ready first</option>
+                <option value="relevance_desc">Relevance</option>
+                <option value="size_asc">Size</option>
+                <option value="name_asc">Name A-Z</option>
+              </select>
+            </label>
+          </div>
+          <div id="aiModelList" class="admin-list"></div>
+        </section>
+        <section class="admin-ai-section admin-ai-span">
+          <div class="admin-section-head">
+            <div>
+              <div class="admin-section-title">Candidate Metrics</div>
+              <div class="subtitle" id="aiCandidateMeta">--</div>
+            </div>
+            <label class="admin-inline-field" for="aiCandidateSort">
+              <span>Sort</span>
+              <select id="aiCandidateSort">
+                <option value="success_desc">Success rate</option>
+                <option value="quality_desc">Quality</option>
+                <option value="latency_asc">Latency</option>
+                <option value="updated_desc">Updated</option>
+                <option value="name_asc">Name A-Z</option>
+              </select>
+            </label>
+          </div>
+          <div id="aiCandidateList" class="admin-list"></div>
+        </section>
+      </div>
+    </section>
+
     <section class="card admin-users">
       <div class="card-header">
         <h2>Active Users</h2>

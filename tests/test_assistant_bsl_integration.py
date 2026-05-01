@@ -5,7 +5,7 @@ import pytest
 
 HAS_REAL_FLASK = hasattr(flask.Flask, "test_client")
 if HAS_REAL_FLASK:
-    import refiner_web  # noqa: E402
+    from refiner import refiner_web  # noqa: E402
 
 
 class _FakeProvider:
@@ -90,15 +90,15 @@ def test_assistant_requirements_returns_capacity_unavailable(monkeypatch):
 
 
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
-def test_assistant_reply_payload_prefers_rust_gesture_planner(monkeypatch):
+def test_assistant_reply_payload_prefers_nmstt_gesture_planner(monkeypatch):
     monkeypatch.setattr(refiner_web, "STT_GESTURE_ENABLED", True)
     monkeypatch.setattr(refiner_web, "STT_BSL_ENABLED", True)
-    monkeypatch.setattr(refiner_web, "STT_GESTURE_RUST_FALLBACK", True)
+    monkeypatch.setattr(refiner_web, "STT_GESTURE_NMSTT_FALLBACK", True)
     monkeypatch.setattr(refiner_web, "STT_BACKEND", "server")
     monkeypatch.setattr(refiner_web, "STT_SERVER_URL", "http://stt.local")
     monkeypatch.setattr(
         refiner_web,
-        "_run_rust_gesture_plan",
+        "_run_nmstt_gesture_plan",
         lambda *args, **kwargs: {
             "gesture_mode": "bsl",
             "avatar_mode": "office",
