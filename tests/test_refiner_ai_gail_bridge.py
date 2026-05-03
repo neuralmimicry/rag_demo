@@ -1,4 +1,8 @@
-from refiner.llm_providers import get_provider
+from refiner.llm_providers import (
+    get_provider,
+    register_event_callback,
+    unregister_event_callback,
+)
 from refiner.refiner_ai_orchestration import (
     build_workflow_provider,
     orchestrate_provider_candidates,
@@ -172,6 +176,209 @@ def test_build_workflow_provider_uses_gail_and_normalizes_provider_credentials(m
     assert provider.fallback_api_key == "sk-fallback"
     assert provider.selection_mode == "best"
     assert provider.max_candidates == 3
+
+
+def test_build_workflow_provider_propagates_include_configured_default_to_gail(monkeypatch):
+    _enable_gail(monkeypatch)
+    monkeypatch.setenv("REFINER_AI_INCLUDE_CONFIGURED_CANDIDATES", "0")
+
+    provider = build_workflow_provider(
+        workflow="project_solver",
+        role="planner",
+        preferred_provider="ollama",
+        preferred_model="llama3.2",
+        preferred_api_key=None,
+    )
+
+    assert provider.include_configured is False
+
+
+def test_gail_workflow_provider_omits_hint_only_candidates_when_using_configured_pool(monkeypatch):
+    _enable_gail(monkeypatch)
+    captured = {}
+    from refiner import refiner_ai_gail
+
+    def _fake_post(url, *, headers, json_payload, timeout, max_retries):
+        captured["url"] = url
+        captured["json_payload"] = json_payload
+        return _FakeResponse(
+            {
+                "text": "ok",
+                "provider": "ollama",
+                "model": "llama3.2",
+                "latency_ms": 15,
+            }
+        )
+
+    monkeypatch.setattr(refiner_ai_gail, "_http_post", _fake_post)
+
+    provider = build_workflow_provider(
+        workflow="project_solver",
+        role="planner",
+        preferred_provider="openai",
+        preferred_model="gpt-4o-mini",
+        preferred_api_key=None,
+        fallback_provider="gemini",
+        fallback_model="gemini-2.5-flash",
+        fallback_api_key=None,
+        include_configured=True,
+    )
+    response = provider.predict([{"role": "user", "content": "Plan the fix."}])
+
+    assert response.provider == "ollama"
+    assert response.model == "llama3.2"
+    assert captured["url"] == "https://gail.internal.example/v1/llm/complete"
+    assert captured["json_payload"]["preferred_provider"] is None
+    assert captured["json_payload"]["preferred_model"] is None
+    assert captured["json_payload"]["preferred_api_key"] is None
+    assert captured["json_payload"]["fallback_provider"] is None
+    assert captured["json_payload"]["fallback_model"] is None
+    assert captured["json_payload"]["fallback_api_key"] is None
+
+
+def test_gail_workflow_provider_preserves_explicit_credentials_with_configured_pool(monkeypatch):
+    _enable_gail(monkeypatch)
+    captured = {}
+    from refiner import refiner_ai_gail
+
+    def _fake_post(url, *, headers, json_payload, timeout, max_retries):
+        captured["json_payload"] = json_payload
+        return _FakeResponse(
+            {
+                "text": "ok",
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "latency_ms": 11,
+            }
+        )
+
+    monkeypatch.setattr(refiner_ai_gail, "_http_post", _fake_post)
+
+    provider = build_workflow_provider(
+        workflow="project_solver",
+        role="planner",
+        preferred_provider="openai",
+        preferred_model="gpt-4o-mini",
+        preferred_api_key="sk-primary",
+        fallback_provider="gemini",
+        fallback_model="gemini-2.5-flash",
+        fallback_api_key="ya29.fallback",
+        include_configured=True,
+    )
+    response = provider.predict([{"role": "user", "content": "Plan the fix."}])
+
+    assert response.provider == "openai"
+    assert response.model == "gpt-4o-mini"
+    assert captured["json_payload"]["preferred_provider"] == "openai"
+    assert captured["json_payload"]["preferred_model"] == "gpt-4o-mini"
+    assert captured["json_payload"]["preferred_api_key"] == "sk-primary"
+    assert captured["json_payload"]["fallback_provider"] == "gemini"
+    assert captured["json_payload"]["fallback_model"] == "gemini-2.5-flash"
+    assert captured["json_payload"]["fallback_access_token"] == "ya29.fallback"
+
+
+def test_gail_workflow_provider_preserves_explicit_candidates_when_configured_pool_disabled(monkeypatch):
+    _enable_gail(monkeypatch)
+    captured = {}
+    from refiner import refiner_ai_gail
+
+    def _fake_post(url, *, headers, json_payload, timeout, max_retries):
+        captured["json_payload"] = json_payload
+        return _FakeResponse(
+            {
+                "text": "ok",
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "latency_ms": 10,
+            }
+        )
+
+    monkeypatch.setattr(refiner_ai_gail, "_http_post", _fake_post)
+
+    provider = build_workflow_provider(
+        workflow="project_solver",
+        role="planner",
+        preferred_provider="openai",
+        preferred_model="gpt-4o-mini",
+        preferred_api_key="sk-primary",
+        fallback_provider="gemini",
+        fallback_model="gemini-2.5-flash",
+        fallback_api_key="ya29.fallback",
+        include_configured=False,
+    )
+    response = provider.predict([{"role": "user", "content": "Plan the fix."}])
+
+    assert response.provider == "openai"
+    assert response.model == "gpt-4o-mini"
+    assert captured["json_payload"]["preferred_provider"] == "openai"
+    assert captured["json_payload"]["preferred_model"] == "gpt-4o-mini"
+    assert captured["json_payload"]["preferred_api_key"] == "sk-primary"
+    assert captured["json_payload"]["preferred_access_token"] is None
+    assert captured["json_payload"]["fallback_provider"] == "gemini"
+    assert captured["json_payload"]["fallback_model"] == "gemini-2.5-flash"
+    assert captured["json_payload"]["fallback_api_key"] is None
+    assert captured["json_payload"]["fallback_access_token"] == "ya29.fallback"
+
+
+def test_gail_workflow_provider_emits_usage_for_selected_provider(monkeypatch):
+    _enable_gail(monkeypatch)
+    events = []
+    from refiner import refiner_ai_gail
+
+    def _callback(event):
+        if isinstance(event, dict) and event.get("type") == "token_usage":
+            events.append(event)
+
+    def _fake_post(url, *, headers, json_payload, timeout, max_retries):
+        return _FakeResponse(
+            {
+                "text": "ok",
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "latency_ms": 9,
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "total_tokens": 18,
+                },
+            }
+        )
+
+    monkeypatch.setattr(refiner_ai_gail, "_http_post", _fake_post)
+
+    provider = build_workflow_provider(
+        workflow="project_solver",
+        role="planner",
+        preferred_provider="openai",
+        preferred_model="gpt-4o-mini",
+        preferred_api_key="sk-primary",
+        fallback_provider="ollama",
+        fallback_model="llama3.2",
+        include_configured=False,
+    )
+    setattr(
+        provider,
+        "billing_metadata_map",
+        {
+            "openai": {"credential_source": "service_key", "chargeable": True},
+            "ollama": {"credential_source": "local", "chargeable": False},
+        },
+    )
+
+    register_event_callback(_callback)
+    try:
+        response = provider.predict([{"role": "user", "content": "Plan the fix."}])
+    finally:
+        unregister_event_callback(_callback)
+
+    assert response.provider == "openai"
+    assert response.model == "gpt-4o-mini"
+    assert len(events) == 1
+    assert events[0]["provider"] == "openai"
+    assert events[0]["model"] == "gpt-4o-mini"
+    assert events[0]["usage"]["total"] == 18
+    assert events[0]["credential_source"] == "service_key"
+    assert events[0]["chargeable"] is True
 
 
 def test_orchestrate_provider_candidates_returns_gail_workflow_provider(monkeypatch):

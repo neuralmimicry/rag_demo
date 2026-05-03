@@ -15,16 +15,23 @@ OLLAMA_ENV_KEYS = (
     "SOLVER_OLLAMA_MODEL",
 )
 
-LLM_ENV_KEYS = (
+LLM_CREDENTIAL_ENV_KEYS = (
     "OPENAI_API_KEY",
     "NVIDIA_API_KEY",
+    "GEMINI_API_KEY",
+    "GEMINI_ACCESS_TOKEN",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GOOGLE_ACCESS_TOKEN",
+)
+
+LLM_PROCESS_DEFAULT_ENV_KEYS = (
     "NVIDIA_BASE_URL",
     "NVIDIA_MODEL",
     "NVIDIA_DEFAULT_MODEL",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
-    "GOOGLE_GENERATIVE_AI_API_KEY",
 ) + OLLAMA_ENV_KEYS
+
+LLM_ENV_KEYS = LLM_CREDENTIAL_ENV_KEYS + LLM_PROCESS_DEFAULT_ENV_KEYS
 
 
 def _normalized_hostname(raw: Optional[str]) -> str:
@@ -90,18 +97,34 @@ def apply_managed_ollama_defaults(
     return env
 
 
+def strip_llm_credential_env(
+    env: MutableMapping[str, str],
+) -> MutableMapping[str, str]:
+    """Remove shared LLM credential values from a process environment copy."""
+    for key in LLM_CREDENTIAL_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
 def build_effective_llm_env(
     secret_env: Optional[Mapping[str, str]] = None,
     *,
     process_env: Optional[Mapping[str, str]] = None,
+    allow_process_credentials: bool = True,
 ) -> dict[str, str]:
     """Compose the effective LLM env visible to Refiner request-time workflows."""
     source = process_env or os.environ
     env = dict(secret_env or {})
     apply_managed_ollama_defaults(env, process_env=source)
-    for key in LLM_ENV_KEYS:
+    for key in ("NVIDIA_BASE_URL", "NVIDIA_MODEL", "NVIDIA_DEFAULT_MODEL"):
         if not str(env.get(key) or "").strip():
             fallback = str(source.get(key) or "").strip()
             if fallback:
                 env[key] = fallback
+    if allow_process_credentials:
+        for key in LLM_CREDENTIAL_ENV_KEYS:
+            if not str(env.get(key) or "").strip():
+                fallback = str(source.get(key) or "").strip()
+                if fallback:
+                    env[key] = fallback
     return env

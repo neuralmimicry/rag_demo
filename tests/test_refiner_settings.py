@@ -14,6 +14,11 @@ def test_validate_settings_patch_merges_with_existing_values():
             "default_provider": "openai",
             "default_model": "gpt-5.4",
             "default_reasoning_effort": "medium",
+            "provider_access": {
+                "openai": {"mode": "service", "acknowledged": False},
+                "gemini": {"mode": "service", "acknowledged": False},
+                "nvidia": {"mode": "service", "acknowledged": False},
+            },
         },
         "assistant": {
             "default_profile": "requirements",
@@ -41,6 +46,32 @@ def test_validate_settings_patch_merges_with_existing_values():
     assert merged["ui"]["show_solver_replay"] is True
 
 
+def test_validate_settings_patch_accepts_provider_access_acknowledgement():
+    merged = validate_settings_patch(
+        {
+            "llm": {
+                "provider_access": {
+                    "openai": {"mode": "user_key", "acknowledged": True},
+                    "gemini": {"mode": "service", "acknowledged": True},
+                }
+            }
+        }
+    )
+
+    assert merged["llm"]["provider_access"]["openai"] == {
+        "mode": "user_key",
+        "acknowledged": True,
+    }
+    assert merged["llm"]["provider_access"]["gemini"] == {
+        "mode": "service",
+        "acknowledged": True,
+    }
+    assert merged["llm"]["provider_access"]["nvidia"] == {
+        "mode": "service",
+        "acknowledged": False,
+    }
+
+
 def test_validate_settings_patch_rejects_unknown_keys():
     with pytest.raises(SettingsValidationError) as exc_info:
         validate_settings_patch({"llm": {"unknown_setting": "value"}})
@@ -52,6 +83,11 @@ def test_settings_roundtrip_through_metadata_normalizes_payload():
     metadata = metadata_with_settings(
         {"source": "profile"},
         {
+            "llm": {
+                "provider_access": {
+                    "openai": {"mode": "user_key", "acknowledged": True},
+                }
+            },
             "assistant": {"default_profile": "marketing"},
             "ui": {"show_solver_replay": False},
         },
@@ -61,6 +97,10 @@ def test_settings_roundtrip_through_metadata_normalizes_payload():
     settings = settings_from_metadata(metadata)
 
     assert metadata["source"] == "profile"
+    assert settings["llm"]["provider_access"]["openai"] == {
+        "mode": "user_key",
+        "acknowledged": True,
+    }
     assert settings["assistant"]["default_profile"] == "marketing"
     assert settings["ui"]["show_solver_replay"] is False
     assert settings["llm"]["default_reasoning_effort"] == "medium"

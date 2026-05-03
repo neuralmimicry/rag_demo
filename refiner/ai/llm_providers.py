@@ -138,6 +138,14 @@ def _should_use_background_auto(
     return bool(reasons), reasons
 
 _REQUEST_CATEGORY: ContextVar[str] = ContextVar("llm_request_category", default="llm")
+_REQUEST_BILLING_METADATA: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "llm_request_billing_metadata",
+    default=None,
+)
+_REQUEST_BILLING_MAP: ContextVar[Optional[Dict[str, Dict[str, Any]]]] = ContextVar(
+    "llm_request_billing_map",
+    default=None,
+)
 _TOKEN_TOTALS: Dict[str, Dict[str, int]] = {}
 _TOKEN_TOTALS_LOCK = threading.Lock()
 _USAGE_EVENT_FILE_LOCK = threading.Lock()
@@ -146,6 +154,9 @@ _EVENT_CALLBACKS_LOCK = threading.Lock()
 _PRICING_CACHE_LOCK = threading.Lock()
 _PRICING_CACHE_RAW = None
 _PRICING_CACHE_VALUE: Dict[str, Any] = {}
+_PROVIDER_BILLING_CACHE_LOCK = threading.Lock()
+_PROVIDER_BILLING_CACHE_RAW = None
+_PROVIDER_BILLING_CACHE_VALUE: Dict[str, Dict[str, Any]] = {}
 
 
 @contextmanager
@@ -155,6 +166,150 @@ def request_category(label: Optional[str]):
         yield
     finally:
         _REQUEST_CATEGORY.reset(token)
+
+
+def _normalize_provider_name(value: Optional[str]) -> str:
+    cleaned = str(value or "").strip().lower()
+    if cleaned in {"gpt", "chatgpt"}:
+        return "openai"
+    if cleaned == "google":
+        return "gemini"
+    if cleaned in {"nim", "nvidia_nim"}:
+        return "nvidia"
+    return cleaned
+
+
+def _normalize_credential_source(value: Any) -> str:
+    cleaned = str(value or "").strip().lower()
+    if cleaned in {"user", "user_key", "userkey"}:
+        return "user_key"
+    if cleaned in {"service", "service_key", "servicekey"}:
+        return "service_key"
+    if cleaned == "local":
+        return "local"
+    return "unknown"
+
+
+def _coerce_chargeable(value: Any, *, provider: Optional[str], credential_source: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    cleaned = str(value or "").strip().lower()
+    if cleaned in {"1", "true", "yes", "on", "y"}:
+        return True
+    if cleaned in {"0", "false", "no", "off", "n"}:
+        return False
+    normalized_provider = _normalize_provider_name(provider)
+    if credential_source in {"user_key", "local"}:
+        return False
+    return normalized_provider not in {"", "ollama"}
+
+
+def _default_billing_metadata(provider: Optional[str]) -> Dict[str, Any]:
+    normalized_provider = _normalize_provider_name(provider)
+    if normalized_provider == "ollama":
+        return {"credential_source": "local", "chargeable": False}
+    return {
+        "credential_source": "unknown",
+        "chargeable": normalized_provider not in {"", "ollama"},
+    }
+
+
+def _normalize_billing_metadata(value: Any, *, provider: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    credential_source = _normalize_credential_source(value.get("credential_source"))
+    return {
+        "credential_source": credential_source,
+        "chargeable": _coerce_chargeable(
+            value.get("chargeable"),
+            provider=provider,
+            credential_source=credential_source,
+        ),
+    }
+
+
+def _normalize_billing_map(value: Any) -> Dict[str, Dict[str, Any]]:
+    normalized: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(value, dict):
+        return normalized
+    for provider, metadata in value.items():
+        provider_name = _normalize_provider_name(provider)
+        if not provider_name:
+            continue
+        cleaned = _normalize_billing_metadata(metadata, provider=provider_name)
+        if cleaned:
+            normalized[provider_name] = cleaned
+    return normalized
+
+
+def _copy_billing_map(value: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {provider: dict(metadata or {}) for provider, metadata in (value or {}).items()}
+
+
+def _provider_billing_from_env() -> Dict[str, Dict[str, Any]]:
+    global _PROVIDER_BILLING_CACHE_RAW, _PROVIDER_BILLING_CACHE_VALUE
+    raw = os.getenv("REFINER_LLM_PROVIDER_BILLING") or ""
+    with _PROVIDER_BILLING_CACHE_LOCK:
+        if raw == _PROVIDER_BILLING_CACHE_RAW:
+            return _copy_billing_map(_PROVIDER_BILLING_CACHE_VALUE)
+        try:
+            payload = json.loads(raw) if raw else {}
+        except Exception:
+            payload = {}
+        normalized = _normalize_billing_map(payload)
+        _PROVIDER_BILLING_CACHE_RAW = raw
+        _PROVIDER_BILLING_CACHE_VALUE = normalized
+        return _copy_billing_map(normalized)
+
+
+@contextmanager
+def _request_billing_context(
+    *,
+    metadata: Any = None,
+    billing_map: Any = None,
+):
+    normalized_metadata = _normalize_billing_metadata(metadata)
+    normalized_map = _normalize_billing_map(billing_map)
+    metadata_token = _REQUEST_BILLING_METADATA.set(normalized_metadata)
+    map_token = _REQUEST_BILLING_MAP.set(normalized_map or None)
+    try:
+        yield
+    finally:
+        _REQUEST_BILLING_METADATA.reset(metadata_token)
+        _REQUEST_BILLING_MAP.reset(map_token)
+
+
+def _resolve_billing_metadata(
+    provider: Optional[str],
+    *,
+    fallback: Any = None,
+    billing_map: Any = None,
+) -> Dict[str, Any]:
+    provider_name = _normalize_provider_name(provider)
+    current_map = _normalize_billing_map(billing_map)
+    if not current_map:
+        try:
+            current_map = _normalize_billing_map(_REQUEST_BILLING_MAP.get())
+        except LookupError:
+            current_map = {}
+    if provider_name and provider_name in current_map:
+        return dict(current_map[provider_name])
+    env_map = _provider_billing_from_env()
+    if provider_name and provider_name in env_map:
+        return dict(env_map[provider_name])
+    if not current_map:
+        try:
+            current_metadata = _normalize_billing_metadata(_REQUEST_BILLING_METADATA.get(), provider=provider_name)
+        except LookupError:
+            current_metadata = None
+        if current_metadata:
+            return current_metadata
+    fallback_metadata = _normalize_billing_metadata(fallback, provider=provider_name)
+    if fallback_metadata:
+        return fallback_metadata
+    return _default_billing_metadata(provider_name)
 
 
 def _hash(s: str) -> str:
@@ -520,19 +675,23 @@ class _LLMRequestObserver:
     def _emit(
         self,
         *,
+        provider: Optional[str] = None,
         model: Optional[str],
         outcome: str,
         error_class: Optional[str] = None,
         error_detail: Optional[str] = None,
+        billing_metadata: Any = None,
     ) -> None:
         if self.emitted:
             return
         self.emitted = True
+        effective_provider = str(provider or self.provider or "unknown").strip() or "unknown"
+        billing = _resolve_billing_metadata(effective_provider, fallback=billing_metadata)
         event = {
             "type": "llm_request",
             "ts": time.time(),
             "at": _iso_now(),
-            "provider": self.provider,
+            "provider": effective_provider,
             "model": str(model or "unknown").strip() or "unknown",
             "category": self.category,
             "outcome": outcome,
@@ -541,6 +700,8 @@ class _LLMRequestObserver:
             "estimated_input_tokens": self.estimated_input_tokens,
             "max_tokens": self.max_tokens,
             "reasoning_effort": self.reasoning_effort,
+            "credential_source": billing.get("credential_source"),
+            "chargeable": bool(billing.get("chargeable", False)),
         }
         if error_class:
             event["error_class"] = error_class
@@ -548,16 +709,30 @@ class _LLMRequestObserver:
             event["error_detail"] = error_detail
         _emit_structured_event(event)
 
-    def success(self, *, model: Optional[str]) -> None:
-        self._emit(model=model, outcome="success")
+    def success(self, *, provider: Optional[str], model: Optional[str], billing_metadata: Any = None) -> None:
+        self._emit(
+            provider=provider,
+            model=model,
+            outcome="success",
+            billing_metadata=billing_metadata,
+        )
 
-    def failure(self, *, model: Optional[str], exc: Exception) -> None:
+    def failure(
+        self,
+        *,
+        provider: Optional[str],
+        model: Optional[str],
+        exc: Exception,
+        billing_metadata: Any = None,
+    ) -> None:
         outcome = "quota_error" if isinstance(exc, LLMQuotaError) else "error"
         self._emit(
+            provider=provider,
             model=model,
             outcome=outcome,
             error_class=exc.__class__.__name__,
             error_detail=_sanitize_error_detail(exc),
+            billing_metadata=billing_metadata,
         )
 
 
@@ -565,6 +740,7 @@ def _log_token_usage(provider: str, model: Optional[str], usage: Optional[Dict[s
     if not usage:
         return
     category = _current_request_category()
+    billing = _resolve_billing_metadata(provider)
     prompt = usage.get("prompt")
     completion = usage.get("completion")
     total = usage.get("total")
@@ -599,12 +775,17 @@ def _log_token_usage(provider: str, model: Optional[str], usage: Optional[Dict[s
         },
         "running_total": running,
         "cost": cost,
+        "credential_source": billing.get("credential_source"),
+        "chargeable": bool(billing.get("chargeable", False)),
     }
     _emit_usage_event(event)
 
     cached_note = f" cached={_format_token_value(cached)}" if cached is not None else ""
+    billing_note = (
+        f" source={billing.get('credential_source')} chargeable={str(bool(billing.get('chargeable', False))).lower()}"
+    )
     logger.info(
-        "Token usage [%s] %s/%s: sent=%s received=%s used=%s%s | running total [%s]: sent=%s received=%s used=%s",
+        "Token usage [%s] %s/%s: sent=%s received=%s used=%s%s%s | running total [%s]: sent=%s received=%s used=%s",
         category,
         provider,
         model or "unknown",
@@ -612,6 +793,7 @@ def _log_token_usage(provider: str, model: Optional[str], usage: Optional[Dict[s
         _format_token_value(completion),
         _format_token_value(total_for_add),
         cached_note,
+        billing_note,
         category,
         running.get("prompt", 0),
         running.get("completion", 0),
@@ -859,27 +1041,62 @@ class LLMProvider:
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
         )
-        try:
-            response = self._predict_impl(
-                messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system,
-                timeout=timeout,
-                reasoning_effort=reasoning_effort,
-            )
-        except Exception as exc:
-            observer.failure(model=getattr(self, "model", None), exc=exc)
-            raise
+        provider_name = getattr(self, "name", None)
+        provider_billing = getattr(self, "billing_metadata", None)
+        provider_billing_map = getattr(self, "billing_metadata_map", None)
+        if not provider_billing_map and provider_billing:
+            provider_billing_map = {str(provider_name or "").strip().lower(): provider_billing}
+        with _request_billing_context(
+            metadata=provider_billing,
+            billing_map=provider_billing_map,
+        ):
+            try:
+                response = self._predict_impl(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system=system,
+                    timeout=timeout,
+                    reasoning_effort=reasoning_effort,
+                )
+            except Exception as exc:
+                observer.failure(
+                    provider=provider_name,
+                    model=getattr(self, "model", None),
+                    exc=exc,
+                    billing_metadata=_resolve_billing_metadata(
+                        provider_name,
+                        fallback=getattr(self, "billing_metadata", None),
+                        billing_map=getattr(self, "billing_metadata_map", None),
+                    ),
+                )
+                raise
         if not isinstance(response, LLMResponse):
             exc = LLMError("provider returned an invalid response object")
-            observer.failure(model=getattr(self, "model", None), exc=exc)
+            observer.failure(
+                provider=provider_name,
+                model=getattr(self, "model", None),
+                exc=exc,
+                billing_metadata=_resolve_billing_metadata(
+                    provider_name,
+                    fallback=getattr(self, "billing_metadata", None),
+                    billing_map=getattr(self, "billing_metadata_map", None),
+                ),
+            )
             raise exc
         if not response.provider:
             response.provider = self.name
         if not response.model:
             response.model = getattr(self, "model", None)
-        observer.success(model=response.model or getattr(self, "model", None))
+        observer.success(
+            provider=response.provider or provider_name,
+            model=response.model or getattr(self, "model", None),
+            billing_metadata=_resolve_billing_metadata(
+                response.provider or provider_name,
+                fallback=getattr(self, "billing_metadata", None),
+                billing_map=getattr(self, "billing_metadata_map", None),
+            ),
+        )
         return response
 
     def _predict_impl(

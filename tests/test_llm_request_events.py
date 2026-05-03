@@ -1,9 +1,12 @@
+import json
+
 import pytest
 
 from refiner.llm_providers import (
     LLMProvider,
     LLMQuotaError,
     LLMResponse,
+    _log_token_usage,
     register_event_callback,
     request_category,
     unregister_event_callback,
@@ -42,11 +45,38 @@ class _QuotaProvider(LLMProvider):
         return {"ok": True}
 
 
+class _UsageProvider(LLMProvider):
+    def __init__(self):
+        super().__init__()
+        self.name = "openai"
+        self.model = "gpt-4o-mini"
+
+    def _predict_impl(self, messages, **_kwargs):
+        _log_token_usage(self.name, self.model, {"prompt": 4, "completion": 6, "total": 10})
+        return LLMResponse(text="ok", raw={}, provider=self.name, model=self.model)
+
+    def transcribe(self, file_path: str, timeout=None) -> str:
+        raise NotImplementedError
+
+    def health_check(self, timeout=None):
+        return {"ok": True}
+
+
 def _capture_events():
     events = []
 
     def _callback(event):
         if isinstance(event, dict) and event.get("type") == "llm_request":
+            events.append(event)
+
+    return events, _callback
+
+
+def _capture_usage_events():
+    events = []
+
+    def _callback(event):
+        if isinstance(event, dict) and event.get("type") == "token_usage":
             events.append(event)
 
     return events, _callback
@@ -96,3 +126,25 @@ def test_predict_emits_quota_error_llm_request_event():
     assert event["outcome"] == "quota_error"
     assert event["error_class"] == "LLMQuotaError"
     assert "quota exhausted" in event["error_detail"]
+
+
+def test_usage_events_fall_back_to_env_billing_metadata(monkeypatch):
+    monkeypatch.setenv(
+        "REFINER_LLM_PROVIDER_BILLING",
+        json.dumps({"openai": {"credential_source": "user_key", "chargeable": False}}),
+    )
+    events, callback = _capture_usage_events()
+    register_event_callback(callback)
+    try:
+        provider = _UsageProvider()
+        provider.predict([{"role": "user", "content": "Hello"}], max_tokens=16)
+    finally:
+        unregister_event_callback(callback)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event["provider"] == "openai"
+    assert event["model"] == "gpt-4o-mini"
+    assert event["usage"]["total"] == 10
+    assert event["credential_source"] == "user_key"
+    assert event["chargeable"] is False

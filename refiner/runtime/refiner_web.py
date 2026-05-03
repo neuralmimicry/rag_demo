@@ -71,7 +71,17 @@ from refiner.nmchain_client import NmChainClient, NmChainError
 from refiner.customers_client import CustomersClient, CustomersServiceError
 from refiner.billing_client import BillingClient, BillingServiceError
 from refiner.capabilities import get_capabilities, capability_summary, select_skills, format_skill_brief
-from refiner.runtime_env import apply_managed_ollama_defaults, build_effective_llm_env
+from refiner.runtime.llm_access import (
+    accessible_configured_llm_provider as _accessible_configured_llm_provider,
+    build_effective_llm_env_for_user as _effective_llm_env_for_user,
+    build_job_runtime_env as _build_job_runtime_env_impl,
+    gemini_credential_from_env as _gemini_credential_from_env,
+    provider_billing_map as _provider_billing_map,
+    provider_billing_metadata as _provider_billing_metadata,
+    provider_has_accessible_credentials as _provider_has_accessible_credentials,
+    provider_base_url as _provider_base_url,
+    user_can_use_shared_llm_credentials as _user_can_use_shared_llm_credentials,
+)
 from refiner.solver_memory import SolverEpisode, SolverEpisodeStore
 from refiner.thought_inbox import (
     build_fingerprint as inbox_build_fingerprint,
@@ -4538,6 +4548,8 @@ def _default_token_usage_bucket() -> Dict[str, Any]:
         "prompt": 0,
         "completion": 0,
         "total": 0,
+        "chargeable_total": 0,
+        "non_chargeable_total": 0,
         "cached": None,
         "cost": None,
         "events": 0,
@@ -4548,6 +4560,7 @@ def _default_token_usage_bucket() -> Dict[str, Any]:
 def _default_token_usage_metrics() -> Dict[str, Any]:
     payload = _default_token_usage_bucket()
     payload["by_category"] = {}
+    payload["by_credential_source"] = {}
     payload["by_model"] = {}
     return payload
 
@@ -4573,6 +4586,8 @@ def _normalize_token_usage_bucket(value: Any) -> Dict[str, Any]:
     bucket["prompt"] = _safe_int(value.get("prompt"), 0)
     bucket["completion"] = _safe_int(value.get("completion"), 0)
     bucket["total"] = _safe_int(value.get("total"), 0)
+    bucket["chargeable_total"] = _safe_int(value.get("chargeable_total"), 0)
+    bucket["non_chargeable_total"] = _safe_int(value.get("non_chargeable_total"), 0)
     cached = value.get("cached")
     bucket["cached"] = _safe_int(cached) if cached not in (None, "") else None
     bucket["cost"] = _normalize_token_cost(value.get("cost"))
@@ -4584,6 +4599,7 @@ def _normalize_token_usage_bucket(value: Any) -> Dict[str, Any]:
 def _normalize_token_usage_metrics(value: Any) -> Dict[str, Any]:
     metrics = _normalize_token_usage_bucket(value)
     metrics["by_category"] = {}
+    metrics["by_credential_source"] = {}
     metrics["by_model"] = {}
     if isinstance(value, dict):
         by_category = value.get("by_category")
@@ -4592,6 +4608,12 @@ def _normalize_token_usage_metrics(value: Any) -> Dict[str, Any]:
                 label = str(key or "").strip()
                 if label:
                     metrics["by_category"][label] = _normalize_token_usage_bucket(item)
+        by_credential_source = value.get("by_credential_source")
+        if isinstance(by_credential_source, dict):
+            for key, item in by_credential_source.items():
+                label = str(key or "").strip()
+                if label:
+                    metrics["by_credential_source"][label] = _normalize_token_usage_bucket(item)
         by_model = value.get("by_model")
         if isinstance(by_model, dict):
             for key, item in by_model.items():
@@ -4641,7 +4663,7 @@ def _merge_token_cost(total: Optional[Dict[str, Any]], incoming: Any) -> Optiona
 def _merge_token_usage_bucket(bucket: Dict[str, Any], usage: Any, *, cost: Any = None, event_at: Optional[str] = None) -> Dict[str, Any]:
     extras: Dict[str, Any] = {}
     if isinstance(bucket, dict):
-        for key in ("by_category", "by_model", "provider", "model"):
+        for key in ("by_category", "by_credential_source", "by_model", "provider", "model"):
             if key in bucket:
                 extras[key] = bucket.get(key)
     target = _normalize_token_usage_bucket(bucket)
@@ -4663,8 +4685,38 @@ def _merge_token_usage_bucket(bucket: Dict[str, Any], usage: Any, *, cost: Any =
     target["cost"] = _merge_token_cost(target.get("cost"), cost)
     if event_at:
         target["last_event_at"] = event_at
+    if bool(payload.get("__chargeable__", False)):
+        target["chargeable_total"] = _safe_int(target.get("chargeable_total"), 0) + int(total_value or 0)
+    else:
+        target["non_chargeable_total"] = _safe_int(target.get("non_chargeable_total"), 0) + int(total_value or 0)
     target.update(extras)
     return target
+
+
+def _normalize_credential_source(value: Any) -> str:
+    cleaned = str(value or "").strip().lower()
+    if cleaned in {"user", "user_key", "userkey"}:
+        return "user_key"
+    if cleaned in {"service", "service_key", "servicekey"}:
+        return "service_key"
+    if cleaned == "local":
+        return "local"
+    return "unknown"
+
+
+def _coerce_chargeable_flag(value: Any, *, provider: Optional[str], credential_source: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    cleaned = str(value or "").strip().lower()
+    if cleaned in {"1", "true", "yes", "on", "y"}:
+        return True
+    if cleaned in {"0", "false", "no", "off", "n"}:
+        return False
+    if credential_source in {"user_key", "local"}:
+        return False
+    return _normalize_llm_provider_type(provider) not in {"ollama"}
 
 
 def _merge_token_usage_event(job: "Job", data: Dict[str, Any]) -> None:
@@ -4672,24 +4724,39 @@ def _merge_token_usage_event(job: "Job", data: Dict[str, Any]) -> None:
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     event_at = _event_ts_to_iso(data.get("at") or data.get("ts"))
     cost = data.get("cost")
+    provider = str(data.get("provider") or "unknown").strip() or "unknown"
+    model = str(data.get("model") or "unknown").strip() or "unknown"
+    credential_source = _normalize_credential_source(data.get("credential_source"))
+    chargeable = _coerce_chargeable_flag(
+        data.get("chargeable"),
+        provider=provider,
+        credential_source=credential_source,
+    )
+    usage_payload = dict(usage)
+    usage_payload["__chargeable__"] = chargeable
     # Keep the flat totals and the grouped breakdowns derived from the exact same
     # event so UI summaries and token settlement never drift apart.
-    token_usage = _merge_token_usage_bucket(token_usage, usage, cost=cost, event_at=event_at)
+    token_usage = _merge_token_usage_bucket(token_usage, usage_payload, cost=cost, event_at=event_at)
 
     category = str(data.get("category") or "llm").strip() or "llm"
     token_usage["by_category"][category] = _merge_token_usage_bucket(
         token_usage["by_category"].get(category),
-        usage,
+        usage_payload,
         cost=cost,
         event_at=event_at,
     )
 
-    provider = str(data.get("provider") or "unknown").strip() or "unknown"
-    model = str(data.get("model") or "unknown").strip() or "unknown"
+    token_usage["by_credential_source"][credential_source] = _merge_token_usage_bucket(
+        token_usage["by_credential_source"].get(credential_source),
+        usage_payload,
+        cost=cost,
+        event_at=event_at,
+    )
+
     model_key = f"{provider}/{model}"
     bucket = _merge_token_usage_bucket(
         token_usage["by_model"].get(model_key),
-        usage,
+        usage_payload,
         cost=cost,
         event_at=event_at,
     )
@@ -6875,13 +6942,23 @@ class JobManager:
             return
         job.append_log("Starting job: " + " ".join(command))
         try:
-            env = os.environ.copy()
             use_defaults = job.payload.get("use_default_secrets", True)
-            if use_defaults and job.owner:
-                env.update(_get_secret_store(job.owner).get_env())
-                apply_managed_ollama_defaults(env, process_env=os.environ)
+            job_secrets = job.payload.get("job_secrets") or {}
+            owner_settings = _user_settings(job.owner)
+            owner_role = _user_role(job.owner)
+            owner_secret_env = _get_secret_store(job.owner).get_env() if job.owner else {}
+            env = _build_job_runtime_env(
+                job.owner,
+                settings=owner_settings,
+                role=owner_role,
+                secret_env=owner_secret_env,
+                use_default_secrets=bool(use_defaults),
+                job_secrets=job_secrets,
+            )
             env["REFINER_EMIT_USAGE_EVENTS"] = "1"
             env["REFINER_EVENTS_FILE"] = job.events_path
+            if not _user_can_use_shared_llm_credentials(job.owner, role=owner_role):
+                env["REFINER_AI_INCLUDE_CONFIGURED_CANDIDATES"] = "0"
             policy_mode = (
                 str(job.payload.get("solver_command_policy_mode") or _settings_defaults_for_user(job.owner).get("command_policy_mode") or "standard")
                 .strip()
@@ -6889,19 +6966,6 @@ class JobManager:
             )
             if policy_mode in {"standard", "strict"}:
                 env["REFINER_SOLVER_COMMAND_POLICY_MODE"] = policy_mode
-            job_secrets = job.payload.get("job_secrets") or {}
-            if isinstance(job_secrets, list):
-                for entry in job_secrets:
-                    if not isinstance(entry, dict):
-                        continue
-                    name = (entry.get("name") or "").strip()
-                    value = (entry.get("value") or "").strip()
-                    if name and value:
-                        env[name] = value
-            elif isinstance(job_secrets, dict):
-                for name, value in job_secrets.items():
-                    if name and value:
-                        env[str(name)] = str(value)
             job.process = subprocess.Popen(
                 command,
                 cwd=BASE_DIR,
@@ -7004,6 +7068,7 @@ class JobManager:
 
     def _reserve_tokens(self, job: Job, estimate: int) -> None:
         job.token_estimate = int(estimate or 0)
+        reserve_estimate = _chargeable_token_estimate(job.owner, job.payload, job.token_estimate)
         token_scope = None
         if isinstance(job.payload, dict):
             token_scope = job.payload.get("token_scope")
@@ -7012,7 +7077,7 @@ class JobManager:
         if team_id:
             team_snapshot = _team_token_snapshot(team_id)
             team_available = int(team_snapshot.get("available") or 0)
-        remaining = int(job.token_estimate or 0)
+        remaining = int(reserve_estimate or 0)
         team_reserved = min(remaining, team_available) if team_id else 0
         remaining = max(0, remaining - team_reserved)
         user_reserved = remaining
@@ -7036,6 +7101,11 @@ class JobManager:
             job.append_log(f"Reserved {job.token_reserved} team tokens for estimate.")
         elif user_reserved:
             job.append_log(f"Reserved {job.token_reserved} personal tokens for estimate.")
+        elif job.token_estimate > 0 and reserve_estimate <= 0:
+            job.append_log(
+                "Estimated token usage tracked, but no platform tokens were reserved because only "
+                "user-supplied or local AI providers are currently selected."
+            )
         else:
             job.append_log("No tokens reserved for estimate.")
         base_meta = {"job_id": job.job_id, "estimate": job.token_estimate, "workflow": job.workflow}
@@ -7090,14 +7160,16 @@ class JobManager:
     def _settle_tokens(self, job: Job) -> None:
         if job.token_status == "settled":
             return
-        actual = int(job.metrics.get("token_usage", {}).get("total") or 0)
+        token_usage = job.metrics.get("token_usage", {}) if isinstance(job.metrics, dict) else {}
+        actual = int(token_usage.get("total") or 0)
+        chargeable_actual = int(token_usage.get("chargeable_total") or 0)
         job.token_actual = actual
         team_id = self._effective_team_id(job)
         reserved_user, reserved_team = self._reserved_split(job)
         if job.token_reserved:
             self._release_tokens(job, reason="settle")
-        if actual > 0:
-            user_share, team_share = self._split_usage(actual, reserved_user, reserved_team, team_id)
+        if chargeable_actual > 0:
+            user_share, team_share = self._split_usage(chargeable_actual, reserved_user, reserved_team, team_id)
             base_meta = {"job_id": job.job_id, "estimate": job.token_estimate, "workflow": job.workflow}
             team_shortfall = 0
             team_debited = 0
@@ -7146,6 +7218,11 @@ class JobManager:
                     "Debited "
                     f"{job.token_debited} tokens (team {team_debited}, personal {user_debited}, shortfall {total_shortfall})."
                 )
+        elif actual > 0:
+            job.append_log(
+                "Tracked token usage settled without a platform debit because the job used only "
+                "user-supplied or local AI providers."
+            )
         job.token_status = "settled"
         job.persist(force=True)
         _notify_portal_usage(job)
@@ -8418,8 +8495,36 @@ def _user_settings(user: Optional[str]) -> Dict[str, Any]:
     return settings_from_metadata(_user_metadata(cleaned))
 
 
-def _settings_defaults_for_user(user: Optional[str]) -> Dict[str, Optional[str]]:
+def _settings_defaults_for_user(user: Optional[str]) -> Dict[str, Any]:
     return llm_defaults_from_settings(_user_settings(user))
+
+
+def _build_job_runtime_env(
+    owner: Optional[str],
+    *,
+    settings: Optional[Dict[str, Any]] = None,
+    role: Optional[str] = None,
+    secret_env: Optional[Dict[str, str]] = None,
+    process_env: Optional[Dict[str, str]] = None,
+    use_default_secrets: bool = True,
+    job_secrets: Any = None,
+) -> Dict[str, str]:
+    resolved_settings = settings if settings is not None else _user_settings(owner)
+    resolved_role = role if role is not None else _user_role(owner)
+    resolved_secret_env = (
+        dict(secret_env)
+        if secret_env is not None
+        else (_get_secret_store(owner).get_env() if owner else {})
+    )
+    return _build_job_runtime_env_impl(
+        owner,
+        settings=resolved_settings,
+        role=resolved_role,
+        secret_env=resolved_secret_env,
+        process_env=process_env,
+        use_default_secrets=use_default_secrets,
+        job_secrets=job_secrets,
+    )
 
 
 def _update_user_settings(user: str, raw_settings: Any) -> Dict[str, Any]:
@@ -9386,7 +9491,16 @@ def _resolve_llm_settings(
     provider_hint: Optional[str] = None,
     model_hint: Optional[str] = None,
 ) -> Dict[str, Any]:
-    env = build_effective_llm_env(_get_secret_store(user).get_env(), process_env=os.environ)
+    user_settings = _user_settings(user)
+    user_role = _user_role(user)
+    secret_env = _get_secret_store(user).get_env()
+    env = _effective_llm_env_for_user(
+        secret_env,
+        process_env=os.environ,
+        settings=user_settings,
+        user=user,
+        role=user_role,
+    )
     cfg = _load_llm_config()
     providers = cfg.get("llm_providers") if isinstance(cfg.get("llm_providers"), list) else []
     defaults = _settings_defaults_for_user(user)
@@ -9394,28 +9508,42 @@ def _resolve_llm_settings(
     provider_type = None
     cleaned_provider_hint = str(provider_hint or "").strip() or None
     cleaned_model_hint = str(model_hint or "").strip() or None
-    model = cleaned_model_hint or defaults.get("model")
+    model = None
     base_url = None
 
     preferred_provider = cleaned_provider_hint or defaults.get("provider")
     if preferred_provider:
         match = next((p for p in providers if p.get("name") == preferred_provider), None)
         if match:
-            provider_type = _normalize_llm_provider_type(match.get("type") or preferred_provider) or preferred_provider
-            model = model or match.get("model")
-            base_url = match.get("base_url")
+            candidate_type = _normalize_llm_provider_type(match.get("type") or preferred_provider) or preferred_provider
+            if _provider_has_accessible_credentials(candidate_type, env):
+                provider_type = candidate_type
+                model = cleaned_model_hint or match.get("model") or defaults.get("model")
+                base_url = match.get("base_url")
         else:
-            provider_type = _normalize_llm_provider_type(preferred_provider) or preferred_provider
+            candidate_type = _normalize_llm_provider_type(preferred_provider) or preferred_provider
+            if _provider_has_accessible_credentials(candidate_type, env):
+                provider_type = candidate_type
+                model = cleaned_model_hint or defaults.get("model")
 
     if not provider_type:
-        if env.get("OPENAI_API_KEY"):
+        configured = _accessible_configured_llm_provider(providers, env)
+        if configured:
+            provider_type = configured.get("provider")
+            model = configured.get("model") or defaults.get("model")
+            base_url = configured.get("base_url")
+        elif env.get("OPENAI_API_KEY"):
             provider_type = "openai"
+            model = cleaned_model_hint or defaults.get("model")
         elif env.get("NVIDIA_API_KEY"):
             provider_type = "nvidia"
-        elif env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY") or env.get("GOOGLE_GENERATIVE_AI_API_KEY"):
+            model = cleaned_model_hint or defaults.get("model")
+        elif _gemini_credential_from_env(env):
             provider_type = "gemini"
+            model = cleaned_model_hint or defaults.get("model")
         else:
             provider_type = "ollama"
+            model = cleaned_model_hint or defaults.get("model")
 
     provider_type = _normalize_llm_provider_type(provider_type) or provider_type
 
@@ -9424,31 +9552,33 @@ def _resolve_llm_settings(
     elif provider_type == "nvidia":
         api_key = env.get("NVIDIA_API_KEY")
     elif provider_type == "gemini":
-        api_key = (
-            env.get("GEMINI_API_KEY")
-            or env.get("GOOGLE_API_KEY")
-            or env.get("GOOGLE_GENERATIVE_AI_API_KEY")
-        )
+        api_key = _gemini_credential_from_env(env)
     else:
         api_key = None
 
-    if not base_url:
-        if provider_type == "ollama":
-            base_url = env.get("OLLAMA_BASE_URL")
-        elif provider_type == "nvidia":
-            base_url = env.get("NVIDIA_BASE_URL")
+    base_url = _provider_base_url(provider_type, base_url, env)
+    billing = _provider_billing_metadata(
+        provider_type,
+        settings=user_settings,
+        user=user,
+        role=user_role,
+        secret_env=secret_env,
+        process_env=os.environ,
+    ) or {}
 
     return {
         "provider": provider_type,
         "model": model,
         "base_url": base_url,
         "api_key": api_key,
+        "credential_source": billing.get("credential_source"),
+        "chargeable": bool(billing.get("chargeable", False)),
         "reasoning_effort": defaults.get("reasoning_effort"),
         "assistant_profile": defaults.get("assistant_profile"),
         "assistant_use_memory": defaults.get("assistant_use_memory"),
         "command_policy_mode": defaults.get("command_policy_mode"),
         "show_solver_replay": defaults.get("show_solver_replay"),
-        "settings": _user_settings(user),
+        "settings": user_settings,
     }
 
 
@@ -9470,16 +9600,21 @@ def _api_key_for_provider_type(provider_type: Optional[str], env: Dict[str, str]
     if lowered == "nvidia":
         return env.get("NVIDIA_API_KEY")
     if lowered == "gemini":
-        return (
-            env.get("GEMINI_API_KEY")
-            or env.get("GOOGLE_API_KEY")
-            or env.get("GOOGLE_GENERATIVE_AI_API_KEY")
-        )
+        return _gemini_credential_from_env(env)
     return None
 
 
 def _fallback_llm_settings(user: str, primary: Dict[str, Any]) -> Dict[str, Any]:
-    env = build_effective_llm_env(_get_secret_store(user).get_env(), process_env=os.environ)
+    user_settings = _user_settings(user)
+    user_role = _user_role(user)
+    secret_env = _get_secret_store(user).get_env()
+    env = _effective_llm_env_for_user(
+        secret_env,
+        process_env=os.environ,
+        settings=user_settings,
+        user=user,
+        role=user_role,
+    )
     cfg = _load_llm_config()
     providers = cfg.get("llm_providers") if isinstance(cfg.get("llm_providers"), list) else []
     primary_provider = (
@@ -9488,31 +9623,37 @@ def _fallback_llm_settings(user: str, primary: Dict[str, Any]) -> Dict[str, Any]
     )
     primary_model = str(primary.get("model") or "").strip()
 
-    for item in providers:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip()
-        provider_type = (
-            _normalize_llm_provider_type(item.get("type") or item.get("provider") or name)
-            or str(item.get("type") or item.get("provider") or name).strip()
-        )
-        model = str(item.get("model") or "").strip()
-        if not provider_type:
-            continue
-        same_provider = provider_type.lower() == primary_provider
-        same_model = not primary_model or model == primary_model
-        if same_provider and same_model:
-            continue
-        base_url = item.get("base_url")
-        if not base_url and provider_type == "nvidia":
-            base_url = env.get("NVIDIA_BASE_URL")
+    fallback = _accessible_configured_llm_provider(
+        providers,
+        env,
+        exclude_provider=primary_provider,
+        exclude_model=primary_model,
+    )
+    if fallback:
+        billing = _provider_billing_metadata(
+            fallback.get("provider"),
+            settings=user_settings,
+            user=user,
+            role=user_role,
+            secret_env=secret_env,
+            process_env=os.environ,
+        ) or {}
         return {
-            "provider": provider_type,
-            "model": model or None,
-            "base_url": base_url,
-            "api_key": _api_key_for_provider_type(provider_type, env),
+            "provider": fallback.get("provider"),
+            "model": fallback.get("model"),
+            "base_url": fallback.get("base_url"),
+            "api_key": fallback.get("api_key"),
+            "credential_source": billing.get("credential_source"),
+            "chargeable": bool(billing.get("chargeable", False)),
         }
-    return {"provider": None, "model": None, "base_url": None, "api_key": None}
+    return {
+        "provider": None,
+        "model": None,
+        "base_url": None,
+        "api_key": None,
+        "credential_source": None,
+        "chargeable": False,
+    }
 
 
 def _build_request_llm_provider(
@@ -9523,6 +9664,10 @@ def _build_request_llm_provider(
     role: str = "assistant",
 ) -> Optional[LLMProvider]:
     fallback = _fallback_llm_settings(user, settings)
+    user_role = _user_role(user)
+    user_settings = _user_settings(user)
+    secret_env = _get_secret_store(user).get_env()
+    include_configured = None if _user_can_use_shared_llm_credentials(user, role=user_role) else False
     provider = build_workflow_provider(
         workflow=workflow,
         role=role,
@@ -9533,10 +9678,24 @@ def _build_request_llm_provider(
         fallback_model=fallback.get("model"),
         fallback_api_key=fallback.get("api_key"),
         base_url=settings.get("base_url") or fallback.get("base_url"),
+        include_configured=include_configured,
         provider_factory=get_provider,
         config_path=os.path.join(BASE_DIR, "config.json"),
         inter_request_gap=0.0,
     )
+    provider_billing_map = _provider_billing_map(
+        settings=user_settings,
+        user=user,
+        role=user_role,
+        secret_env=secret_env,
+        process_env=os.environ,
+    )
+    if provider is not None:
+        setattr(provider, "billing_metadata_map", dict(provider_billing_map))
+        initial_provider = _normalize_llm_provider_type(settings.get("provider")) or getattr(provider, "name", None)
+        initial_metadata = provider_billing_map.get(_normalize_llm_provider_type(initial_provider))
+        if initial_metadata:
+            setattr(provider, "billing_metadata", dict(initial_metadata))
     return provider
 
 
@@ -11676,6 +11835,30 @@ def _estimate_job_tokens(payload: Dict[str, Any]) -> int:
     return max(300, int(estimate))
 
 
+def _chargeable_token_estimate(
+    owner: Optional[str],
+    payload: Optional[Dict[str, Any]],
+    estimate: Optional[int],
+) -> int:
+    total_estimate = max(0, int(estimate or 0))
+    if total_estimate <= 0 or not owner or not isinstance(payload, dict):
+        return total_estimate
+    primary = _resolve_llm_settings(
+        user=str(owner),
+        provider_hint=payload.get("llm_provider"),
+        model_hint=payload.get("llm_model"),
+    )
+    if payload.get("fallback_llm_provider") or payload.get("fallback_llm_model"):
+        fallback = _resolve_llm_settings(
+            user=str(owner),
+            provider_hint=payload.get("fallback_llm_provider"),
+            model_hint=payload.get("fallback_llm_model"),
+        )
+    else:
+        fallback = _fallback_llm_settings(str(owner), primary)
+    return total_estimate if (primary.get("chargeable") or fallback.get("chargeable")) else 0
+
+
 REQ_HEADER_ALIASES = {
     "id": {"id", "req", "req id", "requirement id", "requirement", "requirement_id", "req_id"},
     "title": {"title", "summary", "name", "requirement title"},
@@ -12015,7 +12198,8 @@ def _refund_job_snapshot(job: "Job") -> Dict[str, Any]:
 def _refund_max_amount(job: "Job") -> int:
     actual = int(job.token_debited or 0)
     if actual <= 0:
-        actual = int(job.token_actual or 0)
+        tokens = job.metrics.get("token_usage") if isinstance(job.metrics, dict) else {}
+        actual = int(tokens.get("chargeable_total") or 0) if isinstance(tokens, dict) else 0
     return max(0, actual)
 
 
@@ -15015,8 +15199,9 @@ def job_estimate() -> Response:
     if isinstance(payload, dict) and str(payload.get("token_scope") or "").lower() == "personal":
         team_id = None
     estimate = _estimate_job_tokens(payload)
+    chargeable_estimate = _chargeable_token_estimate(user, payload, estimate)
     snapshot = _token_snapshot(user, team_id)
-    return jsonify({"estimate": estimate, **snapshot})
+    return jsonify({"estimate": estimate, "chargeable_estimate": chargeable_estimate, **snapshot})
 
 
 def import_requirements() -> Response:
@@ -15508,14 +15693,16 @@ def jobs() -> Response:
             payload.pop("team_id", None)
             team_id = None
         estimate = _estimate_job_tokens(payload)
+        chargeable_estimate = _chargeable_token_estimate(user, payload, estimate)
         snapshot = _token_snapshot(user, team_id)
-        if estimate > snapshot["available"]:
+        if chargeable_estimate > snapshot["available"]:
             return (
                 jsonify(
                     {
                         "error": "insufficient_tokens",
                         "details": "Insufficient tokens to submit this job.",
                         "estimate": estimate,
+                        "chargeable_estimate": chargeable_estimate,
                         "available": snapshot["available"],
                         "balance": snapshot["balance"],
                     }
@@ -16524,15 +16711,17 @@ def job_actions(job_id: str) -> Response:
         success = manager.stop_job(job_id)
     elif action == "restart":
         estimate = job.token_estimate or _estimate_job_tokens(job.payload)
+        chargeable_estimate = _chargeable_token_estimate(job.owner, job.payload, estimate)
         team_id = _job_team_id(job)
         snapshot = _token_snapshot(job.owner, team_id)
-        if estimate > snapshot["available"] and job.token_reserved <= 0:
+        if chargeable_estimate > snapshot["available"] and job.token_reserved <= 0:
             return (
                 jsonify(
                     {
                         "error": "insufficient_tokens",
                         "details": "Insufficient tokens to restart this job.",
                         "estimate": estimate,
+                        "chargeable_estimate": chargeable_estimate,
                         "available": snapshot["available"],
                     }
                 ),
@@ -16637,14 +16826,16 @@ def job_transfer(job_id: str) -> Response:
             if not (_is_admin_user(user) or access_store.can_manage_project(user, project_id)):
                 return jsonify({"error": "forbidden"}), 403
         estimate = job.token_estimate or _estimate_job_tokens(job.payload)
+        chargeable_estimate = _chargeable_token_estimate(job.owner, job.payload, estimate)
         snapshot = _token_snapshot(job.owner, team_id)
-        if estimate > snapshot["available"]:
+        if chargeable_estimate > snapshot["available"]:
             return (
                 jsonify(
                     {
                         "error": "insufficient_tokens",
                         "details": "Insufficient tokens to transfer this job.",
                         "estimate": estimate,
+                        "chargeable_estimate": chargeable_estimate,
                         "available": snapshot["available"],
                     }
                 ),
@@ -16694,14 +16885,16 @@ def job_transfer(job_id: str) -> Response:
         if job.status in {"running"}:
             return jsonify({"error": "job_active", "details": "Pause or stop the job before reassigning."}), 409
         estimate = job.token_estimate or _estimate_job_tokens(job.payload)
+        chargeable_estimate = _chargeable_token_estimate(target_user, job.payload, estimate)
         snapshot = _token_snapshot(target_user)
-        if estimate > snapshot["available"]:
+        if chargeable_estimate > snapshot["available"]:
             return (
                 jsonify(
                     {
                         "error": "insufficient_tokens",
                         "details": "Target user does not have enough personal tokens.",
                         "estimate": estimate,
+                        "chargeable_estimate": chargeable_estimate,
                         "available": snapshot["available"],
                     }
                 ),

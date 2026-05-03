@@ -237,25 +237,87 @@ def _resolve_llm_selection(
 ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[dict]]:
     """Resolve one LLM slot from explicit CLI input or config defaults."""
     matched_cfg = _match_llm_config(llm_configs, requested_provider)
-    provider = requested_provider
-    model = requested_model
-    base_url = requested_base_url
-    api_key = None
+    normalized_provider = _normalize_llm_provider(requested_provider)
 
-    if matched_cfg is None and not provider and default_cfg:
-        matched_cfg = default_cfg
+    if matched_cfg is not None:
+        selection = _selection_from_llm_config(
+            matched_cfg,
+            model_override=requested_model,
+            base_url_override=requested_base_url,
+            get_llm_credentials=get_llm_credentials,
+        )
+        if selection is not None:
+            return selection
 
-    if matched_cfg:
-        provider_name = matched_cfg.get("name")
-        provider_type = matched_cfg.get("type", provider or "openai")
-        provider = provider_type
-        model = model or matched_cfg.get("model")
-        base_url = base_url or matched_cfg.get("base_url")
-        api_key = get_llm_credentials(provider_name, provider_type)
-    elif provider:
-        api_key = get_llm_credentials(None, provider)
+    if normalized_provider and matched_cfg is None:
+        credential = get_llm_credentials(None, normalized_provider)
+        if _llm_selection_usable(normalized_provider, credential):
+            return (
+                normalized_provider,
+                requested_model,
+                requested_base_url,
+                credential,
+                None,
+            )
 
-    return provider, model, base_url, api_key, matched_cfg
+    candidate_configs: List[dict] = []
+    if default_cfg and default_cfg is not matched_cfg:
+        candidate_configs.append(default_cfg)
+    for cfg in llm_configs:
+        if cfg is matched_cfg or cfg is default_cfg:
+            continue
+        candidate_configs.append(cfg)
+
+    for cfg in candidate_configs:
+        selection = _selection_from_llm_config(
+            cfg,
+            get_llm_credentials=get_llm_credentials,
+        )
+        if selection is not None:
+            return selection
+
+    return None, None, None, None, matched_cfg
+
+
+def _normalize_llm_provider(provider: Optional[str]) -> Optional[str]:
+    lowered = str(provider or "").strip().lower()
+    if lowered in {"gpt", "chatgpt"}:
+        return "openai"
+    if lowered == "google":
+        return "gemini"
+    if lowered in {"nim", "nvidia_nim"}:
+        return "nvidia"
+    return lowered or None
+
+
+def _llm_selection_usable(provider: Optional[str], credential: Optional[str]) -> bool:
+    normalized = _normalize_llm_provider(provider)
+    if not normalized:
+        return False
+    if normalized == "ollama":
+        return True
+    return bool(str(credential or "").strip())
+
+
+def _selection_from_llm_config(
+    config: dict,
+    *,
+    model_override: Optional[str] = None,
+    base_url_override: Optional[str] = None,
+    get_llm_credentials,
+) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[dict]]]:
+    provider_name = config.get("name")
+    provider_type = _normalize_llm_provider(config.get("type") or "openai")
+    credential = get_llm_credentials(provider_name, provider_type or "openai")
+    if not _llm_selection_usable(provider_type, credential):
+        return None
+    return (
+        provider_type,
+        model_override or config.get("model"),
+        base_url_override or config.get("base_url"),
+        credential,
+        config,
+    )
 
 
 def _run_jira_workflow() -> int:
