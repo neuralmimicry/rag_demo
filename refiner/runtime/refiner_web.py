@@ -9691,12 +9691,35 @@ def _build_request_llm_provider(
         process_env=os.environ,
     )
     if provider is not None:
-        setattr(provider, "billing_metadata_map", dict(provider_billing_map))
         initial_provider = _normalize_llm_provider_type(settings.get("provider")) or getattr(provider, "name", None)
         initial_metadata = provider_billing_map.get(_normalize_llm_provider_type(initial_provider))
-        if initial_metadata:
-            setattr(provider, "billing_metadata", dict(initial_metadata))
+        _attach_provider_billing_metadata(
+            provider,
+            billing_map=provider_billing_map,
+            initial_metadata=initial_metadata,
+        )
     return provider
+
+
+def _attach_provider_billing_metadata(
+    provider: Any,
+    *,
+    billing_map: Dict[str, Dict[str, Any]],
+    initial_metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    if provider is None:
+        return
+    try:
+        setattr(provider, "billing_metadata_map", dict(billing_map))
+    except Exception as exc:
+        logger.debug("unable to attach provider billing metadata map: %s", exc)
+        return
+    if not initial_metadata:
+        return
+    try:
+        setattr(provider, "billing_metadata", dict(initial_metadata))
+    except Exception as exc:
+        logger.debug("unable to attach provider billing metadata: %s", exc)
 
 
 def _ai_orchestration_status(*, probe_engines: bool = False, candidate_limit: int = 12) -> Dict[str, Any]:
