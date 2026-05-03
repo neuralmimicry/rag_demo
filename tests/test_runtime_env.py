@@ -85,6 +85,37 @@ def test_build_effective_llm_env_includes_nvidia_defaults():
     assert env["NVIDIA_DEFAULT_MODEL"] == "moonshotai/kimi-k2-instruct-0905"
 
 
+def test_build_effective_llm_env_includes_gemini_access_tokens():
+    env = build_effective_llm_env(
+        {},
+        process_env={
+            "GEMINI_ACCESS_TOKEN": "ya29.gemini-token",
+            "GOOGLE_ACCESS_TOKEN": "ya29.google-token",
+        },
+    )
+
+    assert env["GEMINI_ACCESS_TOKEN"] == "ya29.gemini-token"
+    assert env["GOOGLE_ACCESS_TOKEN"] == "ya29.google-token"
+
+
+def test_build_effective_llm_env_can_skip_process_credentials():
+    env = build_effective_llm_env(
+        {},
+        process_env={
+            "OPENAI_API_KEY": "sk-shared",
+            "GEMINI_ACCESS_TOKEN": "ya29.shared",
+            "OLLAMA_BASE_URL": "http://ollama.neuralmimicry.ai",
+            "NVIDIA_BASE_URL": "https://integrate.api.nvidia.com/v1",
+        },
+        allow_process_credentials=False,
+    )
+
+    assert "OPENAI_API_KEY" not in env
+    assert "GEMINI_ACCESS_TOKEN" not in env
+    assert env["OLLAMA_BASE_URL"] == "http://ollama.neuralmimicry.ai"
+    assert env["NVIDIA_BASE_URL"] == "https://integrate.api.nvidia.com/v1"
+
+
 def test_build_effective_llm_env_replaces_cluster_local_secret_base_url():
     env = build_effective_llm_env(
         {"OLLAMA_BASE_URL": "http://ollama.ollama.svc.cluster.local:11434"},

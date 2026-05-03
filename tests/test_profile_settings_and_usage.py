@@ -163,6 +163,151 @@ def test_job_manager_merges_structured_token_usage_events(monkeypatch, tmp_path)
 
 
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_job_manager_tracks_chargeable_and_non_chargeable_usage(monkeypatch, tmp_path):
+    job = refiner_web.Job(
+        job_id="job-usage-billing",
+        payload={"workflow": "project_solver"},
+        project_name="Usage Demo",
+        owner="alice",
+        meta_path=str(tmp_path / "job.json"),
+    )
+    monkeypatch.setattr(job, "persist", lambda *args, **kwargs: None)
+
+    chargeable = {
+        "type": "token_usage",
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "category": "llm",
+        "credential_source": "service_key",
+        "chargeable": True,
+        "usage": {"prompt": 10, "completion": 10, "total": 20},
+        "at": "2026-05-03T10:00:00Z",
+    }
+    own_key = {
+        "type": "token_usage",
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "category": "llm",
+        "credential_source": "user_key",
+        "chargeable": False,
+        "usage": {"prompt": 6, "completion": 9, "total": 15},
+        "at": "2026-05-03T10:00:05Z",
+    }
+
+    assert refiner_web.manager._handle_event_line(job, "__RAG_EVENT__ " + json.dumps(chargeable)) is True
+    assert refiner_web.manager._handle_event_line(job, "__RAG_EVENT__ " + json.dumps(own_key)) is True
+
+    usage = job.metrics["token_usage"]
+    assert usage["total"] == 35
+    assert usage["chargeable_total"] == 20
+    assert usage["non_chargeable_total"] == 15
+    assert usage["by_credential_source"]["service_key"]["total"] == 20
+    assert usage["by_credential_source"]["service_key"]["chargeable_total"] == 20
+    assert usage["by_credential_source"]["user_key"]["total"] == 15
+    assert usage["by_credential_source"]["user_key"]["non_chargeable_total"] == 15
+    assert usage["by_model"]["openai/gpt-4o-mini"]["chargeable_total"] == 20
+    assert usage["by_model"]["openai/gpt-4o-mini"]["non_chargeable_total"] == 15
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_settle_tokens_only_debits_chargeable_total(monkeypatch, tmp_path):
+    job = refiner_web.Job(
+        job_id="job-settle-billing",
+        payload={"workflow": "project_solver"},
+        project_name="Usage Demo",
+        owner="alice",
+        meta_path=str(tmp_path / "job.json"),
+    )
+    job.metrics["token_usage"] = refiner_web._normalize_token_usage_metrics(
+        {
+            "total": 35,
+            "chargeable_total": 20,
+            "non_chargeable_total": 15,
+        }
+    )
+    monkeypatch.setattr(job, "persist", lambda *args, **kwargs: None)
+    monkeypatch.setattr(refiner_web, "_notify_portal_usage", lambda _job: None)
+
+    token_events = []
+
+    def _fake_record_token_event(scope, subject, action, amount, meta, request_id=None):
+        token_events.append(
+            {
+                "scope": scope,
+                "subject": subject,
+                "action": action,
+                "amount": amount,
+                "meta": dict(meta or {}),
+                "request_id": request_id,
+            }
+        )
+        return {"shortfall": 0}
+
+    monkeypatch.setattr(refiner_web, "_record_token_event", _fake_record_token_event)
+
+    refiner_web.manager._settle_tokens(job)
+
+    assert job.token_actual == 35
+    assert job.token_debited == 20
+    assert job.token_status == "settled"
+    assert token_events == [
+        {
+            "scope": "user",
+            "subject": "alice",
+            "action": "debit",
+            "amount": -20,
+            "meta": {"job_id": "job-settle-billing", "estimate": None, "workflow": "project_solver", "team_id": None, "source": "user"},
+            "request_id": "job-debit:job-settle-billing:user",
+        }
+    ]
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_reserve_tokens_skips_platform_reservation_for_non_chargeable_jobs(monkeypatch, tmp_path):
+    job = refiner_web.Job(
+        job_id="job-reserve-own-key",
+        payload={"workflow": "project_solver"},
+        project_name="Usage Demo",
+        owner="alice",
+        meta_path=str(tmp_path / "job.json"),
+    )
+    monkeypatch.setattr(job, "persist", lambda *args, **kwargs: None)
+    monkeypatch.setattr(refiner_web, "_chargeable_token_estimate", lambda owner, payload, estimate: 0)
+    monkeypatch.setattr(refiner_web, "_record_token_event", lambda *args, **kwargs: {"shortfall": 0})
+
+    refiner_web.manager._reserve_tokens(job, 1200)
+
+    assert job.token_estimate == 1200
+    assert job.token_reserved == 0
+    assert job.token_status == "none"
+    assert any(
+        "no platform tokens were reserved" in entry.get("line", "").lower()
+        for entry in list(job.log_buffer)
+    )
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_refund_max_amount_uses_chargeable_usage_only(tmp_path):
+    job = refiner_web.Job(
+        job_id="job-refund-chargeable",
+        payload={"workflow": "project_solver"},
+        project_name="Usage Demo",
+        owner="alice",
+        meta_path=str(tmp_path / "job.json"),
+    )
+    job.metrics["token_usage"] = refiner_web._normalize_token_usage_metrics(
+        {
+            "total": 90,
+            "chargeable_total": 24,
+            "non_chargeable_total": 66,
+        }
+    )
+    job.token_debited = 0
+
+    assert refiner_web._refund_max_amount(job) == 24
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
 def test_job_manager_persists_llm_request_events(monkeypatch, tmp_path):
     telemetry = _DummyLLMTelemetryStore()
     monkeypatch.setattr(refiner_web, "CENTRAL_STORE", SimpleNamespace(llm_request_telemetry=telemetry))

@@ -1184,13 +1184,18 @@ def orchestrate_provider_candidates(
     if len(existing) == 1 and getattr(existing[0], "refiner_orchestrated", False):
         return existing[0]
 
+    resolved_include_configured = (
+        _include_configured_candidates(config_path)
+        if include_configured is None
+        else bool(include_configured)
+    )
     gail_bridge = _gail_bridge()
     if gail_bridge is not None:
         return gail_bridge["build_workflow_provider_from_candidates"](
             existing,
             workflow=workflow,
             role=role,
-            include_configured=include_configured,
+            include_configured=resolved_include_configured,
             base_url=base_url,
             inter_request_gap=inter_request_gap,
             selection_mode=selection_mode,
@@ -1211,7 +1216,7 @@ def orchestrate_provider_candidates(
         if candidate is not None:
             candidate_entries.append(candidate)
 
-    include_extra = _include_configured_candidates(config_path) if include_configured is None else bool(include_configured)
+    include_extra = resolved_include_configured
     factory = provider_factory or default_get_provider
     if include_extra:
         for spec in _configured_provider_specs(config_path):
@@ -1294,6 +1299,11 @@ def build_workflow_provider(
 ) -> Optional[LLMProvider]:
     """Build and orchestrate providers from provider/model configuration."""
 
+    resolved_include_configured = (
+        _include_configured_candidates(config_path)
+        if include_configured is None
+        else bool(include_configured)
+    )
     gail_bridge = _gail_bridge()
     if gail_bridge is not None:
         preferred_kwargs = _provider_kwargs(preferred_provider, preferred_api_key)
@@ -1310,7 +1320,7 @@ def build_workflow_provider(
             fallback_api_key=fallback_kwargs.get("api_key"),
             fallback_access_token=fallback_kwargs.get("access_token"),
             base_url=base_url,
-            include_configured=include_configured,
+            include_configured=resolved_include_configured,
             inter_request_gap=inter_request_gap,
             selection_mode=selection_mode,
             max_candidates=max_candidates,

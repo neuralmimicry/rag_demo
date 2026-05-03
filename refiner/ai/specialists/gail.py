@@ -18,10 +18,12 @@ from refiner.llm_providers import (
     LLMProvider,
     LLMQuotaError,
     LLMResponse,
+    _extract_openai_usage,
     _env_bool,
     _env_int,
     _http_get,
     _http_post,
+    _log_token_usage,
 )
 
 
@@ -80,6 +82,10 @@ def gail_direct_max_candidates() -> Optional[int]:
         return max(1, int(raw))
     except Exception:
         return None
+
+
+def gail_workflow_preserve_provider_hints() -> bool:
+    return _env_bool("REFINER_GAIL_WORKFLOW_PRESERVE_PROVIDER_HINTS", False)
 
 
 def gail_status(*, candidate_limit: int = 20, probe_engines: bool = False, probe_providers: bool = False) -> Dict[str, Any]:
@@ -193,6 +199,14 @@ class GailProvider(LLMProvider):
             provider=str(data.get("provider") or self.gail_source_provider),
             model=str(data.get("model") or self.gail_source_model or self.model),
         )
+        selected_billing = self._billing_metadata_for_provider(response.provider)
+        if selected_billing:
+            self.billing_metadata = dict(selected_billing)
+        _log_token_usage(
+            response.provider or self.gail_source_provider,
+            response.model or self.gail_source_model or self.model,
+            _extract_openai_usage(data),
+        )
         self.model = response.model or self.model
         return response
 
@@ -216,10 +230,42 @@ class GailProvider(LLMProvider):
         max_candidates = self.max_candidates
         if max_candidates is None and not workflow_mode:
             max_candidates = gail_direct_max_candidates()
+        has_explicit_request_credentials = any(
+            str(value or "").strip()
+            for value in (
+                self.preferred_api_key,
+                self.preferred_access_token,
+                self.fallback_api_key,
+                self.fallback_access_token,
+                self.gail_source_api_key,
+                self.gail_source_access_token,
+            )
+        )
+        preserve_provider_hints = (
+            not workflow_mode
+            or include_configured is False
+            or has_explicit_request_credentials
+            or gail_workflow_preserve_provider_hints()
+        )
         preferred_provider = self.preferred_provider or self.gail_source_provider
         preferred_model = self.preferred_model or self.gail_source_model
         preferred_api_key = self.preferred_api_key or self.gail_source_api_key
         preferred_access_token = self.preferred_access_token or self.gail_source_access_token
+        fallback_provider = self.fallback_provider
+        fallback_model = self.fallback_model
+        fallback_api_key = self.fallback_api_key
+        fallback_access_token = self.fallback_access_token
+        base_url = self.gail_source_base_url
+        if workflow_mode and not preserve_provider_hints:
+            preferred_provider = None
+            preferred_model = None
+            preferred_api_key = None
+            preferred_access_token = None
+            fallback_provider = None
+            fallback_model = None
+            fallback_api_key = None
+            fallback_access_token = None
+            base_url = None
         return {
             "workflow": self.workflow or gail_direct_workflow(),
             "role": self.role or gail_direct_role(),
@@ -227,11 +273,11 @@ class GailProvider(LLMProvider):
             "preferred_model": preferred_model,
             "preferred_api_key": preferred_api_key,
             "preferred_access_token": preferred_access_token,
-            "fallback_provider": self.fallback_provider,
-            "fallback_model": self.fallback_model,
-            "fallback_api_key": self.fallback_api_key,
-            "fallback_access_token": self.fallback_access_token,
-            "base_url": self.gail_source_base_url,
+            "fallback_provider": fallback_provider,
+            "fallback_model": fallback_model,
+            "fallback_api_key": fallback_api_key,
+            "fallback_access_token": fallback_access_token,
+            "base_url": base_url,
             "include_configured": include_configured,
             "selection_mode": selection_mode,
             "max_candidates": max_candidates,
@@ -306,6 +352,18 @@ class GailProvider(LLMProvider):
             max_retries=_env_int("LLM_MAX_RETRIES", 2),
         )
         return _decode_json_response(response, provider="gail")
+
+    def _billing_metadata_for_provider(self, provider: Optional[str]) -> Optional[Dict[str, Any]]:
+        normalized_provider = str(provider or "").strip().lower()
+        billing_map = getattr(self, "billing_metadata_map", None)
+        if isinstance(billing_map, dict):
+            metadata = billing_map.get(normalized_provider)
+            if isinstance(metadata, dict):
+                return dict(metadata)
+        metadata = getattr(self, "billing_metadata", None)
+        if isinstance(metadata, dict):
+            return dict(metadata)
+        return None
 
 
 def build_direct_provider(
