@@ -53,6 +53,38 @@ def test_gemini_api_key_predict(mock_post):
         assert "v1beta" in args[0]
 
 @patch('llm_providers._http_post')
+def test_gemini_model_not_found_retry_uses_fallback_model_url(mock_post):
+    missing_resp = MagicMock()
+    missing_resp.status_code = 404
+    missing_resp.text = "models/gemini-1.5-flash is not found"
+    missing_resp.json.return_value = {
+        "error": {"message": "models/gemini-1.5-flash is not found"}
+    }
+
+    success_resp = MagicMock()
+    success_resp.status_code = 200
+    success_resp.json.return_value = {
+        "candidates": [{"content": {"parts": [{"text": "Hello"}]}}]
+    }
+    mock_post.side_effect = [missing_resp, success_resp]
+
+    with patch.dict(
+        os.environ,
+        {"GEMINI_API_KEY": "test-key", "GEMINI_EXPLICIT_CACHE": "0"},
+        clear=True,
+    ):
+        provider = GeminiProvider(model="gemini-1.5-flash")
+        provider.predict([{"role": "user", "content": "Hi"}])
+
+    assert mock_post.call_args_list[0].args[0].endswith(
+        "/models/gemini-1.5-flash:generateContent"
+    )
+    assert mock_post.call_args_list[1].args[0].endswith(
+        "/models/gemini-2.5-flash:generateContent"
+    )
+    assert provider.model == "gemini-2.5-flash"
+
+@patch('llm_providers._http_post')
 def test_gemini_priority_predict(mock_post):
     mock_resp = MagicMock()
     mock_resp.status_code = 200

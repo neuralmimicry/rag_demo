@@ -2134,7 +2134,6 @@ class GeminiProvider(LLMProvider):
     ) -> LLMResponse:
         # Gemini generateContent expects a contents list of role/parts
         # We use v1beta as it supports newer models and reasoning features
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
         headers = self._gemini_headers()
 
         contents = []
@@ -2189,6 +2188,7 @@ class GeminiProvider(LLMProvider):
         skip_cache = False
         for attempt in range(2):
             payload, cached_content = _build_payload(skip_cache=skip_cache)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
             start = time.time()
             resp = _http_post(url, headers=headers, json_payload=payload, timeout=timeout)
             latency_ms = int((time.time() - start) * 1000)
