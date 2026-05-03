@@ -49,6 +49,39 @@ def gail_enabled() -> bool:
     return bool(gail_base_url())
 
 
+def gail_route_direct_requests() -> bool:
+    return _env_bool("REFINER_GAIL_ROUTE_DIRECT_REQUESTS", True)
+
+
+def gail_direct_workflow() -> str:
+    value = str(os.getenv("REFINER_GAIL_DIRECT_WORKFLOW") or "direct").strip().lower()
+    return value or "direct"
+
+
+def gail_direct_role() -> str:
+    value = str(os.getenv("REFINER_GAIL_DIRECT_ROLE") or "assistant").strip().lower()
+    return value or "assistant"
+
+
+def gail_direct_include_configured() -> bool:
+    return _env_bool("REFINER_GAIL_DIRECT_INCLUDE_CONFIGURED", True)
+
+
+def gail_direct_selection_mode() -> Optional[str]:
+    value = str(os.getenv("REFINER_GAIL_DIRECT_SELECTION_MODE") or "").strip().lower()
+    return value or None
+
+
+def gail_direct_max_candidates() -> Optional[int]:
+    raw = str(os.getenv("REFINER_GAIL_DIRECT_MAX_CANDIDATES") or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return None
+
+
 def gail_status(*, candidate_limit: int = 20, probe_engines: bool = False, probe_providers: bool = False) -> Dict[str, Any]:
     client = _require_gail_client()
     query = f"limit={max(1, int(candidate_limit))}&probe_engines={str(bool(probe_engines)).lower()}&probe_providers={str(bool(probe_providers)).lower()}"
@@ -128,29 +161,15 @@ class GailProvider(LLMProvider):
         timeout: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> LLMResponse:
-        if self.gail_mode == "workflow":
-            payload = {
-                "workflow": self.workflow,
-                "role": self.role,
-                "preferred_provider": self.preferred_provider,
-                "preferred_model": self.preferred_model,
-                "preferred_api_key": self.preferred_api_key,
-                "preferred_access_token": self.preferred_access_token,
-                "fallback_provider": self.fallback_provider,
-                "fallback_model": self.fallback_model,
-                "fallback_api_key": self.fallback_api_key,
-                "fallback_access_token": self.fallback_access_token,
-                "base_url": self.gail_source_base_url,
-                "include_configured": self.include_configured,
-                "selection_mode": self.selection_mode,
-                "max_candidates": self.max_candidates,
-                "messages": list(messages or []),
-                "system": system,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "timeout_seconds": timeout,
-                "reasoning_effort": reasoning_effort,
-            }
+        if self.gail_mode == "workflow" or gail_route_direct_requests():
+            payload = self._build_completion_payload(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system,
+                timeout=timeout,
+                reasoning_effort=reasoning_effort,
+            )
             data = self._post_json("/v1/llm/complete", payload, timeout=timeout)
         else:
             payload = {
@@ -176,6 +195,53 @@ class GailProvider(LLMProvider):
         )
         self.model = response.model or self.model
         return response
+
+    def _build_completion_payload(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        max_tokens: Optional[int],
+        temperature: float,
+        system: Optional[str],
+        timeout: Optional[int],
+        reasoning_effort: Optional[str],
+    ) -> Dict[str, Any]:
+        workflow_mode = self.gail_mode == "workflow"
+        include_configured = self.include_configured
+        if include_configured is None and not workflow_mode:
+            include_configured = gail_direct_include_configured()
+        selection_mode = self.selection_mode
+        if not selection_mode and not workflow_mode:
+            selection_mode = gail_direct_selection_mode()
+        max_candidates = self.max_candidates
+        if max_candidates is None and not workflow_mode:
+            max_candidates = gail_direct_max_candidates()
+        preferred_provider = self.preferred_provider or self.gail_source_provider
+        preferred_model = self.preferred_model or self.gail_source_model
+        preferred_api_key = self.preferred_api_key or self.gail_source_api_key
+        preferred_access_token = self.preferred_access_token or self.gail_source_access_token
+        return {
+            "workflow": self.workflow or gail_direct_workflow(),
+            "role": self.role or gail_direct_role(),
+            "preferred_provider": preferred_provider,
+            "preferred_model": preferred_model,
+            "preferred_api_key": preferred_api_key,
+            "preferred_access_token": preferred_access_token,
+            "fallback_provider": self.fallback_provider,
+            "fallback_model": self.fallback_model,
+            "fallback_api_key": self.fallback_api_key,
+            "fallback_access_token": self.fallback_access_token,
+            "base_url": self.gail_source_base_url,
+            "include_configured": include_configured,
+            "selection_mode": selection_mode,
+            "max_candidates": max_candidates,
+            "messages": list(messages or []),
+            "system": system,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "timeout_seconds": timeout,
+            "reasoning_effort": reasoning_effort,
+        }
 
     def transcribe(self, file_path: str, timeout: Optional[int] = None) -> str:
         with open(file_path, "rb") as handle:

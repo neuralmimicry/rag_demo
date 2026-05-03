@@ -158,6 +158,20 @@ GITIGNORE_BY_BUILD_SYSTEM = {
     ],
 }
 
+DIRECT_CODINGAGENT_AUTH_ENV_KEYS = (
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "NVIDIA_API_KEY",
+    "NVIDIA_BASE_URL",
+    "NVIDIA_MODEL",
+    "NVIDIA_DEFAULT_MODEL",
+    "GEMINI_API_KEY",
+    "GEMINI_ACCESS_TOKEN",
+    "GOOGLE_ACCESS_TOKEN",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+)
+
 PYPI_JSON_CACHE: Dict[str, Dict[str, object]] = {}
 CODEX_PREFLIGHT_STATE: Optional[Dict[str, object]] = None
 
@@ -3703,6 +3717,23 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _gail_managed_routing_enabled() -> bool:
+    raw_enabled = os.getenv("REFINER_GAIL_ENABLED")
+    if raw_enabled is not None:
+        return _env_bool("REFINER_GAIL_ENABLED", False)
+    return bool(str(os.getenv("REFINER_GAIL_BASE_URL") or os.getenv("GAIL_BASE_URL") or "").strip())
+
+
+def _gail_blocks_direct_codingagent_cli() -> bool:
+    return _gail_managed_routing_enabled() and _env_bool("REFINER_GAIL_DISABLE_DIRECT_CODINGAGENT_CLI", True)
+
+
+def _strip_direct_codingagent_auth(env: Dict[str, str]) -> Dict[str, str]:
+    for key in DIRECT_CODINGAGENT_AUTH_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
 class _FallbackProvider:
     def __init__(self, primary, fallback, actions_log: List[str]):
         self._primary = primary
@@ -6302,6 +6333,17 @@ def _codex_preflight(
         CODEX_PREFLIGHT_STATE = state
         return state
 
+    if _gail_blocks_direct_codingagent_cli():
+        state["cli_ready"] = False
+        state["auth_ready"] = False
+        state["auth_source"] = "gail_managed"
+        state["auth_message"] = (
+            "Codex CLI disabled because Gail-managed routing is enabled; provider fallback only."
+        )
+        actions_log.append(state["auth_message"])
+        CODEX_PREFLIGHT_STATE = state
+        return state
+
     if cli_mode == "never":
         state["cli_ready"] = False
         state["auth_ready"] = None
@@ -6566,6 +6608,11 @@ def _query_opencode_plan(
     llm_provider: Optional[str],
     llm_api_key: Optional[str],
 ) -> Optional[Dict[str, object]]:
+    if _gail_blocks_direct_codingagent_cli():
+        actions_log.append(
+            "OpenCode direct execution disabled because Gail-managed routing is enabled."
+        )
+        return None
     server_url_raw = os.getenv("OPENCODE_SERVER_URL")
     server_url = _opencode_server_url()
     server_fallback_to_cli = _env_bool("OPENCODE_SERVER_FALLBACK_TO_CLI", False)
@@ -6632,6 +6679,7 @@ def _query_opencode_plan(
     )
     actions_log.append(f"Querying OpenCode via command: {cmd}")
     env = os.environ.copy()
+    _strip_direct_codingagent_auth(env)
     if llm_api_key and llm_provider:
         if llm_provider in ("openai", "gpt", "chatgpt"):
             env.setdefault("OPENAI_API_KEY", llm_api_key)
@@ -6713,6 +6761,11 @@ def _query_codex_cli_plan(
     model_override: Optional[str],
     reasoning_effort: Optional[str],
 ) -> Optional[Dict[str, object]]:
+    if _gail_blocks_direct_codingagent_cli():
+        actions_log.append(
+            "Codex CLI disabled because Gail-managed routing is enabled."
+        )
+        return None
     if not allow_run:
         actions_log.append("Codex CLI skipped (run commands disabled).")
         return None
@@ -6747,6 +6800,7 @@ def _query_codex_cli_plan(
             reasoning_effort=_normalize_reasoning_effort(reasoning_effort),
         )
         env = os.environ.copy()
+        _strip_direct_codingagent_auth(env)
         if "CODEX_API_KEY" not in env:
             if env.get("OPENAI_API_KEY"):
                 env["CODEX_API_KEY"] = env["OPENAI_API_KEY"]
@@ -6884,6 +6938,24 @@ def _query_codingagent_plan(
     codingagent_reasoning_effort: Optional[str],
 ) -> Optional[Dict[str, object]]:
     agent_norm = (agent or "").lower().strip()
+    effective_reasoning = _normalize_reasoning_effort(codingagent_reasoning_effort) or _normalize_reasoning_effort(llm_reasoning_effort)
+    if agent_norm in {"opencode", "codex"} and _gail_blocks_direct_codingagent_cli():
+        actions_log.append(
+            f"{agent_norm} direct execution disabled because Gail-managed routing is enabled; "
+            "using the Gail-backed provider path instead."
+        )
+        with request_category("codingagent"):
+            return _query_codex_plan(
+                prompt=prompt,
+                provider=provider,
+                system_prompt=system_prompt,
+                llm_max_tokens=llm_max_tokens,
+                llm_temperature=llm_temperature,
+                llm_timeout=llm_timeout,
+                llm_reasoning_effort=effective_reasoning,
+                model_override=codingagent_model,
+                actions_log=actions_log,
+            )
     if agent_norm == "opencode":
         return _query_opencode_plan(
             prompt=prompt,
@@ -6896,7 +6968,6 @@ def _query_codingagent_plan(
         )
     if agent_norm == "codex":
         cli_mode = _codex_cli_mode()
-        effective_reasoning = _normalize_reasoning_effort(codingagent_reasoning_effort) or _normalize_reasoning_effort(llm_reasoning_effort)
         preflight = CODEX_PREFLIGHT_STATE or {}
         cli_ready = preflight.get("cli_ready")
         auth_ready = preflight.get("auth_ready")

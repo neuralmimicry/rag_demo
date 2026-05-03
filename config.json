@@ -18,7 +18,7 @@
     {
       "name": "GeminiFallback",
       "type": "gemini",
-      "model": "gemini-1.5-flash"
+      "model": "gemini-2.5-flash"
     },
     {
       "name": "NVIDIAKimiResearch",
@@ -63,7 +63,7 @@
       {
         "name": "GeminiResearch",
         "provider": "gemini",
-        "model": "gemini-1.5-flash",
+        "model": "gemini-2.5-flash",
         "roles": ["researcher", "reviewer"],
         "specialties": ["research", "citations", "long_context"],
         "weight": 0.3

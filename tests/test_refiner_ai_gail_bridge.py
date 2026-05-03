@@ -12,6 +12,16 @@ def _enable_gail(monkeypatch):
     monkeypatch.setenv("REFINER_GAIL_API_TOKEN", "bridge-secret")
 
 
+class _FakeResponse:
+    def __init__(self, payload):
+        self.status_code = 200
+        self._payload = payload
+        self.text = ""
+
+    def json(self):
+        return self._payload
+
+
 def test_get_provider_returns_gail_direct_provider_when_enabled(monkeypatch):
     _enable_gail(monkeypatch)
 
@@ -48,6 +58,87 @@ def test_get_provider_returns_gail_nvidia_provider_when_enabled(monkeypatch):
     assert provider.gail_source_model == "moonshotai/kimi-k2-instruct-0905"
     assert provider.gail_source_api_key == "nvapi-test"
     assert provider.gail_source_base_url == "https://integrate.api.nvidia.com/v1"
+
+
+def test_gail_direct_provider_routes_via_orchestration_by_default(monkeypatch):
+    _enable_gail(monkeypatch)
+    captured = {}
+    from refiner import refiner_ai_gail
+
+    def _fake_post(url, *, headers, json_payload, timeout, max_retries):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["json_payload"] = json_payload
+        captured["timeout"] = timeout
+        captured["max_retries"] = max_retries
+        return _FakeResponse(
+            {
+                "text": "ok",
+                "provider": "ollama",
+                "model": "llama3.2",
+                "latency_ms": 12,
+            }
+        )
+
+    monkeypatch.setattr(refiner_ai_gail, "_http_post", _fake_post)
+
+    provider = get_provider(
+        "openai",
+        model="gpt-4o-mini",
+        api_key="sk-test",
+    )
+    response = provider.predict(
+        [{"role": "user", "content": "Plan the fix."}],
+        system="You are helpful.",
+        max_tokens=256,
+        timeout=30,
+    )
+
+    assert response.provider == "ollama"
+    assert response.model == "llama3.2"
+    assert captured["url"] == "https://gail.internal.example/v1/llm/complete"
+    assert captured["headers"]["Authorization"] == "Bearer bridge-secret"
+    assert captured["json_payload"]["workflow"] == "direct"
+    assert captured["json_payload"]["role"] == "assistant"
+    assert captured["json_payload"]["preferred_provider"] == "openai"
+    assert captured["json_payload"]["preferred_model"] == "gpt-4o-mini"
+    assert captured["json_payload"]["preferred_api_key"] == "sk-test"
+    assert captured["json_payload"]["include_configured"] is True
+
+
+def test_gail_direct_provider_can_use_direct_complete_when_routing_disabled(monkeypatch):
+    _enable_gail(monkeypatch)
+    monkeypatch.setenv("REFINER_GAIL_ROUTE_DIRECT_REQUESTS", "0")
+    captured = {}
+    from refiner import refiner_ai_gail
+
+    def _fake_post(url, *, headers, json_payload, timeout, max_retries):
+        captured["url"] = url
+        captured["json_payload"] = json_payload
+        return _FakeResponse(
+            {
+                "text": "ok",
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "latency_ms": 7,
+            }
+        )
+
+    monkeypatch.setattr(refiner_ai_gail, "_http_post", _fake_post)
+
+    provider = get_provider(
+        "openai",
+        model="gpt-4o-mini",
+        api_key="sk-test",
+    )
+    response = provider.predict([{"role": "user", "content": "Plan the fix."}])
+
+    assert response.provider == "openai"
+    assert response.model == "gpt-4o-mini"
+    assert captured["url"] == "https://gail.internal.example/v1/llm/direct-complete"
+    assert captured["json_payload"]["provider"] == "openai"
+    assert captured["json_payload"]["model"] == "gpt-4o-mini"
+    assert captured["json_payload"]["api_key"] == "sk-test"
 
 
 def test_build_workflow_provider_uses_gail_and_normalizes_provider_credentials(monkeypatch):

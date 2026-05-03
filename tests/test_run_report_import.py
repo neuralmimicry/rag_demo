@@ -56,7 +56,7 @@ def test_run_topic_research_uses_config_loader_not_main(monkeypatch, tmp_path):
             "instances": [{"jira_url": "https://example.atlassian.net", "name": "Example Co"}],
             "llm_providers": [
                 {"name": "OpenAIPrimary", "type": "openai", "model": "gpt-4o-mini"},
-                {"name": "GeminiFallback", "type": "gemini", "model": "gemini-1.5-flash"},
+                {"name": "GeminiFallback", "type": "gemini", "model": "gemini-2.5-flash"},
             ],
             "search_engines": [],
         },
@@ -83,7 +83,7 @@ def test_run_topic_research_uses_config_loader_not_main(monkeypatch, tmp_path):
     assert calls["init"]["llm_model"] == "gpt-4o-mini"
     assert calls["init"]["llm_api_key"] == "openai:OpenAIPrimary"
     assert calls["init"]["fallback_llm_provider"] == "gemini"
-    assert calls["init"]["fallback_llm_model"] == "gemini-1.5-flash"
+    assert calls["init"]["fallback_llm_model"] == "gemini-2.5-flash"
     assert calls["init"]["fallback_llm_api_key"] == "gemini:GeminiFallback"
     assert calls["instance_name"] == "Example Co"
     assert calls["run"]["source"] == str(source_file)
