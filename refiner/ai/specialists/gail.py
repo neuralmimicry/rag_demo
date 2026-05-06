@@ -494,13 +494,40 @@ def _decode_json_response(resp: requests.Response, *, provider: str) -> Dict[str
         payload = resp.json()
     except Exception:
         payload = {"message": resp.text[:500]}
-    if resp.status_code == 429:
+    if resp.status_code == 429 or _payload_indicates_quota(payload):
         raise LLMQuotaError(str(payload.get("message") or payload.get("error") or "Gail quota exceeded"))
     if resp.status_code >= 400:
         raise LLMError(str(payload.get("message") or payload.get("error") or f"{provider} request failed: {resp.status_code}"))
     if not isinstance(payload, dict):
         raise LLMError(f"{provider} returned a non-object JSON payload")
     return payload
+
+
+def _payload_indicates_quota(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("quota") is True:
+        return True
+    text = " ".join(
+        str(value)
+        for value in (
+            payload.get("message"),
+            payload.get("error"),
+            payload.get("type"),
+            payload.get("code"),
+        )
+        if value is not None
+    ).lower()
+    compact = "".join(ch for ch in text if not ch.isspace())
+    return (
+        "too many requests" in text
+        or "rate limit" in text
+        or "rate_limit" in text
+        or "http 429" in text
+        or "status 429" in text
+        or "status:429" in compact
+        or 'status":429' in compact
+    )
 
 
 def _optional_int(value: Any) -> Optional[int]:

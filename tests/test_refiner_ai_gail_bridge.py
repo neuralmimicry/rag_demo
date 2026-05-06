@@ -1,4 +1,5 @@
 from refiner.llm_providers import (
+    LLMQuotaError,
     get_provider,
     register_event_callback,
     unregister_event_callback,
@@ -17,13 +18,34 @@ def _enable_gail(monkeypatch):
 
 
 class _FakeResponse:
-    def __init__(self, payload):
-        self.status_code = 200
+    def __init__(self, payload, status_code=200):
+        self.status_code = status_code
         self._payload = payload
         self.text = ""
 
     def json(self):
         return self._payload
+
+
+def test_gail_error_payload_quota_flag_is_classified_as_quota():
+    from refiner import refiner_ai_gail
+
+    response = _FakeResponse(
+        {
+            "error": "upstream_error",
+            "message": 'nvidia upstream error: {"status":429,"title":"Too Many Requests"}',
+            "provider": "gail",
+            "quota": True,
+        },
+        status_code=502,
+    )
+
+    try:
+        refiner_ai_gail._decode_json_response(response, provider="gail")
+    except LLMQuotaError:
+        pass
+    else:
+        raise AssertionError("expected Gail wrapped quota payload to raise LLMQuotaError")
 
 
 def test_get_provider_returns_gail_direct_provider_when_enabled(monkeypatch):
