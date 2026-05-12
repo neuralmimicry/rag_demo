@@ -10,6 +10,7 @@ if HAS_REAL_FLASK:
 def test_admin_control_room_queue_defaults_to_all_jobs_scope(monkeypatch):
     monkeypatch.setattr(refiner_web, "_current_user", lambda: "pbisaacs")
     monkeypatch.setattr(refiner_web, "_user_role", lambda user: "admin" if user == "pbisaacs" else "user")
+    monkeypatch.setattr(refiner_web.user_store, "has_users", lambda: True)
 
     with refiner_web.app.test_client() as client:
         response = client.get("/")
@@ -39,6 +40,7 @@ def test_admin_all_jobs_scope_includes_conductor_owned_jobs(monkeypatch):
 
     monkeypatch.setattr(refiner_web, "_current_user", lambda: "pbisaacs")
     monkeypatch.setattr(refiner_web, "_is_admin_user", lambda user: user == "pbisaacs")
+    monkeypatch.setattr(refiner_web.user_store, "has_users", lambda: True)
     monkeypatch.setattr(refiner_web.manager, "list_jobs", lambda status=None: jobs)
 
     with refiner_web.app.test_client() as client:
