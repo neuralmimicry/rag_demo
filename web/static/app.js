@@ -208,7 +208,7 @@ let reqProgressTimer = null;
 const requirementsProgressCache = new Map();
 const requirementsSummaryCache = new Map();
 
-let currentScope = 'team';
+let currentScope = scopeFiltersEl?.querySelector('button[data-scope].active')?.dataset.scope || 'team';
 let projectOptions = [];
 let pendingProjectSelection = '';
 let activeSessionId = null;
@@ -358,7 +358,10 @@ let accessTeamIndex = {};
   const params = new URLSearchParams(window.location.search);
   const scopeParam = (params.get('scope') || '').toLowerCase();
   const jobId = params.get('job_id');
-  if (scopeParam === 'personal' || scopeParam === 'my') {
+  const scopeParamIsAvailable = (scope) => Boolean(scopeFiltersEl?.querySelector(`button[data-scope="${scope}"]`));
+  if (scopeParam === 'all' && scopeParamIsAvailable('all')) {
+    currentScope = 'all';
+  } else if (scopeParam === 'personal' || scopeParam === 'my') {
     currentScope = 'personal';
   } else if (scopeParam === 'team') {
     currentScope = 'team';
