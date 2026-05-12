@@ -10,7 +10,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def test_containerfile_uses_external_nmstt_runtime() -> None:
     containerfile = (PROJECT_ROOT / "Containerfile").read_text(encoding="utf-8")
-    assert "FROM ${BASE_IMAGE} AS source-metadata" in containerfile
+    assert "FROM ${BASE_IMAGE} AS builder" in containerfile
+    assert "FROM ${BASE_IMAGE} AS runtime" in containerfile
     assert ".refiner-build.json" in containerfile
     assert "ARG BUILD_NUMBER=0" in containerfile
     assert "ARG GIT_COMMIT=unknown" in containerfile
