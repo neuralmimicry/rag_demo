@@ -1461,11 +1461,11 @@ class PostgresLLMRequestTelemetry:
                     COALESCE(SUM(estimated_input_tokens_total), 0) AS estimated_input_tokens_total
                 FROM nm_llm_request_telemetry
                 WHERE bucket_hour >= %s
-                  AND (%s IS NULL OR scope = %s)
-                  AND (%s IS NULL OR subject = %s)
-                  AND (%s IS NULL OR provider = %s)
-                  AND (%s IS NULL OR model = %s)
-                  AND (%s IS NULL OR category = %s)
+                  AND (%s::text IS NULL OR scope = %s::text)
+                  AND (%s::text IS NULL OR subject = %s::text)
+                  AND (%s::text IS NULL OR provider = %s::text)
+                  AND (%s::text IS NULL OR model = %s::text)
+                  AND (%s::text IS NULL OR category = %s::text)
                 """,
                 filters,
             ).fetchone()
@@ -1475,11 +1475,11 @@ class PostgresLLMRequestTelemetry:
                     SELECT *
                     FROM nm_llm_request_telemetry
                     WHERE bucket_hour >= %s
-                      AND (%s IS NULL OR scope = %s)
-                      AND (%s IS NULL OR subject = %s)
-                      AND (%s IS NULL OR provider = %s)
-                      AND (%s IS NULL OR model = %s)
-                      AND (%s IS NULL OR category = %s)
+                      AND (%s::text IS NULL OR scope = %s::text)
+                      AND (%s::text IS NULL OR subject = %s::text)
+                      AND (%s::text IS NULL OR provider = %s::text)
+                      AND (%s::text IS NULL OR model = %s::text)
+                      AND (%s::text IS NULL OR category = %s::text)
                 ),
                 aggregated AS (
                     SELECT
@@ -1544,11 +1544,11 @@ class PostgresLLMRequestTelemetry:
                         MAX(last_event_at) AS last_event_at
                     FROM nm_llm_request_telemetry
                     WHERE bucket_hour >= %s
-                      AND (%s IS NULL OR scope = %s)
-                      AND (%s IS NULL OR subject = %s)
-                      AND (%s IS NULL OR provider = %s)
-                      AND (%s IS NULL OR model = %s)
-                      AND (%s IS NULL OR category = %s)
+                      AND (%s::text IS NULL OR scope = %s::text)
+                      AND (%s::text IS NULL OR subject = %s::text)
+                      AND (%s::text IS NULL OR provider = %s::text)
+                      AND (%s::text IS NULL OR model = %s::text)
+                      AND (%s::text IS NULL OR category = %s::text)
                     GROUP BY subject, scope
                     ORDER BY SUM(requests) DESC, MAX(last_event_at) DESC NULLS LAST, subject ASC
                     LIMIT %s
