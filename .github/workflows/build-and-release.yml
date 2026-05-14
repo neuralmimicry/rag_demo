@@ -249,6 +249,7 @@ jobs:
             --version "${{ steps.meta.outputs.package_version }}" \
             --deb-version "${{ steps.meta.outputs.artifact_version }}" \
             "${alias_args[@]}" \
+            --python ".venv/bin/python" \
             --output-dir ./dist
 
       - name: Upload packaged artifacts
