@@ -50,6 +50,16 @@
       <a href="{{ site_base }}/terms">Terms</a>
       <span>|</span>
       <a href="{{ site_base }}/contact">Contact</a>
+      <span
+        class="control-version"
+        id="adminVersion"
+        data-local-version="{{ app_version.version }}"
+        data-local-release="{{ app_version.release_version }}"
+        data-local-build="{{ app_version.build }}"
+        data-local-commit="{{ app_version.commit_short }}"
+        title="Release {{ app_version.release_version }} · version {{ app_version.version }} · build {{ app_version.build }} · commit {{ app_version.commit_short }}"
+        aria-label="Admin Console version {{ app_version.version }}"
+      >{{ app_version.version }}</span>
     </div>
   </header>
   <header class="hero hero-compact">
