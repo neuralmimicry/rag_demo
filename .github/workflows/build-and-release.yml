@@ -113,6 +113,12 @@ jobs:
         if: steps.nmstt_crate.outputs.present == 'true'
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Export Rust environment paths
+        if: steps.nmstt_crate.outputs.present == 'true'
+        run: |
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+
       - name: Install Native Build Dependencies
         if: steps.nmstt_crate.outputs.present == 'true'
         run: |
@@ -122,6 +128,9 @@ jobs:
       - name: Cache Rust Artifacts
         if: steps.nmstt_crate.outputs.present == 'true'
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ${{ steps.nmstt_crate.outputs.path }} -> target
 
       - name: Build nmstt Rust Crate
         if: steps.nmstt_crate.outputs.present == 'true'
