@@ -308,6 +308,24 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
+          gh_retry() {
+            local max_attempts=5
+            local attempt=1
+            local retry_delay=6
+            while true; do
+              if "$@"; then
+                return 0
+              fi
+              if (( attempt >= max_attempts )); then
+                echo "::error::GitHub API command failed after ${max_attempts} attempts: $*" >&2
+                return 1
+              fi
+              echo "::warning::GitHub API command failed (attempt ${attempt}/${max_attempts}); retrying in ${retry_delay}s..." >&2
+              sleep "${retry_delay}"
+              attempt=$((attempt + 1))
+            done
+          }
+
           files=(dist/*)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "::error::No packaged artifacts were downloaded"
@@ -323,7 +341,7 @@ jobs:
             prerelease="true"
           fi
 
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+          if gh_retry gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             edit_args=(
               "${RELEASE_TAG}"
               --target "${GITHUB_SHA}"
@@ -335,14 +353,14 @@ jobs:
             if [[ "${prerelease}" == "true" ]]; then
               edit_args+=(--prerelease)
             fi
-            gh release edit "${edit_args[@]}"
+            gh_retry gh release edit "${edit_args[@]}"
             if [[ "${RELEASE_TAG}" == latest-* ]]; then
-              mapfile -t existing_assets < <(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')
+              mapfile -t existing_assets < <(gh_retry gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')
               for asset_name in "${existing_assets[@]}"; do
-                gh release delete-asset "${RELEASE_TAG}" "${asset_name}" -y || true
+                gh_retry gh release delete-asset "${RELEASE_TAG}" "${asset_name}" -y || true
               done
             fi
-            gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber
+            gh_retry gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber
             exit 0
           fi
 
@@ -361,7 +379,7 @@ jobs:
             args+=(--prerelease)
           fi
 
-          gh release create "${args[@]}"
+          gh_retry gh release create "${args[@]}"
 
   publish-container-arch:
     name: Publish Container (${{ matrix.runner_arch }})
@@ -387,6 +405,7 @@ jobs:
       packages: write
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         runner_arch: [X64, ARM64]
 
@@ -408,11 +427,77 @@ jobs:
         env:
           IMAGE_REPO: ghcr.io/neuralmimicry/refiner
           RELEASE_TAG: ${{ needs.package-release.outputs.release_tag }}
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_PASSWORD: ${{ github.token }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME != '' && secrets.GHCR_USERNAME || github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GHCR_PASSWORD != '' && secrets.GHCR_PASSWORD || github.token }}
+          GHCR_AUTH_SOURCE: ${{ secrets.GHCR_PASSWORD != '' && 'secrets.GHCR_PASSWORD' || 'github.token' }}
           RUNNER_ARCH: ${{ matrix.runner_arch }}
         run: |
           set -euo pipefail
+
+          push_with_retry() {
+            local max_attempts="$1"
+            shift
+            local attempt=1
+            local retry_delay=12
+            while true; do
+              if "$@"; then
+                return 0
+              fi
+              if (( attempt >= max_attempts )); then
+                echo "::error::Push failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              echo "::warning::Push attempt ${attempt}/${max_attempts} failed for ${image_ref}; retrying in ${retry_delay}s..."
+              sleep "${retry_delay}"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          DOCKER_CMD=()
+
+          resolve_docker_cmd() {
+            if [[ ${#DOCKER_CMD[@]} -gt 0 ]]; then
+              return 0
+            fi
+            if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+              DOCKER_CMD=(docker)
+              return 0
+            fi
+            if command -v sudo >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1; then
+              DOCKER_CMD=(sudo docker)
+              return 0
+            fi
+            return 1
+          }
+
+          docker_login() {
+            printf '%s' "${GHCR_PASSWORD}" | "${DOCKER_CMD[@]}" login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+          }
+
+          docker_build() {
+            if [[ "${DOCKER_CMD[0]}" == "sudo" ]]; then
+              sudo DOCKER_BUILDKIT=0 docker build --pull -f Containerfile -t "${image_ref}" .
+            else
+              DOCKER_BUILDKIT=0 docker build --pull -f Containerfile -t "${image_ref}" .
+            fi
+          }
+
+          docker_push() {
+            "${DOCKER_CMD[@]}" push "${image_ref}"
+          }
+
+          podman_push_default() {
+            podman push --retry 3 --retry-delay 8s "${image_ref}"
+          }
+
+          podman_push_compat() {
+            podman push --retry 3 --retry-delay 8s \
+              --format v2s2 \
+              --compression-format gzip \
+              --force-compression \
+              --remove-signatures \
+              "${image_ref}"
+          }
 
           case "${RUNNER_ARCH}" in
             X64) arch="amd64" ;;
@@ -424,16 +509,32 @@ jobs:
           esac
 
           image_ref="${IMAGE_REPO}:${RELEASE_TAG}-${arch}"
+          echo "Using GHCR credentials source: ${GHCR_AUTH_SOURCE}"
           if command -v podman >/dev/null 2>&1; then
             printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
-            podman build --pull -f Containerfile -t "${image_ref}" .
-            podman push "${image_ref}"
-          elif command -v docker >/dev/null 2>&1; then
-            printf '%s' "${GHCR_PASSWORD}" | docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
-            DOCKER_BUILDKIT=0 docker build --pull -f Containerfile -t "${image_ref}" .
-            docker push "${image_ref}"
+            if podman build --format docker --pull -f Containerfile -t "${image_ref}" .; then
+              if push_with_retry 2 podman_push_default; then
+                exit 0
+              fi
+              echo "::warning::Default podman push failed for ${image_ref}; retrying with docker schema2 compatibility options."
+              if push_with_retry 2 podman_push_compat; then
+                exit 0
+              fi
+            fi
+            if ! resolve_docker_cmd; then
+              echo "::error::Podman publish failed and docker fallback is unavailable (docker missing or no daemon access, including sudo)."
+              exit 1
+            fi
+            echo "::warning::Podman publish failed for ${image_ref}; falling back to docker publish."
+            docker_login
+            docker_build
+            push_with_retry 5 docker_push
+          elif resolve_docker_cmd; then
+            docker_login
+            docker_build
+            push_with_retry 5 docker_push
           else
-            echo "::error::Neither podman nor docker is available on this runner."
+            echo "::error::Neither podman nor a usable docker daemon (direct or sudo) is available on this runner."
             exit 1
           fi
 
@@ -474,30 +575,109 @@ jobs:
         env:
           IMAGE_REPO: ghcr.io/neuralmimicry/refiner
           RELEASE_TAG: ${{ needs.package-release.outputs.release_tag }}
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_PASSWORD: ${{ github.token }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME != '' && secrets.GHCR_USERNAME || github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GHCR_PASSWORD != '' && secrets.GHCR_PASSWORD || github.token }}
+          GHCR_AUTH_SOURCE: ${{ secrets.GHCR_PASSWORD != '' && 'secrets.GHCR_PASSWORD' || 'github.token' }}
         run: |
           set -euo pipefail
+
+          push_with_retry() {
+            local max_attempts="$1"
+            shift
+            local attempt=1
+            local retry_delay=12
+            while true; do
+              if "$@"; then
+                return 0
+              fi
+              if (( attempt >= max_attempts )); then
+                echo "::error::Manifest publish failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              echo "::warning::Manifest push attempt ${attempt}/${max_attempts} failed; retrying in ${retry_delay}s..."
+              sleep "${retry_delay}"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          DOCKER_CMD=()
+
+          resolve_docker_cmd() {
+            if [[ ${#DOCKER_CMD[@]} -gt 0 ]]; then
+              return 0
+            fi
+            if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+              DOCKER_CMD=(docker)
+              return 0
+            fi
+            if command -v sudo >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1; then
+              DOCKER_CMD=(sudo docker)
+              return 0
+            fi
+            return 1
+          }
+
+          docker_login() {
+            printf '%s' "${GHCR_PASSWORD}" | "${DOCKER_CMD[@]}" login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+          }
+
+          docker_manifest_push() {
+            "${DOCKER_CMD[@]}" manifest push --purge "${image_ref}"
+          }
+
+          podman_manifest_push_default() {
+            podman manifest push --all "${image_ref}" "docker://${image_ref}"
+          }
+
+          podman_manifest_push_compat() {
+            podman manifest push \
+              --all \
+              --format v2s2 \
+              --compression-format gzip \
+              --force-compression \
+              --remove-signatures \
+              "${image_ref}" \
+              "docker://${image_ref}"
+          }
 
           image_ref="${IMAGE_REPO}:${RELEASE_TAG}"
           amd64_ref="${IMAGE_REPO}:${RELEASE_TAG}-amd64"
           arm64_ref="${IMAGE_REPO}:${RELEASE_TAG}-arm64"
+          echo "Using GHCR credentials source: ${GHCR_AUTH_SOURCE}"
 
           if command -v podman >/dev/null 2>&1; then
             printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
             podman manifest rm "${image_ref}" >/dev/null 2>&1 || true
-            podman manifest create "${image_ref}"
-            podman manifest add "${image_ref}" "docker://${amd64_ref}"
-            podman manifest add "${image_ref}" "docker://${arm64_ref}"
-            podman manifest push --all "${image_ref}" "docker://${image_ref}"
-          elif command -v docker >/dev/null 2>&1; then
-            printf '%s' "${GHCR_PASSWORD}" | docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
-            docker manifest rm "${image_ref}" >/dev/null 2>&1 || true
-            docker manifest create "${image_ref}" "${amd64_ref}" "${arm64_ref}"
-            docker manifest annotate "${image_ref}" "${amd64_ref}" --os linux --arch amd64
-            docker manifest annotate "${image_ref}" "${arm64_ref}" --os linux --arch arm64
-            docker manifest push --purge "${image_ref}"
+            if podman manifest create "${image_ref}" \
+              && podman manifest add "${image_ref}" "docker://${amd64_ref}" \
+              && podman manifest add "${image_ref}" "docker://${arm64_ref}"; then
+              if push_with_retry 2 podman_manifest_push_default; then
+                exit 0
+              fi
+              echo "::warning::Default podman manifest push failed for ${image_ref}; retrying with docker schema2 compatibility options."
+              if push_with_retry 2 podman_manifest_push_compat; then
+                exit 0
+              fi
+            fi
+            if ! resolve_docker_cmd; then
+              echo "::error::Podman manifest publish failed and docker fallback is unavailable (docker missing or no daemon access, including sudo)."
+              exit 1
+            fi
+            echo "::warning::Podman manifest publish failed for ${image_ref}; falling back to docker manifest publish."
+            docker_login
+            "${DOCKER_CMD[@]}" manifest rm "${image_ref}" >/dev/null 2>&1 || true
+            "${DOCKER_CMD[@]}" manifest create "${image_ref}" "${amd64_ref}" "${arm64_ref}"
+            "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${amd64_ref}" --os linux --arch amd64
+            "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${arm64_ref}" --os linux --arch arm64
+            push_with_retry 5 docker_manifest_push
+          elif resolve_docker_cmd; then
+            docker_login
+            "${DOCKER_CMD[@]}" manifest rm "${image_ref}" >/dev/null 2>&1 || true
+            "${DOCKER_CMD[@]}" manifest create "${image_ref}" "${amd64_ref}" "${arm64_ref}"
+            "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${amd64_ref}" --os linux --arch amd64
+            "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${arm64_ref}" --os linux --arch arm64
+            push_with_retry 5 docker_manifest_push
           else
-            echo "::error::Neither podman nor docker is available on this runner."
+            echo "::error::Neither podman nor a usable docker daemon (direct or sudo) is available on this runner."
             exit 1
           fi

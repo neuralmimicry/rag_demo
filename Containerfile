@@ -123,13 +123,15 @@ RUN set -eux; \
 # snapshot of repository capability metadata into the runtime image.
 RUN set -eux; \
     mkdir -p /src/data; \
-    PYTHONPATH=/src python - <<'PY'
-import json
-from refiner.capability_analyzer import analyse_repo
-
-with open('/src/data/capabilities_report.json', 'w', encoding='utf-8') as handle:
-    json.dump(analyse_repo('/src'), handle, ensure_ascii=True)
-PY
+    printf '%s\n' \
+        "import json" \
+        "from refiner.capability_analyzer import analyse_repo" \
+        "" \
+        "with open('/src/data/capabilities_report.json', 'w', encoding='utf-8') as handle:" \
+        "    json.dump(analyse_repo('/src'), handle, ensure_ascii=True)" \
+        > /tmp/generate_capabilities.py; \
+    PYTHONPATH=/src python /tmp/generate_capabilities.py; \
+    rm -f /tmp/generate_capabilities.py
 
 # Remove files that are useful during development but should not be included in
 # the runtime image. Keep this list explicit so accidental future exclusions are
@@ -167,20 +169,22 @@ RUN set -eux; \
 #   --build-arg STRIP_PY_SOURCES=0
 ARG STRIP_PY_SOURCES=1
 RUN set -eux; \
-    STRIP_PY_SOURCES="${STRIP_PY_SOURCES}" python - <<'PY'
-import compileall
-import os
-import pathlib
-import shutil
-
-if os.environ.get('STRIP_PY_SOURCES') == '1':
-    root = pathlib.Path('/src')
-    compileall.compile_dir(str(root), force=True, quiet=1, legacy=True)
-    for path in root.rglob('*.py'):
-        path.unlink()
-    for cache_dir in sorted(root.rglob('__pycache__'), reverse=True):
-        shutil.rmtree(cache_dir)
-PY
+    printf '%s\n' \
+        "import compileall" \
+        "import os" \
+        "import pathlib" \
+        "import shutil" \
+        "" \
+        "if os.environ.get('STRIP_PY_SOURCES') == '1':" \
+        "    root = pathlib.Path('/src')" \
+        "    compileall.compile_dir(str(root), force=True, quiet=1, legacy=True)" \
+        "    for path in root.rglob('*.py'):" \
+        "        path.unlink()" \
+        "    for cache_dir in sorted(root.rglob('__pycache__'), reverse=True):" \
+        "        shutil.rmtree(cache_dir)" \
+        > /tmp/strip_py_sources.py; \
+    STRIP_PY_SOURCES="${STRIP_PY_SOURCES}" python /tmp/strip_py_sources.py; \
+    rm -f /tmp/strip_py_sources.py
 
 # Validate expected executable assets before copying into the runtime image.
 RUN set -eux; \
