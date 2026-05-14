@@ -65,6 +65,7 @@ const projectStatusEl = document.getElementById('projectStatus');
 const projectListEl = document.getElementById('projectList');
 const roomHistoryListEl = document.getElementById('roomHistoryList');
 const auditTransferListEl = document.getElementById('auditTransferList');
+const adminVersionEl = document.getElementById('adminVersion');
 
 let teams = [];
 let projects = [];
@@ -86,6 +87,48 @@ const LONDON_TIME_FORMATTER = new Intl.DateTimeFormat('en-GB', {
 function apiFetch(path, options = {}) {
   const url = `${API_BASE}${path}`;
   return fetch(url, { credentials: 'include', ...options });
+}
+
+function setAdminVersion(payload) {
+  if (!adminVersionEl || !payload) return;
+  const version = typeof payload.version === 'string' ? payload.version.trim() : '';
+  const release = payload.release_version != null ? String(payload.release_version).trim() : '';
+  const build = payload.build != null ? String(payload.build).trim() : '';
+  const commit = payload.commit != null ? String(payload.commit).trim() : '';
+  const fallbackVersion = adminVersionEl.dataset.localVersion || '';
+  const visibleVersion = version || fallbackVersion;
+  if (!visibleVersion) return;
+
+  adminVersionEl.textContent = visibleVersion;
+  const titleParts = [];
+  if (release) {
+    titleParts.push(`Release ${release}`);
+  }
+  if (version) {
+    titleParts.push(`Version ${version}`);
+  } else if (!release) {
+    titleParts.push(`Version ${visibleVersion}`);
+  }
+  if (build) {
+    titleParts.push(`build ${build}`);
+  }
+  if (commit && commit !== 'unknown') {
+    titleParts.push(`commit ${commit}`);
+  }
+  adminVersionEl.title = titleParts.join(' · ');
+  adminVersionEl.setAttribute('aria-label', `Admin Console version ${visibleVersion}`);
+}
+
+async function fetchVersion() {
+  if (!adminVersionEl) return;
+  try {
+    const res = await apiFetch('/api/version', { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    setAdminVersion(data);
+  } catch (_err) {
+    // Keep server-rendered fallback when version endpoint is unavailable.
+  }
 }
 
 function escapeHtml(value) {
@@ -1916,4 +1959,5 @@ if (aiOrchestrationExportCsvBtn) {
 fetchTeams();
 fetchProjects();
 fetchRoomHistory();
+fetchVersion();
 setInterval(fetchRoomHistory, 20000);
