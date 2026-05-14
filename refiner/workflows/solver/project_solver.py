@@ -3717,6 +3717,15 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _solver_completion_exit_code(completion_summary: Optional[Dict[str, object]]) -> int:
+    """Return non-zero when the solver stopped with unresolved requirements."""
+    if not isinstance(completion_summary, dict):
+        return 0
+    if bool(completion_summary.get("needs_more_iterations")):
+        return 2
+    return 0
+
+
 def _gail_managed_routing_enabled() -> bool:
     raw_enabled = os.getenv("REFINER_GAIL_ENABLED")
     if raw_enabled is not None:
@@ -10772,4 +10781,4 @@ def run_project_solver(
         except Exception:
             pass
 
-    return 0
+    return _solver_completion_exit_code(completion_summary)

@@ -476,9 +476,15 @@ jobs:
 
           docker_build() {
             if [[ "${DOCKER_CMD[0]}" == "sudo" ]]; then
-              sudo DOCKER_BUILDKIT=0 docker build --pull -f Containerfile -t "${image_ref}" .
+              sudo DOCKER_BUILDKIT=0 docker build --pull \
+                --build-arg BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
+                --build-arg GIT_COMMIT="${GITHUB_SHA}" \
+                -f Containerfile -t "${image_ref}" .
             else
-              DOCKER_BUILDKIT=0 docker build --pull -f Containerfile -t "${image_ref}" .
+              DOCKER_BUILDKIT=0 docker build --pull \
+                --build-arg BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
+                --build-arg GIT_COMMIT="${GITHUB_SHA}" \
+                -f Containerfile -t "${image_ref}" .
             fi
           }
 
@@ -512,7 +518,10 @@ jobs:
           echo "Using GHCR credentials source: ${GHCR_AUTH_SOURCE}"
           if command -v podman >/dev/null 2>&1; then
             printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
-            if podman build --format docker --pull -f Containerfile -t "${image_ref}" .; then
+            if podman build --format docker --pull \
+              --build-arg BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
+              --build-arg GIT_COMMIT="${GITHUB_SHA}" \
+              -f Containerfile -t "${image_ref}" .; then
               if push_with_retry 2 podman_push_default; then
                 exit 0
               fi

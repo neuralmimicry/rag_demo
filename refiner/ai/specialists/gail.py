@@ -241,10 +241,20 @@ class GailProvider(LLMProvider):
                 self.gail_source_access_token,
             )
         )
+        has_explicit_provider_hints = any(
+            str(value or "").strip()
+            for value in (
+                self.preferred_provider,
+                self.preferred_model,
+                self.fallback_provider,
+                self.fallback_model,
+            )
+        )
         preserve_provider_hints = (
             not workflow_mode
             or include_configured is False
             or has_explicit_request_credentials
+            or has_explicit_provider_hints
             or gail_workflow_preserve_provider_hints()
         )
         preferred_provider = self.preferred_provider or self.gail_source_provider

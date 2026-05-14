@@ -215,7 +215,7 @@ def test_build_workflow_provider_propagates_include_configured_default_to_gail(m
     assert provider.include_configured is False
 
 
-def test_gail_workflow_provider_omits_hint_only_candidates_when_using_configured_pool(monkeypatch):
+def test_gail_workflow_provider_omits_candidates_when_no_hints_and_using_configured_pool(monkeypatch):
     _enable_gail(monkeypatch)
     captured = {}
     from refiner import refiner_ai_gail
@@ -237,11 +237,11 @@ def test_gail_workflow_provider_omits_hint_only_candidates_when_using_configured
     provider = build_workflow_provider(
         workflow="project_solver",
         role="planner",
-        preferred_provider="openai",
-        preferred_model="gpt-4o-mini",
+        preferred_provider=None,
+        preferred_model=None,
         preferred_api_key=None,
-        fallback_provider="gemini",
-        fallback_model="gemini-2.5-flash",
+        fallback_provider=None,
+        fallback_model=None,
         fallback_api_key=None,
         include_configured=True,
     )
@@ -256,6 +256,49 @@ def test_gail_workflow_provider_omits_hint_only_candidates_when_using_configured
     assert captured["json_payload"]["fallback_provider"] is None
     assert captured["json_payload"]["fallback_model"] is None
     assert captured["json_payload"]["fallback_api_key"] is None
+
+
+def test_gail_workflow_provider_preserves_explicit_candidates_with_configured_pool(monkeypatch):
+    _enable_gail(monkeypatch)
+    captured = {}
+    from refiner import refiner_ai_gail
+
+    def _fake_post(url, *, headers, json_payload, timeout, max_retries):
+        captured["json_payload"] = json_payload
+        return _FakeResponse(
+            {
+                "text": "ok",
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "latency_ms": 11,
+            }
+        )
+
+    monkeypatch.setattr(refiner_ai_gail, "_http_post", _fake_post)
+
+    provider = build_workflow_provider(
+        workflow="project_solver",
+        role="planner",
+        preferred_provider="openai",
+        preferred_model="gpt-4o-mini",
+        preferred_api_key=None,
+        fallback_provider="gemini",
+        fallback_model="gemini-2.5-flash",
+        fallback_api_key=None,
+        include_configured=True,
+    )
+    response = provider.predict([{"role": "user", "content": "Plan the fix."}])
+
+    assert response.provider == "openai"
+    assert response.model == "gpt-4o-mini"
+    assert captured["json_payload"]["preferred_provider"] == "openai"
+    assert captured["json_payload"]["preferred_model"] == "gpt-4o-mini"
+    assert captured["json_payload"]["preferred_api_key"] is None
+    assert captured["json_payload"]["preferred_access_token"] is None
+    assert captured["json_payload"]["fallback_provider"] == "gemini"
+    assert captured["json_payload"]["fallback_model"] == "gemini-2.5-flash"
+    assert captured["json_payload"]["fallback_api_key"] is None
+    assert captured["json_payload"]["fallback_access_token"] is None
 
 
 def test_gail_workflow_provider_preserves_explicit_credentials_with_configured_pool(monkeypatch):

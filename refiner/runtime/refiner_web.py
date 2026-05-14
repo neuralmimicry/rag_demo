@@ -7002,21 +7002,28 @@ class JobManager:
         job.finished_at = _now_iso()
         job.metrics["runtime_sec"] = self._compute_runtime_seconds(job)
         completion_reason = None
-        if job.exit_code == 0 and job.workflow in {"project_solver", "project"}:
-            completion_reason = _completion_reason_from_output(job.output_paths.get("primary"))
-        if job.exit_code == 0:
+        completion_summary = None
+        solver_incomplete = False
+        if job.workflow in {"project_solver", "project"}:
+            completion_summary = _completion_summary_from_output(job.output_paths.get("primary"))
+            completion_reason = _completion_reason_from_summary(completion_summary)
+            solver_incomplete = bool(
+                isinstance(completion_summary, dict)
+                and completion_summary.get("needs_more_iterations")
+            )
+        if job.exit_code == 0 or (job.exit_code == 2 and solver_incomplete):
             try:
                 self._finalize_repo(job)
             except Exception as exc:
                 job.append_log(f"Repo finalize failed: {exc}")
         if job.stop_requested:
             job.set_status("stopped")
-        elif job.exit_code == 0:
+        elif job.exit_code == 0 and not solver_incomplete:
             job.set_status("completed")
         else:
             job.set_status("failed")
         job.set_progress(100)
-        if completion_reason and job.status == "completed":
+        if completion_reason and job.status in {"completed", "failed"}:
             job.update_stage("finalize", completion_reason)
         job.append_log(f"Job finished with exit code {job.exit_code}")
         job.persist(force=True)
@@ -9968,23 +9975,6 @@ def _requirements_summary_from_text(text: str, max_items: int = 12) -> Dict[str,
     }
 
 
-def _completion_reason_from_output(output_path: Optional[str]) -> Optional[str]:
-    if not output_path or not os.path.exists(output_path):
-        return None
-    data = _read_json_file(output_path)
-    if not isinstance(data, dict):
-        return None
-    summary = data.get("completion_summary")
-    if not isinstance(summary, dict):
-        return None
-    if summary.get("max_steps_reached"):
-        return "steps"
-    exhausted = summary.get("iterations_exhausted_sources")
-    if isinstance(exhausted, list) and exhausted:
-        return "iterations"
-    return None
-
-
 def _completion_summary_from_output(output_path: Optional[str]) -> Optional[Dict[str, Any]]:
     if not output_path or not os.path.exists(output_path):
         return None
@@ -9995,6 +9985,23 @@ def _completion_summary_from_output(output_path: Optional[str]) -> Optional[Dict
     if isinstance(summary, dict):
         return summary
     return None
+
+
+def _completion_reason_from_summary(summary: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(summary, dict):
+        return None
+    exhausted = summary.get("iterations_exhausted_sources")
+    if summary.get("max_steps_reached"):
+        return "steps"
+    if isinstance(exhausted, list) and exhausted:
+        return "iterations"
+    if bool(summary.get("needs_more_iterations")):
+        return "incomplete"
+    return None
+
+
+def _completion_reason_from_output(output_path: Optional[str]) -> Optional[str]:
+    return _completion_reason_from_summary(_completion_summary_from_output(output_path))
 
 
 def _job_output_insights_from_output(output_path: Optional[str]) -> Dict[str, Any]:
