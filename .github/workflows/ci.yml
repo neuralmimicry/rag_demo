@@ -56,6 +56,23 @@ jobs:
       - name: Use runner Python runtime
         run: python3 --version
 
+      - name: Ensure rustup supports quiet toolchain listing
+        if: steps.nmstt_crate.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -x "$HOME/.cargo/bin/rustup" ]] && "$HOME/.cargo/bin/rustup" toolchain list --quiet >/dev/null 2>&1; then
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            exit 0
+          fi
+          if rustup toolchain list --quiet >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          echo "Installing upstream rustup because system rustup lacks '--quiet' support."
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Setup Rust
         if: steps.nmstt_crate.outputs.present == 'true'
         uses: dtolnay/rust-toolchain@stable
