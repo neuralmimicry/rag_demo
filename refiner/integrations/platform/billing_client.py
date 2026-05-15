@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
@@ -18,7 +19,7 @@ class BillingClient:
         self.base_url = base_url.rstrip("/")
         self.api_token = (api_token or "").strip() or None
         self.timeout = max(1.0, float(timeout))
-        self._session = requests.Session()
+        self._session_local = threading.local()
 
     @classmethod
     def from_env(cls) -> Optional["BillingClient"]:
@@ -114,7 +115,7 @@ class BillingClient:
             headers["Content-Type"] = "application/json"
         url = f"{self.base_url}{path if path.startswith('/') else '/' + path}"
         try:
-            response = self._session.request(
+            response = self._thread_session().request(
                 method=method.upper(),
                 url=url,
                 headers=headers,
@@ -134,6 +135,14 @@ class BillingClient:
         if not isinstance(payload, dict):
             raise BillingServiceError("billing response was not a JSON object")
         return payload
+
+    def _thread_session(self) -> requests.Session:
+        session = getattr(self._session_local, "session", None)
+        if isinstance(session, requests.Session):
+            return session
+        session = requests.Session()
+        self._session_local.session = session
+        return session
 
 
 def _env_first(*names: str, default: str = "") -> str:

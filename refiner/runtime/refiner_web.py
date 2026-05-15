@@ -34,6 +34,7 @@ import time
 import uuid
 import datetime as dt
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
@@ -510,6 +511,20 @@ EXTERNAL_HTTP_BACKOFF_MAX = max(
     EXTERNAL_HTTP_BACKOFF_BASE,
     float(os.getenv("REFINER_EXTERNAL_HTTP_BACKOFF_MAX", "2.0")),
 )
+EXTERNAL_HTTP_WORKERS = max(4, int(os.getenv("REFINER_EXTERNAL_HTTP_WORKERS", "24")))
+EXTERNAL_HTTP_FUTURE_GRACE_SEC = max(0.05, float(os.getenv("REFINER_EXTERNAL_HTTP_FUTURE_GRACE_SEC", "0.5")))
+CUSTOMERS_PROFILE_PREFETCH_WAIT_SEC = max(
+    0.05,
+    float(os.getenv("REFINER_CUSTOMERS_PROFILE_PREFETCH_WAIT_SEC", "0.75")),
+)
+CUSTOMERS_SESSION_LOOKUP_WAIT_SEC = max(
+    0.05,
+    float(os.getenv("REFINER_CUSTOMERS_SESSION_LOOKUP_WAIT_SEC", "1.25")),
+)
+CUSTOMERS_TEAM_DETAIL_MAX_WORKERS = max(
+    1,
+    int(os.getenv("REFINER_CUSTOMERS_TEAM_DETAIL_MAX_WORKERS", "12")),
+)
 STT_KB_LOCAL_PATHS = [
     p.strip()
     for p in (os.getenv("REFINER_STT_KB_LOCAL_PATHS") or "/home/pbisaacs/Developer/neuralmimicry.ai-website").split(",")
@@ -782,15 +797,191 @@ def _continuum_headers() -> Dict[str, str]:
     return _continuum_headers_impl(_continuum_client_config())
 
 
+_EXTERNAL_HTTP_EXECUTOR = ThreadPoolExecutor(
+    max_workers=EXTERNAL_HTTP_WORKERS,
+    thread_name_prefix="refiner-http",
+)
+
+
+def _submit_external_http_request(
+    method: str,
+    url: str,
+    *,
+    session_obj: Optional[requests.Session] = None,
+    headers: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Any] = None,
+    data: Optional[Any] = None,
+    files: Optional[Dict[str, Any]] = None,
+    params: Optional[Any] = None,
+    timeout: float = 20.0,
+    auth: Optional[Any] = None,
+    allow_redirects: Optional[bool] = None,
+) -> Future:
+    """Submit an outbound HTTP request to the shared non-blocking transport pool."""
+    method_upper = str(method or "GET").upper()
+    kwargs: Dict[str, Any] = {
+        "method": method_upper,
+        "url": url,
+        "headers": headers,
+        "json": json_body,
+        "data": data,
+        "files": files,
+        "params": params,
+        "timeout": max(0.001, float(timeout)),
+    }
+    if auth is not None:
+        kwargs["auth"] = auth
+    if allow_redirects is not None:
+        kwargs["allow_redirects"] = bool(allow_redirects)
+    kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if value is not None or key in {"method", "url", "timeout"}
+    }
+
+    request_callable: Callable[..., Any] = requests.request
+    if session_obj is not None:
+        session_request = getattr(session_obj, "request", None)
+        if callable(session_request):
+            request_callable = session_request
+        else:
+            method_callable = getattr(session_obj, method_upper.lower(), None)
+            if callable(method_callable):
+                def _method_request(**request_kwargs: Any) -> Any:
+                    request_kwargs.pop("method", None)
+                    request_url = request_kwargs.pop("url")
+                    return method_callable(request_url, **request_kwargs)
+
+                request_callable = _method_request
+    return _EXTERNAL_HTTP_EXECUTOR.submit(request_callable, **kwargs)
+
+
+def _await_external_http_response(
+    future: Future,
+    *,
+    url: str,
+    timeout: float,
+) -> requests.Response:
+    """Await one submitted HTTP request with an additional guard window."""
+    wait_timeout = max(0.1, float(timeout)) + EXTERNAL_HTTP_FUTURE_GRACE_SEC
+    try:
+        response = future.result(timeout=wait_timeout)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise requests.Timeout(f"external request timed out for {url}") from exc
+    if response is None or not hasattr(response, "status_code"):
+        raise RuntimeError(f"external request returned unexpected response type for {url}")
+    return response
+
+
+def _external_http_request(
+    method: str,
+    url: str,
+    *,
+    session_obj: Optional[requests.Session] = None,
+    headers: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Any] = None,
+    data: Optional[Any] = None,
+    files: Optional[Dict[str, Any]] = None,
+    params: Optional[Any] = None,
+    timeout: float = 20.0,
+    auth: Optional[Any] = None,
+    allow_redirects: Optional[bool] = None,
+) -> requests.Response:
+    """Run one outbound HTTP request on the shared executor and await result."""
+    future = _submit_external_http_request(
+        method,
+        url,
+        session_obj=session_obj,
+        headers=headers,
+        json_body=json_body,
+        data=data,
+        files=files,
+        params=params,
+        timeout=timeout,
+        auth=auth,
+        allow_redirects=allow_redirects,
+    )
+    return _await_external_http_response(future, url=url, timeout=timeout)
+
+
+def _submit_external_call(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future:
+    """Submit one external integration call to the shared non-blocking pool."""
+    return _EXTERNAL_HTTP_EXECUTOR.submit(func, *args, **kwargs)
+
+
+def _await_external_call_result(
+    future: Future,
+    *,
+    operation: str,
+    timeout: float,
+) -> Any:
+    """Await one submitted external call with a bounded guard window."""
+    wait_timeout = max(0.05, float(timeout)) + EXTERNAL_HTTP_FUTURE_GRACE_SEC
+    try:
+        return future.result(timeout=wait_timeout)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(f"{operation} timed out") from exc
+
+
+def _run_external_call(
+    operation: str,
+    func: Callable[..., Any],
+    /,
+    *args: Any,
+    timeout: float = 20.0,
+    **kwargs: Any,
+) -> Any:
+    """Execute one external call via the shared pool and await completion."""
+    future = _submit_external_call(func, *args, **kwargs)
+    return _await_external_call_result(
+        future,
+        operation=operation,
+        timeout=timeout,
+    )
+
+
+def _service_timeout_seconds(service: Any, *, default: float = 5.0) -> float:
+    try:
+        return max(0.1, float(getattr(service, "timeout", default)))
+    except Exception:
+        return max(0.1, float(default))
+
+
+def _log_external_future_exception(future: Future, *, operation: str) -> None:
+    try:
+        future.result()
+    except Exception as exc:
+        logger.warning("%s failed: %s", operation, exc)
+
+
+def _submit_external_background_call(
+    operation: str,
+    func: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    future = _submit_external_call(func, *args, **kwargs)
+    future.add_done_callback(
+        lambda done_future, op=operation: _log_external_future_exception(done_future, operation=op)
+    )
+
+
 def _http_request_with_retry(
     method: str,
     url: str,
     *,
-    headers: Optional[Dict[str, str]] = None,
+    session_obj: Optional[requests.Session] = None,
+    headers: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
-    data: Optional[Dict[str, Any]] = None,
-    params: Optional[Dict[str, Any]] = None,
+    data: Optional[Any] = None,
+    files: Optional[Dict[str, Any]] = None,
+    params: Optional[Any] = None,
     timeout: float = 20.0,
+    auth: Optional[Any] = None,
+    allow_redirects: Optional[bool] = None,
     retries: Optional[int] = None,
     retryable_statuses: Optional[set[int]] = None,
 ) -> requests.Response:
@@ -800,14 +991,18 @@ def _http_request_with_retry(
     response: Optional[requests.Response] = None
     for attempt in range(attempts):
         try:
-            response = requests.request(
+            response = _external_http_request(
                 method=method,
                 url=url,
+                session_obj=session_obj,
                 headers=headers,
-                json=json_body,
+                json_body=json_body,
                 data=data,
+                files=files,
                 params=params,
-                timeout=max(0.1, float(timeout)),
+                timeout=timeout,
+                auth=auth,
+                allow_redirects=allow_redirects,
             )
         except requests.RequestException:
             if attempt + 1 >= attempts:
@@ -1785,7 +1980,7 @@ def _oidc_discovery() -> Optional[Dict[str, Any]]:
     if cached and (now - float(_OIDC_CACHE.get("ts", 0.0)) < OIDC_DISCOVERY_TTL):
         return cached
     url = OIDC_ISSUER.rstrip("/") + "/.well-known/openid-configuration"
-    resp = requests.get(url, timeout=12)
+    resp = _http_request_with_retry("GET", url, timeout=12, retries=1)
     resp.raise_for_status()
     data = resp.json()
     if not isinstance(data, dict):
@@ -1808,7 +2003,7 @@ def _oidc_jwks() -> Optional[Dict[str, Any]]:
     jwks_uri = config.get("jwks_uri")
     if not jwks_uri:
         return None
-    resp = requests.get(jwks_uri, timeout=12)
+    resp = _http_request_with_retry("GET", jwks_uri, timeout=12, retries=1)
     resp.raise_for_status()
     data = resp.json()
     if isinstance(data, dict):
@@ -1916,10 +2111,12 @@ def _oidc_maybe_enrich_claims(
     if not userinfo_endpoint:
         return claims
     try:
-        info_resp = requests.get(
+        info_resp = _http_request_with_retry(
+            "GET",
             userinfo_endpoint,
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=12,
+            retries=1,
         )
     except Exception as exc:
         logger.debug("OIDC userinfo request failed: %s", exc)
@@ -8049,6 +8246,20 @@ user_store = CENTRAL_STORE.users if CENTRAL_STORE is not None else UserStore(USE
 user_store.ensure_admin_from_env()
 if CENTRAL_STORE is not None:
     CENTRAL_STORE.bootstrap_from_env((os.getenv("REFINER_ADMIN_USER") or "").strip())
+
+
+def _rehydrate_job_manager_from_disk() -> None:
+    """Best-effort startup pass to ensure persisted jobs are visible in memory."""
+    before = len(manager.jobs)
+    try:
+        manager._load_jobs_from_disk()
+    except Exception as exc:
+        logger.warning("job manager disk rehydrate failed for %s: %s", JOB_ROOT, exc)
+        return
+    after = len(manager.jobs)
+    if after != before:
+        logger.info("job manager rehydrated from disk: %s -> %s (%s)", before, after, JOB_ROOT)
+
 _secret_stores: Dict[str, SecretStore] = {}
 _user_activity: Dict[str, float] = {}
 _user_activity_lock = threading.Lock()
@@ -8106,6 +8317,54 @@ def _current_request_auth_headers() -> Tuple[Optional[str], Optional[str]]:
         request.headers.get("Authorization") or request.headers.get("authorization"),
         request.headers.get("Cookie"),
     )
+
+
+def _customers_profile_prefetch(
+    *,
+    authorization: Optional[str],
+    cookie_header: Optional[str],
+) -> Optional[Future]:
+    """Submit a one-time customers profile lookup for this request context."""
+    if not has_request_context() or not _customers_enabled():
+        return None
+    existing = getattr(g, "customers_profile_future", None)
+    if isinstance(existing, Future):
+        return existing
+    if not authorization and not cookie_header:
+        return None
+    future = _submit_external_call(
+        CUSTOMERS_SERVICE.profile_from_headers,
+        authorization=authorization,
+        cookie_header=cookie_header,
+    )
+    g.customers_profile_future = future
+    return future
+
+
+def _customers_profile_from_prefetch(
+    *,
+    wait_timeout: float = CUSTOMERS_PROFILE_PREFETCH_WAIT_SEC,
+) -> Optional[Dict[str, Any]]:
+    """Read the prefetched customers profile result without blocking indefinitely."""
+    if not has_request_context():
+        return None
+    future = getattr(g, "customers_profile_future", None)
+    if not isinstance(future, Future):
+        return None
+    try:
+        payload = _await_external_call_result(
+            future,
+            operation="customers profile prefetch",
+            timeout=max(0.05, float(wait_timeout)),
+        )
+    except TimeoutError:
+        return None
+    except Exception as exc:
+        logger.warning("customers profile prefetch failed: %s", exc)
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
 
 
 def _normalize_identity_groups(value: Any) -> List[str]:
@@ -8468,15 +8727,21 @@ def _current_auth_profile() -> Optional[Dict[str, Any]]:
         g.auth_profile_resolved = True
         return identity
     authorization, cookie_header = _current_request_auth_headers()
-    try:
-        payload = CUSTOMERS_SERVICE.profile_from_headers(
-            authorization=authorization,
-            cookie_header=cookie_header,
-        )
-    except Exception as exc:
-        logger.warning("customers profile lookup failed: %s", exc)
-        payload = {}
-    profile = _normalize_auth_identity(payload) or identity
+    prefetch_future = _customers_profile_prefetch(authorization=authorization, cookie_header=cookie_header)
+    payload = _customers_profile_from_prefetch(wait_timeout=CUSTOMERS_PROFILE_PREFETCH_WAIT_SEC)
+    if payload is None and prefetch_future is None and (authorization or cookie_header):
+        try:
+            payload = _run_external_call(
+                "customers profile lookup",
+                CUSTOMERS_SERVICE.profile_from_headers,
+                authorization=authorization,
+                cookie_header=cookie_header,
+                timeout=_service_timeout_seconds(CUSTOMERS_SERVICE, default=max(1.0, CUSTOMERS_TIMEOUT)),
+            )
+        except Exception as exc:
+            logger.warning("customers profile lookup failed: %s", exc)
+            payload = {}
+    profile = _normalize_auth_identity(payload if isinstance(payload, dict) else {}) or identity
     g.auth_profile = profile
     g.auth_profile_resolved = True
     if profile:
@@ -8671,7 +8936,7 @@ def _proxy_service_request(base_url: str, timeout: float, *, path: Optional[str]
     target_path = path if path is not None else request.path
     url = base_url.rstrip("/") + target_path
     try:
-        upstream = requests.request(
+        upstream = _external_http_request(
             method=request.method,
             url=url,
             params=request.args,
@@ -8756,10 +9021,14 @@ def _customer_access_tree() -> List[Dict[str, Any]]:
         g.customers_access_tree_resolved = True
         return []
     authorization, cookie_header = _current_request_auth_headers()
+    customers_timeout = _service_timeout_seconds(CUSTOMERS_SERVICE, default=max(1.0, CUSTOMERS_TIMEOUT))
     try:
-        payload = CUSTOMERS_SERVICE.teams_from_headers(
+        payload = _run_external_call(
+            "customers teams lookup",
+            CUSTOMERS_SERVICE.teams_from_headers,
             authorization=authorization,
             cookie_header=cookie_header,
+            timeout=customers_timeout,
         )
     except Exception as exc:
         logger.warning("customers teams lookup failed: %s", exc)
@@ -8767,22 +9036,44 @@ def _customer_access_tree() -> List[Dict[str, Any]]:
     tree = payload.get("tree") if isinstance(payload.get("tree"), list) else []
     teams = payload.get("teams") if isinstance(payload.get("teams"), list) else []
     detail_map: Dict[str, Dict[str, Any]] = {}
+    team_ids: List[str] = []
     for team in teams:
         if not isinstance(team, dict):
             continue
         team_id = str(team.get("id") or "").strip()
         if not team_id:
             continue
-        try:
-            detail_payload = CUSTOMERS_SERVICE.team_detail_from_headers(
+        team_ids.append(team_id)
+        detail_map[team_id] = {}
+
+    max_parallel = max(1, min(CUSTOMERS_TEAM_DETAIL_MAX_WORKERS, len(team_ids)))
+    for start in range(0, len(team_ids), max_parallel):
+        batch_ids = team_ids[start : start + max_parallel]
+        futures: Dict[Future, str] = {
+            _submit_external_call(
+                CUSTOMERS_SERVICE.team_detail_from_headers,
                 team_id,
                 authorization=authorization,
                 cookie_header=cookie_header,
-            )
-        except Exception as exc:
-            logger.warning("customers team detail lookup failed for %s: %s", team_id, exc)
-            detail_payload = {}
-        detail_map[team_id] = _customer_team_member_lists(detail_payload)
+            ): team_id
+            for team_id in batch_ids
+        }
+        try:
+            for future in as_completed(futures, timeout=customers_timeout + EXTERNAL_HTTP_FUTURE_GRACE_SEC):
+                team_id = futures[future]
+                try:
+                    detail_payload = future.result()
+                except Exception as exc:
+                    logger.warning("customers team detail lookup failed for %s: %s", team_id, exc)
+                    detail_payload = {}
+                detail_map[team_id] = _customer_team_member_lists(
+                    detail_payload if isinstance(detail_payload, dict) else {}
+                )
+        except FutureTimeoutError:
+            for future, team_id in futures.items():
+                if not future.done():
+                    future.cancel()
+                    logger.warning("customers team detail lookup timed out for %s", team_id)
     enriched_tree = _enrich_customer_team_tree(tree, detail_map)
     g.customers_access_tree = enriched_tree
     g.customers_access_tree_resolved = True
@@ -8834,7 +9125,13 @@ def _local_account_summary(scope: str, account_id: str) -> Dict[str, Any]:
 def _chain_account_summary(scope: str, account_id: str) -> Dict[str, Any]:
     if not _chain_enabled():
         raise NmChainError("nmchain not configured")
-    snapshot = NMCHAIN.account_snapshot(scope, account_id)
+    snapshot = _run_external_call(
+        "nmchain account snapshot",
+        NMCHAIN.account_snapshot,
+        scope,
+        account_id,
+        timeout=_service_timeout_seconds(NMCHAIN, default=10.0),
+    )
     return {
         "balance": int(snapshot.get("balance") or 0),
         "paid_balance": int(snapshot.get("paid_balance") or snapshot.get("balance") or 0),
@@ -8855,7 +9152,13 @@ def _chain_account_summary(scope: str, account_id: str) -> Dict[str, Any]:
 def _account_summary(scope: str, account_id: str) -> Dict[str, Any]:
     if _billing_enabled():
         try:
-            return BILLING_SERVICE.account_snapshot(scope, account_id)
+            return _run_external_call(
+                "billing account snapshot",
+                BILLING_SERVICE.account_snapshot,
+                scope,
+                account_id,
+                timeout=_service_timeout_seconds(BILLING_SERVICE, default=10.0),
+            )
         except Exception as exc:
             logger.warning("billing summary fetch failed for %s/%s: %s", scope, account_id, exc)
     if CENTRAL_STORE is not None:
@@ -8872,7 +9175,14 @@ def _account_entries(scope: str, account_id: str, limit: int = 50) -> List[Dict[
     limit_val = max(1, min(int(limit), 500))
     if _billing_enabled():
         try:
-            payload = BILLING_SERVICE.ledger_entries(scope, account_id, limit=limit_val)
+            payload = _run_external_call(
+                "billing ledger entries",
+                BILLING_SERVICE.ledger_entries,
+                scope,
+                account_id,
+                limit=limit_val,
+                timeout=_service_timeout_seconds(BILLING_SERVICE, default=10.0),
+            )
             entries = payload.get("entries")
             if isinstance(entries, list):
                 return entries
@@ -8883,7 +9193,14 @@ def _account_entries(scope: str, account_id: str, limit: int = 50) -> List[Dict[
         return ledger.list_entries(account_id, limit=limit_val)
     if _chain_enabled():
         try:
-            payload = NMCHAIN.ledger_entries(scope, account_id, limit=limit_val)
+            payload = _run_external_call(
+                "nmchain ledger entries",
+                NMCHAIN.ledger_entries,
+                scope,
+                account_id,
+                limit=limit_val,
+                timeout=_service_timeout_seconds(NMCHAIN, default=10.0),
+            )
             entries = payload.get("entries")
             if isinstance(entries, list):
                 return entries
@@ -8905,13 +9222,16 @@ def _record_token_event(
     meta_dict = dict(meta or {})
     if _billing_enabled():
         try:
-            result = BILLING_SERVICE.apply_token(
+            result = _run_external_call(
+                "billing token event",
+                BILLING_SERVICE.apply_token,
                 scope,
                 account_id,
                 entry_type=entry_type,
                 delta=int(delta),
                 request_id=request_id,
                 meta=meta_dict,
+                timeout=_service_timeout_seconds(BILLING_SERVICE, default=10.0),
             )
             entry = result.get("entry")
             if isinstance(entry, dict):
@@ -8932,13 +9252,16 @@ def _record_token_event(
         ledger = team_token_ledger if scope == "team" else token_ledger
         return ledger.record(account_id, entry_type, int(delta), meta_dict, request_id=request_id)
     if _chain_enabled():
-        result = NMCHAIN.apply_token(
+        result = _run_external_call(
+            "nmchain token event",
+            NMCHAIN.apply_token,
             scope,
             account_id,
             entry_type=entry_type,
             delta=int(delta),
             request_id=request_id,
             meta=meta_dict,
+            timeout=_service_timeout_seconds(NMCHAIN, default=10.0),
         )
         entry = result.get("entry")
         if isinstance(entry, dict):
@@ -8967,7 +9290,9 @@ def _capture_payment_event(
     meta_dict = dict(meta or {})
     if _billing_enabled():
         try:
-            result = BILLING_SERVICE.capture_payment(
+            result = _run_external_call(
+                "billing payment capture",
+                BILLING_SERVICE.capture_payment,
                 user,
                 tokens=int(tokens),
                 amount_minor=_safe_int(meta_dict.get("amount_minor")),
@@ -8977,6 +9302,7 @@ def _capture_payment_event(
                 checkout_flow=str(meta_dict.get("checkout_flow") or "").strip() or None,
                 request_id=request_id,
                 meta=meta_dict,
+                timeout=_service_timeout_seconds(BILLING_SERVICE, default=10.0),
             )
             entry = result.get("entry")
             if isinstance(entry, dict):
@@ -8996,7 +9322,9 @@ def _capture_payment_event(
     if CENTRAL_STORE is not None:
         return token_ledger.record(user, "topup", int(tokens), meta_dict, request_id=request_id)
     if _chain_enabled():
-        result = NMCHAIN.capture_payment(
+        result = _run_external_call(
+            "nmchain payment capture",
+            NMCHAIN.capture_payment,
             user,
             tokens=int(tokens),
             amount_minor=_safe_int(meta_dict.get("amount_minor")),
@@ -9006,6 +9334,7 @@ def _capture_payment_event(
             checkout_flow=str(meta_dict.get("checkout_flow") or "").strip() or None,
             request_id=request_id,
             meta=meta_dict,
+            timeout=_service_timeout_seconds(NMCHAIN, default=10.0),
         )
         entry = result.get("entry")
         if isinstance(entry, dict):
@@ -9043,18 +9372,17 @@ def _record_identity_event(
                 details[key] = identity.get(key)
     elif role and "groups" not in details:
         details["groups"] = [str(role).strip().lower()]
-    try:
-        NMCHAIN.upsert_identity(
-            user,
-            role=role,
-            email=email,
-            provider=provider,
-            subject=subject,
-            request_id=request_id,
-            meta=details,
-        )
-    except Exception as exc:
-        logger.warning("nmchain identity upsert failed for %s: %s", user, exc)
+    _submit_external_background_call(
+        "nmchain identity upsert",
+        NMCHAIN.upsert_identity,
+        user,
+        role=role,
+        email=email,
+        provider=provider,
+        subject=subject,
+        request_id=request_id,
+        meta=details,
+    )
 
 
 def _record_login_event(
@@ -9071,17 +9399,16 @@ def _record_login_event(
     if provider and "provider" not in details:
         details["provider"] = provider
     remote_addr = request.remote_addr if has_request_context() else None
-    try:
-        NMCHAIN.observe_login(
-            user,
-            system=REFINER_CHAIN_SYSTEM,
-            auth_mode=auth_mode,
-            session_id=session_id,
-            remote_addr=remote_addr,
-            meta=details,
-        )
-    except Exception as exc:
-        logger.warning("nmchain login record failed for %s: %s", user, exc)
+    _submit_external_background_call(
+        "nmchain login observe",
+        NMCHAIN.observe_login,
+        user,
+        system=REFINER_CHAIN_SYSTEM,
+        auth_mode=auth_mode,
+        session_id=session_id,
+        remote_addr=remote_addr,
+        meta=details,
+    )
 if STT_LEARNING_ENABLED:
     try:
         stt_learning_store: Optional[SttLearningStore] = SttLearningStore(
@@ -10513,7 +10840,12 @@ def _voice_user_from_request(payload: Optional[Dict[str, Any]] = None) -> Option
         user = None
         if _customers_enabled():
             try:
-                identity = CUSTOMERS_SERVICE.resolve_voice_token(token)
+                identity = _run_external_call(
+                    "customers voice token resolve",
+                    CUSTOMERS_SERVICE.resolve_voice_token,
+                    token,
+                    timeout=_service_timeout_seconds(CUSTOMERS_SERVICE, default=max(1.0, CUSTOMERS_TIMEOUT)),
+                )
                 if identity.get("authenticated"):
                     user = identity.get("user")
             except Exception as exc:
@@ -11027,7 +11359,14 @@ def _run_stt_server_bytes(
     resp: Optional[requests.Response] = None
     for attempt in range(attempts):
         try:
-            resp = session.post(endpoint, files=files, data=data, timeout=STT_SERVER_TIMEOUT)
+            resp = _external_http_request(
+                "POST",
+                endpoint,
+                session_obj=session,
+                files=files,
+                data=data,
+                timeout=STT_SERVER_TIMEOUT,
+            )
         except requests.RequestException:
             if attempt + 1 >= attempts:
                 return None, "stt_server_unreachable", None
@@ -11350,7 +11689,7 @@ def _alexa_fetch_cert_chain(url: str) -> List[Any]:
     if not VOICE_ALLOW_NETWORK:
         return []
     try:
-        resp = requests.get(url, timeout=10)
+        resp = _http_request_with_retry("GET", url, timeout=10, retries=1)
     except Exception:
         return []
     if resp.status_code >= 400:
@@ -11487,7 +11826,7 @@ def _google_fetch_keys() -> Dict[str, Any]:
         if cached.get("expires_at", 0) > now and cached.get("keys"):
             return cached["keys"]
     try:
-        resp = requests.get(GOOGLE_CERTS_URL, timeout=10)
+        resp = _http_request_with_retry("GET", GOOGLE_CERTS_URL, timeout=10, retries=1)
     except Exception:
         return {}
     if resp.status_code >= 400:
@@ -11692,7 +12031,19 @@ def _notify_portal_usage(job: "Job") -> None:
     if PORTAL_WEBHOOK_TOKEN:
         headers["Authorization"] = f"Bearer {PORTAL_WEBHOOK_TOKEN}"
     try:
-        requests.post(PORTAL_WEBHOOK_URL, json=payload, headers=headers, timeout=PORTAL_WEBHOOK_TIMEOUT)
+        future = _submit_external_http_request(
+            "POST",
+            PORTAL_WEBHOOK_URL,
+            json_body=payload,
+            headers=headers,
+            timeout=PORTAL_WEBHOOK_TIMEOUT,
+        )
+        future.add_done_callback(
+            lambda done_future: _log_external_future_exception(
+                done_future,
+                operation="portal usage webhook notify",
+            )
+        )
     except Exception:
         pass
 
@@ -12321,18 +12672,33 @@ def _current_user() -> Optional[str]:
         g.auth_profile = identity
         g.auth_profile_resolved = True
         return str(session_user).strip()
-    auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+    auth_header, cookie_header = _current_request_auth_headers()
     token = _extract_bearer_token(auth_header)
-    if _customers_enabled() and (auth_header or request.headers.get("Cookie")):
+    if _customers_enabled() and (auth_header or cookie_header):
+        _customers_profile_prefetch(
+            authorization=auth_header,
+            cookie_header=cookie_header,
+        )
         try:
-            payload = CUSTOMERS_SERVICE.session_from_headers(
+            payload = _run_external_call(
+                "customers session lookup",
+                CUSTOMERS_SERVICE.session_from_headers,
                 authorization=auth_header,
-                cookie_header=request.headers.get("Cookie"),
+                cookie_header=cookie_header,
+                timeout=min(
+                    _service_timeout_seconds(CUSTOMERS_SERVICE, default=max(1.0, CUSTOMERS_TIMEOUT)),
+                    CUSTOMERS_SESSION_LOOKUP_WAIT_SEC,
+                ),
             )
         except Exception as exc:
             logger.warning("customers session lookup failed: %s", exc)
             payload = {}
         identity = _normalize_auth_identity(payload)
+        if not (identity and identity.get("authenticated") and identity.get("user")):
+            prefetched_payload = _customers_profile_from_prefetch(wait_timeout=CUSTOMERS_PROFILE_PREFETCH_WAIT_SEC)
+            prefetched_identity = _normalize_auth_identity(prefetched_payload or {})
+            if prefetched_identity and prefetched_identity.get("authenticated") and prefetched_identity.get("user"):
+                identity = prefetched_identity
         if identity and identity.get("authenticated") and identity.get("user"):
             _set_request_identity(identity, resolved=True)
             return str(identity.get("user") or "").strip() or None
@@ -13069,7 +13435,14 @@ def oidc_callback() -> Response:
             token_payload["client_secret"] = OIDC_CLIENT_SECRET
         else:
             auth = (OIDC_CLIENT_ID, OIDC_CLIENT_SECRET)
-    token_resp = requests.post(token_endpoint, data=token_payload, auth=auth, timeout=15)
+    token_resp = _http_request_with_retry(
+        "POST",
+        token_endpoint,
+        data=token_payload,
+        auth=auth,
+        timeout=15,
+        retries=1,
+    )
     if token_resp.status_code >= 400:
         _audit_event("oidc_callback", actor=None, status="failed", details={"error": "token_exchange_failed"})
         return redirect(url_for("login"))
@@ -13160,7 +13533,14 @@ def api_oidc_exchange() -> Response:
                 token_payload["client_secret"] = OIDC_CLIENT_SECRET
             else:
                 auth = (OIDC_CLIENT_ID, OIDC_CLIENT_SECRET)
-        token_resp = requests.post(token_endpoint, data=token_payload, auth=auth, timeout=15)
+        token_resp = _http_request_with_retry(
+            "POST",
+            token_endpoint,
+            data=token_payload,
+            auth=auth,
+            timeout=15,
+            retries=1,
+        )
         if token_resp.status_code >= 400:
             _audit_event("oidc_exchange", actor=None, status="failed", details={"error": "token_exchange_failed"})
             return jsonify({"error": "token_exchange_failed"}), 401
@@ -18224,6 +18604,8 @@ if hasattr(app, "add_url_rule"):
 
 def main() -> int:
     """Run the Refiner backend Flask application."""
+    _rehydrate_job_manager_from_disk()
+
     # Register API documentation and health endpoints
     try:
         from refiner.api_docs import add_api_documentation_support
