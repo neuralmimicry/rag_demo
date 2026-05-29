@@ -1409,19 +1409,24 @@ class PostgresLLMRequestTelemetry:
         subject_limit_value = max(1, min(_coerce_int(subject_limit, 12), 100))
         now = dt.datetime.now(UTC)
         window_start = now - dt.timedelta(hours=hours_value)
-        filters = (
-            window_start,
-            scope_value,
-            scope_value,
-            subject_value,
-            subject_value,
-            provider_value,
-            provider_value,
-            model_value,
-            model_value,
-            category_value,
-            category_value,
-        )
+        where_fragments: List[str] = ["bucket_hour >= %s"]
+        where_params: List[Any] = [window_start]
+        if scope_value is not None:
+            where_fragments.append("scope = %s")
+            where_params.append(scope_value)
+        if subject_value is not None:
+            where_fragments.append("subject = %s")
+            where_params.append(subject_value)
+        if provider_value is not None:
+            where_fragments.append("provider = %s")
+            where_params.append(provider_value)
+        if model_value is not None:
+            where_fragments.append("model = %s")
+            where_params.append(model_value)
+        if category_value is not None:
+            where_fragments.append("category = %s")
+            where_params.append(category_value)
+        where_sql = " AND ".join(where_fragments)
 
         def _summary_payload(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             payload = {
@@ -1448,7 +1453,7 @@ class PostgresLLMRequestTelemetry:
 
         with self.store.pool.connection() as conn:
             totals_row = conn.execute(
-                """
+                f"""
                 SELECT
                     COALESCE(SUM(requests), 0) AS requests,
                     COALESCE(SUM(successes), 0) AS successes,
@@ -1460,26 +1465,16 @@ class PostgresLLMRequestTelemetry:
                     COALESCE(SUM(input_chars_total), 0) AS input_chars_total,
                     COALESCE(SUM(estimated_input_tokens_total), 0) AS estimated_input_tokens_total
                 FROM nm_llm_request_telemetry
-                WHERE bucket_hour >= %s
-                  AND (%s::text IS NULL OR scope = %s::text)
-                  AND (%s::text IS NULL OR subject = %s::text)
-                  AND (%s::text IS NULL OR provider = %s::text)
-                  AND (%s::text IS NULL OR model = %s::text)
-                  AND (%s::text IS NULL OR category = %s::text)
+                WHERE {where_sql}
                 """,
-                filters,
+                tuple(where_params),
             ).fetchone()
             rows = conn.execute(
-                """
+                f"""
                 WITH filtered AS (
                     SELECT *
                     FROM nm_llm_request_telemetry
-                    WHERE bucket_hour >= %s
-                      AND (%s::text IS NULL OR scope = %s::text)
-                      AND (%s::text IS NULL OR subject = %s::text)
-                      AND (%s::text IS NULL OR provider = %s::text)
-                      AND (%s::text IS NULL OR model = %s::text)
-                      AND (%s::text IS NULL OR category = %s::text)
+                    WHERE {where_sql}
                 ),
                 aggregated AS (
                     SELECT
@@ -1525,12 +1520,12 @@ class PostgresLLMRequestTelemetry:
                 ORDER BY aggregated.requests DESC, aggregated.latency_ms_total DESC, aggregated.provider ASC, aggregated.model ASC
                 LIMIT %s
                 """,
-                (*filters, limit_value),
+                (*where_params, limit_value),
             ).fetchall()
             subject_rows: List[Dict[str, Any]] = []
             if include_subjects:
                 subject_rows = conn.execute(
-                    """
+                    f"""
                     SELECT
                         subject,
                         scope,
@@ -1543,17 +1538,12 @@ class PostgresLLMRequestTelemetry:
                         MAX(latency_ms_max) AS latency_ms_max,
                         MAX(last_event_at) AS last_event_at
                     FROM nm_llm_request_telemetry
-                    WHERE bucket_hour >= %s
-                      AND (%s::text IS NULL OR scope = %s::text)
-                      AND (%s::text IS NULL OR subject = %s::text)
-                      AND (%s::text IS NULL OR provider = %s::text)
-                      AND (%s::text IS NULL OR model = %s::text)
-                      AND (%s::text IS NULL OR category = %s::text)
+                    WHERE {where_sql}
                     GROUP BY subject, scope
                     ORDER BY SUM(requests) DESC, MAX(last_event_at) DESC NULLS LAST, subject ASC
                     LIMIT %s
                     """,
-                    (*filters, subject_limit_value),
+                    (*where_params, subject_limit_value),
                 ).fetchall()
 
         groups: List[Dict[str, Any]] = []

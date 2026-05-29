@@ -147,6 +147,56 @@ spec:
                 secretKeyRef:
                   name: refiner-secrets
                   key: REFINER_ADMIN_PASSWORD
+            - name: REFINER_AUTH_DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_AUTH_DB_HOST
+            - name: REFINER_AUTH_DB_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_AUTH_DB_PORT
+            - name: REFINER_AUTH_DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_AUTH_DB_NAME
+            - name: REFINER_AUTH_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_AUTH_DB_USER
+            - name: REFINER_AUTH_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_AUTH_DB_PASSWORD
+            - name: REFINER_AUTH_DB_SSLMODE
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_AUTH_DB_SSLMODE
+            - name: REFINER_AUTH_DB_CONNECT_TIMEOUT
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_AUTH_DB_CONNECT_TIMEOUT
+            - name: REFINER_AUTH_DB_POOL_MIN
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_AUTH_DB_POOL_MIN
+            - name: REFINER_AUTH_DB_POOL_MAX
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_AUTH_DB_POOL_MAX
+            - name: REFINER_AUTH_DB_POOL_TIMEOUT
+              valueFrom:
+                secretKeyRef:
+                  name: refiner-secrets
+                  key: REFINER_AUTH_DB_POOL_TIMEOUT
           startupProbe:
             httpGet:
               path: /api/health
@@ -154,18 +204,23 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 30
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /api/health
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /api/health
               port: http
             initialDelaySeconds: 30
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
           volumeMounts:
             - name: job-data
               mountPath: /app/job_data

@@ -7,6 +7,7 @@ from central_store.assistant import (
     PostgresAssistantTraceStore,
 )
 from central_store.rag import PostgresRagMetadataStore
+from refiner.runtime.central_store import PostgresLLMRequestTelemetry
 
 
 class _FakeResult:
@@ -433,3 +434,26 @@ def test_postgres_rag_metadata_store_reads_active_version_and_deletes_versions()
     assert "SELECT version_id FROM nm_rag_collection_versions" in connection.execute_calls[1][0]
     assert connection.executemany_calls[0][1] == [("version-1",), ("version-2",)]
     assert "DELETE FROM nm_rag_collections" in connection.execute_calls[2][0]
+
+
+def test_postgres_llm_request_telemetry_summary_avoids_nullable_filter_placeholders():
+    connection = _FakeConnection(
+        responses=[
+            _FakeResult(row={}),
+            _FakeResult(rows=[]),
+        ]
+    )
+    telemetry = PostgresLLMRequestTelemetry(_FakeStore(connection))
+
+    payload = telemetry.summary(hours=72, limit=12)
+
+    assert payload["enabled"] is True
+    assert len(connection.execute_calls) == 2
+
+    totals_query, totals_params = connection.execute_calls[0]
+    grouped_query, grouped_params = connection.execute_calls[1]
+
+    assert "%s::text IS NULL" not in totals_query
+    assert "%s::text IS NULL" not in grouped_query
+    assert totals_params and len(totals_params) == 1
+    assert grouped_params and len(grouped_params) == 2

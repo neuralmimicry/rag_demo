@@ -76,6 +76,71 @@ except Exception:  # pragma: no cover
     jira_mod.JIRA = JIRA
     sys.modules['jira'] = jira_mod
 
+# werkzeug.security stub
+try:
+    from werkzeug.security import check_password_hash, generate_password_hash  # type: ignore # noqa: F401
+except Exception:  # pragma: no cover
+    werkzeug_mod = types.ModuleType('werkzeug')
+    werkzeug_security = types.ModuleType('werkzeug.security')
+
+    def generate_password_hash(value):
+        return f"stub::{value}"
+
+    def check_password_hash(hashed, value):
+        return hashed == f"stub::{value}"
+
+    werkzeug_security.generate_password_hash = generate_password_hash
+    werkzeug_security.check_password_hash = check_password_hash
+    werkzeug_mod.security = werkzeug_security
+    sys.modules['werkzeug'] = werkzeug_mod
+    sys.modules['werkzeug.security'] = werkzeug_security
+
+# psycopg/psycopg_pool stubs
+try:
+    import psycopg  # type: ignore
+except Exception:  # pragma: no cover
+    psycopg = types.ModuleType('psycopg')
+    rows_mod = types.ModuleType('psycopg.rows')
+    rows_mod.dict_row = object()
+    types_mod = types.ModuleType('psycopg.types')
+    json_mod = types.ModuleType('psycopg.types.json')
+
+    class Jsonb:  # minimal wrapper used by code paths in tests
+        def __init__(self, value):
+            self.value = value
+
+    def _connect(*_args, **_kwargs):
+        raise RuntimeError("psycopg is not installed in this test environment")
+
+    json_mod.Jsonb = Jsonb
+    types_mod.json = json_mod
+    psycopg.connect = _connect
+    psycopg.rows = rows_mod
+    psycopg.types = types_mod
+    sys.modules['psycopg'] = psycopg
+    sys.modules['psycopg.rows'] = rows_mod
+    sys.modules['psycopg.types'] = types_mod
+    sys.modules['psycopg.types.json'] = json_mod
+
+try:
+    import psycopg_pool  # type: ignore
+except Exception:  # pragma: no cover
+    psycopg_pool = types.ModuleType('psycopg_pool')
+
+    class ConnectionPool:  # minimal placeholder for imports
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def wait(self):
+            return None
+
+        def connection(self):
+            raise RuntimeError("ConnectionPool stub does not provide real connections")
+
+    psycopg_pool.ConnectionPool = ConnectionPool
+    sys.modules['psycopg_pool'] = psycopg_pool
+
 # matplotlib non-interactive backend
 matplotlib.use('Agg')
 # also ensure pyplot exists
