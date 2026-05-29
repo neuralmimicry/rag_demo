@@ -686,6 +686,61 @@ def _safe_path(root: str, candidate: str, extra_roots: Optional[List[str]] = Non
     return None
 
 
+def _rewrite_project_prefixed_command_paths(command: str, project_name: str) -> Tuple[str, bool]:
+    if not command or not project_name:
+        return command, False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command, False
+    if not parts:
+        return command, False
+    cleaned_name = project_name.strip().strip("/\\")
+    if not cleaned_name:
+        return command, False
+    changed = False
+    for idx, token in enumerate(parts):
+        if not token or os.path.isabs(token):
+            continue
+        normalized = token.replace("\\", "/")
+        if normalized == cleaned_name:
+            parts[idx] = "."
+            changed = True
+            continue
+        prefix = cleaned_name + "/"
+        if normalized.startswith(prefix):
+            remainder = normalized[len(prefix):]
+            parts[idx] = f"./{remainder}" if remainder else "."
+            changed = True
+    if not changed:
+        return command, False
+    rewritten = " ".join(shlex.quote(p) for p in parts)
+    return rewritten, True
+
+
+def _fallback_workdir_for_parent_path(
+    *,
+    workdir: str,
+    project_root: str,
+    command: str,
+) -> Tuple[Optional[str], str, Optional[str]]:
+    if not workdir:
+        return None, command, None
+    candidate = os.path.abspath(workdir if os.path.isabs(workdir) else os.path.join(project_root, workdir))
+    project_abs = os.path.abspath(project_root)
+    parent = os.path.dirname(project_abs)
+    if candidate != parent:
+        return None, command, None
+    rewritten_command, changed = _rewrite_project_prefixed_command_paths(
+        command,
+        os.path.basename(project_abs),
+    )
+    note = f"Normalized unsafe workdir to project root: {workdir} -> {project_abs}"
+    if changed:
+        note += f"; rewrote command paths: {command} -> {rewritten_command}"
+    return project_abs, rewritten_command, note
+
+
 def _read_text_file(path: str, max_bytes: int) -> Optional[str]:
     try:
         if os.path.getsize(path) > max_bytes:
@@ -2593,7 +2648,7 @@ def _parse_json_payload(text: str) -> Dict[str, object]:
         except Exception:
             continue
 
-    logger.error("Failed to parse LLM JSON payload: no valid JSON object found.")
+    logger.debug("Failed to parse LLM JSON payload: no valid JSON object found.")
     raise json.JSONDecodeError("Failed to parse LLM JSON payload", cleaned or "", 0)
 
 
@@ -3174,7 +3229,20 @@ def _execute_shell_command(
             actions_log.append(
                 f"Verification output issue detected ({verification_issue}); treating as failure."
             )
-    success = result.returncode == 0 and not verification_issue
+    no_tests_is_informational = (
+        verification_issue == "no tests ran"
+        and "pytest" in (command or "").lower()
+        and result.returncode in {0, 5}
+        and not _has_pytest_config(workdir)
+        and not os.path.isdir(os.path.join(workdir, "tests"))
+    )
+    if no_tests_is_informational:
+        verification_issue = None
+        actions_log.append(
+            "No pytest tests discovered and no pytest config/tests directory found; "
+            "treating this verification output as informational."
+        )
+    success = (result.returncode == 0 and not verification_issue) or no_tests_is_informational
     if command_trust_store is not None:
         try:
             trust = command_trust_store.record(
@@ -3238,6 +3306,27 @@ def _has_pytest_config(project_root: str) -> bool:
     return False
 
 
+def _python_syntax_check_command(project_root: str, *, max_files: int = 40) -> Optional[str]:
+    ignored = _ignored_dirnames(None)
+    python_files: List[str] = []
+    for walk_root, dirs, files in os.walk(project_root):
+        _filter_walk_dirs(walk_root, dirs, ignored)
+        for filename in sorted(files):
+            if not filename.endswith(".py"):
+                continue
+            path = os.path.join(walk_root, filename)
+            rel = os.path.relpath(path, project_root)
+            python_files.append(rel)
+            if len(python_files) >= max_files:
+                break
+        if len(python_files) >= max_files:
+            break
+    if not python_files:
+        return None
+    args = " ".join(shlex.quote(path) for path in python_files)
+    return f"python -m py_compile {args}"
+
+
 def _select_verification_steps(
     project_root: str,
     lang_info: Dict[str, List[str]],
@@ -3260,15 +3349,17 @@ def _select_verification_steps(
                 }
             )
         else:
-            steps.append(
-                {
-                    "type": "run_command",
-                    "step": "Run Python checks",
-                    "command": "python -m pytest",
-                    "workdir": ".",
-                    "timeout": 900,
-                }
-            )
+            syntax_cmd = _python_syntax_check_command(project_root)
+            if syntax_cmd:
+                steps.append(
+                    {
+                        "type": "run_command",
+                        "step": "Run Python syntax checks",
+                        "command": syntax_cmd,
+                        "workdir": ".",
+                        "timeout": 900,
+                    }
+                )
 
     if ("node" in languages or "node" in build_systems) and len(steps) < max_steps:
         scripts = _package_json_scripts(project_root)
@@ -5463,6 +5554,38 @@ def _normalize_plan_step_paths(plan_steps: List[Dict[str, object]]) -> bool:
     return changed
 
 
+def _drop_blocked_mutating_vcs_steps(
+    plan_steps: List[Dict[str, object]],
+    *,
+    actions_log: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, object]], int]:
+    if not isinstance(plan_steps, list):
+        return [], 0
+    filtered: List[Dict[str, object]] = []
+    dropped = 0
+    for step in plan_steps:
+        if not isinstance(step, dict):
+            filtered.append(step)
+            continue
+        if _normalize_step_type(step.get("type")) != "run_command":
+            filtered.append(step)
+            continue
+        command = step.get("command")
+        if not isinstance(command, str):
+            filtered.append(step)
+            continue
+        policy = evaluate_command_policy(command)
+        if policy.allowed or policy.category != "vcs_mutation":
+            filtered.append(step)
+            continue
+        dropped += 1
+        if actions_log is not None:
+            actions_log.append(
+                f"Dropped blocked mutating VCS command from plan: {command} ({policy.reason})"
+            )
+    return filtered, dropped
+
+
 def _plan_has_actionable_steps(plan_steps: List[Dict[str, object]]) -> bool:
     for step in plan_steps:
         if not isinstance(step, dict):
@@ -7581,6 +7704,25 @@ def _source_is_under_root(source_path: str, root_path: str) -> bool:
     return norm_source == norm_root or norm_source.startswith(norm_root + os.sep)
 
 
+def _is_workspace_project_mirror_source(source_path: str, project_root: str) -> bool:
+    if not source_path:
+        return False
+    normalized = source_path.replace("\\", "/").strip("/")
+    project_name = os.path.basename(os.path.abspath(project_root)).replace("\\", "/").strip("/")
+    if not project_name:
+        return False
+    mirror_prefixes = (
+        f"project_root/{project_name}/",
+        f"project-root/{project_name}/",
+    )
+    return any(
+        normalized == prefix.rstrip("/")
+        or normalized.startswith(prefix)
+        or f"/{prefix}" in f"/{normalized}"
+        for prefix in mirror_prefixes
+    )
+
+
 def _apply_step(
     project_root: str,
     step: Dict[str, object],
@@ -7919,12 +8061,25 @@ def _apply_step(
             workdir = workdir_value.strip()
         else:
             workdir = "."
+        effective_command = command
         abs_workdir = _safe_path(project_root, workdir, extra_roots=allowed_roots)
         if not abs_workdir:
-            actions_log.append(f"Skipped run_command unsafe workdir: {workdir}")
-            logger.info(f"Skipped run_command (unsafe workdir): {workdir}")
-            return
-        sanitized_command = _sanitize_shell_command(command, venv_path)
+            fallback_workdir, fallback_command, fallback_note = _fallback_workdir_for_parent_path(
+                workdir=workdir,
+                project_root=project_root,
+                command=command,
+            )
+            if fallback_workdir:
+                abs_workdir = fallback_workdir
+                effective_command = fallback_command
+                if fallback_note:
+                    actions_log.append(fallback_note)
+                    logger.info(fallback_note)
+            else:
+                actions_log.append(f"Skipped run_command unsafe workdir: {workdir}")
+                logger.info(f"Skipped run_command (unsafe workdir): {workdir}")
+                return
+        sanitized_command = _sanitize_shell_command(effective_command, venv_path)
         rewritten_command = _rewrite_command_for_venv(sanitized_command, venv_path)
         rewritten_command = _rewrite_requirements_path_in_command(
             rewritten_command,
@@ -8383,6 +8538,18 @@ def run_project_solver(
                 max_code_files=80,
                 extra_ignored=None,
             )
+            mirror_filtered = []
+            mirror_dropped = 0
+            for ws_source in workspace_sources:
+                if _is_workspace_project_mirror_source(ws_source.path, project_root):
+                    mirror_dropped += 1
+                    continue
+                mirror_filtered.append(ws_source)
+            workspace_sources = mirror_filtered
+            if mirror_dropped:
+                actions_log.append(
+                    f"Skipped {mirror_dropped} mirrored requirement source(s) from solver workspace."
+                )
             if workspace_sources:
                 requirement_sources.extend(workspace_sources)
                 actions_log.append(
@@ -9030,6 +9197,7 @@ def run_project_solver(
                 "- Ensure at least one global requirement ID is referenced in the plan steps.\n"
                 "- Prefer write_file for new files, replace_in_file for edits, and run_command only when necessary.\n"
                 "- Keep changes within the project root, or within the solver workspace if provided outside the project root. Do not delete files.\n"
+                "- Do not include mutating git commands (git init/add/commit/push/reset/checkout); repository actions are handled outside solver execution.\n"
                 "- Ignore virtual environments and third-party packages; do not propose edits inside site-packages or venv folders.\n"
                 "- If you write or modify code, ensure it is robust, secure, resilient, modular, scalable, and follows best practices. Include brief inline documentation for non-obvious logic.\n"
                 "- If audit findings are provided, include at least one plan step prefixed with 'AUDIT:' that explicitly addresses them.\n"
@@ -9862,6 +10030,21 @@ def run_project_solver(
                     _record_action("Plan contained only notes; retrying.", source_actions_log)
                     continue
                 _normalize_plan_step_paths(plan_steps)
+                plan_steps, dropped_vcs_steps = _drop_blocked_mutating_vcs_steps(
+                    plan_steps,
+                    actions_log=source_actions_log,
+                )
+                if dropped_vcs_steps:
+                    _record_action(
+                        f"Dropped {dropped_vcs_steps} blocked mutating VCS step(s) before execution.",
+                        source_actions_log,
+                    )
+                if not plan_steps:
+                    _record_action(
+                        "Plan became empty after dropping blocked mutating VCS steps; retrying.",
+                        source_actions_log,
+                    )
+                    continue
                 suspicious_issues = _plan_suspicious_issues(plan_steps, eval_info)
                 if suspicious_issues:
                     reason = "; ".join(suspicious_issues)
@@ -10085,7 +10268,16 @@ def run_project_solver(
                             failure for failure in failures_to_fix if _is_verification_failure(failure)
                         ]
                         if verification_failures and verification_first and allow_run:
-                            verification_failures_by_source[source.path] = verification_failures
+                            verification_failures_by_source[source.path] = [
+                                {
+                                    **failure,
+                                    "recovery_attempts": max(
+                                        int(failure.get("recovery_attempts") or 0),
+                                        recovery_attempts,
+                                    ),
+                                }
+                                for failure in verification_failures
+                            ]
                             replan_due_to_verification = True
                             _record_action(
                                 "Verification failed; replanning current source before proceeding.",
@@ -10335,7 +10527,7 @@ def run_project_solver(
                     {
                         "source": source.path,
                         "iteration": last_iteration,
-                        "recovery_attempts": 0,
+                        "recovery_attempts": int(failure.get("recovery_attempts") or 0),
                         "status": "unresolved",
                         "verification_issue": failure.get("verification_issue"),
                     }
