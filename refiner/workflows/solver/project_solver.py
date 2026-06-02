@@ -639,6 +639,36 @@ WEB_RESEARCH_TRIGGER_RE = re.compile(
     r"(traceback|exception|error|failed|module not found|importerror|modulenotfounderror)",
     re.IGNORECASE,
 )
+PYTEST_FILE_NOT_FOUND_RE = re.compile(
+    r"file or directory not found:\s*([^\r\n]+)",
+    re.IGNORECASE,
+)
+PLAN_PLACEHOLDER_LITERALS = {
+    "shell command",
+    "relative dir (project root) or absolute dir under solver workspace if outside project root",
+    "relative path for file operations (project root) or absolute path under solver workspace if outside project root",
+}
+PYTEST_PATH_VALUE_OPTIONS = {
+    "-c",
+    "--confcutdir",
+    "--rootdir",
+    "--basetemp",
+    "--junitxml",
+    "--resultlog",
+    "--log-file",
+    "--ignore",
+    "--ignore-glob",
+}
+PYTEST_PATH_VALUE_OPTION_PREFIXES = (
+    "--confcutdir=",
+    "--rootdir=",
+    "--basetemp=",
+    "--junitxml=",
+    "--resultlog=",
+    "--log-file=",
+    "--ignore=",
+    "--ignore-glob=",
+)
 
 DEFAULT_OPENCODE_COMMAND_TEMPLATE = (
     "{opencode_bin} run --format json {opencode_model_flag} --file {prompt_file} "
@@ -684,6 +714,184 @@ def _safe_path(root: str, candidate: str, extra_roots: Optional[List[str]] = Non
         if _is_subpath(allowed, abs_path):
             return abs_path
     return None
+
+
+def _normalize_placeholder_literal(value: str) -> str:
+    lowered = (value or "").strip().strip("'\"`").lower()
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered
+
+
+def _is_placeholder_command_literal(command: str) -> bool:
+    if not isinstance(command, str) or not command.strip():
+        return False
+    normalized = _normalize_placeholder_literal(command)
+    return normalized in PLAN_PLACEHOLDER_LITERALS
+
+
+def _is_placeholder_workdir_literal(workdir: str) -> bool:
+    if not isinstance(workdir, str) or not workdir.strip():
+        return False
+    normalized = _normalize_placeholder_literal(workdir)
+    return normalized in PLAN_PLACEHOLDER_LITERALS
+
+
+def _split_pytest_node_selector(token: str) -> Tuple[str, str]:
+    if "::" not in token:
+        return token, ""
+    base, remainder = token.split("::", 1)
+    return base, f"::{remainder}"
+
+
+def _command_invokes_pytest(parts: List[str]) -> bool:
+    if not parts:
+        return False
+    for idx, token in enumerate(parts):
+        base = os.path.basename(token).lower()
+        if base.startswith("pytest"):
+            return True
+        if token in {"-m", "--module"} and idx + 1 < len(parts):
+            if parts[idx + 1].strip().lower() == "pytest":
+                return True
+    return False
+
+
+def _token_looks_like_path(token: str) -> bool:
+    if not token or token.startswith("-"):
+        return False
+    base, _ = _split_pytest_node_selector(token)
+    if not base:
+        return False
+    if any(ch in base for ch in "*?[]"):
+        return False
+    normalized = base.replace("\\", "/")
+    if normalized.startswith("./") or normalized.startswith("../"):
+        return True
+    if "/" in normalized:
+        return True
+    if normalized.lower().endswith(
+        (
+            ".py",
+            ".txt",
+            ".ini",
+            ".cfg",
+            ".toml",
+            ".json",
+            ".yaml",
+            ".yml",
+        )
+    ):
+        return True
+    return False
+
+
+def _candidate_command_path_variants(path_token: str) -> List[str]:
+    normalized = path_token.replace("\\", "/").strip()
+    if not normalized:
+        return []
+    candidates: List[str] = [normalized]
+    trimmed = normalized
+    while trimmed.startswith("./"):
+        trimmed = trimmed[2:]
+    if trimmed and trimmed != normalized:
+        candidates.append(trimmed)
+    parts = [part for part in trimmed.split("/") if part and part != "."]
+    for idx in range(1, len(parts)):
+        candidates.append("/".join(parts[idx:]))
+    seen = set()
+    deduped: List[str] = []
+    for candidate in candidates:
+        key = candidate.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+    return deduped
+
+
+def _resolve_relative_command_path(
+    path_token: str,
+    *,
+    abs_workdir: str,
+    project_root: Optional[str],
+    workspace_root: Optional[str],
+) -> Optional[str]:
+    if not path_token or os.path.isabs(path_token):
+        return None
+    if any(ch in path_token for ch in "*?[]"):
+        return None
+    existing_local = os.path.join(abs_workdir, path_token)
+    if os.path.exists(existing_local):
+        return None
+    search_roots: List[str] = [abs_workdir]
+    if workspace_root:
+        search_roots.append(workspace_root)
+    if project_root:
+        search_roots.append(project_root)
+    variants = _candidate_command_path_variants(path_token)
+    if not variants:
+        return None
+    seen_abs: set = set()
+    for rel_candidate in variants:
+        for root in search_roots:
+            root_abs = os.path.abspath(root)
+            abs_candidate = os.path.abspath(os.path.join(root_abs, rel_candidate))
+            if abs_candidate in seen_abs:
+                continue
+            seen_abs.add(abs_candidate)
+            if not os.path.exists(abs_candidate):
+                continue
+            rel_from_workdir = os.path.relpath(abs_candidate, abs_workdir)
+            return rel_from_workdir.replace("\\", "/")
+    return None
+
+
+def _replace_command_token(command: str, old_token: str, new_token: str) -> Optional[str]:
+    if not command or not old_token or old_token == new_token:
+        return None
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    changed = False
+    for idx, token in enumerate(parts):
+        if token == old_token:
+            parts[idx] = new_token
+            changed = True
+    if not changed:
+        return None
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def _coerce_pytest_command(command: str, *, use_pythonpath: bool = False) -> Optional[str]:
+    if not command:
+        return None
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    pytest_index: Optional[int] = None
+    for idx, token in enumerate(parts):
+        if os.path.basename(token).lower().startswith("pytest"):
+            pytest_index = idx
+            break
+    if pytest_index is None:
+        for idx, token in enumerate(parts[:-1]):
+            if token in {"-m", "--module"} and parts[idx + 1].strip().lower() == "pytest":
+                pytest_index = idx + 1
+                break
+    if pytest_index is None:
+        return None
+    pytest_args = parts[pytest_index + 1 :]
+    rebuilt_parts = ["python", "-m", "pytest", *pytest_args]
+    rebuilt = " ".join(shlex.quote(part) for part in rebuilt_parts)
+    if use_pythonpath:
+        rebuilt = "PYTHONPATH=. " + rebuilt
+    return rebuilt
 
 
 def _rewrite_project_prefixed_command_paths(command: str, project_name: str) -> Tuple[str, bool]:
@@ -1913,10 +2121,11 @@ def _rewrite_requirements_path_in_command(
     command: str,
     *,
     abs_workdir: str,
+    project_root: Optional[str],
     workspace_root: Optional[str],
     actions_log: List[str],
 ) -> str:
-    if not command or not workspace_root:
+    if not command:
         return command
     try:
         parts = shlex.split(command)
@@ -1924,29 +2133,63 @@ def _rewrite_requirements_path_in_command(
         return command
     if not parts:
         return command
+
+    def _rewrite_path_token(token: str) -> Optional[str]:
+        base_token, node_selector = _split_pytest_node_selector(token)
+        rewritten_base = _resolve_relative_command_path(
+            base_token,
+            abs_workdir=abs_workdir,
+            project_root=project_root,
+            workspace_root=workspace_root,
+        )
+        if not rewritten_base:
+            return None
+        return rewritten_base + node_selector
+
     changed = False
+    pytest_invocation = _command_invokes_pytest(parts)
     for idx, token in enumerate(parts):
         if token in ("-r", "--requirement") and idx + 1 < len(parts):
             req_path = parts[idx + 1]
-            if not os.path.isabs(req_path):
-                candidate = os.path.join(abs_workdir, req_path)
-                workspace_candidate = os.path.join(workspace_root, req_path)
-                if not os.path.exists(candidate) and os.path.exists(workspace_candidate):
-                    parts[idx + 1] = workspace_candidate
-                    changed = True
+            rewritten_req = _rewrite_path_token(req_path)
+            if rewritten_req and rewritten_req != req_path:
+                parts[idx + 1] = rewritten_req
+                changed = True
         elif token.startswith("-r") and len(token) > 2:
             req_path = token[2:]
-            if not os.path.isabs(req_path):
-                candidate = os.path.join(abs_workdir, req_path)
-                workspace_candidate = os.path.join(workspace_root, req_path)
-                if not os.path.exists(candidate) and os.path.exists(workspace_candidate):
-                    parts[idx] = "-r" + workspace_candidate
+            rewritten_req = _rewrite_path_token(req_path)
+            if rewritten_req and rewritten_req != req_path:
+                parts[idx] = "-r" + rewritten_req
+                changed = True
+        if not pytest_invocation:
+            continue
+        if token in PYTEST_PATH_VALUE_OPTIONS and idx + 1 < len(parts):
+            value = parts[idx + 1]
+            rewritten_value = _rewrite_path_token(value)
+            if rewritten_value and rewritten_value != value:
+                parts[idx + 1] = rewritten_value
+                changed = True
+            continue
+        for option_prefix in PYTEST_PATH_VALUE_OPTION_PREFIXES:
+            if token.startswith(option_prefix):
+                value = token[len(option_prefix) :]
+                rewritten_value = _rewrite_path_token(value)
+                if rewritten_value and rewritten_value != value:
+                    parts[idx] = option_prefix + rewritten_value
                     changed = True
+                break
+        else:
+            if not _token_looks_like_path(token):
+                continue
+            rewritten_token = _rewrite_path_token(token)
+            if rewritten_token and rewritten_token != token:
+                parts[idx] = rewritten_token
+                changed = True
     if not changed:
         return command
     rewritten = " ".join(shlex.quote(part) for part in parts)
     actions_log.append(
-        f"Rewrote requirements path to solver workspace: {command} -> {rewritten}"
+        f"Rewrote command paths for current workspace: {command} -> {rewritten}"
     )
     return rewritten
 
@@ -5330,6 +5573,60 @@ def _is_verification_failure(failure: Dict[str, object]) -> bool:
     return bool(failure.get("verification_issue"))
 
 
+def _failure_fingerprint(failure: Dict[str, object]) -> str:
+    command = re.sub(r"\s+", " ", _safe_str(failure.get("command")).lower())
+    workdir = _safe_str(failure.get("workdir")).replace("\\", "/").lower()
+    exit_code = _safe_str(failure.get("exit_code"))
+    verification_issue = _safe_str(failure.get("verification_issue")).lower()
+    output = (_safe_str(failure.get("stderr")) + "\n" + _safe_str(failure.get("stdout"))).lower()
+    signal = verification_issue
+    if not signal and output:
+        for marker in (
+            "file or directory not found",
+            "no such file or directory",
+            "modulenotfounderror",
+            "no module named",
+            "blocked by solver policy",
+            "timeout",
+            "timed out",
+        ):
+            if marker in output:
+                signal = marker
+                break
+    if not signal and output.strip():
+        first_line = next((line.strip() for line in output.splitlines() if line.strip()), "")
+        signal = first_line[:140]
+    return f"{command}|{workdir}|{exit_code}|{signal[:140]}"
+
+
+def _suppress_repeated_failures(
+    failures: List[Dict[str, object]],
+    *,
+    seen_counts: Dict[str, int],
+    repeat_limit: int,
+    actions_log: List[str],
+    scope_label: str,
+) -> List[Dict[str, object]]:
+    if repeat_limit < 1:
+        return failures
+    retained: List[Dict[str, object]] = []
+    dropped = 0
+    for failure in failures:
+        fingerprint = _failure_fingerprint(failure)
+        count = int(seen_counts.get(fingerprint, 0))
+        if count >= repeat_limit:
+            dropped += 1
+            continue
+        seen_counts[fingerprint] = count + 1
+        retained.append(failure)
+    if dropped:
+        actions_log.append(
+            f"Recovery loop breaker ({scope_label}): skipped {dropped} repeated failure(s) "
+            f"after {repeat_limit} occurrence(s)."
+        )
+    return retained
+
+
 def _build_indentation_recovery_steps(
     failures: List[Dict[str, object]],
     *,
@@ -7200,13 +7497,14 @@ def _plan_recovery_steps(
         '      "find": "text to replace",\n'
         '      "replace": "replacement text",\n'
         '      "count": 0,\n'
-        '      "command": "shell command",\n'
-        '      "workdir": "relative dir (project root) or absolute dir under solver workspace if outside project root",\n'
+        '      "command": "python -m pytest tests/test_example.py",\n'
+        '      "workdir": ".",\n'
         '      "timeout": 600\n'
         "    }\n"
         "  ]\n"
         "}\n"
         "Notes:\n"
+        "- The command/workdir values above are examples; never emit placeholder literals.\n"
         "- Avoid using 'source' or activation scripts as standalone commands; use venv/bin/python or venv/bin/pip directly.\n"
         "- Keep changes within the project root or solver workspace.\n"
         "- If failure output includes a FutureWarning, apply the suggested fix in the warning before retrying.\n"
@@ -7307,6 +7605,17 @@ def _plan_local_recovery(
         or packaging.get("pipfile")
         or "python" in languages
     )
+    failure_workdir_value = result.get("workdir")
+    if isinstance(failure_workdir_value, str) and failure_workdir_value.strip():
+        failure_workdir = failure_workdir_value.strip()
+    else:
+        failure_workdir = "."
+    failure_workdir_abs = (
+        os.path.abspath(failure_workdir)
+        if os.path.isabs(failure_workdir)
+        else os.path.abspath(os.path.join(workspace, failure_workdir))
+    )
+    is_pytest_command = bool(_coerce_pytest_command(command))
 
     if python_signals and (".venv/bin/python" in command or ".venv\\scripts\\python" in command.lower()):
         venv_candidate = os.path.join(workspace, ".venv", "bin", "python")
@@ -7366,6 +7675,60 @@ def _plan_local_recovery(
             recovery["commands"] = [f"{pip_cmd} install -U pytest"]
         return recovery
 
+    if is_pytest_command and PYTEST_FILE_NOT_FOUND_RE.search(text):
+        recovery["reason"] = "pytest target path missing"
+        commands: List[Dict[str, str]] = []
+        normalized_command = _rewrite_requirements_path_in_command(
+            command,
+            abs_workdir=failure_workdir_abs,
+            project_root=workspace,
+            workspace_root=workspace,
+            actions_log=[],
+        )
+        if normalized_command != command:
+            commands.append({"command": normalized_command, "workdir": failure_workdir})
+        match = PYTEST_FILE_NOT_FOUND_RE.search(text)
+        missing_target = match.group(1).strip().strip("'\"`") if match else ""
+        if missing_target:
+            missing_base, missing_selector = _split_pytest_node_selector(missing_target)
+            missing_basename = os.path.basename(missing_base)
+            if missing_basename and missing_basename != missing_base:
+                replaced = _replace_command_token(
+                    command,
+                    missing_target,
+                    missing_basename + missing_selector,
+                )
+                if replaced:
+                    commands.append({"command": replaced, "workdir": failure_workdir})
+        root_pytest = _coerce_pytest_command(normalized_command if normalized_command != command else command)
+        if root_pytest:
+            commands.append({"command": root_pytest, "workdir": "."})
+        if commands:
+            recovery["commands"] = commands
+            return recovery
+
+    if is_pytest_command and (
+        "no module named" in text
+        or "modulenotfounderror" in text
+        or "importerror" in text
+    ):
+        recovery["reason"] = "pytest import path or dependency issue"
+        commands: List[Dict[str, str]] = []
+        pytest_with_pythonpath = _coerce_pytest_command(command, use_pythonpath=True)
+        if pytest_with_pythonpath:
+            commands.append({"command": pytest_with_pythonpath, "workdir": "."})
+        pytest_from_root = _coerce_pytest_command(command)
+        if pytest_from_root:
+            commands.append({"command": pytest_from_root, "workdir": "."})
+        if packaging["pyproject"] or packaging["setup_py"] or packaging["setup_cfg"]:
+            commands.append({"command": f"{pip_cmd} install -e .", "workdir": "."})
+        else:
+            req_file = _candidate_requirements_files_local(workspace)
+            if req_file:
+                commands.append({"command": f"{pip_cmd} install -r {req_file}", "workdir": "."})
+        recovery["commands"] = commands
+        return recovery
+
     if python_signals and (
         "no module named" in text
         and ("pip install" in command or "-m pytest" in command or "pytest" in command)
@@ -7395,7 +7758,7 @@ def _plan_local_recovery(
         recovery["commands"] = [f"{pip_cmd} install -U pipenv", "pipenv install --dev"]
         return recovery
 
-    if "pytest" in command and ("failed" in text or "error" in text) and "--lf" not in command:
+    if is_pytest_command and ("failed" in text or "error" in text) and "--lf" not in command:
         recovery["reason"] = "pytest failure; retry last failed tests"
         recovery["commands"] = [command + " --lf"]
         return recovery
@@ -7463,27 +7826,46 @@ def _plan_local_recovery_steps(
         if commands:
             actions_log.append(f"Local recovery ({reason}) generated {len(commands)} command(s).")
         for rec_cmd in commands:
-            if not rec_cmd or rec_cmd in seen_commands:
+            rec_command = ""
+            rec_workdir = "."
+            rec_timeout = 900
+            if isinstance(rec_cmd, dict):
+                rec_command = _safe_str(rec_cmd.get("command"))
+                rec_workdir_raw = rec_cmd.get("workdir")
+                if isinstance(rec_workdir_raw, str) and rec_workdir_raw.strip():
+                    rec_workdir = rec_workdir_raw.strip()
+                timeout_raw = rec_cmd.get("timeout")
+                if isinstance(timeout_raw, (int, float)):
+                    rec_timeout = int(timeout_raw)
+            elif isinstance(rec_cmd, str):
+                rec_command = rec_cmd
+            if not rec_command:
                 continue
-            seen_commands.add(rec_cmd)
+            dedupe_key = (rec_command, rec_workdir)
+            if dedupe_key in seen_commands:
+                continue
+            seen_commands.add(dedupe_key)
             steps.append(
                 {
                     "type": "run_command",
                     "step": f"Recovery: {reason}",
-                    "command": rec_cmd,
-                    "workdir": ".",
-                    "timeout": 900,
+                    "command": rec_command,
+                    "workdir": rec_workdir,
+                    "timeout": rec_timeout,
                 }
             )
         retry_cmd = command
-        if retry_cmd and retry_cmd not in seen_commands:
-            seen_commands.add(retry_cmd)
+        retry_workdir_raw = failure.get("workdir")
+        retry_workdir = retry_workdir_raw if isinstance(retry_workdir_raw, str) and retry_workdir_raw else "."
+        retry_key = (retry_cmd, retry_workdir)
+        if retry_cmd and retry_key not in seen_commands:
+            seen_commands.add(retry_key)
             steps.append(
                 {
                     "type": "run_command",
                     "step": f"Retry command after recovery: {command}",
                     "command": command,
-                    "workdir": failure.get("workdir") or ".",
+                    "workdir": retry_workdir,
                     "timeout": 900,
                 }
             )
@@ -8048,6 +8430,25 @@ def _apply_step(
             actions_log.append("Skipped run_command missing command.")
             logger.info("Skipped run_command (missing command).")
             return
+        if _is_placeholder_command_literal(command):
+            placeholder_msg = (
+                f"Skipped run_command placeholder command literal: {command!r}. "
+                "Planner must provide a real executable command."
+            )
+            actions_log.append(placeholder_msg)
+            logger.info(placeholder_msg)
+            if failure_log is not None:
+                failure_log.append(
+                    {
+                        "command": command,
+                        "workdir": step.get("workdir") or ".",
+                        "exit_code": None,
+                        "stdout": "",
+                        "stderr": "placeholder command literal",
+                        "verification_issue": "placeholder command literal",
+                    }
+                )
+            return
         if not allow_run:
             actions_log.append(f"Skipped run_command (disabled): {command}")
             logger.info(f"Skipped run_command (disabled): {command}")
@@ -8060,6 +8461,14 @@ def _apply_step(
         if isinstance(workdir_value, str) and workdir_value.strip():
             workdir = workdir_value.strip()
         else:
+            workdir = "."
+        if _is_placeholder_workdir_literal(workdir):
+            actions_log.append(
+                f"Normalized placeholder workdir literal to project root: {workdir!r} -> '.'"
+            )
+            logger.info(
+                f"Normalized placeholder workdir literal to project root: {workdir!r} -> '.'"
+            )
             workdir = "."
         effective_command = command
         abs_workdir = _safe_path(project_root, workdir, extra_roots=allowed_roots)
@@ -8084,6 +8493,7 @@ def _apply_step(
         rewritten_command = _rewrite_requirements_path_in_command(
             rewritten_command,
             abs_workdir=abs_workdir,
+            project_root=project_root,
             workspace_root=workspace_root,
             actions_log=actions_log,
         )
@@ -8777,6 +9187,8 @@ def run_project_solver(
     last_web_research_steps_by_source: Dict[str, int] = {}
     verification_failures_by_source: Dict[str, List[Dict[str, object]]] = {}
     replace_failures_by_source: Dict[str, List[Dict[str, object]]] = {}
+    recovery_failure_counts_by_source: Dict[str, Dict[str, int]] = {}
+    recovery_repeat_limit = max(1, _env_int("SOLVER_RECOVERY_REPEAT_LIMIT", 2))
     agentic_workflow = AgenticWorkflow(
         phases=["plan", "act", "verify", "reflect"],
         max_cycles=max_iterations,
@@ -9174,8 +9586,8 @@ def run_project_solver(
                 '      "find": "text to replace",\n'
                 '      "replace": "replacement text",\n'
                 '      "count": 0,\n'
-                '      "command": "shell command",\n'
-                '      "workdir": "relative dir (project root) or absolute dir under solver workspace if outside project root",\n'
+                '      "command": "python -m pytest tests/test_example.py",\n'
+                '      "workdir": ".",\n'
                 '      "timeout": 600\n'
                 "    }\n"
                 "  ],\n"
@@ -9183,8 +9595,8 @@ def run_project_solver(
                 "    {\n"
                 '      "type": "run_command",\n'
                 '      "step": "verification step",\n'
-                '      "command": "shell command",\n'
-                '      "workdir": "relative dir (project root) or absolute dir under solver workspace if outside project root",\n'
+                '      "command": "python -m pytest tests/test_example.py",\n'
+                '      "workdir": ".",\n'
                 '      "timeout": 600\n'
                 "    }\n"
                 "  ]\n"
@@ -9192,6 +9604,7 @@ def run_project_solver(
             )
             notes_section = (
                 "Notes:\n"
+                "- Command/workdir values shown in schema are examples, not literal placeholders.\n"
                 "- Treat ONLY the current requirement source. Do not merge requirements from other files unless explicitly requested.\n"
                 "- Reference requirement IDs (REQ-###) from the formal register in every plan step and in any code comments you add.\n"
                 "- Ensure at least one global requirement ID is referenced in the plan steps.\n"
@@ -10153,9 +10566,39 @@ def run_project_solver(
 
                 if command_failures and allow_run:
                     venv_path = current_venv or _find_workspace_venv(solver_workspace)
+                    source_failure_counts = recovery_failure_counts_by_source.setdefault(source.path, {})
                     recovery_attempts = 0
-                    failures_to_fix = command_failures
-                    while failures_to_fix and recovery_attempts < 2:
+                    failures_to_fix = _suppress_repeated_failures(
+                        command_failures,
+                        seen_counts=source_failure_counts,
+                        repeat_limit=recovery_repeat_limit,
+                        actions_log=source_actions_log,
+                        scope_label=f"{source.path} across iterations",
+                    )
+                    skip_recovery = False
+                    if not failures_to_fix:
+                        failures_to_fix = command_failures
+                        skip_recovery = True
+                        _record_action(
+                            "Recovery loop breaker: repeated failure pattern exceeded retry limit; recording unresolved failure.",
+                            source_actions_log,
+                        )
+                    attempt_failure_counts: Dict[str, int] = {}
+                    while failures_to_fix and recovery_attempts < 2 and not skip_recovery:
+                        filtered_failures = _suppress_repeated_failures(
+                            failures_to_fix,
+                            seen_counts=attempt_failure_counts,
+                            repeat_limit=1,
+                            actions_log=source_actions_log,
+                            scope_label="current recovery cycle",
+                        )
+                        if not filtered_failures:
+                            _record_action(
+                                "Recovery loop breaker: repeated failures persisted within current recovery cycle.",
+                                source_actions_log,
+                            )
+                            break
+                        failures_to_fix = filtered_failures
                         recovery_attempts += 1
                         _record_action(
                             f"Attempting recovery for {len(failures_to_fix)} failed command(s) (attempt {recovery_attempts}).",

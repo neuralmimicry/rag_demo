@@ -136,3 +136,199 @@ def test_drop_blocked_mutating_vcs_steps():
     assert len(filtered) == 1
     assert filtered[0]["type"] == "write_file"
     assert any("Dropped blocked mutating VCS command" in item for item in actions)
+
+
+def test_apply_step_skips_placeholder_command_literal(tmp_path):
+    project_root = tmp_path / "sample-project"
+    project_root.mkdir()
+    actions_log = []
+    failure_log = []
+    step = {
+        "type": "run_command",
+        "command": "shell command",
+        "workdir": ".",
+    }
+
+    project_solver._apply_step(
+        str(project_root),
+        step,
+        allow_run=True,
+        actions_log=actions_log,
+        failure_log=failure_log,
+    )
+
+    assert any("placeholder command literal" in item.lower() for item in actions_log)
+    assert failure_log
+    assert failure_log[0]["verification_issue"] == "placeholder command literal"
+
+
+def test_apply_step_normalizes_placeholder_workdir_literal(monkeypatch, tmp_path):
+    project_root = tmp_path / "sample-project"
+    tests_dir = project_root / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    captured = {}
+
+    def _fake_execute(command, **kwargs):
+        captured["command"] = command
+        captured["workdir"] = kwargs.get("workdir")
+        return True
+
+    monkeypatch.setattr(project_solver, "_execute_shell_command", _fake_execute)
+    actions_log = []
+    step = {
+        "type": "run_command",
+        "command": "python -m pytest tests/test_sample.py",
+        "workdir": "relative dir (project root) or absolute dir under solver workspace if outside project root",
+    }
+
+    project_solver._apply_step(
+        str(project_root),
+        step,
+        allow_run=True,
+        actions_log=actions_log,
+    )
+
+    assert captured["workdir"] == str(project_root)
+    assert any("normalized placeholder workdir literal" in item.lower() for item in actions_log)
+
+
+def test_rewrite_requirements_path_in_command_normalizes_pytest_target_from_deep_workdir(tmp_path):
+    project_root = tmp_path / "sample-project"
+    tests_dir = project_root / "project_solver_output" / "src" / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_badge_system.py").write_text("def test_badge():\n    assert True\n", encoding="utf-8")
+    actions_log = []
+
+    rewritten = project_solver._rewrite_requirements_path_in_command(
+        "pytest project_solver_output/src/tests/test_badge_system.py",
+        abs_workdir=str(tests_dir),
+        project_root=str(project_root),
+        workspace_root=str(project_root / "project_solver_output"),
+        actions_log=actions_log,
+    )
+
+    assert rewritten == "pytest test_badge_system.py"
+    assert any("rewrote command paths" in item.lower() for item in actions_log)
+
+
+def test_plan_local_recovery_generates_pytest_file_not_found_fix(tmp_path):
+    workspace = tmp_path / "sample-project"
+    tests_dir = workspace / "project_solver_output" / "src" / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_badge_system.py").write_text("def test_badge():\n    assert True\n", encoding="utf-8")
+
+    recovery = project_solver._plan_local_recovery(
+        command="pytest project_solver_output/src/tests/test_badge_system.py",
+        result={
+            "workdir": str(tests_dir),
+            "stdout": "",
+            "stderr": "ERROR: file or directory not found: project_solver_output/src/tests/test_badge_system.py",
+        },
+        workspace=str(workspace),
+        venv_path=None,
+    )
+
+    assert recovery
+    assert "pytest target path missing" in (recovery.get("reason") or "")
+    commands = recovery.get("commands") or []
+    assert any(
+        isinstance(item, dict)
+        and item.get("workdir") == str(tests_dir)
+        and "pytest test_badge_system.py" in str(item.get("command"))
+        for item in commands
+    )
+    assert any(
+        isinstance(item, dict) and str(item.get("command")).startswith("python -m pytest")
+        for item in commands
+    )
+
+
+def test_plan_local_recovery_handles_pytest_import_issue_with_pythonpath(tmp_path):
+    workspace = tmp_path / "sample-project"
+    workspace.mkdir()
+    (workspace / "pyproject.toml").write_text("[project]\nname = 'sample'\nversion = '0.1.0'\n", encoding="utf-8")
+
+    recovery = project_solver._plan_local_recovery(
+        command="pytest tests/test_app.py",
+        result={
+            "workdir": str(workspace),
+            "stdout": "",
+            "stderr": "ModuleNotFoundError: No module named 'src'",
+        },
+        workspace=str(workspace),
+        venv_path=None,
+    )
+
+    assert recovery
+    assert "pytest import path or dependency issue" in (recovery.get("reason") or "")
+    commands = recovery.get("commands") or []
+    assert any(
+        isinstance(item, dict)
+        and str(item.get("command")).startswith("PYTHONPATH=. python -m pytest")
+        for item in commands
+    )
+
+
+def test_plan_local_recovery_steps_preserves_structured_recovery_workdir(tmp_path):
+    project_root = tmp_path / "sample-project"
+    tests_dir = project_root / "project_solver_output" / "src" / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_badge_system.py").write_text("def test_badge():\n    assert True\n", encoding="utf-8")
+    actions_log = []
+
+    steps = project_solver._plan_local_recovery_steps(
+        [
+            {
+                "command": "pytest project_solver_output/src/tests/test_badge_system.py",
+                "workdir": str(tests_dir),
+                "stdout": "",
+                "stderr": "ERROR: file or directory not found: project_solver_output/src/tests/test_badge_system.py",
+            }
+        ],
+        project_root=str(project_root),
+        venv_path=None,
+        workspace=str(project_root),
+        actions_log=actions_log,
+    )
+
+    assert steps
+    assert any(
+        step.get("type") == "run_command"
+        and step.get("workdir") == str(tests_dir)
+        and "pytest test_badge_system.py" in str(step.get("command"))
+        for step in steps
+    )
+
+
+def test_suppress_repeated_failures_breaks_recovery_loop():
+    seen_counts = {}
+    actions_log = []
+    failures = [
+        {
+            "command": "pytest tests/test_app.py",
+            "workdir": ".",
+            "exit_code": 4,
+            "stderr": "ERROR: file or directory not found: tests/test_app.py",
+            "stdout": "",
+        }
+    ]
+
+    first_pass = project_solver._suppress_repeated_failures(
+        failures,
+        seen_counts=seen_counts,
+        repeat_limit=1,
+        actions_log=actions_log,
+        scope_label="unit test",
+    )
+    second_pass = project_solver._suppress_repeated_failures(
+        failures,
+        seen_counts=seen_counts,
+        repeat_limit=1,
+        actions_log=actions_log,
+        scope_label="unit test",
+    )
+
+    assert len(first_pass) == 1
+    assert second_pass == []
+    assert any("loop breaker" in item.lower() for item in actions_log)
