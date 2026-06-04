@@ -1448,6 +1448,94 @@ def _filter_walk_dirs(walk_root: str, dirs: List[str], ignored: set) -> None:
     dirs[:] = keep
 
 
+def _workspace_path_prefixes(project_root: str, workspace_root: str) -> List[str]:
+    prefixes: List[str] = []
+    workspace_abs = os.path.abspath(workspace_root)
+    workspace_name = os.path.basename(workspace_abs)
+    if workspace_name:
+        prefixes.append(workspace_name.replace("\\", "/"))
+    if _is_subpath(project_root, workspace_abs):
+        rel_workspace = os.path.relpath(workspace_abs, project_root).replace("\\", "/")
+        if rel_workspace not in {".", ""}:
+            prefixes.append(rel_workspace)
+    deduped: List[str] = []
+    seen = set()
+    for prefix in sorted(prefixes, key=len, reverse=True):
+        key = prefix.strip("/")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+    return deduped
+
+
+def _strip_path_prefix(path_value: str, prefix: str) -> Optional[str]:
+    if not path_value or not prefix:
+        return None
+    if path_value == prefix:
+        return ""
+    marker = prefix + "/"
+    if path_value.startswith(marker):
+        return path_value[len(marker):]
+    return None
+
+
+def _normalize_workspace_prefixed_path(
+    rel_path: str,
+    *,
+    project_root: str,
+    workspace_root: Optional[str],
+) -> Tuple[str, Optional[str]]:
+    if not rel_path or os.path.isabs(rel_path) or not workspace_root:
+        return rel_path, None
+    normalized = os.path.normpath(rel_path).replace("\\", "/")
+    if normalized in {".", ""}:
+        return rel_path, None
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    prefixes = _workspace_path_prefixes(project_root, workspace_root)
+    if not prefixes:
+        return normalized, None
+
+    candidates: List[str] = [normalized]
+    for _ in range(4):
+        expanded = False
+        for candidate in list(candidates):
+            for prefix in prefixes:
+                stripped = _strip_path_prefix(candidate, prefix)
+                if stripped is None:
+                    continue
+                stripped = stripped.strip("/")
+                if not stripped or stripped in candidates:
+                    continue
+                candidates.append(stripped)
+                expanded = True
+        if not expanded:
+            break
+    if len(candidates) == 1:
+        return normalized, None
+
+    def _candidate_score(candidate: str) -> Tuple[int, int, int, int]:
+        project_exists = os.path.exists(os.path.join(project_root, candidate))
+        workspace_exists = os.path.exists(os.path.join(workspace_root, candidate))
+        starts_with_prefix = any(
+            candidate == prefix or candidate.startswith(prefix + "/")
+            for prefix in prefixes
+        )
+        return (
+            0 if (project_exists or workspace_exists) else 1,
+            0 if not starts_with_prefix else 1,
+            candidate.count("/"),
+            len(candidate),
+        )
+
+    best = min(candidates, key=_candidate_score)
+    if best == normalized:
+        return best, None
+    note = f"Normalized workspace-prefixed path: {rel_path} -> {best}"
+    return best, note
+
+
 def _resolve_file_target(
     rel_path: str,
     *,
@@ -1470,6 +1558,12 @@ def _resolve_file_target(
     )
     if corrected_path:
         rel_path = corrected_path
+    rel_path, workspace_note = _normalize_workspace_prefixed_path(
+        rel_path,
+        project_root=project_root,
+        workspace_root=workspace_root,
+    )
+    correction_note = _merge_notes(correction_note, workspace_note)
     if os.path.isabs(rel_path) or not workspace_root:
         return rel_path, correction_note
     _, ext = os.path.splitext(rel_path)
@@ -3570,10 +3664,47 @@ def _python_syntax_check_command(project_root: str, *, max_files: int = 40) -> O
     return f"python -m py_compile {args}"
 
 
+def _looks_like_pytest_file(filename: str) -> bool:
+    if not filename:
+        return False
+    lowered = filename.lower()
+    return (lowered.startswith("test_") and lowered.endswith(".py")) or lowered.endswith("_test.py")
+
+
+def _discover_pytest_target(root: str, *, max_depth: int = 4) -> Optional[str]:
+    if not root or not os.path.isdir(root):
+        return None
+    preferred = ("tests", "src/tests")
+    for rel in preferred:
+        candidate = os.path.join(root, rel)
+        if not os.path.isdir(candidate):
+            continue
+        try:
+            names = os.listdir(candidate)
+        except OSError:
+            names = []
+        for name in names:
+            if _looks_like_pytest_file(name):
+                return rel
+    ignored = _ignored_dirnames(None)
+    root_depth = root.rstrip(os.sep).count(os.sep)
+    for walk_root, dirs, files in os.walk(root):
+        _filter_walk_dirs(walk_root, dirs, ignored)
+        depth = walk_root.rstrip(os.sep).count(os.sep) - root_depth
+        if depth > max_depth:
+            dirs[:] = []
+            continue
+        if any(_looks_like_pytest_file(name) for name in files):
+            rel = os.path.relpath(walk_root, root).replace("\\", "/")
+            return "." if rel == "." else rel
+    return None
+
+
 def _select_verification_steps(
     project_root: str,
     lang_info: Dict[str, List[str]],
     *,
+    workspace_root: Optional[str] = None,
     max_steps: int = 2,
 ) -> List[Dict[str, object]]:
     languages = set(lang_info.get("languages") or [])
@@ -3581,13 +3712,49 @@ def _select_verification_steps(
     steps: List[Dict[str, object]] = []
 
     if "python" in languages or "python" in build_systems:
-        if _has_pytest_config(project_root) or os.path.isdir(os.path.join(project_root, "tests")):
+        project_pytest_config = _has_pytest_config(project_root)
+        project_pytest_target = _discover_pytest_target(project_root)
+        workspace_pytest_config = bool(workspace_root and _has_pytest_config(workspace_root))
+        workspace_pytest_target = _discover_pytest_target(workspace_root) if workspace_root else None
+        if project_pytest_config or project_pytest_target:
+            command = "python -m pytest"
+            if project_pytest_target and not project_pytest_config and project_pytest_target != ".":
+                command += f" {shlex.quote(project_pytest_target)}"
             steps.append(
                 {
                     "type": "run_command",
                     "step": "Run Python tests",
-                    "command": "python -m pytest",
+                    "command": command,
                     "workdir": ".",
+                    "timeout": 900,
+                }
+            )
+        elif workspace_root and (workspace_pytest_config or workspace_pytest_target):
+            if workspace_pytest_target in {None, ""}:
+                workspace_pytest_target = "."
+            if _is_subpath(project_root, workspace_root):
+                rel_workspace = os.path.relpath(workspace_root, project_root).replace("\\", "/")
+                if rel_workspace in {"", "."}:
+                    command_target = workspace_pytest_target
+                elif workspace_pytest_target in {".", ""}:
+                    command_target = rel_workspace
+                else:
+                    command_target = f"{rel_workspace}/{workspace_pytest_target}"
+                command = "python -m pytest"
+                if command_target not in {"", "."}:
+                    command += f" {shlex.quote(command_target)}"
+                workdir = "."
+            else:
+                command = "python -m pytest"
+                if workspace_pytest_target not in {"", "."}:
+                    command += f" {shlex.quote(workspace_pytest_target)}"
+                workdir = workspace_root
+            steps.append(
+                {
+                    "type": "run_command",
+                    "step": "Run Python tests (solver workspace)",
+                    "command": command,
+                    "workdir": workdir,
                     "timeout": 900,
                 }
             )
@@ -3913,6 +4080,7 @@ def _build_local_plan_from_intent(
     project_root: str,
     lang_info: Dict[str, List[str]],
     *,
+    workspace_root: Optional[str] = None,
     allow_run: bool,
     required_ids: Optional[set] = None,
 ) -> Optional[Dict[str, object]]:
@@ -3928,7 +4096,12 @@ def _build_local_plan_from_intent(
     summary_bits: List[str] = [intent.replace("_", " ")]
 
     if intent == "verification_only":
-        verification_steps = _select_verification_steps(project_root, lang_info, max_steps=2)
+        verification_steps = _select_verification_steps(
+            project_root,
+            lang_info,
+            workspace_root=workspace_root,
+            max_steps=2,
+        )
         if not verification_steps:
             return None
         plan_steps.extend(verification_steps)
@@ -3964,7 +4137,12 @@ def _build_local_plan_from_intent(
         if isinstance(step, dict)
     )
     if needs_verification and allow_run:
-        verification_steps = _select_verification_steps(project_root, lang_info, max_steps=2)
+        verification_steps = _select_verification_steps(
+            project_root,
+            lang_info,
+            workspace_root=workspace_root,
+            max_steps=2,
+        )
         for step in verification_steps:
             plan_steps.append(step)
         if verification_steps:
@@ -4455,7 +4633,6 @@ def _ensure_global_requirements(
         for item in requirements
         if isinstance(item, dict) and _safe_str(item.get("id"))
     }
-    default_sources = sorted({src.path for src in requirement_sources}) if requirement_sources else []
     existing_titles = {
         _safe_str(item.get("title")).lower()
         for item in requirements
@@ -4480,7 +4657,7 @@ def _ensure_global_requirements(
                 "description": desc,
                 "type": _normalize_requirement_type(_safe_str(req.get("type"))),
                 "priority": _normalize_priority(_safe_str(req.get("priority")), f"{title} {desc}"),
-                "source": ["global"] if not default_sources else ["global"] + default_sources,
+                "source": ["global"],
                 "acceptance_criteria": list(req.get("acceptance_criteria") or []),
                 "dependencies": list(req.get("dependencies") or []),
                 "verification": _safe_str(req.get("verification")),
@@ -5466,7 +5643,7 @@ def _build_requirements_register_section(
             if req_id:
                 global_ids.append(req_id)
     if global_ids:
-        section += "\nGlobal requirement IDs (reference at least one in each plan step):\n"
+        section += "\nGlobal requirement IDs (cross-cutting constraints; reference when directly addressed):\n"
         for req_id in global_ids:
             section += f"- {req_id}\n"
     sequence_ids = []
@@ -5571,6 +5748,41 @@ def _is_verification_failure(failure: Dict[str, object]) -> bool:
     if isinstance(command, str) and _is_verification_command(command):
         return True
     return bool(failure.get("verification_issue"))
+
+
+def _is_deterministic_recovery_failure(failure: Dict[str, object]) -> bool:
+    signal = " ".join(
+        [
+            _safe_str(failure.get("verification_issue")),
+            _safe_str(failure.get("stderr")),
+            _safe_str(failure.get("stdout")),
+        ]
+    ).lower()
+    if not signal:
+        return False
+    deterministic_markers = (
+        "file or directory not found",
+        "no such file or directory",
+        "modulenotfounderror",
+        "no module named",
+        "importerror",
+    )
+    return any(marker in signal for marker in deterministic_markers)
+
+
+def _should_replan_verification_failures(
+    verification_failures: List[Dict[str, object]],
+    *,
+    verification_first: bool,
+    allow_run: bool,
+    repeated_failures_exhausted: bool,
+) -> bool:
+    return bool(
+        verification_failures
+        and verification_first
+        and allow_run
+        and not repeated_failures_exhausted
+    )
 
 
 def _failure_fingerprint(failure: Dict[str, object]) -> str:
@@ -7803,6 +8015,7 @@ def _plan_local_recovery_steps(
     venv_path: Optional[str],
     workspace: Optional[str],
     actions_log: List[str],
+    retry_seen_fingerprints: Optional[set] = None,
 ) -> List[Dict[str, object]]:
     if not failures:
         return []
@@ -7813,6 +8026,10 @@ def _plan_local_recovery_steps(
         command = failure.get("command")
         if not isinstance(command, str) or not command:
             continue
+        fingerprint = _failure_fingerprint(failure)
+        fingerprint_seen = bool(
+            retry_seen_fingerprints is not None and fingerprint in retry_seen_fingerprints
+        )
         recovery = _plan_local_recovery(
             command=command,
             result=failure,
@@ -7858,7 +8075,24 @@ def _plan_local_recovery_steps(
         retry_workdir_raw = failure.get("workdir")
         retry_workdir = retry_workdir_raw if isinstance(retry_workdir_raw, str) and retry_workdir_raw else "."
         retry_key = (retry_cmd, retry_workdir)
-        if retry_cmd and retry_key not in seen_commands:
+        has_recovery_commands = bool(commands)
+        deterministic_failure = _is_deterministic_recovery_failure(failure)
+        allow_retry = True
+        if has_recovery_commands and deterministic_failure:
+            allow_retry = False
+            actions_log.append(
+                f"Skipped immediate retry for deterministic failure fingerprint: {fingerprint}"
+            )
+        if fingerprint_seen:
+            allow_retry = False
+            actions_log.append(
+                f"Skipped retry for unchanged failure fingerprint: {fingerprint}"
+            )
+        if (
+            allow_retry
+            and retry_cmd
+            and retry_key not in seen_commands
+        ):
             seen_commands.add(retry_key)
             steps.append(
                 {
@@ -7869,6 +8103,8 @@ def _plan_local_recovery_steps(
                     "timeout": 900,
                 }
             )
+        if retry_seen_fingerprints is not None:
+            retry_seen_fingerprints.add(fingerprint)
     return steps
 
 
@@ -9188,6 +9424,10 @@ def run_project_solver(
     verification_failures_by_source: Dict[str, List[Dict[str, object]]] = {}
     replace_failures_by_source: Dict[str, List[Dict[str, object]]] = {}
     recovery_failure_counts_by_source: Dict[str, Dict[str, int]] = {}
+    recovery_retry_fingerprints_by_source: Dict[str, set] = {}
+    failure_fingerprint_totals_by_source: Dict[str, Dict[str, int]] = {}
+    selected_verification_commands: List[Dict[str, object]] = []
+    selected_verification_keys: set = set()
     recovery_repeat_limit = max(1, _env_int("SOLVER_RECOVERY_REPEAT_LIMIT", 2))
     agentic_workflow = AgenticWorkflow(
         phases=["plan", "act", "verify", "reflect"],
@@ -9200,6 +9440,34 @@ def run_project_solver(
         actions_log.append(message)
         if local_log is not None:
             local_log.append(message)
+
+    def _record_selected_verification_commands(
+        source_path: str,
+        steps: List[Dict[str, object]],
+        *,
+        reason: str,
+    ) -> None:
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            if _normalize_step_type(step.get("type")) != "run_command":
+                continue
+            command = _safe_str(step.get("command"))
+            if not command or not _is_verification_command(command):
+                continue
+            workdir = _safe_str(step.get("workdir")) or "."
+            key = (source_path, reason, command, workdir)
+            if key in selected_verification_keys:
+                continue
+            selected_verification_keys.add(key)
+            selected_verification_commands.append(
+                {
+                    "source": source_path,
+                    "reason": reason,
+                    "command": command,
+                    "workdir": workdir,
+                }
+            )
 
     source_count = len(requirement_sources)
     source_index_map = {src.path: idx + 1 for idx, src in enumerate(requirement_sources)}
@@ -9607,7 +9875,7 @@ def run_project_solver(
                 "- Command/workdir values shown in schema are examples, not literal placeholders.\n"
                 "- Treat ONLY the current requirement source. Do not merge requirements from other files unless explicitly requested.\n"
                 "- Reference requirement IDs (REQ-###) from the formal register in every plan step and in any code comments you add.\n"
-                "- Ensure at least one global requirement ID is referenced in the plan steps.\n"
+                "- Reference global requirement IDs when a step explicitly addresses cross-cutting constraints; do not force every step to cite one.\n"
                 "- Prefer write_file for new files, replace_in_file for edits, and run_command only when necessary.\n"
                 "- Keep changes within the project root, or within the solver workspace if provided outside the project root. Do not delete files.\n"
                 "- Do not include mutating git commands (git init/add/commit/push/reset/checkout); repository actions are handled outside solver execution.\n"
@@ -9846,6 +10114,7 @@ def run_project_solver(
                 source,
                 project_root,
                 language_info,
+                workspace_root=solver_workspace,
                 allow_run=allow_run,
                 required_ids=source_required_ids,
             )
@@ -9858,6 +10127,11 @@ def run_project_solver(
                 )
                 if usable:
                     payload = local_payload
+                    _record_selected_verification_commands(
+                        source.path,
+                        local_steps if isinstance(local_steps, list) else [],
+                        reason="local_intent",
+                    )
                     _record_action(
                         f"Using local intent plan ({local_intent.get('intent')}).",
                         source_actions_log,
@@ -10032,7 +10306,12 @@ def run_project_solver(
                     plan_steps = agent_payload.get("plan")
                     if pure_code and isinstance(plan_steps, list):
                         if _plan_has_code_changes(plan_steps) and not _plan_has_verification(plan_steps):
-                            verification_steps = _select_verification_steps(project_root, language_info, max_steps=2)
+                            verification_steps = _select_verification_steps(
+                                project_root,
+                                language_info,
+                                workspace_root=solver_workspace,
+                                max_steps=2,
+                            )
                             if not verification_steps:
                                 verification_steps = [
                                     {
@@ -10045,6 +10324,11 @@ def run_project_solver(
                                 ]
                             plan_steps.extend(verification_steps)
                             agent_payload["plan"] = plan_steps
+                            _record_selected_verification_commands(
+                                source.path,
+                                verification_steps,
+                                reason="codingagent_code_only_fallback",
+                            )
                             _record_action(
                                 "Added verification command after code-only coding agent output.",
                                 source_actions_log,
@@ -10132,6 +10416,11 @@ def run_project_solver(
                     plan_steps.append(step)
                     added += 1
                 if added:
+                    _record_selected_verification_commands(
+                        source.path,
+                        verification_steps,
+                        reason="payload_verification_steps",
+                    )
                     _record_action(
                         f"Appended {added} verification step(s) from payload.",
                         source_actions_log,
@@ -10356,7 +10645,12 @@ def run_project_solver(
                         continue
             if plan_has_code_changes and not _plan_has_verification(plan_steps):
                 if not strict_verification and allow_run:
-                    verification_steps = _select_verification_steps(project_root, language_info, max_steps=2)
+                    verification_steps = _select_verification_steps(
+                        project_root,
+                        language_info,
+                        workspace_root=solver_workspace,
+                        max_steps=2,
+                    )
                     if not verification_steps:
                         verification_steps = [
                             {
@@ -10369,6 +10663,11 @@ def run_project_solver(
                         ]
                     plan_steps.extend(verification_steps)
                     if verification_steps:
+                        _record_selected_verification_commands(
+                            source.path,
+                            verification_steps,
+                            reason="auto_verification_for_code_changes",
+                        )
                         commands = [step.get("command") for step in verification_steps if isinstance(step, dict)]
                         _record_action(
                             "Auto-selected verification command(s): " + ", ".join([c for c in commands if c]),
@@ -10442,6 +10741,7 @@ def run_project_solver(
                 else:
                     _record_action("Plan contained only notes; retrying.", source_actions_log)
                     continue
+            if source_requires_code:
                 _normalize_plan_step_paths(plan_steps)
                 plan_steps, dropped_vcs_steps = _drop_blocked_mutating_vcs_steps(
                     plan_steps,
@@ -10470,12 +10770,41 @@ def run_project_solver(
                         plan_steps = payload.get("plan", [])
                         if not isinstance(plan_steps, list):
                             continue
+                        _normalize_plan_step_paths(plan_steps)
+                        plan_steps, dropped_vcs_steps = _drop_blocked_mutating_vcs_steps(
+                            plan_steps,
+                            actions_log=source_actions_log,
+                        )
+                        if dropped_vcs_steps:
+                            _record_action(
+                                f"Dropped {dropped_vcs_steps} blocked mutating VCS step(s) before execution.",
+                                source_actions_log,
+                            )
+                        if not plan_steps:
+                            _record_action(
+                                "Fallback plan became empty after dropping blocked mutating VCS steps; retrying.",
+                                source_actions_log,
+                            )
+                            continue
+                        suspicious_issues = _plan_suspicious_issues(plan_steps, eval_info)
+                        if suspicious_issues:
+                            _record_action(
+                                "Fallback plan still contains suspicious patterns; retrying.",
+                                source_actions_log,
+                            )
+                            continue
                     else:
                         _record_action(
                             f"Plan flagged for likely schema or helper misuse ({reason}); retrying.",
                             source_actions_log,
                         )
                         continue
+                if not _plan_has_actionable_steps(plan_steps):
+                    _record_action(
+                        "Plan contained only notes after normalization and policy filtering; retrying.",
+                        source_actions_log,
+                    )
+                    continue
 
             remaining_steps = max_steps - total_steps_applied
             if remaining_steps <= 0:
@@ -10567,6 +10896,11 @@ def run_project_solver(
                 if command_failures and allow_run:
                     venv_path = current_venv or _find_workspace_venv(solver_workspace)
                     source_failure_counts = recovery_failure_counts_by_source.setdefault(source.path, {})
+                    source_failure_totals = failure_fingerprint_totals_by_source.setdefault(source.path, {})
+                    for failure in command_failures:
+                        fingerprint = _failure_fingerprint(failure)
+                        source_failure_totals[fingerprint] = int(source_failure_totals.get(fingerprint, 0)) + 1
+                    source_retry_fingerprints = recovery_retry_fingerprints_by_source.setdefault(source.path, set())
                     recovery_attempts = 0
                     failures_to_fix = _suppress_repeated_failures(
                         command_failures,
@@ -10576,9 +10910,11 @@ def run_project_solver(
                         scope_label=f"{source.path} across iterations",
                     )
                     skip_recovery = False
+                    repeated_failures_exhausted = False
                     if not failures_to_fix:
                         failures_to_fix = command_failures
                         skip_recovery = True
+                        repeated_failures_exhausted = True
                         _record_action(
                             "Recovery loop breaker: repeated failure pattern exceeded retry limit; recording unresolved failure.",
                             source_actions_log,
@@ -10616,6 +10952,7 @@ def run_project_solver(
                                 venv_path=venv_path,
                                 workspace=solver_workspace,
                                 actions_log=source_actions_log,
+                                retry_seen_fingerprints=source_retry_fingerprints,
                             )
                         if not recovery_steps:
                             recovery_steps = _plan_recovery_steps(
@@ -10710,7 +11047,12 @@ def run_project_solver(
                         verification_failures = [
                             failure for failure in failures_to_fix if _is_verification_failure(failure)
                         ]
-                        if verification_failures and verification_first and allow_run:
+                        if _should_replan_verification_failures(
+                            verification_failures,
+                            verification_first=verification_first,
+                            allow_run=allow_run,
+                            repeated_failures_exhausted=repeated_failures_exhausted,
+                        ):
                             verification_failures_by_source[source.path] = [
                                 {
                                     **failure,
@@ -10718,6 +11060,7 @@ def run_project_solver(
                                         int(failure.get("recovery_attempts") or 0),
                                         recovery_attempts,
                                     ),
+                                    "fingerprint": _failure_fingerprint(failure),
                                 }
                                 for failure in verification_failures
                             ]
@@ -10727,6 +11070,11 @@ def run_project_solver(
                                 source_actions_log,
                             )
                         else:
+                            if verification_failures and repeated_failures_exhausted:
+                                _record_action(
+                                    "Verification recovery loop breaker: retry limit reached; recording unresolved verification failures instead of replanning.",
+                                    source_actions_log,
+                                )
                             for failure in failures_to_fix:
                                 entry = dict(failure)
                                 entry.update(
@@ -10735,6 +11083,7 @@ def run_project_solver(
                                         "iteration": iteration,
                                         "recovery_attempts": recovery_attempts,
                                         "status": "unresolved",
+                                        "fingerprint": _failure_fingerprint(failure),
                                     }
                                 )
                                 unresolved_failures.append(entry)
@@ -10973,6 +11322,7 @@ def run_project_solver(
                         "recovery_attempts": int(failure.get("recovery_attempts") or 0),
                         "status": "unresolved",
                         "verification_issue": failure.get("verification_issue"),
+                        "fingerprint": _safe_str(failure.get("fingerprint")) or _failure_fingerprint(failure),
                     }
                 )
                 unresolved_failures.append(entry)
@@ -11020,8 +11370,14 @@ def run_project_solver(
         applied_steps_by_source,
         project_root,
     )
+    requirements_sanity_strict_global = _env_bool(
+        "SOLVER_REQUIREMENTS_SANITY_STRICT_GLOBAL",
+        False,
+    )
     refs_in_plans = _collect_requirement_refs_from_plans(all_plans)
     requirements_missing_ids: List[str] = []
+    requirements_missing_hard_ids: List[str] = []
+    requirements_missing_advisory_ids: List[str] = []
     requirements_referenced = 0
     if isinstance(requirements_register_list, list):
         for req in requirements_register_list:
@@ -11034,17 +11390,35 @@ def run_project_solver(
                 requirements_referenced += 1
             else:
                 requirements_missing_ids.append(req_id)
+                if req_id in requirements_register_global_ids:
+                    requirements_missing_advisory_ids.append(req_id)
+                else:
+                    requirements_missing_hard_ids.append(req_id)
+    sanity_status = "ok"
+    if requirements_missing_hard_ids:
+        sanity_status = "missing"
+    elif requirements_missing_advisory_ids:
+        sanity_status = "advisory_missing"
     requirements_sanity = {
         "total": len(requirements_register_list) if isinstance(requirements_register_list, list) else 0,
         "referenced": requirements_referenced,
         "missing_ids": requirements_missing_ids,
-        "status": "ok" if not requirements_missing_ids else "missing",
+        "missing_hard_ids": requirements_missing_hard_ids,
+        "missing_advisory_ids": requirements_missing_advisory_ids,
+        "strict_global": requirements_sanity_strict_global,
+        "status": sanity_status,
     }
-    if requirements_missing_ids:
+    if requirements_missing_hard_ids:
         actions_log.append(
-            "Requirements sanity check missing IDs: "
-            + ", ".join(requirements_missing_ids[:20])
-            + (" ...(truncated)" if len(requirements_missing_ids) > 20 else "")
+            "Requirements sanity check missing hard IDs: "
+            + ", ".join(requirements_missing_hard_ids[:20])
+            + (" ...(truncated)" if len(requirements_missing_hard_ids) > 20 else "")
+        )
+    if requirements_missing_advisory_ids:
+        actions_log.append(
+            "Requirements sanity advisory missing global IDs: "
+            + ", ".join(requirements_missing_advisory_ids[:20])
+            + (" ...(truncated)" if len(requirements_missing_advisory_ids) > 20 else "")
         )
     if coverage_missing_sources:
         actions_log.append(
@@ -11073,7 +11447,9 @@ def run_project_solver(
             or coverage_missing_sources
         )
     )
-    if requirements_missing_ids:
+    if requirements_missing_hard_ids:
+        needs_more_iterations = True
+    if requirements_sanity_strict_global and requirements_missing_advisory_ids:
         needs_more_iterations = True
     if unresolved_verification_failures:
         needs_more_iterations = True
@@ -11090,6 +11466,9 @@ def run_project_solver(
         "max_iterations": max_iterations,
         "needs_more_iterations": needs_more_iterations,
         "requirements_missing_ids": requirements_missing_ids,
+        "requirements_missing_hard_ids": requirements_missing_hard_ids,
+        "requirements_missing_advisory_ids": requirements_missing_advisory_ids,
+        "requirements_sanity_strict_global": requirements_sanity_strict_global,
         "unresolved_verification_failures": [
             {
                 "command": failure.get("command"),
@@ -11097,6 +11476,7 @@ def run_project_solver(
                 "exit_code": failure.get("exit_code"),
                 "verification_issue": failure.get("verification_issue"),
                 "source": failure.get("source"),
+                "fingerprint": _safe_str(failure.get("fingerprint")) or _failure_fingerprint(failure),
             }
             for failure in unresolved_verification_failures
         ],
@@ -11122,7 +11502,10 @@ def run_project_solver(
                 "verification_issue": failure.get("verification_issue"),
                 "stderr": failure.get("stderr"),
                 "status": "open",
-                "notes": f"Recovery attempts: {failure.get('recovery_attempts', 0)}",
+                "notes": (
+                    f"Recovery attempts: {failure.get('recovery_attempts', 0)}; "
+                    f"fingerprint={_safe_str(failure.get('fingerprint')) or _failure_fingerprint(failure)}"
+                ),
             }
         )
     for path in incomplete_sources:
@@ -11164,15 +11547,26 @@ def run_project_solver(
                     "notes": "; ".join(missing[:20]) + ("; ...(truncated)" if len(missing) > 20 else ""),
                 }
             )
-    if requirements_missing_ids:
+    if requirements_missing_hard_ids:
         todo_items.append(
             {
                 "type": "requirements_sanity_missing",
                 "source": "requirements_register",
                 "status": "open",
-                "notes": "Missing requirement IDs: "
-                + ", ".join(requirements_missing_ids[:20])
-                + (" ...(truncated)" if len(requirements_missing_ids) > 20 else ""),
+                "notes": "Missing hard requirement IDs: "
+                + ", ".join(requirements_missing_hard_ids[:20])
+                + (" ...(truncated)" if len(requirements_missing_hard_ids) > 20 else ""),
+            }
+        )
+    if requirements_missing_advisory_ids:
+        todo_items.append(
+            {
+                "type": "requirements_sanity_advisory_missing",
+                "source": "requirements_register",
+                "status": "warn",
+                "notes": "Missing advisory global requirement IDs: "
+                + ", ".join(requirements_missing_advisory_ids[:20])
+                + (" ...(truncated)" if len(requirements_missing_advisory_ids) > 20 else ""),
             }
         )
     for entry in module_registry.get("missing_tests", []):
@@ -11265,6 +11659,9 @@ def run_project_solver(
             "requirements_sanity_missing": sum(
                 1 for item in todo_items if item.get("type") == "requirements_sanity_missing"
             ),
+            "requirements_sanity_advisory_missing": sum(
+                1 for item in todo_items if item.get("type") == "requirements_sanity_advisory_missing"
+            ),
             "module_missing_tests": sum(
                 1 for item in todo_items if item.get("type") == "module_missing_tests"
             ),
@@ -11295,6 +11692,28 @@ def run_project_solver(
             f"{top_source.get('source_path')} "
             f"({top_source.get('recent_non_successes')} recent non-success episodes)."
         )
+
+    failure_fingerprint_summary: List[Dict[str, object]] = []
+    for source_path, fingerprint_counts in failure_fingerprint_totals_by_source.items():
+        if not isinstance(fingerprint_counts, dict):
+            continue
+        for fingerprint, count in fingerprint_counts.items():
+            if not fingerprint or not isinstance(count, int) or count <= 0:
+                continue
+            failure_fingerprint_summary.append(
+                {
+                    "source": source_path,
+                    "fingerprint": fingerprint,
+                    "count": count,
+                }
+            )
+    failure_fingerprint_summary.sort(
+        key=lambda item: (
+            -int(item.get("count") or 0),
+            _safe_str(item.get("source")),
+            _safe_str(item.get("fingerprint")),
+        )
+    )
 
     output_data = {
         "summary": all_plans[-1].get("summary") if all_plans else None,
@@ -11367,6 +11786,8 @@ def run_project_solver(
         },
         "solver_replay_analysis": solver_replay_analysis,
         "codex_preflight": codex_preflight,
+        "verification_command_summary": selected_verification_commands,
+        "failure_fingerprint_summary": failure_fingerprint_summary,
         "completion_summary": completion_summary,
         "run_config": {
             "project_root": project_root,
@@ -11374,9 +11795,11 @@ def run_project_solver(
             "requirements_only": requirements_only,
             "output_path": output_path,
             "project_output_dir": project_output_dir,
+            "allow_run": allow_run,
             "max_steps": max_steps,
             "max_iterations": max_iterations,
             "verification_first": _env_bool("SOLVER_VERIFICATION_FIRST", True),
+            "requirements_sanity_strict_global": requirements_sanity_strict_global,
             "codingagent": codingagent_primary or "llm",
             "codingagent_fallback": codingagent_fallback_norm or "llm",
             "codingagent_mode": codingagent_primary_mode,

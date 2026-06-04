@@ -332,3 +332,156 @@ def test_suppress_repeated_failures_breaks_recovery_loop():
     assert len(first_pass) == 1
     assert second_pass == []
     assert any("loop breaker" in item.lower() for item in actions_log)
+
+
+def test_resolve_file_target_normalizes_nested_workspace_prefix(tmp_path):
+    project_root = tmp_path / "sample-project"
+    workspace_root = project_root / "project_solver_output"
+    workspace_root.mkdir(parents=True)
+    (workspace_root / "index.html").write_text("<html></html>\n", encoding="utf-8")
+
+    target, note = project_solver._resolve_file_target(
+        "project_solver_output/project_solver_output/index.html",
+        project_root=str(project_root),
+        workspace_root=str(workspace_root),
+        step_type="write_file",
+        prefer_workspace_new_files=True,
+    )
+
+    assert target == str(workspace_root / "index.html")
+    assert note and "normalized workspace-prefixed path" in note.lower()
+
+
+def test_select_verification_steps_targets_workspace_tests_when_project_has_none(tmp_path):
+    project_root = tmp_path / "sample-project"
+    project_root.mkdir()
+    workspace_root = project_root / "project_solver_output"
+    tests_dir = workspace_root / "src" / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_badge.py").write_text("def test_badge():\n    assert True\n", encoding="utf-8")
+    lang_info = {"languages": ["python"], "build_systems": []}
+
+    steps = project_solver._select_verification_steps(
+        str(project_root),
+        lang_info,
+        workspace_root=str(workspace_root),
+    )
+
+    assert steps
+    first = steps[0]
+    assert first["workdir"] == "."
+    assert "python -m pytest" in first["command"]
+    assert "project_solver_output/src/tests" in first["command"]
+
+
+def test_plan_local_recovery_steps_skips_retry_for_deterministic_pytest_failures(tmp_path):
+    project_root = tmp_path / "sample-project"
+    tests_dir = project_root / "project_solver_output" / "src" / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_badge_system.py").write_text("def test_badge():\n    assert True\n", encoding="utf-8")
+    retry_fingerprints = set()
+
+    steps = project_solver._plan_local_recovery_steps(
+        [
+            {
+                "command": "pytest project_solver_output/src/tests/test_badge_system.py",
+                "workdir": str(tests_dir),
+                "stdout": "",
+                "stderr": "ERROR: file or directory not found: project_solver_output/src/tests/test_badge_system.py",
+            }
+        ],
+        project_root=str(project_root),
+        venv_path=None,
+        workspace=str(project_root),
+        actions_log=[],
+        retry_seen_fingerprints=retry_fingerprints,
+    )
+
+    assert steps
+    assert any("pytest test_badge_system.py" in str(step.get("command")) for step in steps)
+    assert all(
+        not str(step.get("step", "")).startswith("Retry command after recovery:")
+        for step in steps
+    )
+
+
+def test_plan_local_recovery_steps_gates_retries_by_failure_fingerprint(tmp_path):
+    project_root = tmp_path / "sample-project"
+    project_root.mkdir()
+    failure = {
+        "command": "pytest tests/test_app.py",
+        "workdir": ".",
+        "stdout": "FAILED tests/test_app.py::test_main - AssertionError\n",
+        "stderr": "",
+    }
+    retry_fingerprints = set()
+
+    first = project_solver._plan_local_recovery_steps(
+        [failure],
+        project_root=str(project_root),
+        venv_path=None,
+        workspace=str(project_root),
+        actions_log=[],
+        retry_seen_fingerprints=retry_fingerprints,
+    )
+    second = project_solver._plan_local_recovery_steps(
+        [failure],
+        project_root=str(project_root),
+        venv_path=None,
+        workspace=str(project_root),
+        actions_log=[],
+        retry_seen_fingerprints=retry_fingerprints,
+    )
+
+    assert any(
+        str(step.get("step", "")).startswith("Retry command after recovery:")
+        for step in first
+    )
+    assert all(
+        not str(step.get("step", "")).startswith("Retry command after recovery:")
+        for step in second
+    )
+
+
+def test_should_replan_verification_failures_respects_loop_breaker():
+    failures = [
+        {"command": "python -m pytest", "verification_issue": "no tests ran"},
+    ]
+
+    assert project_solver._should_replan_verification_failures(
+        failures,
+        verification_first=True,
+        allow_run=True,
+        repeated_failures_exhausted=False,
+    )
+    assert not project_solver._should_replan_verification_failures(
+        failures,
+        verification_first=True,
+        allow_run=True,
+        repeated_failures_exhausted=True,
+    )
+
+
+def test_ensure_global_requirements_remain_global_scope():
+    register = {"requirements": []}
+    sources = [
+        project_solver.RequirementSource(
+            path="requirements.md",
+            requirements_text="Build a demo app",
+            requirement_lines=[],
+            todo_lines=[],
+            context_excerpt="",
+        )
+    ]
+
+    result = project_solver._ensure_global_requirements(
+        register,
+        requirement_sources=sources,
+    )
+
+    globals_only = [
+        req for req in result.get("requirements", [])
+        if isinstance(req, dict) and "global" in (req.get("source") or [])
+    ]
+    assert globals_only
+    assert all(req.get("source") == ["global"] for req in globals_only)
