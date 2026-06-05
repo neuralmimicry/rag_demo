@@ -94,7 +94,8 @@ GitHub Actions release automation lives in `.github/workflows/build-and-release.
 
 - `pyproject.toml` is the release version source of truth.
 - official GitHub releases require a matching `vX.Y.Z` tag.
-- `scripts/package-release.sh --version <pyproject-version> --output-dir ./dist` builds the sdist/wheel set and a checksum manifest.
+- `scripts/package-release.sh --version <pyproject-version> --output-dir ./dist` builds the sdist/wheel set, Debian package, and checksum manifest.
+- pass `--build-number` and `--git-commit` (wired in CI) to bake `.refiner-build.json` so `/api/version` reflects deploy build metadata.
 - manual `workflow_dispatch` runs can package artifacts from any ref.
 - publish steps only run from a `v*` tag ref, either automatically on tag push or manually from `workflow_dispatch`.
 

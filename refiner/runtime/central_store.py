@@ -1518,7 +1518,7 @@ class PostgresLLMRequestTelemetry:
                 FROM aggregated
                 LEFT JOIN latest USING (provider, model, category)
                 ORDER BY aggregated.requests DESC, aggregated.latency_ms_total DESC, aggregated.provider ASC, aggregated.model ASC
-                LIMIT %s
+                LIMIT %s::integer
                 """,
                 (*where_params, limit_value),
             ).fetchall()
@@ -1541,7 +1541,7 @@ class PostgresLLMRequestTelemetry:
                     WHERE {where_sql}
                     GROUP BY subject, scope
                     ORDER BY SUM(requests) DESC, MAX(last_event_at) DESC NULLS LAST, subject ASC
-                    LIMIT %s
+                    LIMIT %s::integer
                     """,
                     (*where_params, subject_limit_value),
                 ).fetchall()

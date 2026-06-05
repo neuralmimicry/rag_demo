@@ -457,3 +457,27 @@ def test_postgres_llm_request_telemetry_summary_avoids_nullable_filter_placehold
     assert "%s::text IS NULL" not in grouped_query
     assert totals_params and len(totals_params) == 1
     assert grouped_params and len(grouped_params) == 2
+
+
+def test_postgres_llm_request_telemetry_summary_casts_limit_placeholders():
+    connection = _FakeConnection(
+        responses=[
+            _FakeResult(row={}),
+            _FakeResult(rows=[]),
+            _FakeResult(rows=[]),
+        ]
+    )
+    telemetry = PostgresLLMRequestTelemetry(_FakeStore(connection))
+
+    payload = telemetry.summary(hours=72, limit=12, include_subjects=True, subject_limit=6)
+
+    assert payload["enabled"] is True
+    assert len(connection.execute_calls) == 3
+
+    grouped_query, grouped_params = connection.execute_calls[1]
+    subject_query, subject_params = connection.execute_calls[2]
+
+    assert "LIMIT %s::integer" in grouped_query
+    assert "LIMIT %s::integer" in subject_query
+    assert grouped_params[-1] == 12
+    assert subject_params[-1] == 6

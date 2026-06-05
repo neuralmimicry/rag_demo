@@ -173,6 +173,8 @@ jobs:
       artifact_version: ${{ steps.meta.outputs.artifact_version }}
       package_version: ${{ steps.meta.outputs.package_version }}
       release_tag: ${{ steps.meta.outputs.release_tag }}
+      build_number: ${{ steps.meta.outputs.build_number }}
+      git_commit: ${{ steps.meta.outputs.git_commit }}
 
     steps:
       - name: Checkout
@@ -228,11 +230,15 @@ jobs:
           fi
 
           artifact_name="refiner-dist-${artifact_version}"
+          build_number=$((GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))
+          git_commit="${GITHUB_SHA}"
 
           echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
           echo "artifact_version=$artifact_version" >> "$GITHUB_OUTPUT"
           echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "build_number=$build_number" >> "$GITHUB_OUTPUT"
+          echo "git_commit=$git_commit" >> "$GITHUB_OUTPUT"
 
       - name: Package release artifacts
         shell: bash
@@ -248,6 +254,8 @@ jobs:
           ./scripts/package-release.sh \
             --version "${{ steps.meta.outputs.package_version }}" \
             --deb-version "${{ steps.meta.outputs.artifact_version }}" \
+            --build-number "${{ steps.meta.outputs.build_number }}" \
+            --git-commit "${{ steps.meta.outputs.git_commit }}" \
             "${alias_args[@]}" \
             --python ".venv/bin/python" \
             --output-dir ./dist
@@ -431,6 +439,8 @@ jobs:
           GHCR_PASSWORD: ${{ secrets.GHCR_PASSWORD != '' && secrets.GHCR_PASSWORD || github.token }}
           GHCR_AUTH_SOURCE: ${{ secrets.GHCR_PASSWORD != '' && 'secrets.GHCR_PASSWORD' || 'github.token' }}
           RUNNER_ARCH: ${{ matrix.runner_arch }}
+          BUILD_NUMBER: ${{ needs.package-release.outputs.build_number }}
+          BUILD_GIT_COMMIT: ${{ needs.package-release.outputs.git_commit }}
         run: |
           set -euo pipefail
 
@@ -477,13 +487,13 @@ jobs:
           docker_build() {
             if [[ "${DOCKER_CMD[0]}" == "sudo" ]]; then
               sudo DOCKER_BUILDKIT=0 docker build --pull \
-                --build-arg BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
-                --build-arg GIT_COMMIT="${GITHUB_SHA}" \
+                --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
+                --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
                 -f Containerfile -t "${image_ref}" .
             else
               DOCKER_BUILDKIT=0 docker build --pull \
-                --build-arg BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
-                --build-arg GIT_COMMIT="${GITHUB_SHA}" \
+                --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
+                --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
                 -f Containerfile -t "${image_ref}" .
             fi
           }
@@ -519,8 +529,8 @@ jobs:
           if command -v podman >/dev/null 2>&1; then
             printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
             if podman build --format docker --pull \
-              --build-arg BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
-              --build-arg GIT_COMMIT="${GITHUB_SHA}" \
+              --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
+              --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
               -f Containerfile -t "${image_ref}" .; then
               if push_with_retry 2 podman_push_default; then
                 exit 0
@@ -652,41 +662,50 @@ jobs:
           image_ref="${IMAGE_REPO}:${RELEASE_TAG}"
           amd64_ref="${IMAGE_REPO}:${RELEASE_TAG}-amd64"
           arm64_ref="${IMAGE_REPO}:${RELEASE_TAG}-arm64"
+          manifest_tags=("${RELEASE_TAG}")
+          if [[ "${RELEASE_TAG}" == "latest-main" || "${RELEASE_TAG}" == "latest-master" ]]; then
+            manifest_tags+=("latest")
+          fi
           echo "Using GHCR credentials source: ${GHCR_AUTH_SOURCE}"
 
-          if command -v podman >/dev/null 2>&1; then
-            printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
-            podman manifest rm "${image_ref}" >/dev/null 2>&1 || true
-            if podman manifest create "${image_ref}" \
-              && podman manifest add "${image_ref}" "docker://${amd64_ref}" \
-              && podman manifest add "${image_ref}" "docker://${arm64_ref}"; then
-              if push_with_retry 2 podman_manifest_push_default; then
-                exit 0
+          for manifest_tag in "${manifest_tags[@]}"; do
+            image_ref="${IMAGE_REPO}:${manifest_tag}"
+            echo "Publishing manifest ${image_ref}"
+
+            if command -v podman >/dev/null 2>&1; then
+              printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+              podman manifest rm "${image_ref}" >/dev/null 2>&1 || true
+              if podman manifest create "${image_ref}" \
+                && podman manifest add "${image_ref}" "docker://${amd64_ref}" \
+                && podman manifest add "${image_ref}" "docker://${arm64_ref}"; then
+                if push_with_retry 2 podman_manifest_push_default; then
+                  continue
+                fi
+                echo "::warning::Default podman manifest push failed for ${image_ref}; retrying with docker schema2 compatibility options."
+                if push_with_retry 2 podman_manifest_push_compat; then
+                  continue
+                fi
               fi
-              echo "::warning::Default podman manifest push failed for ${image_ref}; retrying with docker schema2 compatibility options."
-              if push_with_retry 2 podman_manifest_push_compat; then
-                exit 0
+              if ! resolve_docker_cmd; then
+                echo "::error::Podman manifest publish failed and docker fallback is unavailable (docker missing or no daemon access, including sudo)."
+                exit 1
               fi
-            fi
-            if ! resolve_docker_cmd; then
-              echo "::error::Podman manifest publish failed and docker fallback is unavailable (docker missing or no daemon access, including sudo)."
+              echo "::warning::Podman manifest publish failed for ${image_ref}; falling back to docker manifest publish."
+              docker_login
+              "${DOCKER_CMD[@]}" manifest rm "${image_ref}" >/dev/null 2>&1 || true
+              "${DOCKER_CMD[@]}" manifest create "${image_ref}" "${amd64_ref}" "${arm64_ref}"
+              "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${amd64_ref}" --os linux --arch amd64
+              "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${arm64_ref}" --os linux --arch arm64
+              push_with_retry 5 docker_manifest_push
+            elif resolve_docker_cmd; then
+              docker_login
+              "${DOCKER_CMD[@]}" manifest rm "${image_ref}" >/dev/null 2>&1 || true
+              "${DOCKER_CMD[@]}" manifest create "${image_ref}" "${amd64_ref}" "${arm64_ref}"
+              "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${amd64_ref}" --os linux --arch amd64
+              "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${arm64_ref}" --os linux --arch arm64
+              push_with_retry 5 docker_manifest_push
+            else
+              echo "::error::Neither podman nor a usable docker daemon (direct or sudo) is available on this runner."
               exit 1
             fi
-            echo "::warning::Podman manifest publish failed for ${image_ref}; falling back to docker manifest publish."
-            docker_login
-            "${DOCKER_CMD[@]}" manifest rm "${image_ref}" >/dev/null 2>&1 || true
-            "${DOCKER_CMD[@]}" manifest create "${image_ref}" "${amd64_ref}" "${arm64_ref}"
-            "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${amd64_ref}" --os linux --arch amd64
-            "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${arm64_ref}" --os linux --arch arm64
-            push_with_retry 5 docker_manifest_push
-          elif resolve_docker_cmd; then
-            docker_login
-            "${DOCKER_CMD[@]}" manifest rm "${image_ref}" >/dev/null 2>&1 || true
-            "${DOCKER_CMD[@]}" manifest create "${image_ref}" "${amd64_ref}" "${arm64_ref}"
-            "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${amd64_ref}" --os linux --arch amd64
-            "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${arm64_ref}" --os linux --arch arm64
-            push_with_retry 5 docker_manifest_push
-          else
-            echo "::error::Neither podman nor a usable docker daemon (direct or sudo) is available on this runner."
-            exit 1
-          fi
+          done
