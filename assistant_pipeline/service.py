@@ -2650,6 +2650,8 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
         capabilities_hint = deps.capability_summary(
             max_items=min(3, routing_policy.capability_hint_max_items) if routing_policy.enabled else 3
         )
+        operator_context_raw = payload.get("operator_context") or payload.get("operatorContext") or ""
+        operator_context = str(operator_context_raw).strip()[:2000] if operator_context_raw else ""
         system = build_assistant_requirements_system_prompt(
             decision,
             gesture_mode=gesture_mode,
@@ -2657,6 +2659,7 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
             marketing_vocab_hint=marketing_vocab_hint,
             persona_guidance=persona_guidance,
             channel_guidance=channel_guidance,
+            operator_context=operator_context,
         )
 
         chat_messages: List[Dict[str, Any]] = []
