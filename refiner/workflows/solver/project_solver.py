@@ -756,6 +756,27 @@ def _command_invokes_pytest(parts: List[str]) -> bool:
     return False
 
 
+def _python_script_token_index(parts: List[str]) -> Optional[int]:
+    if not parts:
+        return None
+    first = os.path.basename(parts[0]).lower()
+    if not first.startswith("python"):
+        return None
+    idx = 1
+    while idx < len(parts):
+        token = parts[idx]
+        if token in {"-m", "--module", "-c"}:
+            return None
+        if token in {"-W", "-X"}:
+            idx += 2
+            continue
+        if token.startswith("-"):
+            idx += 1
+            continue
+        return idx
+    return None
+
+
 def _token_looks_like_path(token: str) -> bool:
     if not token or token.startswith("-"):
         return False
@@ -2278,6 +2299,14 @@ def _rewrite_requirements_path_in_command(
             rewritten_token = _rewrite_path_token(token)
             if rewritten_token and rewritten_token != token:
                 parts[idx] = rewritten_token
+                changed = True
+    script_index = _python_script_token_index(parts)
+    if script_index is not None:
+        script_token = parts[script_index]
+        if _token_looks_like_path(script_token):
+            rewritten_script = _rewrite_path_token(script_token)
+            if rewritten_script and rewritten_script != script_token:
+                parts[script_index] = rewritten_script
                 changed = True
     if not changed:
         return command
@@ -7926,18 +7955,19 @@ def _plan_local_recovery(
     ):
         recovery["reason"] = "pytest import path or dependency issue"
         commands: List[Dict[str, str]] = []
+        preferred_workdir = workspace if workspace and os.path.isdir(workspace) else "."
         pytest_with_pythonpath = _coerce_pytest_command(command, use_pythonpath=True)
         if pytest_with_pythonpath:
-            commands.append({"command": pytest_with_pythonpath, "workdir": "."})
+            commands.append({"command": pytest_with_pythonpath, "workdir": preferred_workdir})
         pytest_from_root = _coerce_pytest_command(command)
         if pytest_from_root:
-            commands.append({"command": pytest_from_root, "workdir": "."})
+            commands.append({"command": pytest_from_root, "workdir": preferred_workdir})
         if packaging["pyproject"] or packaging["setup_py"] or packaging["setup_cfg"]:
-            commands.append({"command": f"{pip_cmd} install -e .", "workdir": "."})
+            commands.append({"command": f"{pip_cmd} install -e .", "workdir": preferred_workdir})
         else:
             req_file = _candidate_requirements_files_local(workspace)
             if req_file:
-                commands.append({"command": f"{pip_cmd} install -r {req_file}", "workdir": "."})
+                commands.append({"command": f"{pip_cmd} install -r {req_file}", "workdir": preferred_workdir})
         recovery["commands"] = commands
         return recovery
 

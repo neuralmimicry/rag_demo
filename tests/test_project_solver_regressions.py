@@ -212,6 +212,26 @@ def test_rewrite_requirements_path_in_command_normalizes_pytest_target_from_deep
     assert any("rewrote command paths" in item.lower() for item in actions_log)
 
 
+def test_rewrite_requirements_path_in_command_normalizes_python_entrypoint_from_project_root(tmp_path):
+    project_root = tmp_path / "sample-project"
+    workspace_root = project_root / "project_solver_output"
+    app_path = workspace_root / "flashcard_app" / "app.py"
+    app_path.parent.mkdir(parents=True)
+    app_path.write_text("print('ok')\n", encoding="utf-8")
+    actions_log = []
+
+    rewritten = project_solver._rewrite_requirements_path_in_command(
+        "python flashcard_app/app.py",
+        abs_workdir=str(project_root),
+        project_root=str(project_root),
+        workspace_root=str(workspace_root),
+        actions_log=actions_log,
+    )
+
+    assert rewritten == "python project_solver_output/flashcard_app/app.py"
+    assert any("rewrote command paths" in item.lower() for item in actions_log)
+
+
 def test_plan_local_recovery_generates_pytest_file_not_found_fix(tmp_path):
     workspace = tmp_path / "sample-project"
     tests_dir = workspace / "project_solver_output" / "src" / "tests"
@@ -265,6 +285,39 @@ def test_plan_local_recovery_handles_pytest_import_issue_with_pythonpath(tmp_pat
     commands = recovery.get("commands") or []
     assert any(
         isinstance(item, dict)
+        and str(item.get("command")).startswith("PYTHONPATH=. python -m pytest")
+        for item in commands
+    )
+    assert any(
+        isinstance(item, dict) and item.get("workdir") == str(workspace)
+        for item in commands
+    )
+
+
+def test_plan_local_recovery_handles_pytest_import_issue_prefers_solver_workspace_workdir(tmp_path):
+    project_root = tmp_path / "sample-project"
+    project_root.mkdir()
+    solver_workspace = project_root / "project_solver_output"
+    pkg_dir = solver_workspace / "flashcard_app"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    recovery = project_solver._plan_local_recovery(
+        command="python -m pytest project_solver_output/tests/test_flashcards.py",
+        result={
+            "workdir": str(project_root),
+            "stdout": "",
+            "stderr": "ModuleNotFoundError: No module named 'flashcard_app.app'",
+        },
+        workspace=str(solver_workspace),
+        venv_path=None,
+    )
+
+    assert recovery
+    commands = recovery.get("commands") or []
+    assert any(
+        isinstance(item, dict)
+        and item.get("workdir") == str(solver_workspace)
         and str(item.get("command")).startswith("PYTHONPATH=. python -m pytest")
         for item in commands
     )
