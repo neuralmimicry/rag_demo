@@ -66,10 +66,26 @@ const projectListEl = document.getElementById('projectList');
 const roomHistoryListEl = document.getElementById('roomHistoryList');
 const auditTransferListEl = document.getElementById('auditTransferList');
 const adminVersionEl = document.getElementById('adminVersion');
+const assistantAnalyticsOwnerEl = document.getElementById('assistantAnalyticsOwner');
+const assistantAnalyticsRouteEl = document.getElementById('assistantAnalyticsRoute');
+const assistantAnalyticsChannelEl = document.getElementById('assistantAnalyticsChannel');
+const assistantAnalyticsProfileEl = document.getElementById('assistantAnalyticsProfile');
+const assistantAnalyticsSinceHoursEl = document.getElementById('assistantAnalyticsSinceHours');
+const assistantAnalyticsLimitEl = document.getElementById('assistantAnalyticsLimit');
+const assistantAnalyticsRefreshBtn = document.getElementById('assistantAnalyticsRefresh');
+const assistantAnalyticsStatusEl = document.getElementById('assistantAnalyticsStatus');
+const assistantAnalyticsSummaryEl = document.getElementById('assistantAnalyticsSummary');
+const assistantAnalyticsRouteBreakdownEl = document.getElementById('assistantAnalyticsRouteBreakdown');
+const assistantAnalyticsChannelBreakdownEl = document.getElementById('assistantAnalyticsChannelBreakdown');
+const assistantAnalyticsProfileBreakdownEl = document.getElementById('assistantAnalyticsProfileBreakdown');
+const assistantAnalyticsSentimentBreakdownEl = document.getElementById('assistantAnalyticsSentimentBreakdown');
+const assistantAnalyticsProviderBreakdownEl = document.getElementById('assistantAnalyticsProviderBreakdown');
+const assistantAnalyticsErrorBreakdownEl = document.getElementById('assistantAnalyticsErrorBreakdown');
 
 let teams = [];
 let projects = [];
 let aiOrchestrationSnapshot = null;
+let assistantAnalyticsSnapshot = null;
 const AI_ORCHESTRATION_LIMIT = 50;
 
 const LONDON_TIMEZONE = 'Europe/London';
@@ -175,6 +191,12 @@ function formatLatencyValue(value) {
   const num = Number(value);
   if (!Number.isFinite(num)) return '--';
   return `${Math.round(num)} ms`;
+}
+
+function parseClampedInteger(value, fallback, min, max) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(parsed, max));
 }
 
 function formatBytes(value) {
@@ -827,6 +849,184 @@ function aiExportCsv() {
   });
 
   return rows.map((row) => row.map(aiCsvValue).join(',')).join('\n');
+}
+
+function assistantAnalyticsFilters() {
+  const owner = String(assistantAnalyticsOwnerEl?.value || '').trim();
+  const route = String(assistantAnalyticsRouteEl?.value || '').trim();
+  const channel = String(assistantAnalyticsChannelEl?.value || '').trim().toLowerCase();
+  const assistantProfile = String(assistantAnalyticsProfileEl?.value || '').trim().toLowerCase();
+  const sinceHours = parseClampedInteger(assistantAnalyticsSinceHoursEl?.value, 24, 1, 720);
+  const limit = parseClampedInteger(assistantAnalyticsLimitEl?.value, 2000, 1, 10000);
+  if (assistantAnalyticsSinceHoursEl) assistantAnalyticsSinceHoursEl.value = String(sinceHours);
+  if (assistantAnalyticsLimitEl) assistantAnalyticsLimitEl.value = String(limit);
+  return {
+    owner,
+    route,
+    channel,
+    assistant_profile: assistantProfile,
+    since_hours: sinceHours,
+    limit,
+  };
+}
+
+function renderAssistantAnalyticsBreakdown(el, rows, totalTraces, emptyText) {
+  if (!el) return;
+  const entries = Array.isArray(rows) ? rows.slice(0, 8) : [];
+  if (!entries.length) {
+    el.innerHTML = `<p class="subtitle">${escapeHtml(emptyText)}</p>`;
+    return;
+  }
+  el.innerHTML = '';
+  entries.forEach((entry) => {
+    const count = Number(entry?.count) || 0;
+    const share = totalTraces > 0 ? formatPercent(count / totalTraces) : '--';
+    const row = document.createElement('div');
+    row.className = 'admin-list-item';
+    const label = document.createElement('div');
+    label.textContent = String(entry?.label || 'unknown');
+    const meta = document.createElement('small');
+    meta.textContent = `${formatInteger(count)} · ${share}`;
+    row.appendChild(label);
+    row.appendChild(meta);
+    el.appendChild(row);
+  });
+}
+
+function renderAssistantAnalyticsPanel(snapshot) {
+  const analytics = snapshot?.analytics || {};
+  const filters = snapshot?.filters || {};
+  const breakdowns = analytics?.breakdowns || {};
+  const totalTraces = Number(analytics?.total_traces) || 0;
+
+  if (assistantAnalyticsSummaryEl) {
+    const cards = [
+      {
+        label: 'Traces',
+        value: formatInteger(totalTraces),
+        meta: `Window ${formatInteger(filters?.since_hours || analytics?.window_hours || 24)}h`,
+      },
+      {
+        label: 'Success Rate',
+        value: formatPercent(analytics?.success_rate),
+        meta: 'Completed responses',
+      },
+      {
+        label: 'Cache Hit Rate',
+        value: formatPercent(analytics?.cache_hit_rate),
+        meta: 'Semantic cache reuse',
+      },
+      {
+        label: 'Handoff Rate',
+        value: formatPercent(analytics?.handoff_rate),
+        meta: 'Human handoff requests',
+      },
+      {
+        label: 'Conversion Rate',
+        value: formatPercent(analytics?.conversion_rate),
+        meta: 'Completed conversion markers',
+      },
+      {
+        label: 'Average Duration',
+        value: formatLatencyValue(analytics?.avg_duration_ms),
+        meta: 'Trace duration',
+      },
+    ];
+    assistantAnalyticsSummaryEl.innerHTML = cards
+      .map(
+        (card) => `
+          <div class="admin-status-card">
+            <span>${escapeHtml(card.label)}<small>${escapeHtml(card.meta)}</small></span>
+            <strong>${escapeHtml(card.value)}</strong>
+          </div>
+        `,
+      )
+      .join('');
+  }
+
+  renderAssistantAnalyticsBreakdown(
+    assistantAnalyticsRouteBreakdownEl,
+    breakdowns?.route,
+    totalTraces,
+    'No route data available.',
+  );
+  renderAssistantAnalyticsBreakdown(
+    assistantAnalyticsChannelBreakdownEl,
+    breakdowns?.channel,
+    totalTraces,
+    'No channel data available.',
+  );
+  renderAssistantAnalyticsBreakdown(
+    assistantAnalyticsProfileBreakdownEl,
+    breakdowns?.assistant_profile,
+    totalTraces,
+    'No assistant profile data available.',
+  );
+  renderAssistantAnalyticsBreakdown(
+    assistantAnalyticsSentimentBreakdownEl,
+    breakdowns?.sentiment,
+    totalTraces,
+    'No sentiment data available.',
+  );
+  renderAssistantAnalyticsBreakdown(
+    assistantAnalyticsProviderBreakdownEl,
+    breakdowns?.provider,
+    totalTraces,
+    'No provider data available.',
+  );
+  renderAssistantAnalyticsBreakdown(
+    assistantAnalyticsErrorBreakdownEl,
+    breakdowns?.error_code,
+    totalTraces,
+    'No error data recorded.',
+  );
+}
+
+async function loadAssistantAnalytics({ silent = false } = {}) {
+  if (
+    !assistantAnalyticsSummaryEl
+    && !assistantAnalyticsRouteBreakdownEl
+    && !assistantAnalyticsStatusEl
+  ) {
+    return;
+  }
+  if (!silent) {
+    setStatus(assistantAnalyticsStatusEl, 'Loading assistant analytics...', false);
+  }
+  const filters = assistantAnalyticsFilters();
+  try {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value === null || value === undefined || value === '') return;
+      params.set(key, String(value));
+    });
+    const res = await apiFetch(`/api/admin/assistant/analytics?${params.toString()}`, { cache: 'no-store' });
+    if (res.status === 401 || res.redirected) {
+      window.location.href = res.url || '/login';
+      return;
+    }
+    const data = await res.json();
+    if (res.status === 403) {
+      setStatus(assistantAnalyticsStatusEl, 'Admin access required.', true);
+      return;
+    }
+    if (!res.ok) {
+      setStatus(
+        assistantAnalyticsStatusEl,
+        data?.message || data?.details || data?.error || 'Unable to load assistant analytics.',
+        true,
+      );
+      return;
+    }
+    assistantAnalyticsSnapshot = data;
+    renderAssistantAnalyticsPanel(assistantAnalyticsSnapshot);
+    if (!silent) {
+      setStatus(assistantAnalyticsStatusEl, 'Assistant analytics refreshed.', false);
+    }
+  } catch (err) {
+    console.error(err);
+    setStatus(assistantAnalyticsStatusEl, 'Unable to load assistant analytics.', true);
+  }
 }
 
 function populateTeamSelect(selectEl, items, includeNone = true) {
@@ -1830,6 +2030,10 @@ loadRefunds();
 setInterval(loadRefunds, 20000);
 loadAuditTransfers();
 setInterval(loadAuditTransfers, 20000);
+loadAssistantAnalytics({ silent: false });
+setInterval(() => {
+  loadAssistantAnalytics({ silent: true });
+}, 30000);
 
 if (teamCreateBtn) {
   teamCreateBtn.addEventListener('click', async () => {
@@ -1904,6 +2108,31 @@ if (aiOrchestrationRefreshBtn) {
     await loadAiOrchestration({ probe: Boolean(aiOrchestrationProbeEl?.checked) });
   });
 }
+
+if (assistantAnalyticsRefreshBtn) {
+  assistantAnalyticsRefreshBtn.addEventListener('click', async () => {
+    await loadAssistantAnalytics({ silent: false });
+  });
+}
+
+[
+  assistantAnalyticsOwnerEl,
+  assistantAnalyticsRouteEl,
+  assistantAnalyticsChannelEl,
+  assistantAnalyticsProfileEl,
+  assistantAnalyticsSinceHoursEl,
+  assistantAnalyticsLimitEl,
+].forEach((el) => {
+  if (!el) return;
+  el.addEventListener('change', () => {
+    loadAssistantAnalytics({ silent: false });
+  });
+  el.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    loadAssistantAnalytics({ silent: false });
+  });
+});
 
 if (aiOrchestrationSearchEl) {
   aiOrchestrationSearchEl.addEventListener('input', () => {

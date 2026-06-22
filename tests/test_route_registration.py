@@ -17,7 +17,11 @@ def test_voice_and_assistant_routes_are_registered():
     assert "/api/voice/stt" in rules
     assert "/api/voice/tokens" in rules
     assert "/api/assistant/requirements" in rules
+    assert "/api/assistant/aaron/respond" in rules
+    assert "/api/assistant/channels/telegram/webhook" in rules
+    assert "/api/assistant/channels/whatsapp/webhook" in rules
     assert "/api/assistant/form-fill" in rules
+    assert "/api/assistant/onboarding/plan" in rules
     assert "/api/playground/plan" in rules
     assert "/api/execution/plan" in rules
     assert "/api/rag/indexes" in rules
@@ -41,6 +45,7 @@ def test_voice_and_assistant_routes_are_registered():
     assert "/api/admin/assistant/conversations/<conversation_id>" in rules
     assert "/api/admin/assistant/traces" in rules
     assert "/api/admin/assistant/traces/<trace_id>" in rules
+    assert "/api/admin/assistant/analytics" in rules
     assert "/api/workers/telemetry" in rules
 
 
@@ -81,6 +86,7 @@ def test_register_admin_routes_includes_assistant_admin_debug_endpoints():
         assistant_admin_conversation_detail=_noop,
         assistant_admin_traces=_noop,
         assistant_admin_trace_detail=_noop,
+        assistant_admin_analytics=_noop,
     )
 
     rules = {entry["rule"] for entry in app.rules}
@@ -88,3 +94,4 @@ def test_register_admin_routes_includes_assistant_admin_debug_endpoints():
     assert "/api/admin/assistant/conversations/<conversation_id>" in rules
     assert "/api/admin/assistant/traces" in rules
     assert "/api/admin/assistant/traces/<trace_id>" in rules
+    assert "/api/admin/assistant/analytics" in rules

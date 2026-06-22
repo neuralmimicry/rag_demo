@@ -8,6 +8,7 @@ public Refiner API.
 from __future__ import annotations
 
 import calendar
+import datetime as dt
 import hashlib
 import json
 import math
@@ -938,6 +939,200 @@ class PostgresAssistantTraceStore:
                 (trace_id, limit_val),
             ).fetchall()
         return [_row_payload(row) for row in rows]
+
+    def analytics_summary(
+        self,
+        owner: str = "",
+        *,
+        route: str = "",
+        channel: str = "",
+        assistant_profile: str = "",
+        since_hours: float = 24.0,
+        limit: int = 2000,
+    ) -> Dict[str, Any]:
+        """Aggregate assistant KPIs for dashboard-style observability."""
+
+        owner = clamp_text(owner, max_length=128)
+        route = clamp_text(route, max_length=96)
+        channel = clamp_text(channel, max_length=32).lower()
+        assistant_profile = clamp_text(assistant_profile, max_length=64).lower()
+        try:
+            since_hours_val = max(1.0, min(float(since_hours or 24.0), 24.0 * 30.0))
+        except Exception:
+            since_hours_val = 24.0
+        limit_val = max(1, min(coerce_int(limit, 2000), 10000))
+
+        where = ["created_at >= NOW() - (%s * INTERVAL '1 hour')"]
+        params: List[Any] = [since_hours_val]
+        if owner:
+            where.append("owner = %s")
+            params.append(owner)
+        if route:
+            where.append("route = %s")
+            params.append(route)
+        if channel:
+            where.append("LOWER(COALESCE(response_meta->>'channel', request_meta->>'channel', 'web')) = %s")
+            params.append(channel)
+        if assistant_profile:
+            where.append("LOWER(COALESCE(response_meta->>'assistant_profile', request_meta->>'assistant_profile', '')) = %s")
+            params.append(assistant_profile)
+
+        with self.store.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    trace_id,
+                    route,
+                    status,
+                    provider,
+                    model,
+                    cache_hit,
+                    request_meta,
+                    response_meta,
+                    error_code,
+                    created_at,
+                    finished_at
+                FROM nm_assistant_traces
+                WHERE """
+                + " AND ".join(where)
+                + """
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                tuple(params + [limit_val]),
+            ).fetchall()
+
+        def _as_bool(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        def _as_datetime(value: Any) -> Optional[dt.datetime]:
+            if isinstance(value, dt.datetime):
+                if value.tzinfo is None:
+                    return value.replace(tzinfo=dt.timezone.utc)
+                return value.astimezone(dt.timezone.utc)
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if not cleaned:
+                    return None
+                try:
+                    parsed = dt.datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+                except Exception:
+                    return None
+                if parsed.tzinfo is None:
+                    return parsed.replace(tzinfo=dt.timezone.utc)
+                return parsed.astimezone(dt.timezone.utc)
+            return None
+
+        def _bucket_increment(bucket: Dict[str, int], key: str) -> None:
+            cleaned = clamp_text(key, max_length=128) or "unknown"
+            bucket[cleaned] = int(bucket.get(cleaned) or 0) + 1
+
+        def _sorted_breakdown(bucket: Dict[str, int]) -> List[Dict[str, Any]]:
+            ordered = sorted(bucket.items(), key=lambda item: (-item[1], item[0]))
+            return [{"label": key, "count": count} for key, count in ordered]
+
+        traces = [dict(row) for row in rows or [] if isinstance(row, dict)]
+        total = len(traces)
+        if total <= 0:
+            return {
+                "window_hours": since_hours_val,
+                "total_traces": 0,
+                "success_rate": 0.0,
+                "cache_hit_rate": 0.0,
+                "handoff_rate": 0.0,
+                "conversion_rate": 0.0,
+                "avg_duration_ms": 0.0,
+                "breakdowns": {
+                    "route": [],
+                    "channel": [],
+                    "assistant_profile": [],
+                    "sentiment": [],
+                    "provider": [],
+                    "error_code": [],
+                },
+            }
+
+        success_count = 0
+        cache_hits = 0
+        handoff_count = 0
+        conversion_count = 0
+        duration_total_ms = 0.0
+        duration_count = 0
+
+        route_counts: Dict[str, int] = {}
+        channel_counts: Dict[str, int] = {}
+        profile_counts: Dict[str, int] = {}
+        sentiment_counts: Dict[str, int] = {}
+        provider_counts: Dict[str, int] = {}
+        error_counts: Dict[str, int] = {}
+
+        for row in traces:
+            row_status = clamp_text(row.get("status"), max_length=24).lower()
+            if row_status == "success":
+                success_count += 1
+            if _as_bool(row.get("cache_hit")):
+                cache_hits += 1
+
+            req_meta = row.get("request_meta") if isinstance(row.get("request_meta"), dict) else {}
+            res_meta = row.get("response_meta") if isinstance(row.get("response_meta"), dict) else {}
+
+            route_name = clamp_text(row.get("route"), max_length=96) or "unknown"
+            channel_name = (
+                clamp_text(res_meta.get("channel"), max_length=32)
+                or clamp_text(req_meta.get("channel"), max_length=32)
+                or "web"
+            ).lower()
+            profile_name = (
+                clamp_text(res_meta.get("assistant_profile"), max_length=64)
+                or clamp_text(req_meta.get("assistant_profile"), max_length=64)
+                or "requirements"
+            ).lower()
+            sentiment = clamp_text(res_meta.get("sentiment_label"), max_length=24).lower() or "neutral"
+            provider = clamp_text(row.get("provider"), max_length=128) or "unknown"
+            model = clamp_text(row.get("model"), max_length=128) or "default"
+
+            _bucket_increment(route_counts, route_name)
+            _bucket_increment(channel_counts, channel_name)
+            _bucket_increment(profile_counts, profile_name)
+            _bucket_increment(sentiment_counts, sentiment)
+            _bucket_increment(provider_counts, f"{provider}/{model}")
+
+            if _as_bool(res_meta.get("handoff_requested")):
+                handoff_count += 1
+            if _as_bool(res_meta.get("conversion_completed")):
+                conversion_count += 1
+
+            error_code = clamp_text(row.get("error_code"), max_length=96)
+            if error_code:
+                _bucket_increment(error_counts, error_code)
+
+            created_at = _as_datetime(row.get("created_at"))
+            finished_at = _as_datetime(row.get("finished_at"))
+            if created_at is not None and finished_at is not None and finished_at >= created_at:
+                duration_total_ms += (finished_at - created_at).total_seconds() * 1000.0
+                duration_count += 1
+
+        return {
+            "window_hours": since_hours_val,
+            "total_traces": total,
+            "success_rate": round(success_count / total, 4),
+            "cache_hit_rate": round(cache_hits / total, 4),
+            "handoff_rate": round(handoff_count / total, 4),
+            "conversion_rate": round(conversion_count / total, 4),
+            "avg_duration_ms": round((duration_total_ms / duration_count) if duration_count > 0 else 0.0, 2),
+            "breakdowns": {
+                "route": _sorted_breakdown(route_counts),
+                "channel": _sorted_breakdown(channel_counts),
+                "assistant_profile": _sorted_breakdown(profile_counts),
+                "sentiment": _sorted_breakdown(sentiment_counts),
+                "provider": _sorted_breakdown(provider_counts),
+                "error_code": _sorted_breakdown(error_counts),
+            },
+        }
 
 
 class PostgresAssistantSemanticCacheStore:

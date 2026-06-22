@@ -116,6 +116,8 @@ from assistant_pipeline.retrieval import (
     serialize_rag_match as _serialize_rag_match_impl,
 )
 from assistant_pipeline.runtime import OwnerAwareCapacityLimiter
+from assistant_pipeline.runtime.first_arrival_gate import claim_first_arrival
+from assistant_pipeline.experience import normalise_channel_context
 from assistant_pipeline.memory.episodic_store import (
     assistant_memory_entry_line as _assistant_memory_entry_line_impl,
     assistant_memory_matches as _assistant_memory_matches_impl,
@@ -385,6 +387,8 @@ ASSISTANT_MAX_CONCURRENT_PER_USER = max(
     ),
 )
 ASSISTANT_CAPACITY_WAIT_SEC = max(0.0, float(os.getenv("REFINER_ASSISTANT_CAPACITY_WAIT_SEC", "0.5")))
+ASSISTANT_DEFAULT_CHANNEL = (os.getenv("REFINER_ASSISTANT_DEFAULT_CHANNEL") or "web").strip().lower()
+ASSISTANT_DEFAULT_PROFILE = (os.getenv("REFINER_ASSISTANT_DEFAULT_PROFILE") or "requirements").strip().lower()
 ASSISTANT_SECURITY_POLICY_ENABLED = _env_flag("REFINER_ASSISTANT_SECURITY_POLICY_ENABLED", True)
 ASSISTANT_SECURITY_STRICT_MESSAGE_ROLES = _env_flag("REFINER_ASSISTANT_SECURITY_STRICT_MESSAGE_ROLES", False)
 ASSISTANT_SECURITY_BLOCK_PROMPT_LEAK = _env_flag("REFINER_ASSISTANT_SECURITY_BLOCK_PROMPT_LEAK", False)
@@ -14441,6 +14445,81 @@ def api_voice_token_delete(token_id: str) -> Response:
     return jsonify({"status": "revoked", "id": token_id})
 
 
+def _assistant_reply_text(payload: Optional[Dict[str, Any]]) -> str:
+    values = payload if isinstance(payload, dict) else {}
+    for key in ("reply", "answer", "summary", "message"):
+        value = values.get(key)
+        if value is None:
+            continue
+        cleaned = str(value).strip()
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _aaron_wake_parse(text: str, wake_name: str = "") -> Tuple[bool, str]:
+    wake = str(wake_name or os.getenv("REFINER_AARON_WAKE_NAME") or "aaron").strip().lower() or "aaron"
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return False, ""
+    pattern = re.compile(rf"^\s*(?:hey|ok|okay)?\s*{re.escape(wake)}\s*[,:\-]?\s*(.*)$", re.IGNORECASE)
+    match = pattern.match(cleaned)
+    if not match:
+        return False, cleaned
+    remainder = str(match.group(1) or "").strip()
+    return True, remainder
+
+
+def _voice_aaron_assist(user: str, *, text: str, channel: str) -> Dict[str, Any]:
+    wake_detected, prompt = _aaron_wake_parse(text)
+    if not wake_detected:
+        return {"wake_detected": False}
+    if not prompt:
+        return {"wake_detected": True, "reply": "I am listening. What do you need?"}
+    channel_name = normalise_channel_context({"channel": channel}).get("name") or "web"
+    dedupe_decision = claim_first_arrival(
+        owner=user,
+        prompt=prompt,
+        channel=channel_name,
+    )
+    if dedupe_decision.get("suppressed"):
+        winner_channel = str(dedupe_decision.get("winner_channel") or "").strip() or "another"
+        return {
+            "wake_detected": True,
+            "suppressed_duplicate": True,
+            "winner_channel": winner_channel,
+            "status_code": 200,
+            "reply": "",
+            "response_payload": {
+                "reply": "",
+                "delivery_suppressed": True,
+                "suppression_reason": str(dedupe_decision.get("reason") or "duplicate_cross_channel"),
+                "first_channel": winner_channel,
+            },
+        }
+    payload = {
+        "mode": "ask",
+        "prompt": prompt,
+        "channel": channel_name,
+    }
+    try:
+        result = assistant_service.assistant_requirements(
+            _assistant_pipeline_dependencies(),
+            user=user,
+            payload=payload,
+        )
+    except ServiceError as exc:
+        return {"wake_detected": True, "error": exc.to_payload(), "status_code": exc.status_code}
+    response_payload = dict(result.payload or {})
+    reply = _assistant_reply_text(response_payload)
+    return {
+        "wake_detected": True,
+        "reply": reply or "Done.",
+        "status_code": result.status_code,
+        "response_payload": response_payload,
+    }
+
+
 def api_voice_capture() -> Response:
     """API endpoint for voice capture."""
     payload = request.get_json(force=False, silent=True) or {}
@@ -14451,6 +14530,38 @@ def api_voice_capture() -> Response:
     if not text:
         return jsonify({"error": "text_required"}), 400
     source = str(payload.get("source") or request.args.get("source") or "voice").strip().lower() or "voice"
+    aaron_result = _voice_aaron_assist(user, text=text, channel=source)
+    if aaron_result.get("wake_detected"):
+        if aaron_result.get("error"):
+            return jsonify(aaron_result["error"]), int(aaron_result.get("status_code") or 400)
+        if aaron_result.get("suppressed_duplicate"):
+            winner_channel = str(aaron_result.get("winner_channel") or "").strip() or "another"
+            return jsonify(
+                {
+                    "status": "ok",
+                    "assistant_name": "Aaron",
+                    "wake_word_detected": True,
+                    "delivery_suppressed": True,
+                    "first_channel": winner_channel,
+                    "channel": normalise_channel_context({"channel": source}).get("name") or "web",
+                    "reply": "",
+                    "response": aaron_result.get("response_payload") or {
+                        "reply": "",
+                        "delivery_suppressed": True,
+                        "first_channel": winner_channel,
+                    },
+                }
+            )
+        return jsonify(
+            {
+                "status": "ok",
+                "assistant_name": "Aaron",
+                "wake_word_detected": True,
+                "channel": normalise_channel_context({"channel": source}).get("name") or "web",
+                "reply": aaron_result.get("reply"),
+                "response": aaron_result.get("response_payload") or {"reply": aaron_result.get("reply")},
+            }
+        )
     device = _extract_voice_device(payload)
     meta = {}
     locale = payload.get("locale")
@@ -14482,6 +14593,35 @@ def api_voice_siri() -> Response:
     text = _extract_voice_text(payload)
     if not text:
         return jsonify({"error": "text_required"}), 400
+    aaron_result = _voice_aaron_assist(user, text=text, channel="siri")
+    if aaron_result.get("wake_detected"):
+        if aaron_result.get("error"):
+            message = (
+                aaron_result["error"].get("details")
+                or aaron_result["error"].get("error")
+                or "Assistant request failed."
+            )
+            return jsonify({"error": aaron_result["error"], "message": message}), int(aaron_result.get("status_code") or 400)
+        if aaron_result.get("suppressed_duplicate"):
+            winner_channel = str(aaron_result.get("winner_channel") or "").strip() or "another"
+            message = f"Already handled on {winner_channel}."
+        else:
+            message = str(aaron_result.get("reply") or "Done.")
+        wants_plain = "text/plain" in (request.headers.get("Accept") or "")
+        wants_plain = wants_plain or (request.args.get("format") or "").strip().lower() in {"text", "plain"}
+        if wants_plain:
+            return Response(message, mimetype="text/plain")
+        return jsonify(
+            {
+                "status": "ok",
+                "assistant_name": "Aaron",
+                "wake_word_detected": True,
+                "message": message,
+                "delivery_suppressed": bool(aaron_result.get("suppressed_duplicate")),
+                "first_channel": aaron_result.get("winner_channel"),
+                "response": aaron_result.get("response_payload") or {"reply": message},
+            }
+        )
     device = _extract_voice_device(payload)
     meta = {}
     shortcut = payload.get("shortcut") or request.values.get("shortcut")
@@ -14525,6 +14665,19 @@ def api_voice_alexa() -> Response:
     text = _extract_alexa_text(payload)
     if not text:
         return _alexa_response("Sorry, I didn't catch that. What should I capture?", end_session=False)
+    aaron_result = _voice_aaron_assist(user, text=text, channel="alexa")
+    if aaron_result.get("wake_detected"):
+        if aaron_result.get("error"):
+            message = (
+                aaron_result["error"].get("details")
+                or aaron_result["error"].get("error")
+                or "Assistant request failed."
+            )
+            return _alexa_response(message, end_session=True), int(aaron_result.get("status_code") or 400)
+        if aaron_result.get("suppressed_duplicate"):
+            winner_channel = str(aaron_result.get("winner_channel") or "").strip() or "another"
+            return _alexa_response(f"Already handled on {winner_channel}.", end_session=True)
+        return _alexa_response(str(aaron_result.get("reply") or "Done."), end_session=True)
     request_payload = payload.get("request") if isinstance(payload.get("request"), dict) else {}
     intent = request_payload.get("intent") if isinstance(request_payload.get("intent"), dict) else {}
     meta = {
@@ -14564,6 +14717,19 @@ def api_voice_google() -> Response:
     text = _extract_google_text(payload)
     if not text:
         return _google_response("Sorry, I didn't catch that. What should I capture?")
+    aaron_result = _voice_aaron_assist(user, text=text, channel="google_home")
+    if aaron_result.get("wake_detected"):
+        if aaron_result.get("error"):
+            message = (
+                aaron_result["error"].get("details")
+                or aaron_result["error"].get("error")
+                or "Assistant request failed."
+            )
+            return _google_response(message), int(aaron_result.get("status_code") or 400)
+        if aaron_result.get("suppressed_duplicate"):
+            winner_channel = str(aaron_result.get("winner_channel") or "").strip() or "another"
+            return _google_response(f"Already handled on {winner_channel}.")
+        return _google_response(str(aaron_result.get("reply") or "Done."))
     query_result = payload.get("queryResult") if isinstance(payload.get("queryResult"), dict) else {}
     intent = query_result.get("intent") if isinstance(query_result.get("intent"), dict) else {}
     meta = {
@@ -18223,6 +18389,8 @@ def _assistant_pipeline_runtime_config() -> Dict[str, Any]:
     return {
         "request_capacity": _ASSISTANT_REQUEST_CAPACITY,
         "capacity_wait_sec": ASSISTANT_CAPACITY_WAIT_SEC,
+        "default_channel": ASSISTANT_DEFAULT_CHANNEL,
+        "default_profile": ASSISTANT_DEFAULT_PROFILE,
     }
 
 
@@ -18434,6 +18602,30 @@ def execution_plan() -> Response:
     return _EXTRACTED_ASSISTANT_HANDLERS["execution_plan"]()
 
 
+def assistant_onboarding_plan() -> Response:
+    """Handle the assistant onboarding planner route via the extracted assistant pipeline."""
+
+    return _EXTRACTED_ASSISTANT_HANDLERS["assistant_onboarding_plan"]()
+
+
+def assistant_aaron_respond() -> Response:
+    """Handle omni-channel Aaron interaction requests via the extracted assistant pipeline."""
+
+    return _EXTRACTED_ASSISTANT_HANDLERS["assistant_aaron_respond"]()
+
+
+def assistant_telegram_webhook() -> Response:
+    """Handle Telegram webhook events routed into the Aaron assistant pipeline."""
+
+    return _EXTRACTED_ASSISTANT_HANDLERS["assistant_telegram_webhook"]()
+
+
+def assistant_whatsapp_webhook() -> Response:
+    """Handle WhatsApp webhook events routed into the Aaron assistant pipeline."""
+
+    return _EXTRACTED_ASSISTANT_HANDLERS["assistant_whatsapp_webhook"]()
+
+
 def _sse(entry: Dict[str, Any]) -> str:
     payload = json.dumps(entry)
     return f"data: {payload}\n\n"
@@ -18460,6 +18652,7 @@ if hasattr(app, "add_url_rule"):
         assistant_admin_conversation_detail=_EXTRACTED_ASSISTANT_ADMIN_HANDLERS["assistant_admin_conversation_detail"],
         assistant_admin_traces=_EXTRACTED_ASSISTANT_ADMIN_HANDLERS["assistant_admin_traces"],
         assistant_admin_trace_detail=_EXTRACTED_ASSISTANT_ADMIN_HANDLERS["assistant_admin_trace_detail"],
+        assistant_admin_analytics=_EXTRACTED_ASSISTANT_ADMIN_HANDLERS["assistant_admin_analytics"],
         workers_telemetry=workers_telemetry,
         api_audit=api_audit,
     )
@@ -18509,7 +18702,11 @@ if hasattr(app, "add_url_rule"):
         app,
         assistant_rag_mcp=assistant_rag_mcp,
         assistant_requirements=assistant_requirements,
+        assistant_aaron_respond=assistant_aaron_respond,
+        assistant_telegram_webhook=assistant_telegram_webhook,
+        assistant_whatsapp_webhook=assistant_whatsapp_webhook,
         assistant_form_fill=assistant_form_fill,
+        assistant_onboarding_plan=assistant_onboarding_plan,
         playground_plan=playground_plan,
         execution_plan=execution_plan,
     )

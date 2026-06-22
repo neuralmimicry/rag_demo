@@ -239,6 +239,10 @@ let automationSnapshot = {
 
 const assistantMessagesEl = document.getElementById('assistantMessages');
 const assistantInputEl = document.getElementById('assistantInput');
+const assistantInterfaceChannelEl = document.getElementById('assistantInterfaceChannel');
+const assistantInterfaceWorkflowEl = document.getElementById('assistantInterfaceWorkflow');
+const assistantWakeNameEl = document.getElementById('assistantWakeName');
+const assistantWakeRequiredEl = document.getElementById('assistantWakeRequired');
 const assistantAskBtn = document.getElementById('assistantAsk');
 const assistantDraftBtn = document.getElementById('assistantDraft');
 const assistantInsertBtn = document.getElementById('assistantInsert');
@@ -2154,7 +2158,7 @@ function renderAssistantMessages() {
   if (!assistantMessagesEl) return;
   assistantMessagesEl.innerHTML = '';
   if (!assistantState.messages.length) {
-    assistantMessagesEl.innerHTML = '<p class="subtitle">Ask a question to get started.</p>';
+    assistantMessagesEl.innerHTML = '<p class="subtitle">Ask Aaron a question to get started.</p>';
     return;
   }
   assistantState.messages.forEach((msg) => {
@@ -2173,17 +2177,42 @@ async function sendAssistant(mode) {
     return;
   }
   clearAssistantStatus();
+  const selectedChannel = assistantInterfaceChannelEl?.value || 'web';
+  const selectedWorkflow = assistantInterfaceWorkflowEl?.value || 'assistant_requirements';
+  const wakeName = String(assistantWakeNameEl?.value || 'Aaron').trim() || 'Aaron';
+  const wakeRequired = Boolean(assistantWakeRequiredEl?.checked);
+  let effectivePrompt = prompt;
+  if (mode === 'ask' && prompt && wakeRequired) {
+    const lowered = prompt.toLowerCase();
+    const wake = wakeName.toLowerCase();
+    const hasWakePrefix = (
+      lowered.startsWith(wake)
+      || lowered.startsWith(`hey ${wake}`)
+      || lowered.startsWith(`ok ${wake}`)
+      || lowered.startsWith(`okay ${wake}`)
+    );
+    if (!hasWakePrefix) {
+      effectivePrompt = `${wakeName}, ${prompt}`;
+    }
+  }
   if (prompt && mode === 'ask') {
-    assistantState.messages.push({ role: 'user', content: prompt });
+    assistantState.messages.push({ role: 'user', content: effectivePrompt });
     renderAssistantMessages();
     assistantInputEl.value = '';
   }
 
+  const workflow = mode === 'draft' ? 'assistant_requirements' : selectedWorkflow;
   const payload = {
-    mode,
-    prompt,
+    workflow,
+    mode: mode === 'draft' ? 'draft' : 'ask',
+    prompt: effectivePrompt,
     requirements_text: requirementsTextEl ? requirementsTextEl.value.trim() : '',
     messages: assistantState.messages,
+    source: selectedChannel,
+    channel: selectedChannel,
+    wake_name: wakeName,
+    require_wake_word: wakeRequired,
+    assistant_name: 'Aaron',
     provider: document.getElementById('llmProvider')?.value || undefined,
     model: document.getElementById('llmModel')?.value.trim() || undefined,
     temperature: parseFloat(document.getElementById('llmTemperature')?.value || '0.2'),
@@ -2194,7 +2223,7 @@ async function sendAssistant(mode) {
 
   showAssistantStatus('Thinking...');
   try {
-    const res = await apiFetch('/api/assistant/requirements', {
+    const res = await apiFetch('/api/assistant/aaron/respond', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -2208,8 +2237,15 @@ async function sendAssistant(mode) {
       showAssistantStatus(data.details || data.error || 'Assistant request failed.', true);
       return;
     }
-    assistantState.messages.push({ role: 'assistant', content: data.reply });
-    assistantState.lastResponse = data.reply;
+    const responsePayload = data?.response && typeof data.response === 'object' ? data.response : data;
+    const replyText = (
+      (typeof data?.reply === 'string' && data.reply.trim())
+      || (typeof responsePayload?.reply === 'string' && responsePayload.reply.trim())
+      || (typeof responsePayload?.answer === 'string' && responsePayload.answer.trim())
+      || 'Done.'
+    );
+    assistantState.messages.push({ role: 'assistant', content: replyText });
+    assistantState.lastResponse = replyText;
     renderAssistantMessages();
     showAssistantStatus('Response ready.');
   } catch (err) {

@@ -310,6 +310,7 @@ def _build_dependencies(
     routing_config: Optional[Dict[str, Any]] = None,
     cache_config: Optional[Dict[str, Any]] = None,
     retrieval_config: Optional[Dict[str, Any]] = None,
+    runtime_config: Optional[Dict[str, Any]] = None,
     global_requirements_count: int = 0,
     global_requirements_titles: Optional[List[str]] = None,
     opencode_available: bool = False,
@@ -388,6 +389,11 @@ def _build_dependencies(
         "rerank_max_phrase_terms": 6,
         "refuse_on_insufficient": True,
         **(retrieval_config or {}),
+    }
+    runtime_config = {
+        "request_capacity": semaphore,
+        "capacity_wait_sec": 0.0,
+        **(runtime_config or {}),
     }
     state: Dict[str, Any] = {
         "logger": logger,
@@ -622,7 +628,7 @@ def _build_dependencies(
         get_assistant_cache_store=lambda: semantic_cache_store,
         get_stt_learning_store=lambda: stt_learning_store,
         get_rag_config=lambda: dict(rag_config),
-        get_assistant_runtime_config=lambda: {"request_capacity": semaphore, "capacity_wait_sec": 0.0},
+        get_assistant_runtime_config=lambda: dict(runtime_config),
         get_assistant_security_config=lambda: dict(security_config),
         get_assistant_routing_config=lambda: dict(routing_config),
         get_assistant_cache_config=lambda: dict(cache_config),
@@ -976,7 +982,11 @@ def test_assistant_form_fill_uses_reference_suggestions_and_records_memory() -> 
     request_payload = json.loads(provider.calls[0]["messages"][0]["content"])
     assert request_payload["reference_suggestions"][0]["workflow"] == "project_solver"
     assert state["memory_records"][0]["metadata"]["workflow"] == "project_solver"
-    assert state["trace_store"].finishes[0]["response_meta"] == {"suggestion_count": 1, "workflow": "project_solver"}
+    assert state["trace_store"].finishes[0]["response_meta"] == {
+        "suggestion_count": 1,
+        "workflow": "project_solver",
+        "channel": "web",
+    }
     assert [call["role"] for call in state["conversation_store"].append_calls] == ["user", "assistant"]
 
 
@@ -1030,6 +1040,7 @@ def test_playground_plan_uses_memory_and_builds_job_payload() -> None:
     assert state["trace_store"].finishes[0]["response_meta"] == {
         "project_name": "School Helper",
         "token_estimate": 321,
+        "channel": "web",
     }
 
 
@@ -1089,6 +1100,7 @@ def test_execution_plan_uses_governed_prompt_and_builds_job_payload() -> None:
     assert state["trace_store"].finishes[0]["response_meta"] == {
         "project_name": "Release Stabiliser",
         "token_estimate": 321,
+        "channel": "web",
     }
 
 
@@ -1112,6 +1124,145 @@ def test_assistant_requirements_redacts_reply_text_when_output_policy_is_enabled
     assert result.payload["reply"] == "Email [email] or call [phone]."
     assert state["reply_payload_calls"][0]["reply_text"] == "Email [email] or call [phone]."
     assert state["trace_store"].spans[-1]["stage"] == "output_guard"
+
+
+def test_assistant_requirements_enriches_response_with_channel_persona_and_markers() -> None:
+    provider = _FakeProvider(response=_FakeLLMResponse(text="Great news, the issue is fixed and resolved."))
+    deps, state = _build_dependencies(provider=provider)
+
+    result = assistant_service.assistant_requirements(
+        deps,
+        user="alice",
+        payload={
+            "mode": "ask",
+            "prompt": "Can you update me?",
+            "assistant_profile": "support",
+            "channel": "whatsapp",
+            "handoff_requested": True,
+            "handoff_reason": "Complex account query",
+            "conversation_id": "conv-exp-1",
+        },
+    )
+
+    assert result.payload["assistant_profile"] == "support"
+    assert result.payload["channel"]["name"] == "whatsapp"
+    assert result.payload["handoff_requested"] is True
+    assert result.payload["conversion_completed"] is False
+    assert result.payload["sentiment"] == "positive"
+    assert state["trace_store"].finishes[0]["response_meta"]["channel"] == "whatsapp"
+    assert state["trace_store"].finishes[0]["response_meta"]["assistant_profile"] == "support"
+
+
+def test_assistant_requirements_uses_runtime_channel_and_profile_defaults_when_missing() -> None:
+    provider = _FakeProvider(response=_FakeLLMResponse(text="All checks are complete."))
+    deps, state = _build_dependencies(
+        provider=provider,
+        runtime_config={"default_channel": "linkedin", "default_profile": "sales"},
+    )
+
+    result = assistant_service.assistant_requirements(
+        deps,
+        user="alice",
+        payload={
+            "mode": "ask",
+            "prompt": "Give me an update.",
+            "conversation_id": "conv-exp-defaults-1",
+        },
+    )
+
+    assert result.payload["assistant_profile"] == "sales"
+    assert result.payload["channel"]["name"] == "linkedin"
+    assert state["trace_store"].starts[0]["request_meta"]["channel"] == "linkedin"
+    assert state["trace_store"].finishes[0]["response_meta"]["assistant_profile"] == "sales"
+
+
+def test_assistant_requirements_explicit_channel_and_profile_override_runtime_defaults() -> None:
+    provider = _FakeProvider(response=_FakeLLMResponse(text="Resolved."))
+    deps, state = _build_dependencies(
+        provider=provider,
+        runtime_config={"default_channel": "linkedin", "default_profile": "sales"},
+    )
+
+    result = assistant_service.assistant_requirements(
+        deps,
+        user="alice",
+        payload={
+            "mode": "ask",
+            "prompt": "Give me an update.",
+            "assistant_profile": "support",
+            "channel": "whatsapp",
+            "conversation_id": "conv-exp-defaults-2",
+        },
+    )
+
+    assert result.payload["assistant_profile"] == "support"
+    assert result.payload["channel"]["name"] == "whatsapp"
+    assert state["trace_store"].starts[0]["request_meta"]["channel"] == "whatsapp"
+    assert state["trace_store"].finishes[0]["response_meta"]["assistant_profile"] == "support"
+
+
+def test_assistant_rag_mcp_enriches_response_with_channel_persona_and_conversion_marker() -> None:
+    provider = _FakeProvider(response=_FakeLLMResponse(text="Great fit for your team."))
+    rag_store = _FakeRagStore()
+    rag_store.indexes["ops"] = _FakeIndex(
+        "ops",
+        matches=[
+            {
+                "chunk_id": "chunk-1",
+                "citation": "[Ops 1]",
+                "text": "Customer sync happens nightly.",
+                "score": 0.8,
+            }
+        ],
+    )
+    metadata_store = _FakeRagMetadataStore()
+    metadata_store.active_versions[("alice", "ops")] = {"active_version_id": "version-19"}
+    deps, state = _build_dependencies(
+        provider=provider,
+        rag_store=rag_store,
+        rag_metadata_store=metadata_store,
+    )
+
+    result = assistant_service.assistant_rag_mcp(
+        deps,
+        user="alice",
+        payload={
+            "prompt": "Summarise the sync guidance.",
+            "assistant_profile": "sales",
+            "conversion_completed": True,
+            "channel_context": {"name": "linkedin", "handoff_requested": True, "handoff_reason": "Legal sign-off"},
+            "rag": {"index": "ops", "top_k": 1},
+        },
+    )
+
+    assert result.payload["assistant_profile"] == "sales"
+    assert result.payload["channel"]["name"] == "linkedin"
+    assert result.payload["handoff_requested"] is True
+    assert result.payload["conversion_completed"] is True
+    assert state["trace_store"].finishes[0]["response_meta"]["channel"] == "linkedin"
+    assert state["trace_store"].finishes[0]["response_meta"]["assistant_profile"] == "sales"
+
+
+def test_assistant_onboarding_plan_returns_four_step_launch_template() -> None:
+    deps, state = _build_dependencies()
+
+    result = assistant_service.assistant_onboarding_plan(
+        deps,
+        user="alice",
+        payload={
+            "assistant_profile": "support",
+            "channel": "whatsapp",
+            "rag_index_name": "customer-help",
+            "sources": [{"url": "https://example.com/help"}],
+        },
+    )
+
+    assert result.payload["ready_to_launch"] is True
+    assert result.payload["assistant_profile"]["id"] == "support"
+    assert result.payload["channel"]["name"] == "whatsapp"
+    assert len(result.payload["steps"]) == 4
+    assert result.payload["templates"]["rag_index_create"]["name"] == "customer-help"
+    assert state["trace_store"].finishes[0]["status"] == "success"
 
 
 def test_assistant_rag_mcp_blocks_prompt_leak_request_when_policy_is_enabled() -> None:

@@ -253,6 +253,96 @@ def test_postgres_assistant_trace_store_lists_trace_headers_details_and_spans():
     assert connection.execute_calls[2][1] == ("trace-1", 20)
 
 
+def test_postgres_assistant_trace_store_analytics_summary_aggregates_kpis():
+    connection = _FakeConnection(
+        responses=[
+            _FakeResult(
+                rows=[
+                    {
+                        "trace_id": "trace-1",
+                        "route": "assistant_rag_mcp",
+                        "status": "success",
+                        "provider": "openai",
+                        "model": "gpt-5.1",
+                        "cache_hit": True,
+                        "request_meta": {"channel": "whatsapp"},
+                        "response_meta": {
+                            "assistant_profile": "support",
+                            "channel": "whatsapp",
+                            "sentiment_label": "positive",
+                            "handoff_requested": True,
+                            "conversion_completed": False,
+                        },
+                        "error_code": None,
+                        "created_at": "2026-06-22T10:00:00Z",
+                        "finished_at": "2026-06-22T10:00:02Z",
+                    },
+                    {
+                        "trace_id": "trace-2",
+                        "route": "assistant_rag_mcp",
+                        "status": "success",
+                        "provider": "openai",
+                        "model": "gpt-5.1",
+                        "cache_hit": False,
+                        "request_meta": {"channel": "web"},
+                        "response_meta": {
+                            "assistant_profile": "sales",
+                            "channel": "web",
+                            "sentiment_label": "neutral",
+                            "handoff_requested": False,
+                            "conversion_completed": True,
+                        },
+                        "error_code": None,
+                        "created_at": "2026-06-22T10:01:00Z",
+                        "finished_at": "2026-06-22T10:01:01Z",
+                    },
+                    {
+                        "trace_id": "trace-3",
+                        "route": "assistant_rag_mcp",
+                        "status": "failed",
+                        "provider": "openai",
+                        "model": "gpt-5.1",
+                        "cache_hit": False,
+                        "request_meta": {"channel": "whatsapp"},
+                        "response_meta": {
+                            "assistant_profile": "support",
+                            "channel": "whatsapp",
+                            "sentiment_label": "negative",
+                            "handoff_requested": False,
+                            "conversion_completed": False,
+                        },
+                        "error_code": "llm_request_failed",
+                        "created_at": "2026-06-22T10:02:00Z",
+                        "finished_at": None,
+                    },
+                ]
+            )
+        ]
+    )
+    store = PostgresAssistantTraceStore(_FakeStore(connection))
+
+    summary = store.analytics_summary(
+        owner="alice",
+        route="assistant_rag_mcp",
+        channel="whatsapp",
+        assistant_profile="support",
+        since_hours=48,
+        limit=500,
+    )
+
+    assert summary["total_traces"] == 3
+    assert summary["success_rate"] == 0.6667
+    assert summary["cache_hit_rate"] == 0.3333
+    assert summary["handoff_rate"] == 0.3333
+    assert summary["conversion_rate"] == 0.3333
+    assert summary["avg_duration_ms"] == 1500.0
+    assert summary["breakdowns"]["channel"][0] == {"label": "whatsapp", "count": 2}
+    assert summary["breakdowns"]["assistant_profile"][0] == {"label": "support", "count": 2}
+    assert summary["breakdowns"]["error_code"][0] == {"label": "llm_request_failed", "count": 1}
+    assert "LOWER(COALESCE(response_meta->>'channel', request_meta->>'channel', 'web')) = %s" in connection.execute_calls[0][0]
+    assert connection.execute_calls[0][1][-1] == 500
+
+
 def test_postgres_assistant_semantic_cache_store_upserts_lists_and_marks_hits():
     connection = _FakeConnection(
         responses=[

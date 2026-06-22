@@ -11,6 +11,8 @@ def build_assistant_requirements_system_prompt(
     gesture_mode: str,
     capabilities_hint: str = "",
     marketing_vocab_hint: str = "",
+    persona_guidance: str = "",
+    channel_guidance: str = "",
 ) -> str:
     """Build the system prompt for requirements and marketing assistant flows."""
 
@@ -38,6 +40,10 @@ def build_assistant_requirements_system_prompt(
             "'- REQ-001: Short title' (zero-padded, unique IDs). Add any detail as indented bullets "
             "beneath each REQ line so the register can be parsed."
         )
+    if persona_guidance:
+        system = f"{system}\n\nPersona guidance:\n{persona_guidance}"
+    if channel_guidance:
+        system = f"{system}\n\nChannel guidance:\n{channel_guidance}"
     if capabilities_hint:
         system = f"{system}\n\nCapabilities summary:\n{capabilities_hint}"
     return system
@@ -49,6 +55,8 @@ def build_assistant_rag_mcp_system_prompt(
     capabilities_hint: str = "",
     skills_hint: str = "",
     rag_context_present: bool = False,
+    persona_guidance: str = "",
+    channel_guidance: str = "",
 ) -> str:
     """Build the system prompt for RAG and MCP-assisted answering."""
 
@@ -73,10 +81,19 @@ def build_assistant_rag_mcp_system_prompt(
             "When using RAG context, preserve the supplied source citation labels, "
             "including page/block locators, in the answer where they support factual claims."
         )
+    if persona_guidance:
+        system_lines.extend(["Persona guidance:", persona_guidance])
+    if channel_guidance:
+        system_lines.extend(["Channel guidance:", channel_guidance])
     return "\n".join(system_lines)
 
 
-def build_assistant_form_fill_system_prompt(decision: RouteIntent, *, capabilities_hint: str = "") -> str:
+def build_assistant_form_fill_system_prompt(
+    decision: RouteIntent,
+    *,
+    capabilities_hint: str = "",
+    channel_guidance: str = "",
+) -> str:
     """Build the system prompt for structured form filling."""
 
     system = (
@@ -87,6 +104,8 @@ def build_assistant_form_fill_system_prompt(decision: RouteIntent, *, capabiliti
     )
     if capabilities_hint:
         system = f"{system}\n\nCapabilities summary:\n{capabilities_hint}"
+    if channel_guidance:
+        system = f"{system}\n\nChannel guidance:\n{channel_guidance}"
     return system
 
 

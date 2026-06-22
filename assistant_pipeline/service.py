@@ -16,6 +16,15 @@ from assistant_pipeline.cache import (
 )
 from assistant_pipeline.contracts import ServiceError, ServiceResult
 from assistant_pipeline.dependencies import AssistantPipelineDependencies
+from assistant_pipeline.experience import (
+    assistant_experience_response_meta,
+    channel_prompt_guidance,
+    channel_response_payload,
+    derive_engagement_markers,
+    normalise_channel_context,
+    persona_prompt_guidance,
+    resolve_assistant_persona,
+)
 from assistant_pipeline.ingestion.artifact_store import (
     delete_versioned_collection_artifacts,
     load_index_artifact,
@@ -143,6 +152,8 @@ def _assistant_runtime(deps: AssistantPipelineDependencies) -> Dict[str, Any]:
     return {
         "request_capacity": runtime.get("request_capacity"),
         "capacity_wait_sec": float(runtime.get("capacity_wait_sec") or 0.0),
+        "default_channel": str(runtime.get("default_channel") or "web"),
+        "default_profile": str(runtime.get("default_profile") or "requirements"),
     }
 
 
@@ -152,6 +163,48 @@ def _assistant_security_policy(deps: AssistantPipelineDependencies):
 
 def _assistant_routing_policy(deps: AssistantPipelineDependencies):
     return assistant_routing_policy_from_config(deps.get_assistant_routing_config())
+
+
+def _assistant_experience_defaults(deps: AssistantPipelineDependencies) -> Dict[str, str]:
+    runtime = _assistant_runtime(deps)
+    channel = normalise_channel_context({"channel": runtime.get("default_channel")}).get("name") or "web"
+    profile = (
+        resolve_assistant_persona(
+            {"assistant_profile": runtime.get("default_profile")},
+            default_profile="requirements",
+        ).get("id")
+        or "requirements"
+    )
+    return {
+        "channel": channel,
+        "profile": profile,
+    }
+
+
+def _resolve_channel_context(
+    deps: AssistantPipelineDependencies,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    values = dict(payload or {})
+    channel_context = values.get("channel_context") if isinstance(values.get("channel_context"), dict) else {}
+    has_channel_name = bool(str(channel_context.get("name") or "").strip())
+    has_explicit_channel = bool(
+        str(values.get("channel") or values.get("deployment_channel") or values.get("channel_name") or "").strip()
+    )
+    if not (has_channel_name or has_explicit_channel):
+        values["channel"] = _assistant_experience_defaults(deps)["channel"]
+    return normalise_channel_context(values)
+
+
+def _resolve_persona(
+    deps: AssistantPipelineDependencies,
+    payload: Dict[str, Any],
+    *,
+    route_default_profile: str,
+) -> Dict[str, Any]:
+    runtime_default_profile = _assistant_experience_defaults(deps)["profile"]
+    fallback_profile = runtime_default_profile or str(route_default_profile or "").strip() or "requirements"
+    return resolve_assistant_persona(payload, default_profile=fallback_profile)
 
 
 def _assistant_cache_policy(deps: AssistantPipelineDependencies):
@@ -870,6 +923,41 @@ def _atlassian_action_response_metadata(result: Any) -> Dict[str, Any]:
         "atlassian_status": str(result.get("status") or ""),
         "atlassian_instance": str(result.get("instance") or ""),
     }
+
+
+def _apply_experience_payload(
+    response_payload: Dict[str, Any],
+    *,
+    persona: Dict[str, Any],
+    channel_context: Dict[str, Any],
+    markers: Dict[str, Any],
+) -> Dict[str, Any]:
+    enriched = dict(response_payload or {})
+    enriched["assistant_profile"] = str(persona.get("id") or "requirements")
+    enriched["channel"] = channel_response_payload(channel_context)
+    enriched["sentiment"] = str(markers.get("sentiment_label") or "neutral")
+    enriched["handoff_requested"] = bool(markers.get("handoff_requested"))
+    enriched["conversion_completed"] = bool(markers.get("conversion_completed"))
+    if markers.get("handoff_reason"):
+        enriched["handoff_reason"] = str(markers.get("handoff_reason"))
+    return enriched
+
+
+def _experience_trace_metadata(
+    *,
+    persona: Dict[str, Any],
+    channel_context: Dict[str, Any],
+    markers: Dict[str, Any],
+) -> Dict[str, Any]:
+    metadata = assistant_experience_response_meta(
+        channel_context=channel_context,
+        persona=persona,
+        markers=markers,
+    )
+    handoff_reason = str(markers.get("handoff_reason") or "").strip()
+    if handoff_reason:
+        metadata["handoff_reason"] = handoff_reason[:240]
+    return metadata
 
 
 def _predict_with_capacity(
@@ -1631,13 +1719,18 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
         raise ServiceError("unauthorized", status_code=401)
     prompt = str(payload.get("prompt") or "").strip()
     conversation_id = conversation_id_from_payload(payload)
+    channel_context = _resolve_channel_context(deps, payload)
     trace = TraceRecorder(
         deps,
         owner=user,
         route="assistant_rag_mcp",
         intent="assistant_rag_mcp",
         conversation_id=conversation_id,
-        request_meta={"prompt_chars": len(prompt)},
+        request_meta={
+            "prompt_chars": len(prompt),
+            "channel": channel_context.get("name"),
+            "handoff_requested": bool(channel_context.get("handoff_requested")),
+        },
     )
     try:
         if not prompt:
@@ -1654,6 +1747,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
         )
         payload = input_result.payload
         prompt = str(payload.get("prompt") or "").strip()
+        channel_context = _resolve_channel_context(deps, payload)
 
         rag_cfg = payload.get("rag") if isinstance(payload.get("rag"), dict) else {}
         rag_index_name = str(rag_cfg.get("index") or "").strip()
@@ -1669,6 +1763,9 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
             has_rag=bool(rag_index_name),
             has_mcp=bool(mcp_cfg or atlassian_cfg),
         )
+        persona = _resolve_persona(deps, payload, route_default_profile=decision.prompt_profile)
+        persona_guidance = persona_prompt_guidance(persona)
+        channel_guidance = channel_prompt_guidance(channel_context)
         rewrite = _rewrite_retrieval_query(
             deps,
             owner=user,
@@ -1689,7 +1786,11 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
             conversation_id=conversation_id,
             route="assistant_rag_mcp",
             title=prompt[:120],
-            metadata={"mode": "assistant_rag_mcp"},
+            metadata={
+                "mode": "assistant_rag_mcp",
+                "channel": channel_context.get("name"),
+                "assistant_profile": persona.get("id"),
+            },
         )
         append_turn(
             deps,
@@ -1700,7 +1801,11 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
             content=prompt,
             rewritten_query=rewrite.retrieval_query if rewrite.rewritten else "",
             request_payload=payload,
-            metadata={"mode": "assistant_rag_mcp"},
+            metadata={
+                "mode": "assistant_rag_mcp",
+                "channel": channel_context.get("name"),
+                "assistant_profile": persona.get("id"),
+            },
         )
 
         provider_hint = payload.get("provider") or payload.get("llm_provider")
@@ -1751,6 +1856,22 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                     response_payload=response_payload,
                     policy=security_policy,
                 )
+                markers = derive_engagement_markers(
+                    payload=payload,
+                    channel_context=channel_context,
+                    reply_text=str(response_payload.get("answer") or ""),
+                )
+                response_payload = _apply_experience_payload(
+                    response_payload,
+                    persona=persona,
+                    channel_context=channel_context,
+                    markers=markers,
+                )
+                experience_meta = _experience_trace_metadata(
+                    persona=persona,
+                    channel_context=channel_context,
+                    markers=markers,
+                )
                 _maybe_record_rag_query(
                     deps,
                     owner=user,
@@ -1766,6 +1887,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                             "conversation_id": conversation_id,
                             "cache_hit": True,
                             "cache_similarity": cache_lookup.hit.similarity,
+                            **experience_meta,
                             **_citation_response_metadata(response_payload),
                         },
                 )
@@ -1784,6 +1906,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                         "has_mcp": False,
                         "has_atlassian_action": False,
                         "cache_hit": True,
+                        **experience_meta,
                         **_citation_response_metadata(response_payload),
                     },
                 )
@@ -1796,6 +1919,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                         "rag_match_count": len(response_payload.get("rag_matches") or []),
                         "has_mcp": False,
                         "has_atlassian_action": False,
+                        **experience_meta,
                         **_citation_response_metadata(response_payload),
                     },
                 )
@@ -1861,6 +1985,22 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                         response_payload=response_payload,
                         policy=security_policy,
                     )
+                    markers = derive_engagement_markers(
+                        payload=payload,
+                        channel_context=channel_context,
+                        reply_text=str(response_payload.get("answer") or ""),
+                    )
+                    response_payload = _apply_experience_payload(
+                        response_payload,
+                        persona=persona,
+                        channel_context=channel_context,
+                        markers=markers,
+                    )
+                    experience_meta = _experience_trace_metadata(
+                        persona=persona,
+                        channel_context=channel_context,
+                        markers=markers,
+                    )
                     _maybe_record_rag_query(
                         deps,
                         owner=user,
@@ -1877,6 +2017,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                             **retrieval_loop_metadata,
                             "refused": True,
                             "refusal_reason": "insufficient_retrieval_coverage",
+                            **experience_meta,
                             **_citation_response_metadata(response_payload),
                         },
                     )
@@ -1896,6 +2037,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                             "has_atlassian_action": False,
                             **retrieval_loop_metadata,
                             "refused": True,
+                            **experience_meta,
                             **_citation_response_metadata(response_payload),
                         },
                     )
@@ -1910,6 +2052,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                             "has_atlassian_action": False,
                             **retrieval_loop_metadata,
                             "refused": True,
+                            **experience_meta,
                             **_citation_response_metadata(response_payload),
                         },
                     )
@@ -2142,6 +2285,8 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
             capabilities_hint=capabilities_hint,
             skills_hint=skills_hint,
             rag_context_present=bool(rag_context),
+            persona_guidance=persona_guidance,
+            channel_guidance=channel_guidance,
         )
         user_blocks = [f"User request:\n{prompt}"]
         if rag_context:
@@ -2193,6 +2338,24 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
             response_payload=response_payload,
             policy=security_policy,
         )
+        markers = derive_engagement_markers(
+            payload=payload,
+            channel_context=channel_context,
+            reply_text=str(response_payload.get("answer") or answer),
+            atlassian_result=atlassian_result,
+            mcp_result=mcp_result,
+        )
+        response_payload = _apply_experience_payload(
+            response_payload,
+            persona=persona,
+            channel_context=channel_context,
+            markers=markers,
+        )
+        experience_meta = _experience_trace_metadata(
+            persona=persona,
+            channel_context=channel_context,
+            markers=markers,
+        )
         if rag_index_name:
             _maybe_record_rag_query(
                 deps,
@@ -2210,6 +2373,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                     **retrieval_loop_metadata,
                     **_tool_guard_response_metadata(tool_guard_result),
                     **_atlassian_action_response_metadata(atlassian_result),
+                    **experience_meta,
                     **_citation_response_metadata(response_payload),
                 },
             )
@@ -2229,6 +2393,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                 "provider": str(getattr(response, "provider", None) or settings.get("provider") or ""),
                 "model": str(getattr(response, "model", None) or settings.get("model") or ""),
                 **_atlassian_action_response_metadata(atlassian_result),
+                **experience_meta,
                 **_citation_response_metadata(response_payload),
             },
         )
@@ -2246,6 +2411,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                 "rag_index": rag_index_name,
                 "has_mcp": bool(mcp_result),
                 **_atlassian_action_response_metadata(atlassian_result),
+                **experience_meta,
                 **_citation_response_metadata(response_payload),
             },
         )
@@ -2259,6 +2425,7 @@ def assistant_rag_mcp(deps: AssistantPipelineDependencies, *, user: Optional[str
                 "has_mcp": bool(mcp_result),
                 **_atlassian_action_response_metadata(atlassian_result),
                 **retrieval_loop_metadata,
+                **experience_meta,
                 **_citation_response_metadata(response_payload),
             },
         )
@@ -2278,6 +2445,7 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
     requirements_text = str(payload.get("requirements_text") or "").strip()
     mode = str(payload.get("mode") or "ask").strip().lower()
     conversation_id = conversation_id_from_payload(payload)
+    channel_context = _resolve_channel_context(deps, payload)
     trace = TraceRecorder(
         deps,
         owner=user,
@@ -2288,6 +2456,8 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
             "mode": mode,
             "prompt_chars": len(prompt),
             "requirements_chars": len(requirements_text),
+            "channel": channel_context.get("name"),
+            "handoff_requested": bool(channel_context.get("handoff_requested")),
         },
     )
     try:
@@ -2305,6 +2475,7 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
         payload = input_result.payload
         prompt = str(payload.get("prompt") or "").strip()
         requirements_text = str(payload.get("requirements_text") or "").strip()
+        channel_context = _resolve_channel_context(deps, payload)
         raw_prompt = prompt
         messages = input_result.messages
         marketing_context = ""
@@ -2320,7 +2491,10 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
             route="assistant_requirements",
             scope=mode,
             title=(prompt or requirements_text)[:120],
-            metadata={"mode": mode},
+            metadata={
+                "mode": mode,
+                "channel": channel_context.get("name"),
+            },
         )
         append_turn(
             deps,
@@ -2332,7 +2506,10 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
             prompt_text=prompt,
             requirements_text=requirements_text,
             request_payload=payload,
-            metadata={"mode": mode},
+            metadata={
+                "mode": mode,
+                "channel": channel_context.get("name"),
+            },
         )
 
         provider_hint = payload.get("provider") or payload.get("llm_provider")
@@ -2360,6 +2537,22 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
             payload=payload,
             is_marketing_assistant=is_marketing_assistant,
         )
+        persona = _resolve_persona(deps, payload, route_default_profile=decision.prompt_profile)
+        persona_guidance = persona_prompt_guidance(persona)
+        channel_guidance = channel_prompt_guidance(channel_context)
+        ensure_conversation(
+            deps,
+            owner=user,
+            conversation_id=conversation_id,
+            route="assistant_requirements",
+            scope=mode,
+            title=(prompt or requirements_text)[:120],
+            metadata={
+                "mode": mode,
+                "channel": channel_context.get("name"),
+                "assistant_profile": persona.get("id"),
+            },
+        )
         assistant_memory_scope = deps.assistant_memory_scope(
             "assistant_requirements",
             mode=mode,
@@ -2380,6 +2573,22 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
                 request_payload=payload,
                 policy=security_policy,
             )
+            markers = derive_engagement_markers(
+                payload=payload,
+                channel_context=channel_context,
+                reply_text=str(greeting_payload.get("reply") or ""),
+            )
+            greeting_payload = _apply_experience_payload(
+                greeting_payload,
+                persona=persona,
+                channel_context=channel_context,
+                markers=markers,
+            )
+            experience_meta = _experience_trace_metadata(
+                persona=persona,
+                channel_context=channel_context,
+                markers=markers,
+            )
             append_turn(
                 deps,
                 owner=user,
@@ -2388,9 +2597,18 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
                 route="assistant_requirements",
                 content=str(greeting_payload.get("reply") or ""),
                 response_payload=greeting_payload,
-                metadata={"mode": mode, "assistant_profile": "marketing"},
+                metadata={
+                    "mode": mode,
+                    "assistant_profile": persona.get("id"),
+                    **experience_meta,
+                },
             )
-            trace.finish(status="success", provider="rule", model="greeting_fastpath", response_meta={"mode": mode, "greeting_fastpath": True})
+            trace.finish(
+                status="success",
+                provider="rule",
+                model="greeting_fastpath",
+                response_meta={"mode": mode, "greeting_fastpath": True, **experience_meta},
+            )
             return ServiceResult(greeting_payload)
 
         stt_learning_store = deps.get_stt_learning_store()
@@ -2437,6 +2655,8 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
             gesture_mode=gesture_mode,
             capabilities_hint=capabilities_hint,
             marketing_vocab_hint=marketing_vocab_hint,
+            persona_guidance=persona_guidance,
+            channel_guidance=channel_guidance,
         )
 
         chat_messages: List[Dict[str, Any]] = []
@@ -2550,9 +2770,7 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
                 prompt_text=raw_prompt or "Draft a complete requirements document.",
                 requirements_text=requirements_text,
                 reply_text=reply_text,
-                extra_notes=[
-                    "assistant_profile: marketing" if is_marketing_assistant else "assistant_profile: requirements"
-                ],
+                extra_notes=[f"assistant_profile: {persona.get('id') or 'requirements'}"],
             )
         elif use_assistant_ask_memory and assistant_memory_enabled:
             deps.record_assistant_memory(
@@ -2561,8 +2779,8 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
                 prompt_text=raw_prompt,
                 requirements_text=requirements_text,
                 reply_text=reply_text,
-                extra_notes=["assistant_profile: requirements", "mode: ask"],
-                metadata={"mode": "ask"},
+                extra_notes=[f"assistant_profile: {persona.get('id') or 'requirements'}", "mode: ask"],
+                metadata={"mode": "ask", "assistant_profile": persona.get("id")},
             )
         if is_marketing_assistant:
             deps.stt_record_learning(raw_prompt, source="assistant_marketing_user")
@@ -2578,6 +2796,22 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
             request_payload=payload,
             policy=security_policy,
         )
+        markers = derive_engagement_markers(
+            payload=payload,
+            channel_context=channel_context,
+            reply_text=str(response_payload.get("reply") or reply_text),
+        )
+        response_payload = _apply_experience_payload(
+            response_payload,
+            persona=persona,
+            channel_context=channel_context,
+            markers=markers,
+        )
+        experience_meta = _experience_trace_metadata(
+            persona=persona,
+            channel_context=channel_context,
+            markers=markers,
+        )
         append_turn(
             deps,
             owner=user,
@@ -2590,14 +2824,15 @@ def assistant_requirements(deps: AssistantPipelineDependencies, *, user: Optiona
             response_payload=response_payload,
             metadata={
                 "mode": mode,
-                "assistant_profile": decision.prompt_profile,
+                "assistant_profile": persona.get("id"),
+                **experience_meta,
             },
         )
         trace.finish(
             status="success",
             provider=str(getattr(response, "provider", None) or settings.get("provider") or ""),
             model=str(getattr(response, "model", None) or settings.get("model") or ""),
-            response_meta={"mode": mode, "assistant_profile": decision.prompt_profile},
+            response_meta={"mode": mode, "assistant_profile": persona.get("id"), **experience_meta},
         )
         return ServiceResult(response_payload)
     except ServiceError as exc:
@@ -2616,13 +2851,19 @@ def assistant_form_fill(deps: AssistantPipelineDependencies, *, user: Optional[s
     workflow = str(payload.get("workflow") or "").strip()
     scope = str(payload.get("scope") or "").strip()
     conversation_id = conversation_id_from_payload(payload)
+    channel_context = _resolve_channel_context(deps, payload)
     trace = TraceRecorder(
         deps,
         owner=user,
         route="assistant_form_fill",
         intent="assistant_form_fill",
         conversation_id=conversation_id,
-        request_meta={"field_count": len(fields), "prompt_chars": len(prompt), "workflow": workflow},
+        request_meta={
+            "field_count": len(fields),
+            "prompt_chars": len(prompt),
+            "workflow": workflow,
+            "channel": channel_context.get("name"),
+        },
     )
     try:
         security_policy = _assistant_security_policy(deps)
@@ -2639,6 +2880,7 @@ def assistant_form_fill(deps: AssistantPipelineDependencies, *, user: Optional[s
         )
         payload = input_result.payload
         prompt = str(payload.get("prompt") or "").strip()
+        channel_context = _resolve_channel_context(deps, payload)
 
         ensure_conversation(
             deps,
@@ -2647,7 +2889,11 @@ def assistant_form_fill(deps: AssistantPipelineDependencies, *, user: Optional[s
             route="assistant_form_fill",
             scope=scope,
             title=(workflow or prompt)[:120],
-            metadata={"workflow": workflow, "scope": scope},
+            metadata={
+                "workflow": workflow,
+                "scope": scope,
+                "channel": channel_context.get("name"),
+            },
         )
         append_turn(
             deps,
@@ -2658,7 +2904,11 @@ def assistant_form_fill(deps: AssistantPipelineDependencies, *, user: Optional[s
             content=prompt,
             prompt_text=prompt,
             request_payload=payload,
-            metadata={"workflow": workflow, "scope": scope},
+            metadata={
+                "workflow": workflow,
+                "scope": scope,
+                "channel": channel_context.get("name"),
+            },
         )
 
         provider_hint = payload.get("provider") or payload.get("llm_provider")
@@ -2747,6 +2997,7 @@ def assistant_form_fill(deps: AssistantPipelineDependencies, *, user: Optional[s
         system = build_assistant_form_fill_system_prompt(
             decision,
             capabilities_hint=capabilities_hint,
+            channel_guidance=channel_prompt_guidance(channel_context),
         )
 
         user_text: Dict[str, Any] = {
@@ -2840,13 +3091,21 @@ def assistant_form_fill(deps: AssistantPipelineDependencies, *, user: Optional[s
             provider=str(getattr(response, "provider", None) or settings.get("provider") or ""),
             model=str(getattr(response, "model", None) or settings.get("model") or ""),
             response_payload=response_payload,
-            metadata={"workflow": workflow, "scope": scope},
+            metadata={
+                "workflow": workflow,
+                "scope": scope,
+                "channel": channel_context.get("name"),
+            },
         )
         trace.finish(
             status="success",
             provider=str(getattr(response, "provider", None) or settings.get("provider") or ""),
             model=str(getattr(response, "model", None) or settings.get("model") or ""),
-            response_meta={"suggestion_count": len(cleaned), "workflow": workflow},
+            response_meta={
+                "suggestion_count": len(cleaned),
+                "workflow": workflow,
+                "channel": channel_context.get("name"),
+            },
         )
         return ServiceResult(response_payload)
     except ServiceError as exc:
@@ -3044,13 +3303,14 @@ def _structured_project_plan(
         raise ServiceError("unauthorized", status_code=401)
     prompt = str(payload.get("prompt") or "").strip()
     conversation_id = conversation_id_from_payload(payload)
+    channel_context = _resolve_channel_context(deps, payload)
     trace = TraceRecorder(
         deps,
         owner=user,
         route=route,
         intent=route,
         conversation_id=conversation_id,
-        request_meta={"prompt_chars": len(prompt)},
+        request_meta={"prompt_chars": len(prompt), "channel": channel_context.get("name")},
     )
     try:
         if not prompt:
@@ -3067,6 +3327,7 @@ def _structured_project_plan(
         )
         payload = input_result.payload
         prompt = str(payload.get("prompt") or "").strip()
+        channel_context = _resolve_channel_context(deps, payload)
 
         ensure_conversation(
             deps,
@@ -3074,7 +3335,7 @@ def _structured_project_plan(
             conversation_id=conversation_id,
             route=route,
             title=prompt[:120],
-            metadata={"mode": conversation_mode},
+            metadata={"mode": conversation_mode, "channel": channel_context.get("name")},
         )
         append_turn(
             deps,
@@ -3085,7 +3346,7 @@ def _structured_project_plan(
             content=prompt,
             prompt_text=prompt,
             request_payload=payload,
-            metadata={"mode": conversation_mode},
+            metadata={"mode": conversation_mode, "channel": channel_context.get("name")},
         )
 
         provider_hint = payload.get("provider") or payload.get("llm_provider")
@@ -3200,6 +3461,7 @@ def _structured_project_plan(
                 "token_estimate": token_estimate,
                 "provider": str(getattr(response, "provider", None) or settings.get("provider") or ""),
                 "model": str(getattr(response, "model", None) or settings.get("model") or ""),
+                "channel": channel_response_payload(channel_context),
             },
             policy=security_policy,
         )
@@ -3213,13 +3475,21 @@ def _structured_project_plan(
             provider=str(getattr(response, "provider", None) or settings.get("provider") or ""),
             model=str(getattr(response, "model", None) or settings.get("model") or ""),
             response_payload=response_payload,
-            metadata={"project_name": plan_details["project_name"], "mode": conversation_mode},
+            metadata={
+                "project_name": plan_details["project_name"],
+                "mode": conversation_mode,
+                "channel": channel_context.get("name"),
+            },
         )
         trace.finish(
             status="success",
             provider=str(getattr(response, "provider", None) or settings.get("provider") or ""),
             model=str(getattr(response, "model", None) or settings.get("model") or ""),
-            response_meta={"project_name": plan_details["project_name"], "token_estimate": token_estimate},
+            response_meta={
+                "project_name": plan_details["project_name"],
+                "token_estimate": token_estimate,
+                "channel": channel_context.get("name"),
+            },
         )
         return ServiceResult(response_payload)
     except ServiceError as exc:
@@ -3262,3 +3532,114 @@ def execution_plan(deps: AssistantPipelineDependencies, *, user: Optional[str], 
         user_text_builder=_execution_plan_user_text,
         fallback_requirements_builder=_fallback_execution_requirements_text,
     )
+
+
+def assistant_onboarding_plan(
+    deps: AssistantPipelineDependencies,
+    *,
+    user: Optional[str],
+    payload: Dict[str, Any],
+) -> ServiceResult:
+    """Return a four-step launch plan for assistant setup and deployment."""
+
+    if not user:
+        raise ServiceError("unauthorized", status_code=401)
+    channel_context = _resolve_channel_context(deps, payload)
+    profile = _resolve_persona(deps, payload, route_default_profile="support")
+    sources = deps.coerce_rag_sources(payload)
+    rag_index_name = str(payload.get("rag_index_name") or payload.get("name") or "default").strip() or "default"
+    trace = TraceRecorder(
+        deps,
+        owner=user,
+        route="assistant_onboarding_plan",
+        intent="assistant_onboarding_plan",
+        request_meta={
+            "channel": channel_context.get("name"),
+            "assistant_profile": profile.get("id"),
+            "source_count": len(sources),
+        },
+    )
+    try:
+        source_count = len(sources)
+        has_sources = source_count > 0
+        ready_to_launch = bool(channel_context.get("name")) and bool(profile.get("id")) and has_sources
+        steps = [
+            {
+                "id": "step-1",
+                "name": "Channel and Persona",
+                "status": "ready",
+                "details": f"Channel '{channel_context.get('name')}' with persona '{profile.get('id')}'.",
+            },
+            {
+                "id": "step-2",
+                "name": "Knowledge Sources",
+                "status": "ready" if has_sources else "required",
+                "details": (
+                    f"{source_count} source(s) prepared for RAG indexing."
+                    if has_sources
+                    else "Add at least one source (URL, file path, inline text, or structured records)."
+                ),
+            },
+            {
+                "id": "step-3",
+                "name": "Policy and Validation",
+                "status": "ready",
+                "details": "Assistant security and output validation are active by default.",
+            },
+            {
+                "id": "step-4",
+                "name": "Go Live",
+                "status": "ready" if ready_to_launch else "pending",
+                "details": "Run a live prompt through /api/assistant/requirements or /api/assistant/rag-mcp.",
+            },
+        ]
+        response_payload = {
+            "ready_to_launch": ready_to_launch,
+            "assistant_profile": profile,
+            "channel": channel_response_payload(channel_context),
+            "steps": steps,
+            "templates": {
+                "rag_index_create": {
+                    "name": rag_index_name,
+                    "sources": sources[:5]
+                    if has_sources
+                    else [{"url": "https://example.com/knowledge-base"}],
+                },
+                "assistant_requirements": {
+                    "mode": "ask",
+                    "assistant_profile": profile.get("id"),
+                    "channel": channel_context.get("name"),
+                    "prompt": "Summarise the next setup action I should complete.",
+                },
+                "assistant_rag_mcp": {
+                    "assistant_profile": profile.get("id"),
+                    "channel": channel_context.get("name"),
+                    "prompt": "Answer using the indexed sources.",
+                    "rag": {"index": rag_index_name, "top_k": 4},
+                },
+            },
+        }
+        response_payload = _guard_output(
+            deps,
+            trace,
+            route="assistant_onboarding_plan",
+            response_payload=response_payload,
+        )
+        trace.finish(
+            status="success",
+            provider="rule",
+            model="onboarding_template",
+            response_meta={
+                "ready_to_launch": ready_to_launch,
+                "source_count": source_count,
+                "channel": channel_context.get("name"),
+                "assistant_profile": profile.get("id"),
+            },
+        )
+        return ServiceResult(response_payload)
+    except ServiceError as exc:
+        trace.finish(status="failed", error_code=exc.code, error_detail=exc.details or str(exc))
+        raise
+    except Exception as exc:
+        trace.finish(status="failed", error_code="assistant_onboarding_plan_failed", error_detail=str(exc))
+        raise

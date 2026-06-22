@@ -11,12 +11,14 @@ Key aspects:
 - Project solver: scan a local folder for requirement signals, derive a plan with an LLM, and optionally apply file edits/run commands.
 - Agentic workflows: explicit plan → act → verify → reflect loops, verification-first execution, and role-based LLM overrides for planning/review.
 - Concurrent AI orchestration: LLM-backed workflows can now fan out across multiple provider/model candidates per role, score the responses, and retain rolling health/quality telemetry for future routing decisions.
+- Assistant growth features: channel-aware conversation context, persona/tone profiles, structured-record RAG ingestion, onboarding templates, an admin assistant analytics panel, deploy-time channel/profile defaults, and an Aaron omni-channel interaction endpoint are now available for faster deployment.
 - Neuromorphic specialist support: Refiner can attach multiple concurrent SNN/AER specialist engines for neuromorphic tasks, keep an AARNN path available by default, and use offline AER translation when a live runtime is not present.
 - Refinement principle: every run should improve the solution in a measurable, qualitative, and quantifiable way, with attention to efficiency and performance where applicable. This principle is core to the Refiner name.
 - Reuse & traceability: generated/updated modules are intended to be modular, tracked against requirement IDs, and paired with tests/examples to aid cross-project reuse.
 - Privacy for reuse: reusable modules must be scrubbed of user/company-identifying information to prevent cross-project leakage.
 - Codebase intent/workflow reference: see [CODEBASE_INTENT_AND_WORKFLOW.md](CODEBASE_INTENT_AND_WORKFLOW.md).
 - AI orchestration details: see [REFINER_AI_ORCHESTRATION.md](REFINER_AI_ORCHESTRATION.md).
+- Assistant onboarding/analytics details: see [ASSISTANT_GROWTH_FEATURES.md](ASSISTANT_GROWTH_FEATURES.md).
 
 ## Platform split
 Refiner is now the orchestration and public-API gateway layer in a split multi-service platform.
@@ -106,14 +108,29 @@ The web UI is backed by the same Flask server module (`refiner.refiner_web`). It
 
 ### Current JSON API surface
 - Auth + profile: `/api/setup`, `/api/register`, `/api/login`, `/api/login/mfa/totp`, `/api/logout`, `/api/session`, `/api/profile`, `/api/profile/password`, `/api/profile/mfa/totp/*`, `/api/profile/passkeys/register/*`, `/api/profile/passkeys/<credential_id>`, `/api/passkeys/authenticate/*`, `/api/sso/issue`, `/api/oidc/exchange`
-- Assistant + planning: `/api/assistant/requirements`, `/api/assistant/form-fill`, `/api/assistant/rag-mcp`, `/api/playground/plan`, `/api/execution/plan`
+- Assistant + planning: `/api/assistant/requirements`, `/api/assistant/form-fill`, `/api/assistant/rag-mcp`, `/api/assistant/onboarding/plan`, `/api/assistant/aaron/respond`, `/api/assistant/channels/telegram/webhook`, `/api/assistant/channels/whatsapp/webhook`, `/api/playground/plan`, `/api/execution/plan`
 - Voice + capture: `/api/voice/tokens`, `/api/voice/capture`, `/api/voice/siri`, `/api/voice/alexa`, `/api/voice/google`, `/api/voice/stt`
 - Jobs + workspaces: `/api/jobs`, `/api/jobs/estimate`, `/api/jobs/<job_id>/workspace`, `/api/jobs/<job_id>/editor/*`, `/api/jobs/<job_id>/logs`, `/api/jobs/<job_id>/actions`, `/api/jobs/<job_id>/transfer`, `/api/jobs/<job_id>/archive`
 - Inbox automation: `/api/todos`, `/api/todos/next`, `/api/todos/<todo_id>/route`, `/api/todos/<todo_id>/schedule`, `/api/schedules`, `/api/subtasks`
 - Access + collaboration: `/api/projects`, `/api/teams`, `/api/teams/<team_id>/tokens`, `/api/access/tree`, `/api/sessions`, `/api/sessions/<session_id>/stream`
-- Admin + operations: `/api/health`, `/api/version`, `/api/capabilities`, `/api/admin/stats`, `/api/admin/ai-orchestration`, `/api/workers/telemetry`, `/api/audit`, `/api/secrets`, `/api/github/tree`
+- Admin + operations: `/api/health`, `/api/version`, `/api/capabilities`, `/api/admin/stats`, `/api/admin/ai-orchestration`, `/api/admin/assistant/analytics`, `/api/workers/telemetry`, `/api/audit`, `/api/secrets`, `/api/github/tree`
 
 For the detailed route inventory and example payloads, see [API_DOCS_README.md](API_DOCS_README.md) and [`openapi_refiner.yaml`](openapi_refiner.yaml).
+
+For channel bridge deployments, Aaron also supports inbound webhook adapters:
+- `POST /api/assistant/channels/telegram/webhook`
+- `GET|POST /api/assistant/channels/whatsapp/webhook` (Meta verification uses `hub.*` query params on `GET`)
+
+Optional channel bridge environment variables:
+- `REFINER_AARON_WAKE_NAME` (default `Aaron`)
+- `REFINER_AARON_CHANNEL_WAKE_REQUIRED` (default `true`)
+- `REFINER_AARON_FIRST_ARRIVAL_ENABLED` (default `true`) enables near-simultaneous cross-channel dedupe for Aaron replies.
+- `REFINER_AARON_FIRST_ARRIVAL_WINDOW_SEC` (default `6`) sets the dedupe window in seconds.
+- `REFINER_AARON_FIRST_ARRIVAL_CHANNELS` (default `alexa,google_assistant,google_home,messenger,siri,telegram,voice,voice_capture,whatsapp`)
+- `REFINER_TELEGRAM_WEBHOOK_SECRET` (header check: `X-Telegram-Bot-Api-Secret-Token`)
+- `REFINER_WHATSAPP_VERIFY_TOKEN` (Meta webhook verification token)
+
+With first-arrival dedupe enabled, if the same user submits the same Aaron prompt across multiple channels inside the configured window, only the first channel receives the substantive reply; later channels get a suppressed-delivery response to avoid repeated answers.
 
 When `REFINER_CUSTOMERS_API_BASE` is configured, the auth/profile/voice-token routes above are proxied to Customers so the public contract remains stable while the identity implementation lives in the separate service.
 

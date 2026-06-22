@@ -240,6 +240,88 @@
       </div>
     </section>
 
+    <section class="card admin-wide">
+      <div class="card-header admin-card-header-actions">
+        <div>
+          <h2>Assistant Analytics</h2>
+          <p>Operational KPIs and compact route/channel/profile breakdowns for assistant traffic.</p>
+        </div>
+        <div class="assistant-actions admin-inline-actions">
+          <button type="button" class="ghost" id="assistantAnalyticsRefresh">Refresh</button>
+        </div>
+      </div>
+      <span class="status-banner" id="assistantAnalyticsStatus" hidden></span>
+      <div class="admin-form-grid">
+        <div class="field grid-3">
+          <div>
+            <label for="assistantAnalyticsOwner">Owner</label>
+            <input id="assistantAnalyticsOwner" type="text" placeholder="all owners">
+          </div>
+          <div>
+            <label for="assistantAnalyticsRoute">Route</label>
+            <input id="assistantAnalyticsRoute" type="text" placeholder="assistant_rag_mcp">
+          </div>
+          <div>
+            <label for="assistantAnalyticsChannel">Channel</label>
+            <input id="assistantAnalyticsChannel" type="text" placeholder="web, whatsapp, linkedin">
+          </div>
+        </div>
+        <div class="field grid-3">
+          <div>
+            <label for="assistantAnalyticsProfile">Assistant Profile</label>
+            <input id="assistantAnalyticsProfile" type="text" placeholder="requirements, support, sales">
+          </div>
+          <div>
+            <label for="assistantAnalyticsSinceHours">Window (hours)</label>
+            <input id="assistantAnalyticsSinceHours" type="number" min="1" max="720" step="1" value="24">
+          </div>
+          <div>
+            <label for="assistantAnalyticsLimit">Trace limit</label>
+            <input id="assistantAnalyticsLimit" type="number" min="1" max="10000" step="1" value="2000">
+          </div>
+        </div>
+      </div>
+      <div id="assistantAnalyticsSummary" class="admin-status-grid"></div>
+      <div class="admin-ai-layout">
+        <section class="admin-ai-section">
+          <div class="admin-section-head">
+            <div class="admin-section-title">By Route</div>
+          </div>
+          <div id="assistantAnalyticsRouteBreakdown" class="admin-list"></div>
+        </section>
+        <section class="admin-ai-section">
+          <div class="admin-section-head">
+            <div class="admin-section-title">By Channel</div>
+          </div>
+          <div id="assistantAnalyticsChannelBreakdown" class="admin-list"></div>
+        </section>
+        <section class="admin-ai-section">
+          <div class="admin-section-head">
+            <div class="admin-section-title">By Profile</div>
+          </div>
+          <div id="assistantAnalyticsProfileBreakdown" class="admin-list"></div>
+        </section>
+        <section class="admin-ai-section">
+          <div class="admin-section-head">
+            <div class="admin-section-title">By Sentiment</div>
+          </div>
+          <div id="assistantAnalyticsSentimentBreakdown" class="admin-list"></div>
+        </section>
+        <section class="admin-ai-section">
+          <div class="admin-section-head">
+            <div class="admin-section-title">By Provider</div>
+          </div>
+          <div id="assistantAnalyticsProviderBreakdown" class="admin-list"></div>
+        </section>
+        <section class="admin-ai-section">
+          <div class="admin-section-head">
+            <div class="admin-section-title">By Error</div>
+          </div>
+          <div id="assistantAnalyticsErrorBreakdown" class="admin-list"></div>
+        </section>
+      </div>
+    </section>
+
     <section class="card admin-users">
       <div class="card-header">
         <h2>Active Users</h2>

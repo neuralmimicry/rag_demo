@@ -26,6 +26,7 @@ def register_admin_routes(
     assistant_admin_conversation_detail: Callable,
     assistant_admin_traces: Callable,
     assistant_admin_trace_detail: Callable,
+    assistant_admin_analytics: Callable,
 ) -> None:
     """Register admin/system/public routes."""
     app.add_url_rule("/", view_func=index)
@@ -48,5 +49,6 @@ def register_admin_routes(
     )
     app.add_url_rule("/api/admin/assistant/traces", view_func=assistant_admin_traces)
     app.add_url_rule("/api/admin/assistant/traces/<trace_id>", view_func=assistant_admin_trace_detail)
+    app.add_url_rule("/api/admin/assistant/analytics", view_func=assistant_admin_analytics)
     app.add_url_rule("/api/workers/telemetry", view_func=workers_telemetry)
     app.add_url_rule("/api/audit", view_func=api_audit)

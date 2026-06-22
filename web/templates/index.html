@@ -370,16 +370,50 @@
             <div class="requirements-flow">
               <div class="assistant-panel requirements-assistant">
                 <div class="card-header">
-                  <h4 class="has-tip" data-tooltip="Chat with an LLM to draft or refine requirements. Responses can be inserted into the requirements text box.">Requirements Assistant</h4>
-                  <p>Ask questions, refine scope, or generate a structured requirements draft.</p>
+                  <h4 class="has-tip" data-tooltip="Aaron is the omni-channel assistant interface for drafting and workflow guidance. Responses can be inserted into the requirements text box.">Aaron Interface</h4>
+                  <p>Use one interactive assistant surface for web, mobile, messaging, and voice-assistant channels.</p>
                 </div>
                 <div id="assistantMessages" class="assistant-messages"></div>
                 <div class="field">
-                  <label for="assistantInput">Assistant Prompt</label>
-                  <textarea id="assistantInput" rows="3" placeholder="Ask for clarifications or request a draft..."></textarea>
+                  <label for="assistantInput">Aaron Prompt</label>
+                  <textarea id="assistantInput" rows="3" placeholder="Example: Aaron, summarise the delivery blockers and propose next steps."></textarea>
+                </div>
+                <div class="field grid-3">
+                  <div>
+                    <label for="assistantInterfaceChannel">Channel</label>
+                    <select id="assistantInterfaceChannel">
+                      <option value="web">Web</option>
+                      <option value="mobile">Mobile</option>
+                      <option value="messenger">Messenger</option>
+                      <option value="whatsapp">WhatsApp</option>
+                      <option value="telegram">Telegram</option>
+                      <option value="siri">Siri</option>
+                      <option value="alexa">Alexa</option>
+                      <option value="google_home">Google Home</option>
+                      <option value="api">API</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="assistantInterfaceWorkflow">Workflow</label>
+                    <select id="assistantInterfaceWorkflow">
+                      <option value="assistant_requirements">Requirements</option>
+                      <option value="assistant_rag_mcp">RAG + MCP</option>
+                      <option value="assistant_form_fill">Form Fill</option>
+                      <option value="playground_plan">Playground Plan</option>
+                      <option value="execution_plan">Execution Plan</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="assistantWakeName">Wake Name</label>
+                    <input id="assistantWakeName" type="text" value="Aaron" placeholder="Aaron">
+                  </div>
                 </div>
                 <div class="assistant-actions">
-                  <button type="button" id="assistantAsk" class="primary">Ask</button>
+                  <label class="check">
+                    <input id="assistantWakeRequired" type="checkbox" checked>
+                    Require wake name
+                  </label>
+                  <button type="button" id="assistantAsk" class="primary">Aaron, Ask</button>
                   <button type="button" id="assistantDraft" class="ghost">Draft Requirements</button>
                   <button type="button" id="assistantInsert" class="ghost">Insert Last Response</button>
                   <button type="button" id="assistantClear" class="ghost">Clear Chat</button>
