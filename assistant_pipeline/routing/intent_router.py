@@ -77,7 +77,13 @@ def resolve_route_intent(
 
     if route_name == "assistant_requirements":
         mode = _clean(values.get("mode") or "ask").lower() or "ask"
-        profile = "marketing" if is_marketing_assistant else "requirements"
+        raw_profile = _clean(values.get("assistant_profile") or values.get("profile") or "")
+        if raw_profile == "admin_ops":
+            profile = "admin_ops"
+        elif is_marketing_assistant:
+            profile = "marketing"
+        else:
+            profile = "requirements"
         if policy.enabled:
             intent_id = f"assistant_requirements:{profile}:{mode}"
         else:
