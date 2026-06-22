@@ -1494,7 +1494,9 @@ def test_assistant_requirements_records_intent_route_when_routing_is_enabled() -
     )
 
     assert result.payload["reply"] == "Hello from marketing."
-    assert "NeuralMimicry marketing assistant" in provider.calls[0]["system"]
+    system_prompt = provider.calls[0]["system"]
+    assert "NeuralMimicry assistant" in system_prompt
+    assert "Do not output requirements-document structures" in system_prompt
     assert state["trace_store"].spans[1]["stage"] == "intent_route"
     assert state["trace_store"].spans[1]["metadata"]["intent_id"] == "assistant_requirements:marketing:ask"
 
