@@ -1,5 +1,13 @@
 # Refiner
 
+## Sponsor NeuralMimicry
+
+Refiner is the open-source LLM workflow engine and public API gateway at the heart of NeuralMimicry — agentic delivery pipelines, Jira and Confluence analysis, RAG, MCP integrations, project solver, multi-provider AI orchestration, and a full assistant platform, all in one deployable Python service. NeuralMimicry is an independent open-source initiative and we rely on community support to sustain this work.
+
+**[☕ Support us on Crowdfunder](https://www.crowdfunder.co.uk/p/qr/aWggxwPW?utm_campaign=sharemodal&utm_medium=referral&utm_source=shortlink)**
+
+---
+
 Refiner is a lightweight reporting and analysis toolkit for Jira and Confluence. It discovers relevant scope (projects, epics, and spaces), fetches only the necessary data, and produces CSV/HTML reports on throughput, timelines, and resourcing. It also includes LLM-backed workflows for topic research and project solving.
 
 Key aspects:
