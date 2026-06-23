@@ -14,7 +14,7 @@ Ensure bullet points are expanded in to actionable paragraphs, without going too
 
 NeuralMimicry Network Autonomy & SDN KPI Framework
 
-By Paul Isaac'S
+By Paul Isaac's
 
 Open image-20251127-142951.png
 image-20251127-142951.png
