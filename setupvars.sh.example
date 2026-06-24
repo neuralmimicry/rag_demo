@@ -1,0 +1,32 @@
+#! /bin/bash
+# setupvars.sh.example — copy to setupvars.sh and fill in real values.
+# setupvars.sh is gitignored and must never be committed.
+#
+# Usage:
+#   cp setupvars.sh.example setupvars.sh
+#   # edit setupvars.sh with real credentials
+#   source setupvars.sh
+
+# ── Google Search & Generative AI ────────────────────────────────────────────
+export GOOGLE_API_KEY=YOUR_GOOGLE_API_KEY
+export GOOGLE_CSE_ID=YOUR_GOOGLE_CUSTOM_SEARCH_ENGINE_ID
+export GEMINI_API_KEY=YOUR_GOOGLE_GEMINI_API_KEY
+export GOOGLE_GENERATIVE_AI_API_KEY=YOUR_GOOGLE_GENERATIVE_AI_API_KEY
+
+# ── OpenAI ────────────────────────────────────────────────────────────────────
+export OPENAI_API_KEY=YOUR_OPENAI_API_KEY
+
+# ── ZEN / alternative LLM provider ───────────────────────────────────────────
+export ZEN_KEY=YOUR_ZEN_API_KEY
+
+# ── Jira / Atlassian ─────────────────────────────────────────────────────────
+export JIRA_USERNAME=your-email@example.com
+export JIRA_PASSWORD=YOUR_JIRA_API_TOKEN   # Atlassian API token, not account password
+
+# ── Local services ────────────────────────────────────────────────────────────
+export OLLAMA_BASE_URL=http://127.0.0.1:11434
+export OPENCODE_SERVER_URL=http://127.0.0.1:4096
+
+# ── OpenAI response replay (development only) ─────────────────────────────────
+export OPENAI_RESPONSES_REPLAY_INCOMPLETE=1
+export OPENAI_RESPONSES_REPLAY_PROMPT=1

@@ -226,6 +226,12 @@ __marimo__/
 .*.jsonl
 .vscode/
 .agent/skills/
+
+# Local credential / environment files — never commit
+setupvars.sh
+setupvars.local.sh
+*.secret
+*.credentials
 .agents/skills/
 .claude/skills/
 .codex/skills/
