@@ -86,7 +86,7 @@ This document summarises the assistant upgrades added to Refiner for faster go-l
 
 ## Ansible Deployment Notes
 
-For Continuum/Ansible deployments (`/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible`):
+For Continuum/Ansible deployments (`${SWARMHPC_ROOT}/swarmhpc/ansible`):
 - the Refiner tenant role now exposes explicit defaults:
   - `continuum_tenant_refiner_assistant_default_channel` (default `web`)
   - `continuum_tenant_refiner_assistant_default_profile` (default `requirements`)

@@ -200,7 +200,7 @@ BSL_IMPLEMENTATION_SUMMARY.md
 ### Run Tests
 
 ```bash
-cd /home/pbisaacs/Developer/neuralmimicry/nmstt
+cd ${NM_LOCAL_REPO_ROOT}/nmstt
 cargo test bsl -- --nocapture
 ```
 
@@ -265,7 +265,7 @@ curl -X POST http://localhost:7079/gesture-plan \
 
 Run tests to verify implementation:
 ```bash
-cd /home/pbisaacs/Developer/neuralmimicry/nmstt
+cd ${NM_LOCAL_REPO_ROOT}/nmstt
 cargo test
 ```
 

@@ -14,7 +14,7 @@
 ### Step 1: Restart STT Service
 
 ```bash
-cd /home/pbisaacs/Developer/neuralmimicry/nmstt
+cd ${NM_LOCAL_REPO_ROOT}/nmstt
 
 # Kill existing STT service
 pkill -f nmstt
@@ -26,7 +26,7 @@ pkill -f nmstt
 ### Step 2: Restart Frontend
 
 ```bash
-cd /home/pbisaacs/Developer/neuralmimicry.ai-website
+cd ${NM_LOCAL_REPO_ROOT}.ai-website
 npm run dev
 ```
 

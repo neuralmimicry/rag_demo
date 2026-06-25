@@ -15,37 +15,37 @@ Status key:
 
 ### Assistant / RAG route extraction
 
-- `[x]` Added [assistant_api/assistant_handlers.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_api/assistant_handlers.py)
-- `[x]` Added [assistant_api/rag_handlers.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_api/rag_handlers.py)
-- `[x]` Added [assistant_pipeline/contracts.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/contracts.py)
-- `[x]` Added [assistant_pipeline/dependencies.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/dependencies.py)
-- `[x]` Added [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py)
-- `[x]` Added [assistant_pipeline/memory/episodic_store.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/memory/episodic_store.py)
-- `[x]` Added [assistant_pipeline/memory/conversation_store.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/memory/conversation_store.py)
-- `[x]` Added [assistant_pipeline/tracing/recorder.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/tracing/recorder.py)
-- `[x]` Added dedicated RAG route registration in [refiner_routes/rag.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner_routes/rag.py)
-- `[x]` Removed RAG route registration from [refiner_routes/jobs.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner_routes/jobs.py)
-- `[x]` Rewired [refiner/refiner_web.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_web.py) to register the extracted handlers
-- `[x]` Deleted the superseded inline assistant/RAG route bodies from [refiner/refiner_web.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_web.py)
-- `[x]` Added pure-Python service coverage in [tests/test_assistant_pipeline_service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/tests/test_assistant_pipeline_service.py)
-- `[x]` Added helper coverage in [tests/test_assistant_pipeline_runtime_helpers.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/tests/test_assistant_pipeline_runtime_helpers.py)
+- `[x]` Added [assistant_api/assistant_handlers.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_api/assistant_handlers.py)
+- `[x]` Added [assistant_api/rag_handlers.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_api/rag_handlers.py)
+- `[x]` Added [assistant_pipeline/contracts.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/contracts.py)
+- `[x]` Added [assistant_pipeline/dependencies.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/dependencies.py)
+- `[x]` Added [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py)
+- `[x]` Added [assistant_pipeline/memory/episodic_store.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/memory/episodic_store.py)
+- `[x]` Added [assistant_pipeline/memory/conversation_store.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/memory/conversation_store.py)
+- `[x]` Added [assistant_pipeline/tracing/recorder.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/tracing/recorder.py)
+- `[x]` Added dedicated RAG route registration in [refiner_routes/rag.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner_routes/rag.py)
+- `[x]` Removed RAG route registration from [refiner_routes/jobs.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner_routes/jobs.py)
+- `[x]` Rewired [refiner/refiner_web.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_web.py) to register the extracted handlers
+- `[x]` Deleted the superseded inline assistant/RAG route bodies from [refiner/refiner_web.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_web.py)
+- `[x]` Added pure-Python service coverage in [tests/test_assistant_pipeline_service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/tests/test_assistant_pipeline_service.py)
+- `[x]` Added helper coverage in [tests/test_assistant_pipeline_runtime_helpers.py](${NM_LOCAL_REPO_ROOT}/rag_demo/tests/test_assistant_pipeline_runtime_helpers.py)
 
 ### Postgres metadata split
 
-- `[x]` Added [central_store/base.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/central_store/base.py)
-- `[x]` Added [central_store/assistant.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/central_store/assistant.py)
-- `[x]` Added [central_store/rag.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/central_store/rag.py)
-- `[x]` Added [central_store/__init__.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/central_store/__init__.py)
-- `[x]` Extended [refiner/refiner_central_store.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_central_store.py) to expose:
+- `[x]` Added [central_store/base.py](${NM_LOCAL_REPO_ROOT}/rag_demo/central_store/base.py)
+- `[x]` Added [central_store/assistant.py](${NM_LOCAL_REPO_ROOT}/rag_demo/central_store/assistant.py)
+- `[x]` Added [central_store/rag.py](${NM_LOCAL_REPO_ROOT}/rag_demo/central_store/rag.py)
+- `[x]` Added [central_store/__init__.py](${NM_LOCAL_REPO_ROOT}/rag_demo/central_store/__init__.py)
+- `[x]` Extended [refiner/refiner_central_store.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_central_store.py) to expose:
   - `assistant_conversations`
   - `assistant_episodes`
   - `assistant_traces`
   - `assistant_semantic_cache`
   - `rag_metadata`
-- `[x]` Added Postgres-backed dual-write for assistant episodic memory in [refiner/refiner_web.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_web.py)
-- `[x]` Added Postgres-backed fallback reads for assistant episodic memory in [refiner/refiner_web.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_web.py)
-- `[x]` Added request trace recording and RAG metadata recording inside [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py)
-- `[x]` Added pure-Python metadata helper coverage in [tests/test_central_store_metadata_helpers.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/tests/test_central_store_metadata_helpers.py)
+- `[x]` Added Postgres-backed dual-write for assistant episodic memory in [refiner/refiner_web.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_web.py)
+- `[x]` Added Postgres-backed fallback reads for assistant episodic memory in [refiner/refiner_web.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_web.py)
+- `[x]` Added request trace recording and RAG metadata recording inside [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py)
+- `[x]` Added pure-Python metadata helper coverage in [tests/test_central_store_metadata_helpers.py](${NM_LOCAL_REPO_ROOT}/rag_demo/tests/test_central_store_metadata_helpers.py)
 
 ## Phase 1 Follow-up
 
@@ -53,7 +53,7 @@ Status key:
 
 Files:
 
-- [refiner/refiner_web.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_web.py)
+- [refiner/refiner_web.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_web.py)
 
 Tasks:
 
@@ -73,8 +73,8 @@ Tasks:
 
 Files:
 
-- [refiner/refiner_web.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_web.py)
-- [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py)
+- [refiner/refiner_web.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_web.py)
+- [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py)
 - New: `assistant_pipeline/memory/episodic_store.py`
 
 Tasks:
@@ -85,7 +85,7 @@ Tasks:
 - `[x]` Move `_assistant_memory_reference_payload`
 - `[x]` Move `_should_use_assistant_ask_memory`
 - `[x]` Move `_record_assistant_memory`
-- `[x]` Leave [refiner/refiner_web.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_web.py) with compatibility shims only
+- `[x]` Leave [refiner/refiner_web.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_web.py) with compatibility shims only
 
 ## Phase 2 Follow-up
 
@@ -93,8 +93,8 @@ Tasks:
 
 Files:
 
-- [central_store/assistant.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/central_store/assistant.py)
-- [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py)
+- [central_store/assistant.py](${NM_LOCAL_REPO_ROOT}/rag_demo/central_store/assistant.py)
+- [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py)
 - New: `assistant_pipeline/memory/conversation_store.py`
 
 Tasks:
@@ -108,14 +108,14 @@ Tasks:
 
 Files:
 
-- [central_store/assistant.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/central_store/assistant.py)
-- [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py)
+- [central_store/assistant.py](${NM_LOCAL_REPO_ROOT}/rag_demo/central_store/assistant.py)
+- [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py)
 - New: `assistant_pipeline/tracing/recorder.py`
 
 Tasks:
 
 - `[~]` Record route-level traces and basic stage spans
-- `[x]` Move the recorder into [assistant_pipeline/tracing/recorder.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/tracing/recorder.py)
+- `[x]` Move the recorder into [assistant_pipeline/tracing/recorder.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/tracing/recorder.py)
 - `[ ]` Add trace span schema for richer timestamps if needed
 - `[x]` Add admin/debug read endpoints for trace drill-down
 - `[x]` Add admin/debug read endpoints for conversation drill-down
@@ -125,8 +125,8 @@ Tasks:
 
 Files:
 
-- [central_store/rag.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/central_store/rag.py)
-- [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py)
+- [central_store/rag.py](${NM_LOCAL_REPO_ROOT}/rag_demo/central_store/rag.py)
+- [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py)
 - New: `assistant_pipeline/retrieval/collection_service.py`
 
 Tasks:
@@ -146,12 +146,12 @@ Files:
 - New: `assistant_pipeline/ingestion/metadata.py`
 - New: `assistant_pipeline/ingestion/index_builder.py`
 - New: `assistant_pipeline/ingestion/artifact_store.py`
-- [refiner/refiner_web.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_web.py)
+- [refiner/refiner_web.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_web.py)
 
 Tasks:
 
-- `[x]` Move `_coerce_rag_sources` out of [refiner/refiner_web.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_web.py)
-- `[x]` Move `_build_rag_documents` out of [refiner/refiner_web.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_web.py)
+- `[x]` Move `_coerce_rag_sources` out of [refiner/refiner_web.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_web.py)
+- `[x]` Move `_build_rag_documents` out of [refiner/refiner_web.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_web.py)
 - `[x]` Add `rag_collection_build` subtask execution path
 - `[~]` Switch `/api/rag/index` from synchronous build to queued build
 - `[x]` Version collection artefacts under `job_data/rag/collections/...`
@@ -171,7 +171,7 @@ Files:
 - New: `assistant_pipeline/security/input_guard.py`
 - New: `assistant_pipeline/security/output_guard.py`
 - New: `assistant_pipeline/security/policies.py`
-- [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py)
+- [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py)
 
 Tasks:
 
@@ -184,7 +184,7 @@ Tasks:
 
 Notes:
 
-- `assistant_pipeline/security/input_guard.py`, `assistant_pipeline/security/output_guard.py`, and `assistant_pipeline/security/policies.py` now exist and are wired through [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py).
+- `assistant_pipeline/security/input_guard.py`, `assistant_pipeline/security/output_guard.py`, and `assistant_pipeline/security/policies.py` now exist and are wired through [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py).
 - `assistant_pipeline/security/tool_guard.py` now applies unsafe MCP tool-use policy checks before tool execution and emits rollout telemetry through the existing Postgres LLM telemetry roll-up.
 - Response-shape validation is now active for the extracted assistant/RAG routes.
 - Stricter message-role blocking, prompt-leak blocking, remote RAG URL validation, and output PII redaction are intentionally behind rollout flags to preserve the current contract by default:
@@ -205,8 +205,8 @@ Files:
 - New: `assistant_pipeline/routing/prompt_profiles.py`
 - New: `assistant_pipeline/memory/query_rewriter.py`
 - New: `assistant_pipeline/cache/semantic_cache.py`
-- [central_store/assistant.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/central_store/assistant.py)
-- [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py)
+- [central_store/assistant.py](${NM_LOCAL_REPO_ROOT}/rag_demo/central_store/assistant.py)
+- [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py)
 
 Tasks:
 
@@ -217,12 +217,12 @@ Tasks:
 
 Notes:
 
-- `assistant_pipeline/routing/intent_router.py` and `assistant_pipeline/routing/prompt_profiles.py` are now wired through [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py).
+- `assistant_pipeline/routing/intent_router.py` and `assistant_pipeline/routing/prompt_profiles.py` are now wired through [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py).
 - Routing remains feature-flagged by default to preserve current behaviour until explicitly enabled:
   - `REFINER_ASSISTANT_INTENT_ROUTING_ENABLED`
   - `REFINER_ASSISTANT_ROUTING_SKILL_HINT_LIMIT`
   - `REFINER_ASSISTANT_ROUTING_CAPABILITY_MAX_ITEMS`
-- `central_store/assistant.py` now provides `nm_assistant_semantic_cache` via `PostgresAssistantSemanticCacheStore`, exposed through [refiner/refiner_central_store.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/refiner/refiner_central_store.py).
+- `central_store/assistant.py` now provides `nm_assistant_semantic_cache` via `PostgresAssistantSemanticCacheStore`, exposed through [refiner/refiner_central_store.py](${NM_LOCAL_REPO_ROOT}/rag_demo/refiner/refiner_central_store.py).
 - The first cache rollout is intentionally conservative:
   - Postgres-backed rather than file-backed
   - version-aware through the active RAG version id
@@ -230,8 +230,8 @@ Notes:
   - matched using deterministic normalisation plus token/string similarity
   - still passed through the output guard on cache hits
 - Added focused regression coverage in:
-  - [tests/test_assistant_pipeline_routing.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/tests/test_assistant_pipeline_routing.py)
-  - [tests/test_assistant_pipeline_semantic_cache.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/tests/test_assistant_pipeline_semantic_cache.py)
+  - [tests/test_assistant_pipeline_routing.py](${NM_LOCAL_REPO_ROOT}/rag_demo/tests/test_assistant_pipeline_routing.py)
+  - [tests/test_assistant_pipeline_semantic_cache.py](${NM_LOCAL_REPO_ROOT}/rag_demo/tests/test_assistant_pipeline_semantic_cache.py)
 
 ## Phase 6: Hybrid Retrieval and Self-Correction
 
@@ -256,8 +256,8 @@ Tasks:
 
 Notes:
 
-- `assistant_pipeline/retrieval/sparse_retriever.py`, `assistant_pipeline/retrieval/dense_retriever.py`, and `assistant_pipeline/retrieval/hybrid_retriever.py` now exist and are wired through [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py).
-- `assistant_pipeline/retrieval/coverage_grader.py`, `assistant_pipeline/retrieval/retrieval_planner.py`, and `assistant_pipeline/retrieval/reranker.py` now exist and are wired through [assistant_pipeline/service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/assistant_pipeline/service.py).
+- `assistant_pipeline/retrieval/sparse_retriever.py`, `assistant_pipeline/retrieval/dense_retriever.py`, and `assistant_pipeline/retrieval/hybrid_retriever.py` now exist and are wired through [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py).
+- `assistant_pipeline/retrieval/coverage_grader.py`, `assistant_pipeline/retrieval/retrieval_planner.py`, and `assistant_pipeline/retrieval/reranker.py` now exist and are wired through [assistant_pipeline/service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/assistant_pipeline/service.py).
 - The current hybrid retrieval rollout is intentionally conservative:
   - disabled by default behind feature flags
   - keeps `RagIndex.search()` as the sparse baseline
@@ -276,16 +276,16 @@ Notes:
 - Citation claim binding now runs in the response path with exact chunk ids plus locator metadata preserved for grounded claims.
 - Broader multi-pass planning remains follow-up work.
 - Added focused regression coverage in:
-  - [tests/test_assistant_pipeline_retrieval.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/tests/test_assistant_pipeline_retrieval.py)
-  - [tests/test_assistant_pipeline_service.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/tests/test_assistant_pipeline_service.py)
-  - [tests/test_rag_engine_core.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/tests/test_rag_engine_core.py)
+  - [tests/test_assistant_pipeline_retrieval.py](${NM_LOCAL_REPO_ROOT}/rag_demo/tests/test_assistant_pipeline_retrieval.py)
+  - [tests/test_assistant_pipeline_service.py](${NM_LOCAL_REPO_ROOT}/rag_demo/tests/test_assistant_pipeline_service.py)
+  - [tests/test_rag_engine_core.py](${NM_LOCAL_REPO_ROOT}/rag_demo/tests/test_rag_engine_core.py)
 
 ## Phase 7: Testing and Operational Hardening
 
 Files:
 
 - New: `tests/evals/assistant_rag/`
-- [tests/test_route_registration.py](/home/pbisaacs/Developer/neuralmimicry/rag_demo/tests/test_route_registration.py)
+- [tests/test_route_registration.py](${NM_LOCAL_REPO_ROOT}/rag_demo/tests/test_route_registration.py)
 - New: `tests/test_assistant_rag_pipeline_core.py`
 - New: `tests/test_central_store_assistant_schema.py`
 
@@ -301,9 +301,9 @@ Tasks:
 
 Files:
 
-- [ASSISTANT_RAG_TARGET_ARCHITECTURE.md](/home/pbisaacs/Developer/neuralmimicry/rag_demo/ASSISTANT_RAG_TARGET_ARCHITECTURE.md)
-- [continuum_tenant_refiner_site.yml](/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/continuum_tenant_refiner_site.yml)
-- [defaults/main.yml](/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/roles/continuum_tenant_refiner/defaults/main.yml)
+- [ASSISTANT_RAG_TARGET_ARCHITECTURE.md](${NM_LOCAL_REPO_ROOT}/rag_demo/ASSISTANT_RAG_TARGET_ARCHITECTURE.md)
+- [continuum_tenant_refiner_site.yml](${SWARMHPC_ROOT}/swarmhpc/ansible/continuum_tenant_refiner_site.yml)
+- [defaults/main.yml](${SWARMHPC_ROOT}/swarmhpc/ansible/roles/continuum_tenant_refiner/defaults/main.yml)
 
 Tasks:
 

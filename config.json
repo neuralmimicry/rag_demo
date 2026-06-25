@@ -117,7 +117,7 @@
       {
         "name": "AARNNNeuromorphic",
         "type": "aarnn",
-        "repo_root": "/home/pbisaacs/Developer/neuralmimicry/aarnn_rust",
+        "repo_root": null,
         "socket_path": "/tmp/aarnn_rust.nn",
         "endpoint": "http://127.0.0.1:8000",
         "sensory_size": 32,

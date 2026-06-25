@@ -73,21 +73,21 @@ This ensures BSL signing movements are **clearly visible** and **stronger than g
 
 ## Files Modified
 
-1. **`/home/pbisaacs/Developer/neuralmimicry.ai-website/src/components/AIChatWidget.jsx`**
+1. **`${NM_LOCAL_REPO_ROOT}.ai-website/src/components/AIChatWidget.jsx`**
    - Line 464-473: Updated `SOFTENED_MOTION_SCALES` for BSL
 
 ## Verification
 
 ### Backend Tests
 ```bash
-cd /home/pbisaacs/Developer/neuralmimicry/nmstt
+cd ${NM_LOCAL_REPO_ROOT}/nmstt
 cargo test bsl
 ```
 **Result**: ✅ All 5 BSL tests passing
 
 ### Frontend Build
 ```bash
-cd /home/pbisaacs/Developer/neuralmimicry.ai-website
+cd ${NM_LOCAL_REPO_ROOT}.ai-website
 npm run build
 ```
 **Result**: ✅ Build successful, no errors

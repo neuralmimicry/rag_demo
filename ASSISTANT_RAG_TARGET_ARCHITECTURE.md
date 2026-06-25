@@ -7,7 +7,7 @@ It is intentionally not a new public microservice.
 The target is a modular monolith inside Refiner with background workers for ingestion and indexing.
 
 Implementation work is tracked in
-[ASSISTANT_RAG_MIGRATION_BACKLOG.md](/home/pbisaacs/Developer/neuralmimicry/rag_demo/ASSISTANT_RAG_MIGRATION_BACKLOG.md).
+[ASSISTANT_RAG_MIGRATION_BACKLOG.md](${NM_LOCAL_REPO_ROOT}/rag_demo/ASSISTANT_RAG_MIGRATION_BACKLOG.md).
 
 This keeps the current public contract stable:
 

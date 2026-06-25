@@ -163,7 +163,7 @@ Example engine registry:
       {
         "name": "AARNNPrimary",
         "type": "aarnn",
-        "repo_root": "/home/pbisaacs/Developer/neuralmimicry/aarnn_rust",
+        "repo_root": "${NM_LOCAL_REPO_ROOT}/aarnn_rust",
         "roles": ["planner", "assistant"],
         "specialties": ["aarnn", "snn", "neuromorphic", "aer"]
       },

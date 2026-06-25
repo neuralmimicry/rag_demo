@@ -91,7 +91,7 @@ jobs:
             candidates+=("${GITHUB_WORKSPACE}/../nmstt")
             candidates+=("$(dirname "${GITHUB_WORKSPACE}")/nmstt")
           fi
-          candidates+=("/home/pbisaacs/Developer/neuralmimicry/nmstt")
+          candidates+=("${NM_LOCAL_REPO_ROOT}/nmstt")
 
           for candidate in "${candidates[@]}"; do
             if [[ -f "${candidate}/Cargo.toml" ]]; then

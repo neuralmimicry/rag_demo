@@ -38,7 +38,7 @@ pose.right_shoulder_roll += 0.44; // Making it POSITIVE → more down/back
 
 ## The Fix
 
-**File**: `/home/pbisaacs/Developer/neuralmimicry/nmstt/src/main.rs`
+**File**: `${NM_LOCAL_REPO_ROOT}/nmstt/src/main.rs`
 
 ### Change 1: BSL Rest Pose (lines 914-915)
 ```rust
@@ -82,7 +82,7 @@ pose.right_shoulder_roll -= blend.shoulder_roll * intensity * right_bias;
 
 ### Test Results
 ```bash
-cd /home/pbisaacs/Developer/neuralmimicry/nmstt
+cd ${NM_LOCAL_REPO_ROOT}/nmstt
 cargo test
 ```
 **Output**: ✅ All 12 tests passing
@@ -108,7 +108,7 @@ cargo build --release
 
 1. **Restart STT Service**:
    ```bash
-   cd /home/pbisaacs/Developer/neuralmimicry/nmstt
+   cd ${NM_LOCAL_REPO_ROOT}/nmstt
    cargo build --release
    # Then restart the service with the new binary
    ```

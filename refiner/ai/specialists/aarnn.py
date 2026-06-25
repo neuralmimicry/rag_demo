@@ -30,7 +30,10 @@ from refiner.refiner_ai_aer import decode_spikes, decode_spikes_auto, encode_spi
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_AARNN_REPO_ROOT = "/home/pbisaacs/Developer/neuralmimicry/aarnn_rust"
+DEFAULT_AARNN_REPO_ROOT = os.environ.get(
+    "REFINER_AARNN_REPO_ROOT",
+    os.environ.get("NM_AARNN_REPO_ROOT", "/opt/neuralmimicry/aarnn_rust"),
+)
 DEFAULT_AER_SENSORY_BASE = 4096
 DEFAULT_AER_OUTPUT_BASE = 16384
 DEFAULT_SOCKET_PATH = "/tmp/aarnn_rust.nn"

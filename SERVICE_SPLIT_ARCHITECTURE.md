@@ -27,7 +27,7 @@ The service split is deliberately hidden behind that stable API host.
 
 Repository:
 
-- `/home/pbisaacs/Developer/neuralmimicry/rag_demo`
+- `${NM_LOCAL_REPO_ROOT}/rag_demo`
 
 Owns:
 
@@ -47,7 +47,7 @@ Persistence defaults:
 
 Repository:
 
-- `/home/pbisaacs/Developer/neuralmimicry/customers`
+- `${NM_LOCAL_REPO_ROOT}/customers`
 
 Owns:
 
@@ -67,7 +67,7 @@ Persistence defaults:
 
 Repository:
 
-- `/home/pbisaacs/Developer/neuralmimicry/billing`
+- `${NM_LOCAL_REPO_ROOT}/billing`
 
 Owns:
 
@@ -87,7 +87,7 @@ Persistence defaults:
 
 Repository:
 
-- `/home/pbisaacs/Developer/neuralmimicry/nmstt`
+- `${NM_LOCAL_REPO_ROOT}/nmstt`
 
 Owns:
 
@@ -104,7 +104,7 @@ Persistence defaults:
 
 Repository:
 
-- `/home/pbisaacs/Developer/neuralmimicry/nmchain`
+- `${NM_LOCAL_REPO_ROOT}/nmchain`
 
 Owns:
 
@@ -178,8 +178,8 @@ Persistence defaults:
 
 ## Continuum deployment entry points
 
-- Refiner: `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/continuum_tenant_refiner_site.yml`
-- Customers: `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/continuum_tenant_customers_site.yml`
-- Billing: `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/continuum_tenant_billing_site.yml`
-- nmstt: `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/continuum_tenant_nmstt_site.yml`
-- Combined nmchain-backed stack: `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/continuum_tenant_nmchain_site.yml`
+- Refiner: `${SWARMHPC_ROOT}/swarmhpc/ansible/continuum_tenant_refiner_site.yml`
+- Customers: `${SWARMHPC_ROOT}/swarmhpc/ansible/continuum_tenant_customers_site.yml`
+- Billing: `${SWARMHPC_ROOT}/swarmhpc/ansible/continuum_tenant_billing_site.yml`
+- nmstt: `${SWARMHPC_ROOT}/swarmhpc/ansible/continuum_tenant_nmstt_site.yml`
+- Combined nmchain-backed stack: `${SWARMHPC_ROOT}/swarmhpc/ansible/continuum_tenant_nmchain_site.yml`

@@ -531,7 +531,7 @@ CUSTOMERS_TEAM_DETAIL_MAX_WORKERS = max(
 )
 STT_KB_LOCAL_PATHS = [
     p.strip()
-    for p in (os.getenv("REFINER_STT_KB_LOCAL_PATHS") or "/home/pbisaacs/Developer/neuralmimicry.ai-website").split(",")
+    for p in (os.getenv("REFINER_STT_KB_LOCAL_PATHS") or os.getenv("NM_WEBSITE_ROOT", "")).split(",")
     if p.strip()
 ]
 STT_KB_SEED_URLS = [

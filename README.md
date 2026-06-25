@@ -282,7 +282,7 @@ For the split Continuum deployment, point `REFINER_STT_SERVER_URL` at the tenant
 
 Privacy-safe STT learning (optional, enabled by default):
 - `REFINER_STT_LEARNING_ENABLED=1`
-- `REFINER_STT_KB_LOCAL_PATHS=/home/pbisaacs/Developer/neuralmimicry.ai-website`
+- `REFINER_STT_KB_LOCAL_PATHS=${NM_LOCAL_REPO_ROOT}.ai-website`
 - `REFINER_STT_KB_SEED_URLS=https://neuralmimicry.ai`
 - `REFINER_STT_LEARNING_ALLOW_NETWORK=1` (only when outbound network is allowed)
 
@@ -536,7 +536,7 @@ Check rollout + health:
 NeuralMimicry Continuum (`nmc`) now includes a `refiner` command group to manage this deployment lifecycle directly with `kubectl`.
 
 Build `nmc` client:
-- `cmake -S /home/pbisaacs/Developer/neuralmimicry/nmc/nmc_client -B /tmp/nmc_client_build`
+- `cmake -S ${NM_LOCAL_REPO_ROOT}/nmc/nmc_client -B /tmp/nmc_client_build`
 - `cmake --build /tmp/nmc_client_build`
 
 Control Refiner via Continuum:
