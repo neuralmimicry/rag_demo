@@ -7720,6 +7720,31 @@ class JobManager:
         if not project_name:
             raise ValueError("Project name is required to create a starter repo.")
 
+        if bool(payload.get("local_project")) or str(payload.get("source") or "").strip().lower() == "playground":
+            project_root = os.path.join(PROJECTS_ROOT, f"{_slugify(project_name)}-{job.job_id[:8]}")
+            if os.path.exists(project_root):
+                try:
+                    shutil.rmtree(project_root)
+                except Exception:
+                    pass
+            os.makedirs(project_root, exist_ok=True)
+            requirements_rel = (payload.get("requirements_relpath") or "requirements.md").strip()
+            req_path = os.path.join(project_root, requirements_rel)
+            os.makedirs(os.path.dirname(req_path), exist_ok=True)
+            if requirements_text:
+                with open(req_path, "w", encoding="utf-8") as handle:
+                    handle.write(requirements_text)
+            else:
+                if not os.path.exists(requirements_path):
+                    raise ValueError("Requirements path not found on server.")
+                shutil.copyfile(requirements_path, req_path)
+            payload["requirements_path"] = req_path
+            payload["project_root"] = project_root
+            job.append_log(f"Created local starter project workspace: {project_root}")
+            if not job.project_name:
+                job.project_name = project_name
+            return True
+
         fork_org = (payload.get("fork_org") or DEFAULT_FORK_ORG).strip()
         token = self._get_github_token(job)
         if not token:

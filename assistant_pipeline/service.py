@@ -3279,6 +3279,8 @@ def _build_project_solver_job_payload(
         "token_scope": "personal",
         "source": source,
     }
+    if source == "playground":
+        job_payload["local_project"] = True
     codingagent = payload.get("codingagent")
     if codingagent:
         job_payload["codingagent"] = codingagent
