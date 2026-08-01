@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import queue
 import time
 import uuid
@@ -3240,6 +3241,28 @@ def _normalise_project_plan_response(
     }
 
 
+def _processing_time_estimate_ms_from_response(response: Any) -> Optional[int]:
+    """Extract Gail's pre-request AI processing estimate from a provider response."""
+
+    raw = getattr(response, "raw", None)
+    if not isinstance(raw, dict):
+        return None
+    candidates = [raw.get("processing_time_estimate_ms")]
+    gail_meta = raw.get("gail")
+    if isinstance(gail_meta, dict):
+        candidates.append(gail_meta.get("processing_time_estimate_ms"))
+    for value in candidates:
+        if isinstance(value, bool) or value in (None, ""):
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(numeric) and numeric >= 0:
+            return max(0, int(round(numeric)))
+    return None
+
+
 def _build_project_solver_job_payload(
     deps: AssistantPipelineDependencies,
     *,
@@ -3470,6 +3493,9 @@ def _structured_project_plan(
             },
             policy=security_policy,
         )
+        processing_time_estimate_ms = _processing_time_estimate_ms_from_response(response)
+        if processing_time_estimate_ms is not None:
+            response_payload["processing_time_estimate_ms"] = processing_time_estimate_ms
         append_turn(
             deps,
             owner=user,
