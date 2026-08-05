@@ -351,7 +351,13 @@ class GailProvider(LLMProvider):
         }
 
     def get_context_window(self) -> int:
-        return max(4096, _env_int("GAIL_CONTEXT_WINDOW", 128000))
+        return max(
+            4096,
+            _env_int(
+                "REFINER_GAIL_CONTEXT_WINDOW",
+                _env_int("GAIL_CONTEXT_WINDOW", 128000),
+            ),
+        )
 
     def _post_json(self, path: str, payload: Dict[str, Any], *, timeout: Optional[int]) -> Dict[str, Any]:
         response = _http_post(
