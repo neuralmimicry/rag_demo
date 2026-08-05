@@ -798,6 +798,15 @@ def _token_looks_like_path(token: str) -> bool:
             ".cfg",
             ".toml",
             ".json",
+            ".js",
+            ".mjs",
+            ".cjs",
+            ".jsx",
+            ".ts",
+            ".tsx",
+            ".html",
+            ".css",
+            ".sh",
             ".yaml",
             ".yml",
         )
@@ -865,6 +874,60 @@ def _resolve_relative_command_path(
             rel_from_workdir = os.path.relpath(abs_candidate, abs_workdir)
             return rel_from_workdir.replace("\\", "/")
     return None
+
+
+def _command_should_use_workspace(
+    command: str,
+    *,
+    abs_workdir: str,
+    project_root: str,
+    workspace_root: Optional[str],
+) -> bool:
+    """Return whether a command should run with the solver workspace as cwd."""
+    if not command or not workspace_root:
+        return False
+    workspace_abs = os.path.abspath(workspace_root)
+    if os.path.abspath(abs_workdir) == workspace_abs:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+
+    search_roots = (abs_workdir, project_root, workspace_abs)
+    for idx, token in enumerate(parts):
+        if idx == 0 or token.startswith("-") or not _token_looks_like_path(token):
+            continue
+        base_token, _ = _split_pytest_node_selector(token)
+        if os.path.isabs(base_token):
+            if os.path.exists(base_token) and _is_subpath(workspace_abs, base_token):
+                return True
+            continue
+        local_candidate = os.path.abspath(os.path.join(abs_workdir, base_token))
+        if os.path.exists(local_candidate):
+            # Preserve an explicit project-root command when the same
+            # basename also happens to exist in a stale solver workspace.
+            if _is_subpath(workspace_abs, local_candidate):
+                return True
+            continue
+        for rel_candidate in _candidate_command_path_variants(base_token):
+            for root in search_roots:
+                candidate = os.path.abspath(os.path.join(root, rel_candidate))
+                if os.path.exists(candidate) and _is_subpath(workspace_abs, candidate):
+                    return True
+
+    executable = os.path.basename(parts[0]).lower()
+    if executable in {"node", "nodejs", "npm", "npx", "yarn", "pnpm", "bun"}:
+        # Commands such as `npm start` do not name the entry point. If the
+        # generated package lives only in the solver workspace, its cwd must
+        # follow it so package scripts and relative asset paths resolve there.
+        workspace_package = os.path.join(workspace_abs, "package.json")
+        project_package = os.path.join(os.path.abspath(project_root), "package.json")
+        if os.path.exists(workspace_package) and not os.path.exists(project_package):
+            return True
+    return False
 
 
 def _replace_command_token(command: str, old_token: str, new_token: str) -> Optional[str]:
@@ -2315,6 +2378,54 @@ def _rewrite_requirements_path_in_command(
         f"Rewrote command paths for current workspace: {command} -> {rewritten}"
     )
     return rewritten
+
+
+def _rewrite_workspace_command_paths(
+    command: str,
+    *,
+    abs_workdir: str,
+    project_root: Optional[str],
+    workspace_root: Optional[str],
+    actions_log: List[str],
+) -> str:
+    """Rewrite existing relative command inputs that live in the solver workspace."""
+    if not command or not workspace_root:
+        return command
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+    if not parts:
+        return command
+
+    changed = False
+    for idx, token in enumerate(parts):
+        # The executable and option names are not project paths. Values are
+        # considered only when they have a source/config/path-like shape and
+        # the resolver confirms that the file exists in the workspace.
+        if idx == 0 or token.startswith("-") or not _token_looks_like_path(token):
+            continue
+        base_token, node_selector = _split_pytest_node_selector(token)
+        rewritten_base = _resolve_relative_command_path(
+            base_token,
+            abs_workdir=abs_workdir,
+            project_root=project_root,
+            workspace_root=workspace_root,
+        )
+        if not rewritten_base:
+            continue
+        rewritten = rewritten_base + node_selector
+        if rewritten != token:
+            parts[idx] = rewritten
+            changed = True
+
+    if not changed:
+        return command
+    rewritten_command = " ".join(shlex.quote(part) for part in parts)
+    actions_log.append(
+        f"Rewrote workspace command paths: {command} -> {rewritten_command}"
+    )
+    return rewritten_command
 
 
 def _sanitize_shell_command(command: str, venv_path: Optional[str]) -> str:
@@ -8754,9 +8865,36 @@ def _apply_step(
                 actions_log.append(f"Skipped run_command unsafe workdir: {workdir}")
                 logger.info(f"Skipped run_command (unsafe workdir): {workdir}")
                 return
+        workspace_workdir = _safe_path(
+            project_root,
+            workspace_root or "",
+            extra_roots=allowed_roots,
+        ) if workspace_root else None
+        if workspace_workdir and _command_should_use_workspace(
+            command,
+            abs_workdir=abs_workdir,
+            project_root=project_root,
+            workspace_root=workspace_workdir,
+        ):
+            actions_log.append(
+                f"Using solver workspace as command workdir: {abs_workdir} -> {workspace_workdir}"
+            )
+            logger.info(
+                "Using solver workspace as command workdir: %s -> %s",
+                abs_workdir,
+                workspace_workdir,
+            )
+            abs_workdir = workspace_workdir
         sanitized_command = _sanitize_shell_command(effective_command, venv_path)
         rewritten_command = _rewrite_command_for_venv(sanitized_command, venv_path)
         rewritten_command = _rewrite_requirements_path_in_command(
+            rewritten_command,
+            abs_workdir=abs_workdir,
+            project_root=project_root,
+            workspace_root=workspace_root,
+            actions_log=actions_log,
+        )
+        rewritten_command = _rewrite_workspace_command_paths(
             rewritten_command,
             abs_workdir=abs_workdir,
             project_root=project_root,
@@ -9459,6 +9597,7 @@ def run_project_solver(
     selected_verification_commands: List[Dict[str, object]] = []
     selected_verification_keys: set = set()
     recovery_repeat_limit = max(1, _env_int("SOLVER_RECOVERY_REPEAT_LIMIT", 2))
+    planner_failure: Optional[Dict[str, object]] = None
     agentic_workflow = AgenticWorkflow(
         phases=["plan", "act", "verify", "reflect"],
         max_cycles=max_iterations,
@@ -10270,14 +10409,36 @@ def run_project_solver(
                     _record_action(f"Ollama plan request failed: {exc}", source_actions_log)
 
             if payload is None:
-                resp = planner_provider.predict(
-                    [{"role": "user", "content": user_prompt}],
-                    system=system_prompt,
-                    max_tokens=planner_params.get("max_tokens"),
-                    temperature=planner_params.get("temperature", llm_temperature),
-                    timeout=planner_params.get("timeout"),
-                    reasoning_effort=planner_params.get("reasoning_effort"),
-                )
+                try:
+                    resp = planner_provider.predict(
+                        [{"role": "user", "content": user_prompt}],
+                        system=system_prompt,
+                        max_tokens=planner_params.get("max_tokens"),
+                        temperature=planner_params.get("temperature", llm_temperature),
+                        timeout=planner_params.get("timeout"),
+                        reasoning_effort=planner_params.get("reasoning_effort"),
+                    )
+                except (LLMError, TimeoutError) as exc:
+                    message = str(exc) or exc.__class__.__name__
+                    failure_kind = (
+                        "planner_timeout"
+                        if isinstance(exc, TimeoutError)
+                        or "timeout" in message.lower()
+                        or "timed out" in message.lower()
+                        else "planner_llm_error"
+                    )
+                    planner_failure = {
+                        "type": failure_kind,
+                        "message": message,
+                        "source": source.path,
+                        "iteration": iteration,
+                    }
+                    _record_action(
+                        f"Planner failed for {source.path} at iteration {iteration}; "
+                        f"writing an incomplete solver report: {message}",
+                        source_actions_log,
+                    )
+                    break
 
             def _maybe_codingagent_fallback(reason: str, *, requires_code: bool) -> Optional[Dict[str, object]]:
                 if not requires_code:
@@ -11341,6 +11502,8 @@ def run_project_solver(
                 _record_action("Max steps reached; stopping iterations.", source_actions_log)
                 break
             cycle.record("reflect", PhaseResult.ok("continue"))
+        if planner_failure:
+            break
         pending_verification = verification_failures_by_source.get(source.path)
         if pending_verification and (defer_source or total_steps_applied >= max_steps or last_iteration >= max_iterations):
             for failure in pending_verification:
@@ -11381,6 +11544,11 @@ def run_project_solver(
     sources_with_plans = set(final_plan_state.keys())
     unstarted_sources = [path for path in source_paths if path not in sources_with_plans]
     incomplete_sources = [path for path in source_paths if path not in completed_sources_final]
+    if planner_failure:
+        actions_log.append(
+            "Project solver stopped before completion because the planner failed; "
+            "the report is resumable and marked incomplete."
+        )
     final_source_logs = _extract_source_logs(actions_log)
     requirement_coverage, coverage_missing_sources = _build_requirement_coverage(
         requirement_sources,
@@ -11477,6 +11645,8 @@ def run_project_solver(
             or coverage_missing_sources
         )
     )
+    if planner_failure:
+        needs_more_iterations = True
     if requirements_missing_hard_ids:
         needs_more_iterations = True
     if requirements_sanity_strict_global and requirements_missing_advisory_ids:
@@ -11484,6 +11654,7 @@ def run_project_solver(
     if unresolved_verification_failures:
         needs_more_iterations = True
     completion_summary = {
+        "status": "incomplete" if planner_failure else "complete",
         "total_sources": len(source_paths),
         "completed_sources": completed_sources_final,
         "incomplete_sources": incomplete_sources,
@@ -11746,6 +11917,7 @@ def run_project_solver(
     )
 
     output_data = {
+        "status": "incomplete" if planner_failure else "complete",
         "summary": all_plans[-1].get("summary") if all_plans else None,
         "requirements": all_plans[-1].get("requirements") if all_plans else None,
         "plans": all_plans,
@@ -11819,6 +11991,7 @@ def run_project_solver(
         "verification_command_summary": selected_verification_commands,
         "failure_fingerprint_summary": failure_fingerprint_summary,
         "completion_summary": completion_summary,
+        "planner_failure": planner_failure,
         "run_config": {
             "project_root": project_root,
             "requirements_path": requirements_path,

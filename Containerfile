@@ -239,6 +239,8 @@ ARG RUNTIME_PACKAGES="\
     curl \
     ffmpeg \
     git \
+    nodejs \
+    npm \
     tini \
     tzdata \
     libffi8 \
