@@ -470,13 +470,15 @@ jobs:
         run: |
           set -euo pipefail
           runner_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
-          runtime_dir="/run/user/$(id -u)"
+          runtime_dir="${RUNNER_TEMP:-/tmp}/podman-runtime-$(id -u)"
           if [[ -z "${runner_home}" || ! -d "${runner_home}" ]]; then
             echo "::error::Could not resolve the runner user's home directory"
             exit 1
           fi
-          if [[ ! -d "${runtime_dir}" || ! -w "${runtime_dir}" ]]; then
-            echo "::error::Rootless container runtime directory is unavailable: ${runtime_dir}"
+          mkdir -p "${runtime_dir}"
+          chmod 700 "${runtime_dir}"
+          if [[ ! -w "${runtime_dir}" ]]; then
+            echo "::error::Rootless container runtime directory is not writable: ${runtime_dir}"
             exit 1
           fi
           # actions/checkout can temporarily override HOME while configuring
@@ -648,13 +650,15 @@ jobs:
         run: |
           set -euo pipefail
           runner_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
-          runtime_dir="/run/user/$(id -u)"
+          runtime_dir="${RUNNER_TEMP:-/tmp}/podman-runtime-$(id -u)"
           if [[ -z "${runner_home}" || ! -d "${runner_home}" ]]; then
             echo "::error::Could not resolve the runner user's home directory"
             exit 1
           fi
-          if [[ ! -d "${runtime_dir}" || ! -w "${runtime_dir}" ]]; then
-            echo "::error::Rootless container runtime directory is unavailable: ${runtime_dir}"
+          mkdir -p "${runtime_dir}"
+          chmod 700 "${runtime_dir}"
+          if [[ ! -w "${runtime_dir}" ]]; then
+            echo "::error::Rootless container runtime directory is not writable: ${runtime_dir}"
             exit 1
           fi
           echo "HOME=${runner_home}" >> "${GITHUB_ENV}"
