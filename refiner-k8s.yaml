@@ -27,6 +27,7 @@ spec:
         runAsUser: 10001
         runAsGroup: 10001
         fsGroup: 10001
+      # BEGIN ANSIBLE MANAGED REFINER ADMIN INIT
       initContainers:
         - name: sync-local-admin
           image: ghcr.io/neuralmimicry/refiner:latest
@@ -104,6 +105,7 @@ spec:
           volumeMounts:
             - name: job-data
               mountPath: /app/job_data
+      # END ANSIBLE MANAGED REFINER ADMIN INIT
       containers:
         - name: refiner
           image: ghcr.io/neuralmimicry/refiner:latest
