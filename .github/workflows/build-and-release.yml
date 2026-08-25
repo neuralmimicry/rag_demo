@@ -580,7 +580,7 @@ jobs:
           echo "Using GHCR credentials source: ${GHCR_AUTH_SOURCE}"
           if command -v podman >/dev/null 2>&1; then
             if printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin; then
-              if podman build --format docker --pull \
+            if podman build --cgroup-manager=cgroupfs --format docker --pull \
                 --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
                 --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
                 --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
