@@ -1133,6 +1133,7 @@ Config example (`config.json`):
 ```json
 {
   "agentic_roles": {
+    "fast_planner": { "provider": "OpenAIFast", "max_tokens": 2048, "temperature": 0.1 },
     "planner": { "provider": "OpenAIPrimary" },
     "researcher": { "provider": "OpenAIPrimary" },
     "reviewer": { "provider": "GeminiFallback" },
@@ -1147,7 +1148,15 @@ CLI override (repeatable):
 refiner --agent-role planner=openai:gpt-4o --agent-role reviewer=gemini:gemini-1.5-pro
 ```
 
-Supported roles: `planner`, `researcher`, `reviewer`, `critic`, `editor`. Roles fall back to the main LLM provider if not configured.
+Supported roles: `fast_planner`, `planner`, `researcher`, `reviewer`, `critic`, `editor`. The project solver uses `fast_planner` for routine non-code work when configured; code-changing work uses `planner`, with `reviewer` and the configured coding-agent path available for implementation/review. Roles fall back to the main LLM provider if not configured.
+
+Project-solver reliability controls:
+
+- `SOLVER_REPEATED_PLAN_LIMIT` (default `2`) bounds identical actionable plans before the source is marked resumably incomplete and a changed strategy is requested.
+- `SOLVER_STRICT_TEST_COVERAGE` (default `true`) requires code-changing plans to include test changes. Set it to `false` only for projects where equivalent coverage is supplied outside the repository.
+- `REFINER_SOLVER_COMMAND_POLICY_MODE=strict` permits only verification and read-only Git commands; the default `standard` mode also permits bounded application and dependency commands.
+
+Solver command steps should use structured `argv`, an explicit `workdir`, and optional `env` values. Legacy string commands remain supported for compatibility, but are parsed and executed without a shell. Localhost acceptance probes manage the temporary server process group and clean it up after the probe.
 
 ### Skills catalog (optional)
 Refiner uses a small built-in skill list to guide prompts in the web assistant, topic research, and project solver. You can extend it with the `antigravity-awesome-skills` index without installing `npx`.

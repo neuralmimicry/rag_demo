@@ -124,6 +124,8 @@ def test_gail_direct_provider_routes_via_orchestration_by_default(monkeypatch):
     assert response.model == "llama3.2"
     assert captured["url"] == "https://gail.internal.example/v1/llm/complete"
     assert captured["headers"]["Authorization"] == "Bearer bridge-secret"
+    assert captured["headers"]["X-Request-ID"] == captured["json_payload"]["request_id"]
+    assert captured["json_payload"]["request_id"]
     assert captured["json_payload"]["workflow"] == "direct"
     assert captured["json_payload"]["role"] == "assistant"
     assert captured["json_payload"]["preferred_provider"] == "openai"

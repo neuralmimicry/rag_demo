@@ -497,8 +497,8 @@ def test_resolve_file_target_normalizes_nested_workspace_prefix(tmp_path):
         prefer_workspace_new_files=True,
     )
 
-    assert target == str(workspace_root / "index.html")
-    assert note and "normalized workspace-prefixed path" in note.lower()
+    assert target == "index.html"
+    assert note and "canonical project-root" in note.lower()
 
 
 def test_select_verification_steps_targets_workspace_tests_when_project_has_none(tmp_path):
@@ -634,3 +634,33 @@ def test_ensure_global_requirements_remain_global_scope():
     ]
     assert globals_only
     assert all(req.get("source") == ["global"] for req in globals_only)
+
+
+def test_repair_source_requirement_registration_preserves_explicit_ids_and_drops_heading():
+    source = project_solver.RequirementSource(
+        path="requirements.md",
+        requirements_text=(
+            "Overview: build a flashcard app.\n\n"
+            "Requirements Register:\n"
+            "- REQ-001: Use Node.js for the backend.\n"
+            "- REQ-002: Export the Express app for tests.\n"
+        ),
+        requirement_lines=[],
+        todo_lines=[],
+        context_excerpt="",
+    )
+    register = {
+        "requirements": [
+            {"id": "REQ-001", "title": "Overview", "description": "Overview"},
+            {"id": "REQ-002", "title": "Requirements Register", "description": "Requirements Register"},
+            {"id": "GLOBAL-REQ-001", "title": "Clean code", "description": "Keep code maintainable", "source": ["global"]},
+        ]
+    }
+
+    repaired = project_solver._repair_source_requirement_registration(register, [source])
+    by_id = {item["id"]: item for item in repaired["requirements"]}
+
+    assert set(by_id) == {"REQ-001", "REQ-002", "GLOBAL-REQ-001"}
+    assert by_id["REQ-001"]["description"] == "Use Node.js for the backend."
+    assert by_id["REQ-002"]["description"] == "Export the Express app for tests."
+    assert all(item["title"] != "Requirements Register" for item in repaired["requirements"])

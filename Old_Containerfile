@@ -1,3 +1,4 @@
+ARG TARGET_PAGE_SIZE=4k
 ARG BASE_IMAGE=python:3.11-slim-bookworm
 
 FROM ${BASE_IMAGE} AS source-metadata
@@ -105,11 +106,13 @@ RUN chmod +x /src/container/entrypoint.sh \
 FROM ${BASE_IMAGE}
 
 ARG APP_HOME=/app
+ARG TARGET_PAGE_SIZE
 ARG APP_USER=refiner
 ARG APP_UID=10001
 ARG APP_GID=10001
 
-LABEL org.opencontainers.image.title="Refiner" \
+LABEL org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}" \
+      org.opencontainers.image.title="Refiner" \
       org.opencontainers.image.description="Refiner API/runtime image for Podman and Kubernetes" \
       org.opencontainers.image.source="https://github.com/neuralmimicry"
 

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 import os
 import re
 import shlex
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Union
 
 
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
@@ -99,6 +99,9 @@ def _categorize_command(executable: str, argv: List[str]) -> str:
             return "dependency_install"
         return "node"
 
+    if executable in {"node", "nodejs"} and len(argv) > 1 and argv[1] in {"--check", "-c"}:
+        return "verification"
+
     if executable == "cargo":
         if len(argv) > 1 and argv[1] == "test":
             return "verification"
@@ -134,20 +137,30 @@ def _policy_mode() -> str:
     return "standard"
 
 
-def evaluate_command_policy(command: str) -> CommandPolicyDecision:
-    """Validate a solver command and prepare a shell-free subprocess payload."""
+def evaluate_command_policy(command: Union[str, Sequence[str]]) -> CommandPolicyDecision:
+    """Validate a command and prepare a shell-free subprocess payload.
 
-    cleaned = (command or "").strip()
+    Structured ``argv`` input bypasses shell parsing entirely. Legacy string
+    input remains supported, but is parsed into the same shell-free payload.
+    """
+
+    structured = isinstance(command, (list, tuple))
+    if structured:
+        parts = [str(item) for item in command]
+        cleaned = " ".join(shlex.quote(part) for part in parts)
+    else:
+        cleaned = (command or "").strip()
+        parts = []
     if not cleaned:
         return CommandPolicyDecision(
             allowed=False,
             reason="empty command",
             category="invalid",
             risk="blocked",
-            command=command or "",
+            command=cleaned,
         )
 
-    if _SUDO_RE.search(cleaned):
+    if not structured and _SUDO_RE.search(cleaned):
         return CommandPolicyDecision(
             allowed=False,
             reason="privilege-escalation commands are not allowed",
@@ -156,7 +169,7 @@ def evaluate_command_policy(command: str) -> CommandPolicyDecision:
             command=cleaned,
         )
 
-    if _SHELL_BOOTSTRAP_RE.search(cleaned):
+    if not structured and _SHELL_BOOTSTRAP_RE.search(cleaned):
         return CommandPolicyDecision(
             allowed=False,
             reason="pipe-to-shell bootstrap commands are blocked",
@@ -165,7 +178,7 @@ def evaluate_command_policy(command: str) -> CommandPolicyDecision:
             command=cleaned,
         )
 
-    if _DESTRUCTIVE_RE.search(cleaned):
+    if not structured and _DESTRUCTIVE_RE.search(cleaned):
         return CommandPolicyDecision(
             allowed=False,
             reason="destructive command pattern blocked by solver policy",
@@ -174,7 +187,7 @@ def evaluate_command_policy(command: str) -> CommandPolicyDecision:
             command=cleaned,
         )
 
-    if _SHELL_META_RE.search(cleaned):
+    if not structured and _SHELL_META_RE.search(cleaned):
         return CommandPolicyDecision(
             allowed=False,
             reason="shell control operators are not allowed in solver commands",
@@ -183,21 +196,31 @@ def evaluate_command_policy(command: str) -> CommandPolicyDecision:
             command=cleaned,
         )
 
-    try:
-        parts = shlex.split(cleaned, posix=os.name != "nt")
-    except ValueError as exc:
-        return CommandPolicyDecision(
-            allowed=False,
-            reason=f"unable to parse command safely: {exc}",
-            category="invalid",
-            risk="blocked",
-            command=cleaned,
-        )
+    if not structured:
+        try:
+            parts = shlex.split(cleaned, posix=os.name != "nt")
+        except ValueError as exc:
+            return CommandPolicyDecision(
+                allowed=False,
+                reason=f"unable to parse command safely: {exc}",
+                category="invalid",
+                risk="blocked",
+                command=cleaned,
+            )
 
     if not parts:
         return CommandPolicyDecision(
             allowed=False,
             reason="empty command after parsing",
+            category="invalid",
+            risk="blocked",
+            command=cleaned,
+        )
+
+    if not parts[0].strip():
+        return CommandPolicyDecision(
+            allowed=False,
+            reason="command has no executable",
             category="invalid",
             risk="blocked",
             command=cleaned,
@@ -224,6 +247,21 @@ def evaluate_command_policy(command: str) -> CommandPolicyDecision:
             allowed=False,
             reason=f"direct shell executable '{executable}' is blocked",
             category="shell_entrypoint",
+            risk="blocked",
+            command=cleaned,
+        )
+
+    # Structured argv is intentionally exempt from shell-metacharacter
+    # parsing, but destructive executables must still be blocked. Refiner
+    # plans are not allowed to delete, re-partition, or power-cycle hosts.
+    if structured and executable in {
+        "rm", "mkfs", "fdisk", "parted", "shutdown", "reboot", "halt",
+        "poweroff", "mount", "umount", "dd",
+    }:
+        return CommandPolicyDecision(
+            allowed=False,
+            reason=f"destructive executable '{executable}' is blocked by solver policy",
+            category="destructive",
             risk="blocked",
             command=cleaned,
         )

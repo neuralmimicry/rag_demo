@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from typing import Any, Dict, List, Optional, Sequence
 
 import requests
@@ -82,6 +83,23 @@ def gail_direct_max_candidates() -> Optional[int]:
         return max(1, int(raw))
     except Exception:
         return None
+
+
+def gail_request_timeout(timeout: Optional[int]) -> int:
+    """Keep the Refiner HTTP deadline aligned with Gail's bounded candidate path."""
+    configured = _env_int(
+        "REFINER_GAIL_REQUEST_TIMEOUT_SECONDS",
+        _env_int("LLM_TIMEOUT_SECONDS", 60),
+    )
+    ceiling = max(1, configured)
+    if timeout is None:
+        return ceiling
+    return max(1, min(int(timeout), ceiling))
+
+
+def gail_request_retries() -> int:
+    """Gail owns provider fallback; avoid replaying a whole orchestration wave."""
+    return max(0, _env_int("REFINER_GAIL_MAX_RETRIES", 0))
 
 
 def gail_workflow_preserve_provider_hints() -> bool:
@@ -167,18 +185,20 @@ class GailProvider(LLMProvider):
         timeout: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> LLMResponse:
+        request_timeout = gail_request_timeout(timeout)
         if self.gail_mode == "workflow" or gail_route_direct_requests():
             payload = self._build_completion_payload(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 system=system,
-                timeout=timeout,
+                timeout=request_timeout,
                 reasoning_effort=reasoning_effort,
             )
-            data = self._post_json("/v1/llm/complete", payload, timeout=timeout)
+            data = self._post_json("/v1/llm/complete", payload, timeout=request_timeout)
         else:
             payload = {
+                "request_id": str(uuid.uuid4()),
                 "provider": self.gail_source_provider,
                 "model": self.gail_source_model,
                 "api_key": self.gail_source_api_key,
@@ -188,10 +208,10 @@ class GailProvider(LLMProvider):
                 "system": system,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
-                "timeout_seconds": timeout,
+                "timeout_seconds": request_timeout,
                 "reasoning_effort": reasoning_effort,
             }
-            data = self._post_json("/v1/llm/direct-complete", payload, timeout=timeout)
+            data = self._post_json("/v1/llm/direct-complete", payload, timeout=request_timeout)
         response = LLMResponse(
             text=str(data.get("text") or ""),
             raw=data if isinstance(data, dict) else {"raw": data},
@@ -277,6 +297,7 @@ class GailProvider(LLMProvider):
             fallback_access_token = None
             base_url = None
         return {
+            "request_id": str(uuid.uuid4()),
             "workflow": self.workflow or gail_direct_workflow(),
             "role": self.role or gail_direct_role(),
             "preferred_provider": preferred_provider,
@@ -362,10 +383,10 @@ class GailProvider(LLMProvider):
     def _post_json(self, path: str, payload: Dict[str, Any], *, timeout: Optional[int]) -> Dict[str, Any]:
         response = _http_post(
             f"{self.gail_base_url}{path}",
-            headers=_headers(self.gail_api_token),
+            headers=_headers(self.gail_api_token, request_id=str(payload.get("request_id") or "")),
             json_payload=payload,
-            timeout=timeout or _env_int("LLM_TIMEOUT_SECONDS", 180),
-            max_retries=_env_int("LLM_MAX_RETRIES", 2),
+            timeout=timeout or gail_request_timeout(None),
+            max_retries=gail_request_retries(),
         )
         return _decode_json_response(response, provider="gail")
 
@@ -491,10 +512,12 @@ def _provider_spec_from_instance(provider: LLMProvider) -> Dict[str, Optional[st
     }
 
 
-def _headers(token: Optional[str]) -> Dict[str, str]:
+def _headers(token: Optional[str], request_id: Optional[str] = None) -> Dict[str, str]:
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if request_id:
+        headers["X-Request-ID"] = request_id
     return headers
 
 

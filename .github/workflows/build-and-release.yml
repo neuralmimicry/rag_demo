@@ -415,7 +415,16 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        runner_arch: [X64, ARM64]
+        include:
+          - runner_arch: X64
+            variant: amd64
+            page_size: 4k
+          - runner_arch: ARM64
+            variant: arm64-4k
+            page_size: 4k
+          - runner_arch: ARM64
+            variant: arm64-64k-hwe
+            page_size: 64k-hwe
 
     steps:
       - name: Checkout
@@ -489,11 +498,13 @@ jobs:
               sudo DOCKER_BUILDKIT=0 docker build --pull \
                 --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
                 --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
+                --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
                 -f Containerfile -t "${image_ref}" .
             else
               DOCKER_BUILDKIT=0 docker build --pull \
                 --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
                 --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
+                --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
                 -f Containerfile -t "${image_ref}" .
             fi
           }
@@ -515,22 +526,14 @@ jobs:
               "${image_ref}"
           }
 
-          case "${RUNNER_ARCH}" in
-            X64) arch="amd64" ;;
-            ARM64) arch="arm64" ;;
-            *)
-              echo "::error::Unsupported runner architecture: ${RUNNER_ARCH}"
-              exit 1
-              ;;
-          esac
-
-          image_ref="${IMAGE_REPO}:${RELEASE_TAG}-${arch}"
+          image_ref="${IMAGE_REPO}:${RELEASE_TAG}-${{ matrix.variant }}"
           echo "Using GHCR credentials source: ${GHCR_AUTH_SOURCE}"
           if command -v podman >/dev/null 2>&1; then
             printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
             if podman build --format docker --pull \
               --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
               --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
+              --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
               -f Containerfile -t "${image_ref}" .; then
               if push_with_retry 2 podman_push_default; then
                 exit 0
@@ -661,7 +664,7 @@ jobs:
 
           image_ref="${IMAGE_REPO}:${RELEASE_TAG}"
           amd64_ref="${IMAGE_REPO}:${RELEASE_TAG}-amd64"
-          arm64_ref="${IMAGE_REPO}:${RELEASE_TAG}-arm64"
+          arm64_ref="${IMAGE_REPO}:${RELEASE_TAG}-arm64-4k"
           manifest_tags=("${RELEASE_TAG}")
           if [[ "${RELEASE_TAG}" == "latest-main" || "${RELEASE_TAG}" == "latest-master" ]]; then
             manifest_tags+=("latest")

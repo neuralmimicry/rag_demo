@@ -635,6 +635,7 @@ def _run_project_solver(
     codingagent_model: Optional[str] = None,
     codingagent_reasoning_effort: Optional[str] = None,
     agentic_role_overrides: Optional[Dict[str, Dict[str, object]]] = None,
+    event_emitter: Optional[EventEmitter] = None,
 ) -> int:
     """Execute project solver mode and print completion diagnostics."""
     from refiner.credentials import get_llm_credentials
@@ -714,6 +715,11 @@ def _run_project_solver(
         codingagent_model=codingagent_model,
         codingagent_reasoning_effort=codingagent_reasoning_effort,
         agentic_roles=agentic_roles,
+        progress_callback=(
+            (lambda payload: event_emitter.emit("stage", payload))
+            if event_emitter is not None
+            else None
+        ),
     )
     try:
         with open(out_path, "r", encoding="utf-8") as handle:
@@ -1109,6 +1115,7 @@ def run(argv: Optional[List[str]] = None) -> int:
                 codingagent_model=args.codingagent_model,
                 codingagent_reasoning_effort=args.codingagent_reasoning_effort,
                 agentic_role_overrides=agent_role_overrides,
+                event_emitter=emitter,
             )
 
         if args.analyze_confluence:

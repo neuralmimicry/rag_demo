@@ -27,7 +27,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlparse
 
 import requests
@@ -57,6 +57,14 @@ from refiner.web_research import (
 )
 from refiner.skills_engine import build_skill_context, format_skill_directives
 from refiner.refiner_ai_orchestration import build_workflow_provider, describe_provider, provider_log_summary
+from refiner.workflows.solver.reliability import (
+    canonical_project_target,
+    command_spec_from_step,
+    plan_fingerprint,
+    select_planner_role,
+    terminate_process_tree,
+)
+from refiner.workflows.solver.starter_templates import build_starter_template_context
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +253,7 @@ NON_CODE_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 REQ_ID_RE = re.compile(r"\bREQ-\d{3,}\b", re.IGNORECASE)
+GLOBAL_REQ_ID_RE = re.compile(r"\bGLOBAL-REQ-\d{3,}\b", re.IGNORECASE)
 SEQ_NAME_RE = re.compile(r"^(?P<prefix>[A-Za-z][A-Za-z0-9_-]*?)(?P<num>\d+)$")
 SEQUENCE_REQUIREMENT_PREFIXES = {
     "task",
@@ -712,7 +721,12 @@ def _safe_path(root: str, candidate: str, extra_roots: Optional[List[str]] = Non
         allowed_roots.extend([os.path.abspath(r) for r in extra_roots if r])
     for allowed in allowed_roots:
         if _is_subpath(allowed, abs_path):
-            return abs_path
+            # Lexical containment is insufficient when a planner targets a
+            # symlink. Resolve existing parents before allowing a mutation.
+            real_allowed = os.path.realpath(allowed)
+            real_path = os.path.realpath(abs_path)
+            if _is_subpath(real_allowed, real_path):
+                return abs_path
     return None
 
 
@@ -877,7 +891,7 @@ def _resolve_relative_command_path(
 
 
 def _command_should_use_workspace(
-    command: str,
+    command: Union[str, Sequence[str]],
     *,
     abs_workdir: str,
     project_root: str,
@@ -889,10 +903,13 @@ def _command_should_use_workspace(
     workspace_abs = os.path.abspath(workspace_root)
     if os.path.abspath(abs_workdir) == workspace_abs:
         return False
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return False
+    if isinstance(command, (list, tuple)):
+        parts = [str(token) for token in command]
+    else:
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return False
     if not parts:
         return False
 
@@ -947,6 +964,28 @@ def _replace_command_token(command: str, old_token: str, new_token: str) -> Opti
     if not changed:
         return None
     return " ".join(shlex.quote(part) for part in parts)
+
+
+def _rewrite_structured_workspace_command_paths(
+    command: Sequence[str],
+    *,
+    abs_workdir: str,
+    workspace_root: str,
+) -> List[str]:
+    """Rewrite workspace-relative file arguments without losing argv shape."""
+
+    rewritten = [str(part) for part in command]
+    workspace_abs = os.path.abspath(workspace_root)
+    for idx, token in enumerate(rewritten):
+        if idx == 0 or not _token_looks_like_path(token) or os.path.isabs(token):
+            continue
+        base_token, selector = _split_pytest_node_selector(token)
+        candidate = os.path.abspath(os.path.join(abs_workdir, base_token))
+        if not os.path.exists(candidate) or not _is_subpath(workspace_abs, candidate):
+            continue
+        relative = os.path.relpath(candidate, workspace_abs).replace("\\", "/")
+        rewritten[idx] = relative + selector
+    return rewritten
 
 
 def _coerce_pytest_command(command: str, *, use_pythonpath: bool = False) -> Optional[str]:
@@ -1014,8 +1053,8 @@ def _fallback_workdir_for_parent_path(
     *,
     workdir: str,
     project_root: str,
-    command: str,
-) -> Tuple[Optional[str], str, Optional[str]]:
+    command: Union[str, Sequence[str]],
+) -> Tuple[Optional[str], Union[str, Sequence[str]], Optional[str]]:
     if not workdir:
         return None, command, None
     candidate = os.path.abspath(workdir if os.path.isabs(workdir) else os.path.join(project_root, workdir))
@@ -1023,10 +1062,15 @@ def _fallback_workdir_for_parent_path(
     parent = os.path.dirname(project_abs)
     if candidate != parent:
         return None, command, None
-    rewritten_command, changed = _rewrite_project_prefixed_command_paths(
-        command,
-        os.path.basename(project_abs),
-    )
+    if isinstance(command, (list, tuple)):
+        # Structured argv cannot be safely round-tripped through shlex. Keep
+        # literal arguments intact while normalising only the working folder.
+        rewritten_command, changed = command, False
+    else:
+        rewritten_command, changed = _rewrite_project_prefixed_command_paths(
+            command,
+            os.path.basename(project_abs),
+        )
     note = f"Normalized unsafe workdir to project root: {workdir} -> {project_abs}"
     if changed:
         note += f"; rewrote command paths: {command} -> {rewritten_command}"
@@ -1648,6 +1692,15 @@ def _resolve_file_target(
         workspace_root=workspace_root,
     )
     correction_note = _merge_notes(correction_note, workspace_note)
+    canonical_path, canonical_note = canonical_project_target(
+        rel_path,
+        project_root=project_root,
+        workspace_root=workspace_root,
+        step_type=step_type,
+    )
+    if canonical_path != rel_path:
+        rel_path = canonical_path
+    correction_note = _merge_notes(correction_note, canonical_note)
     if os.path.isabs(rel_path) or not workspace_root:
         return rel_path, correction_note
     _, ext = os.path.splitext(rel_path)
@@ -1664,6 +1717,14 @@ def _resolve_file_target(
         return rel_path, correction_note
     workspace_candidate = os.path.join(workspace_root, rel_path)
     if os.path.exists(workspace_candidate):
+        if canonical_note and not os.path.exists(project_candidate):
+            return (
+                rel_path,
+                _merge_notes(
+                    correction_note,
+                    f"Promoting canonical project file from solver workspace: {workspace_candidate} -> {project_candidate}",
+                ),
+            )
         if workspace_outside_project and is_code_or_test:
             return (
                 rel_path,
@@ -1677,7 +1738,7 @@ def _resolve_file_target(
             correction_note,
             f"Redirected file step to solver workspace: {rel_path} -> {workspace_candidate}",
         )
-    if step_type == "write_file" and prefer_workspace_new_files:
+    if step_type == "write_file" and prefer_workspace_new_files and not canonical_note:
         if workspace_outside_project and is_code_or_test:
             return rel_path, _merge_notes(
                 correction_note,
@@ -3409,6 +3470,7 @@ def _is_verification_command(command: str) -> bool:
         r"\bpython(?:3)?\s+-m\s+pytest\b",
         r"\bcoverage\s+run\b.*\bpytest\b",
         r"\bpython(?:3)?\s+-m\s+unittest\b",
+        r"\bnode(?:js)?\s+(?:--check|-c)\b",
         r"\bnosetests?\b",
         r"\btox\b",
         r"\bnox\b",
@@ -3481,6 +3543,19 @@ def _is_verification_command(command: str) -> bool:
     return False
 
 
+def _step_command_text(step: Dict[str, object]) -> str:
+    """Render a plan command for classification without executing it."""
+    if not isinstance(step, dict):
+        return ""
+    raw_argv = step.get("argv")
+    if isinstance(raw_argv, (list, tuple)):
+        try:
+            return shlex.join([str(item) for item in raw_argv])
+        except AttributeError:
+            return " ".join(str(item) for item in raw_argv)
+    return _safe_str(step.get("command"))
+
+
 def _plan_has_verification(plan_steps: List[Dict[str, object]]) -> bool:
     for step in plan_steps:
         if not isinstance(step, dict):
@@ -3488,8 +3563,8 @@ def _plan_has_verification(plan_steps: List[Dict[str, object]]) -> bool:
         step_type = _normalize_step_type(step.get("type"))
         if step_type != "run_command":
             continue
-        command = step.get("command")
-        if isinstance(command, str) and _is_verification_command(command):
+        command = _step_command_text(step)
+        if command and _is_verification_command(command):
             return True
     return False
 
@@ -3502,8 +3577,8 @@ def _split_verification_steps(plan_steps: List[Dict[str, object]]) -> Tuple[List
             continue
         step_type = _normalize_step_type(step.get("type"))
         if step_type == "run_command":
-            command = step.get("command")
-            if isinstance(command, str) and _is_verification_command(command):
+            command = _step_command_text(step)
+            if command and _is_verification_command(command):
                 verification.append(step)
                 continue
         non_verification.append(step)
@@ -3581,8 +3656,24 @@ def _select_node_verify_command(scripts: Dict[str, str]) -> Optional[str]:
     return None
 
 
+def _node_syntax_check_commands(project_root: str, *, max_files: int = 8) -> List[str]:
+    """Discover bounded Node syntax checks when a project has no test script."""
+    commands: List[str] = []
+    ignored = _ignored_dirnames(None)
+    for walk_root, dirs, files in os.walk(project_root):
+        _filter_walk_dirs(walk_root, dirs, ignored)
+        for filename in sorted(files):
+            if not filename.endswith((".js", ".mjs", ".cjs")):
+                continue
+            rel = os.path.relpath(os.path.join(walk_root, filename), project_root)
+            commands.append(f"node --check {shlex.quote(rel)}")
+            if len(commands) >= max_files:
+                return commands
+    return commands
+
+
 def _execute_shell_command(
-    command: str,
+    command: Union[str, Sequence[str]],
     *,
     workdir: str,
     timeout: int,
@@ -3593,17 +3684,19 @@ def _execute_shell_command(
     executed_commands: Optional[List[str]] = None,
     command_trust_store: Optional[CommandTrustStore] = None,
     command_results: Optional[List[Dict[str, object]]] = None,
+    command_env: Optional[Dict[str, str]] = None,
 ) -> bool:
     policy = evaluate_command_policy(command)
+    command_display = policy.command
     trust = None
     if not policy.allowed:
-        message = f"Blocked command by solver policy: {command} ({policy.reason})"
+        message = f"Blocked command by solver policy: {command_display} ({policy.reason})"
         actions_log.append(message)
         logger.info(message)
         if command_results is not None:
             command_results.append(
                 {
-                    "command": command,
+                    "command": command_display,
                     "shape": "",
                     "category": policy.category,
                     "policy_allowed": False,
@@ -3619,7 +3712,7 @@ def _execute_shell_command(
         if failure_log is not None:
             failure_log.append(
                 {
-                    "command": command,
+                    "command": command_display,
                     "workdir": workdir,
                     "exit_code": None,
                     "stdout": "",
@@ -3642,9 +3735,11 @@ def _execute_shell_command(
     run_env = os.environ.copy()
     if policy.env:
         run_env.update(policy.env)
+    if command_env:
+        run_env.update({str(key): str(value) for key, value in command_env.items() if str(key)})
 
     try:
-        logger.info(f"Executing command: {command} (workdir={workdir})")
+        logger.info(f"Executing command: {command_display} (workdir={workdir})")
         result = subprocess.run(
             policy.argv,
             cwd=workdir,
@@ -3660,12 +3755,12 @@ def _execute_shell_command(
                 trust = command_trust_store.record(policy, success=False, exit_code=None)
             except Exception:
                 pass
-        actions_log.append(f"Command failed: {command} ({exc})")
-        logger.info(f"Command failed: {command} ({exc})")
+        actions_log.append(f"Command failed: {command_display} ({exc})")
+        logger.info(f"Command failed: {command_display} ({exc})")
         if command_results is not None:
             command_results.append(
                 {
-                    "command": command,
+                    "command": command_display,
                     "shape": trust.shape if trust else "",
                     "category": policy.category,
                     "policy_allowed": True,
@@ -3681,7 +3776,7 @@ def _execute_shell_command(
         if failure_log is not None:
             failure_log.append(
                 {
-                    "command": command,
+                    "command": command_display,
                     "workdir": workdir,
                     "exit_code": None,
                     "stdout": "",
@@ -3692,10 +3787,10 @@ def _execute_shell_command(
 
     logger.info(f"Command exit code: {result.returncode}")
     actions_log.append(
-        f"Ran command: {command}\nExit code: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        f"Ran command: {command_display}\nExit code: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     )
     verification_issue = None
-    if _is_verification_command(command):
+    if _is_verification_command(command_display):
         verification_issue = _verification_output_issue(
             result.stdout,
             result.stderr,
@@ -3708,7 +3803,7 @@ def _execute_shell_command(
             )
     no_tests_is_informational = (
         verification_issue == "no tests ran"
-        and "pytest" in (command or "").lower()
+        and "pytest" in command_display.lower()
         and result.returncode in {0, 5}
         and not _has_pytest_config(workdir)
         and not os.path.isdir(os.path.join(workdir, "tests"))
@@ -3732,7 +3827,7 @@ def _execute_shell_command(
     if command_results is not None:
         command_results.append(
             {
-                "command": command,
+                "command": command_display,
                 "shape": trust.shape if trust else "",
                 "category": policy.category,
                 "policy_allowed": True,
@@ -3746,17 +3841,17 @@ def _execute_shell_command(
             }
         )
     if success:
-        actions_log.append(f"Command succeeded: {command}")
+        actions_log.append(f"Command succeeded: {command_display}")
         if executed_commands is not None:
-            executed_commands.append(command)
+            executed_commands.append(command_display)
         return True
-    actions_log.append(f"Command failed (exit {result.returncode}): {command}")
+    actions_log.append(f"Command failed (exit {result.returncode}): {command_display}")
     if executed_commands is not None:
-        executed_commands.append(command)
+        executed_commands.append(command_display)
     if failure_log is not None:
         failure_log.append(
             {
-                "command": command,
+                "command": command_display,
                 "workdir": workdir,
                 "exit_code": result.returncode,
                 "stdout": result.stdout,
@@ -3923,6 +4018,27 @@ def _select_verification_steps(
                     "timeout": 900,
                 }
             )
+        elif "build" in scripts:
+            steps.append(
+                {
+                    "type": "run_command",
+                    "step": "Run Node build acceptance check",
+                    "command": "npm run build",
+                    "workdir": ".",
+                    "timeout": 900,
+                }
+            )
+        else:
+            for command in _node_syntax_check_commands(project_root, max_files=max_steps - len(steps)):
+                steps.append(
+                    {
+                        "type": "run_command",
+                        "step": "Run Node syntax acceptance check",
+                        "command": command,
+                        "workdir": ".",
+                        "timeout": 120,
+                    }
+                )
 
     if ("go" in languages) and len(steps) < max_steps:
         steps.append(
@@ -4617,6 +4733,80 @@ def _normalize_requirement_id(raw: object, used: set, next_id: int) -> Tuple[str
             return req_id, next_id
 
 
+def _explicit_source_requirements(
+    requirement_sources: List[RequirementSource],
+) -> List[Dict[str, object]]:
+    """Extract numbered source requirements before LLM normalisation."""
+    extracted: List[Dict[str, object]] = []
+    seen: set = set()
+    for source in requirement_sources:
+        for raw_line in (source.requirements_text or "").splitlines():
+            match = re.search(
+                r"(?P<id>REQ-\d{3,})\s*[:.)-]\s*(?P<text>.+)",
+                raw_line,
+                re.IGNORECASE,
+            )
+            if not match:
+                continue
+            req_id = match.group("id").upper()
+            text = re.sub(r"^[-*\s]+", "", match.group("text")).strip()
+            if not text or req_id in seen:
+                continue
+            if text.lower().rstrip(":") in {"requirements register", "requirements"}:
+                continue
+            seen.add(req_id)
+            extracted.append(
+                {
+                    "id": req_id,
+                    "title": text[:120],
+                    "description": text,
+                    "type": "unspecified",
+                    "priority": _normalize_priority(None, text),
+                    "source": [source.path],
+                    "acceptance_criteria": [],
+                    "dependencies": [],
+                    "verification": "",
+                    "rationale": "Preserved from explicitly numbered source material.",
+                    "notes": "Source requirement; ID preserved before register generation.",
+                }
+            )
+    return extracted
+
+
+def _repair_source_requirement_registration(
+    register: Dict[str, object],
+    requirement_sources: List[RequirementSource],
+) -> Dict[str, object]:
+    """Remove shifted headings and restore authoritative source requirement IDs."""
+    explicit = _explicit_source_requirements(requirement_sources)
+    if not explicit:
+        return register
+    explicit_ids = {str(item["id"]).upper() for item in explicit}
+    current = register.get("requirements")
+    current = current if isinstance(current, list) else []
+    kept: List[Dict[str, object]] = []
+    for item in current:
+        if not isinstance(item, dict):
+            continue
+        req_id = _safe_str(item.get("id")).upper()
+        sources = _coerce_list(item.get("source"))
+        title = _safe_str(item.get("title")).lower().rstrip(":")
+        desc = _safe_str(item.get("description")).lower().rstrip(":")
+        if title in {"requirements register", "requirements"} or desc in {"requirements register", "requirements"}:
+            continue
+        if req_id.startswith("REQ-") and "global" not in sources and req_id not in explicit_ids:
+            continue
+        if req_id in explicit_ids and "global" not in sources:
+            continue
+        kept.append(item)
+    existing_ids = {_safe_str(item.get("id")).upper() for item in kept}
+    for item in explicit:
+        if item["id"] not in existing_ids:
+            kept.append(item)
+    register["requirements"] = kept
+    return register
+
+
 def _truncate_text(text: str, max_chars: int) -> str:
     cleaned = text or ""
     if len(cleaned) <= max_chars:
@@ -4784,12 +4974,18 @@ def _ensure_global_requirements(
         if isinstance(item, dict)
     }
     next_id = 1
+    global_next_id = 1
     for req in GLOBAL_REQUIREMENTS:
         title = _safe_str(req.get("title"))
         desc = _safe_str(req.get("description"))
         if title.lower() in existing_titles or desc.lower() in existing_descriptions:
             continue
-        req_id, next_id = _normalize_requirement_id(req.get("id"), used_ids, next_id)
+        while True:
+            req_id = f"GLOBAL-REQ-{global_next_id:03d}"
+            global_next_id += 1
+            if req_id not in used_ids:
+                used_ids.add(req_id)
+                break
         requirements.append(
             {
                 "id": req_id,
@@ -5768,7 +5964,17 @@ def _build_requirements_register_section(
     requirements = register.get("requirements")
     if not isinstance(requirements, list):
         requirements = []
-    index = _format_requirements_register_index(requirements, max_chars=max_chars)
+    relevant = _requirements_for_source(requirements, source_path, max_items=0)
+    # Keep cross-cutting requirements namespaced and compact. The full global
+    # register adds prompt tokens without helping the current source plan.
+    global_requirements = [
+        req for req in requirements
+        if isinstance(req, dict) and "global" in _coerce_list(req.get("source"))
+    ]
+    index_items = list(relevant)
+    if _env_bool("SOLVER_PROMPT_INCLUDE_GLOBAL_REQUIREMENTS", False):
+        index_items.extend(global_requirements)
+    index = _format_requirements_register_index(index_items, max_chars=max_chars)
     section = "Formal requirements register (use IDs like REQ-001 to reference requirements):\n"
     section += f"{index}\n"
     global_ids = []
@@ -5801,7 +6007,6 @@ def _build_requirements_register_section(
         section += "\nSequence requirement IDs (reference when sequence gaps exist):\n"
         for req_id in sequence_ids:
             section += f"- {req_id}\n"
-    relevant = _requirements_for_source(requirements, source_path)
     if relevant:
         section += "\nRelevant IDs for this source:\n"
         for req in relevant:
@@ -6219,8 +6424,8 @@ def _drop_blocked_mutating_vcs_steps(
         if _normalize_step_type(step.get("type")) != "run_command":
             filtered.append(step)
             continue
-        command = step.get("command")
-        if not isinstance(command, str):
+        command = _step_command_text(step)
+        if not command:
             filtered.append(step)
             continue
         policy = evaluate_command_policy(command)
@@ -6419,6 +6624,7 @@ def _build_requirements_register(
         )
         payload = _parse_json_payload(resp.text or "{}")
         register = _normalize_requirements_register(payload, requirement_sources)
+        register = _repair_source_requirement_registration(register, requirement_sources)
         register = _ensure_global_requirements(register, requirement_sources=requirement_sources)
         if register.get("requirements"):
             return register, "llm"
@@ -6426,6 +6632,7 @@ def _build_requirements_register(
     except Exception as exc:
         actions_log.append(f"Failed to generate requirements register via LLM: {exc}")
     fallback_register = _fallback_requirements_register(requirement_sources, context_summary)
+    fallback_register = _repair_source_requirement_registration(fallback_register, requirement_sources)
     fallback_register = _ensure_global_requirements(
         fallback_register, requirement_sources=requirement_sources
     )
@@ -7849,13 +8056,16 @@ def _plan_recovery_steps(
         '      "find": "text to replace",\n'
         '      "replace": "replacement text",\n'
         '      "count": 0,\n'
-        '      "command": "python -m pytest tests/test_example.py",\n'
+        '      "expected_count": 1,\n'
+        '      "argv": ["python", "-m", "pytest", "tests/test_example.py"],\n'
+        '      "command": "legacy string form; prefer argv",\n'
         '      "workdir": ".",\n'
         '      "timeout": 600\n'
         "    }\n"
         "  ]\n"
         "}\n"
         "Notes:\n"
+        "- Prefer structured argv plus workdir for commands; legacy command strings are accepted for compatibility.\n"
         "- The command/workdir values above are examples; never emit placeholder literals.\n"
         "- Avoid using 'source' or activation scripts as standalone commands; use venv/bin/python or venv/bin/pip directly.\n"
         "- Keep changes within the project root or solver workspace.\n"
@@ -8573,6 +8783,28 @@ def _apply_step(
             logger.info(f"Skipped file step (directory path): {rel_path}")
             return
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        if redirect_note and "Promoting canonical project file" in redirect_note and workspace_root:
+            workspace_source = _safe_path(workspace_root, target_path)
+            if workspace_source and os.path.isfile(workspace_source) and not os.path.exists(abs_path):
+                try:
+                    shutil.copy2(workspace_source, abs_path)
+                    actions_log.append(
+                        f"Promoted existing solver-workspace source into project root: {rel_path}"
+                    )
+                except OSError as exc:
+                    actions_log.append(f"Failed to promote workspace source {rel_path}: {exc}")
+                    if failure_log is not None:
+                        failure_log.append(
+                            {
+                                "command": f"promote:{rel_path}",
+                                "workdir": project_root,
+                                "exit_code": None,
+                                "stdout": "",
+                                "stderr": str(exc),
+                                "verification_issue": "workspace promotion failed",
+                            }
+                        )
+                    return
 
         if step_type == "write_file":
             content = step.get("content", "")
@@ -8727,7 +8959,26 @@ def _apply_step(
                 logger.info(f"Skipped replace_in_file (unreadable): {rel_path}")
                 return
             count = int(step.get("count", 0)) or -1
-            if find_text not in existing:
+            match_count = existing.count(find_text)
+            expected_count = step.get("expected_count")
+            if isinstance(expected_count, (int, float)) and int(expected_count) != match_count:
+                actions_log.append(
+                    f"Skipped replace_in_file; expected {int(expected_count)} match(es) but found {match_count} in {rel_path}"
+                )
+                if replace_failures is not None:
+                    replace_failures.append(
+                        {
+                            "path": rel_path,
+                            "abs_path": abs_path,
+                            "find": find_text,
+                            "issue": "unexpected_match_count",
+                            "expected_count": int(expected_count),
+                            "actual_count": match_count,
+                            "excerpt": _format_text_excerpt(existing),
+                        }
+                    )
+                return
+            if not match_count:
                 actions_log.append(f"Skipped replace_in_file; pattern not found in {rel_path}")
                 logger.info(f"Skipped replace_in_file (pattern not found): {rel_path}")
                 if replace_failures is not None:
@@ -8742,7 +8993,7 @@ def _apply_step(
                         }
                     )
                 return
-            updated = existing.replace(find_text, replace_text, count if count > 0 else existing.count(find_text))
+            updated = existing.replace(find_text, replace_text, count if count > 0 else match_count)
             if abs_path.endswith(".py"):
                 updated = _normalize_python_indentation(updated)
                 pep8_fixed = _autopep8_format_text(updated)
@@ -8802,12 +9053,15 @@ def _apply_step(
             return
 
     if step_type == "run_command":
-        command = step.get("command")
-        if not isinstance(command, str):
+        command_spec = command_spec_from_step(step)
+        raw_argv = step.get("argv")
+        structured_command = isinstance(raw_argv, (list, tuple))
+        command = list(command_spec.argv) if structured_command and command_spec else step.get("command")
+        if command_spec is None or (not structured_command and not isinstance(command, str)):
             actions_log.append("Skipped run_command missing command.")
             logger.info("Skipped run_command (missing command).")
             return
-        if _is_placeholder_command_literal(command):
+        if isinstance(command, str) and _is_placeholder_command_literal(command):
             placeholder_msg = (
                 f"Skipped run_command placeholder command literal: {command!r}. "
                 "Planner must provide a real executable command."
@@ -8830,7 +9084,7 @@ def _apply_step(
             actions_log.append(f"Skipped run_command (disabled): {command}")
             logger.info(f"Skipped run_command (disabled): {command}")
             return
-        if _is_activation_command(command, venv_path):
+        if isinstance(command, str) and _is_activation_command(command, venv_path):
             actions_log.append("Skipped activation command; using venv python/pip directly.")
             logger.info("Skipped activation command; using venv python/pip directly.")
             return
@@ -8847,7 +9101,7 @@ def _apply_step(
                 f"Normalized placeholder workdir literal to project root: {workdir!r} -> '.'"
             )
             workdir = "."
-        effective_command = command
+        effective_command: Union[str, Sequence[str]] = command
         abs_workdir = _safe_path(project_root, workdir, extra_roots=allowed_roots)
         if not abs_workdir:
             fallback_workdir, fallback_command, fallback_note = _fallback_workdir_for_parent_path(
@@ -8876,6 +9130,12 @@ def _apply_step(
             project_root=project_root,
             workspace_root=workspace_workdir,
         ):
+            if structured_command and isinstance(command, list):
+                command = _rewrite_structured_workspace_command_paths(
+                    command,
+                    abs_workdir=abs_workdir,
+                    workspace_root=workspace_workdir,
+                )
             actions_log.append(
                 f"Using solver workspace as command workdir: {abs_workdir} -> {workspace_workdir}"
             )
@@ -8885,25 +9145,30 @@ def _apply_step(
                 workspace_workdir,
             )
             abs_workdir = workspace_workdir
-        sanitized_command = _sanitize_shell_command(effective_command, venv_path)
-        rewritten_command = _rewrite_command_for_venv(sanitized_command, venv_path)
-        rewritten_command = _rewrite_requirements_path_in_command(
-            rewritten_command,
-            abs_workdir=abs_workdir,
-            project_root=project_root,
-            workspace_root=workspace_root,
-            actions_log=actions_log,
-        )
-        rewritten_command = _rewrite_workspace_command_paths(
-            rewritten_command,
-            abs_workdir=abs_workdir,
-            project_root=project_root,
-            workspace_root=workspace_root,
-            actions_log=actions_log,
-        )
+        if structured_command:
+            # Structured argv is already shell-free and must not be round-tripped
+            # through shlex; doing so would turn literal arguments into syntax.
+            rewritten_command: Union[str, Sequence[str]] = list(command)
+        else:
+            sanitized_command = _sanitize_shell_command(str(effective_command), venv_path)
+            rewritten_command = _rewrite_command_for_venv(sanitized_command, venv_path)
+            rewritten_command = _rewrite_requirements_path_in_command(
+                rewritten_command,
+                abs_workdir=abs_workdir,
+                project_root=project_root,
+                workspace_root=workspace_root,
+                actions_log=actions_log,
+            )
+            rewritten_command = _rewrite_workspace_command_paths(
+                rewritten_command,
+                abs_workdir=abs_workdir,
+                project_root=project_root,
+                workspace_root=workspace_root,
+                actions_log=actions_log,
+            )
         timeout = step.get("timeout", 600)
         timeout_value = timeout if isinstance(timeout, (int, float)) else 600
-        probe = _parse_localhost_probe(rewritten_command)
+        probe = _parse_localhost_probe(rewritten_command if isinstance(rewritten_command, str) else "")
         if probe:
             host, port = probe
             scripts = _package_json_scripts(abs_workdir) or _package_json_scripts(project_root)
@@ -8940,10 +9205,12 @@ def _apply_step(
                             server_policy.argv,
                             cwd=abs_workdir,
                             shell=False,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                            bufsize=1,
+                            start_new_session=(os.name == "posix"),
+                            # The probe only needs readiness.  Discarding the
+                            # stream avoids a pipe-buffer deadlock when a dev
+                            # server is noisy during a long acceptance test.
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
                             env=server_env,
                         )
                         if executed_commands is not None:
@@ -8979,11 +9246,7 @@ def _apply_step(
                                 }
                             )
                         if server_proc:
-                            server_proc.terminate()
-                            try:
-                                server_proc.wait(timeout=5)
-                            except Exception:
-                                server_proc.kill()
+                            terminate_process_tree(server_proc)
                         return
                 _execute_shell_command(
                     rewritten_command,
@@ -8996,13 +9259,10 @@ def _apply_step(
                     executed_commands=executed_commands,
                     command_trust_store=command_trust_store,
                     command_results=command_results,
+                    command_env=dict(command_spec.env),
                 )
                 if server_proc:
-                    server_proc.terminate()
-                    try:
-                        server_proc.wait(timeout=5)
-                    except Exception:
-                        server_proc.kill()
+                    terminate_process_tree(server_proc)
                 return
             verify_command = _select_node_verify_command(scripts)
             if verify_command:
@@ -9020,6 +9280,7 @@ def _apply_step(
                     executed_commands=executed_commands,
                     command_trust_store=command_trust_store,
                     command_results=command_results,
+                    command_env=dict(command_spec.env),
                 )
                 actions_log.append(
                     "Skipped localhost probe because no dev/start/preview script was found."
@@ -9036,6 +9297,7 @@ def _apply_step(
             executed_commands=executed_commands,
             command_trust_store=command_trust_store,
             command_results=command_results,
+            command_env=dict(command_spec.env),
         )
         return
 
@@ -9069,6 +9331,7 @@ def run_project_solver(
     codingagent_model: Optional[str] = None,
     codingagent_reasoning_effort: Optional[str] = None,
     agentic_roles: Optional[Dict[str, Dict[str, object]]] = None,
+    progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
 ) -> int:
     """
     Run the project solver for a local project folder.
@@ -9084,6 +9347,21 @@ def run_project_solver(
         raise ValueError(f"Project root is not a directory: {project_root}")
 
     actions_log: List[str] = []
+
+    def _emit_progress(stage: str, status: str, progress: Optional[int] = None, **data: object) -> None:
+        """Emit best-effort live progress without coupling the solver to Flask."""
+        if progress_callback is None:
+            return
+        payload: Dict[str, object] = {"workflow": "project_solver", "stage": stage, "status": status}
+        if progress is not None:
+            payload["progress"] = max(0, min(100, int(progress)))
+        payload.update(data)
+        try:
+            progress_callback(payload)
+        except Exception:
+            logger.debug("Project solver progress callback failed", exc_info=True)
+
+    _emit_progress("prepare", "running", 5)
     provider = build_workflow_provider(
         workflow="project_solver",
         role="general",
@@ -9100,6 +9378,7 @@ def run_project_solver(
     )
     if not provider:
         raise ValueError("No LLM provider available for project solving.")
+    _emit_progress("prepare", "completed", 10)
     provider_summary = describe_provider(provider)
 
     role_configs: Dict[str, Dict[str, object]] = {}
@@ -9158,6 +9437,9 @@ def run_project_solver(
         return role_provider or provider
 
     planner_provider = _build_role_provider("planner")
+    fast_planner_provider = (
+        _build_role_provider("fast_planner") if "fast_planner" in role_configs else None
+    )
     reviewer_provider = _build_role_provider("reviewer")
     researcher_provider = _build_role_provider("researcher")
 
@@ -9168,6 +9450,8 @@ def run_project_solver(
 
     _log_provider_setup("general", provider)
     _log_provider_setup("planner", planner_provider)
+    if fast_planner_provider is not None:
+        _log_provider_setup("fast_planner", fast_planner_provider)
     _log_provider_setup("reviewer", reviewer_provider)
     _log_provider_setup("researcher", researcher_provider)
 
@@ -9426,6 +9710,17 @@ def run_project_solver(
             f"languages={language_info.get('languages') or []}; "
             f"build_systems={language_info.get('build_systems') or []}"
         )
+    acceptance_steps = _select_verification_steps(
+        project_root,
+        language_info,
+        workspace_root=solver_workspace,
+        max_steps=4,
+    )
+    starter_template_context = build_starter_template_context(project_root, language_info)
+    if starter_template_context:
+        actions_log.append("Starter template guidance attached for an incomplete project shape.")
+    if acceptance_steps:
+        actions_log.append(f"Acceptance checks selected: {len(acceptance_steps)}.")
 
     requirements_register, requirements_register_source = _build_requirements_register(
         requirement_sources,
@@ -9501,6 +9796,9 @@ def run_project_solver(
     completed_sources: List[str] = []
     plan_state: Dict[str, Dict[str, object]] = {}
     previous_progress_entries: List[Dict[str, object]] = []
+    previous_applied_steps_by_source: Dict[str, List[Dict[str, object]]] = {}
+    previous_unresolved_failures: List[Dict[str, object]] = []
+    previous_verification_failures: Dict[str, List[Dict[str, object]]] = {}
     resume_source_path: Optional[str] = None
     resume_start_iteration: Dict[str, int] = {}
     resume_used = False
@@ -9515,6 +9813,23 @@ def run_project_solver(
             previous_source_logs = _extract_source_logs(previous_actions_log)
             completed_sources = _extract_completed_sources(previous_actions_log)
             plan_state = _extract_plan_state(previous_plans)
+            raw_applied = previous_run.get("applied_steps_by_source")
+            if isinstance(raw_applied, dict):
+                previous_applied_steps_by_source = {
+                    str(path): [item for item in items if isinstance(item, dict)]
+                    for path, items in raw_applied.items()
+                    if isinstance(items, list)
+                }
+            raw_failures = previous_run.get("unresolved_failures")
+            if isinstance(raw_failures, list):
+                previous_unresolved_failures = [item for item in raw_failures if isinstance(item, dict)]
+            raw_verification = previous_run.get("verification_failures_by_source")
+            if isinstance(raw_verification, dict):
+                previous_verification_failures = {
+                    str(path): [item for item in items if isinstance(item, dict)]
+                    for path, items in raw_verification.items()
+                    if isinstance(items, list)
+                }
             prev_progress = previous_run.get("progress_tracker") if isinstance(previous_run, dict) else None
             if isinstance(prev_progress, dict) and isinstance(prev_progress.get("entries"), list):
                 previous_progress_entries = prev_progress.get("entries") or []
@@ -9541,6 +9856,18 @@ def run_project_solver(
                         resume_source_path = current_source_paths[-1]
                     if resume_source_path:
                         resume_start_iteration[resume_source_path] = int(plan_state.get(resume_source_path, {}).get("last_iteration", 0)) + 1
+            previous_incomplete = str(previous_run.get("status") or "").lower() != "complete"
+            previous_completion = previous_run.get("completion_summary")
+            if isinstance(previous_completion, dict) and previous_completion.get("needs_more_iterations"):
+                previous_incomplete = True
+            if not resume_source_path and previous_incomplete and current_source_paths:
+                resume_source_path = next(
+                    (path for path in current_source_paths if path not in completed_sources),
+                    current_source_paths[0],
+                )
+                resume_start_iteration[resume_source_path] = int(
+                    plan_state.get(resume_source_path, {}).get("last_iteration", 0)
+                ) + 1
             if resume_source_path:
                 resume_used = True
                 actions_log.append(f"Resuming from previous output: {output_path}")
@@ -9578,7 +9905,8 @@ def run_project_solver(
     opencode_used_sources: set = set()
     codingagent_used_sources: Dict[str, set] = {}
     applied_steps_by_source: Dict[str, List[Dict[str, object]]] = {}
-    unresolved_failures: List[Dict[str, object]] = []
+    applied_steps_by_source.update(previous_applied_steps_by_source)
+    unresolved_failures: List[Dict[str, object]] = list(previous_unresolved_failures)
     audit_reports: List[Dict[str, object]] = []
     audit_notes_by_source: Dict[str, str] = {}
     audit_required_by_source: Dict[str, bool] = {}
@@ -9590,6 +9918,7 @@ def run_project_solver(
     last_web_research_iteration_by_source: Dict[str, int] = {}
     last_web_research_steps_by_source: Dict[str, int] = {}
     verification_failures_by_source: Dict[str, List[Dict[str, object]]] = {}
+    verification_failures_by_source.update(previous_verification_failures)
     replace_failures_by_source: Dict[str, List[Dict[str, object]]] = {}
     recovery_failure_counts_by_source: Dict[str, Dict[str, int]] = {}
     recovery_retry_fingerprints_by_source: Dict[str, set] = {}
@@ -9598,6 +9927,11 @@ def run_project_solver(
     selected_verification_keys: set = set()
     recovery_repeat_limit = max(1, _env_int("SOLVER_RECOVERY_REPEAT_LIMIT", 2))
     planner_failure: Optional[Dict[str, object]] = None
+    empty_plan_attempts_by_source: Dict[str, int] = {}
+    empty_plan_retry_limit = max(1, _env_int("SOLVER_EMPTY_PLAN_RETRIES", 3))
+    repeated_plan_limit = max(1, _env_int("SOLVER_REPEATED_PLAN_LIMIT", 2))
+    plan_fingerprint_counts_by_source: Dict[str, Dict[str, int]] = {}
+    repeated_plan_notes_by_source: Dict[str, str] = {}
     agentic_workflow = AgenticWorkflow(
         phases=["plan", "act", "verify", "reflect"],
         max_cycles=max_iterations,
@@ -9610,6 +9944,31 @@ def run_project_solver(
         if local_log is not None:
             local_log.append(message)
 
+    def _record_empty_plan_retry(source_path: str, iteration: int, reason: str) -> bool:
+        """Record a planner miss without consuming a logical iteration."""
+        nonlocal planner_failure
+        count = empty_plan_attempts_by_source.get(source_path, 0) + 1
+        empty_plan_attempts_by_source[source_path] = count
+        _record_action(
+            f"Empty/non-actionable plan for {source_path} ({reason}); retry {count}/{empty_plan_retry_limit}.",
+        )
+        if count >= empty_plan_retry_limit:
+            planner_failure = {
+                "type": "empty_plan",
+                "message": f"planner returned no actionable plan after {count} attempts",
+                "source": source_path,
+                "iteration": iteration,
+            }
+            _record_action(
+                f"Empty-plan retry limit reached for {source_path}; stopping without consuming another iteration."
+            )
+            return True
+        return False
+
+    def _retry_rejected_plan(source_path: str, iteration: int, reason: str) -> bool:
+        """Bound planner/schema retries without consuming a logical iteration."""
+        return _record_empty_plan_retry(source_path, iteration, f"planner rejection: {reason}")
+
     def _record_selected_verification_commands(
         source_path: str,
         steps: List[Dict[str, object]],
@@ -9621,7 +9980,7 @@ def run_project_solver(
                 continue
             if _normalize_step_type(step.get("type")) != "run_command":
                 continue
-            command = _safe_str(step.get("command"))
+            command = _step_command_text(step)
             if not command or not _is_verification_command(command):
                 continue
             workdir = _safe_str(step.get("workdir")) or "."
@@ -9650,6 +10009,14 @@ def run_project_solver(
             actions_log.append(f"Skipping completed requirement source from previous run: {source.path}")
             continue
         actions_log.append(f"Starting requirement source: {source.path}")
+        _emit_progress(
+            "execute",
+            "running",
+            15,
+            source=source.path,
+            completed_sources=len(completed_set),
+            total_sources=source_count,
+        )
         source_actions_log: List[str] = list(previous_source_logs.get(source.path, []))
         source_applied_steps = applied_steps_by_source.setdefault(source.path, [])
         source_hallucinations = hallucinations_by_source.setdefault(source.path, [])
@@ -9672,12 +10039,21 @@ def run_project_solver(
             continue
         defer_source = False
         last_iteration = start_iteration - 1
-        for iteration in range(start_iteration, max_iterations + 1):
+        iteration = start_iteration
+        while iteration <= max_iterations:
             last_iteration = iteration
             if total_steps_applied >= max_steps:
                 _record_action("Max steps reached; stopping iterations.", source_actions_log)
                 break
             cycle = agentic_workflow.start_cycle(iteration, context={"source": source.path})
+            _emit_progress(
+                "execute",
+                "running",
+                15,
+                source=source.path,
+                iteration=iteration,
+                phase="plan",
+            )
             if audit_enabled:
                 last_iter = last_audit_iteration_by_source.get(source.path, 0)
                 last_step = last_audit_steps_by_source.get(source.path, 0)
@@ -9977,6 +10353,23 @@ def run_project_solver(
             research_section = ""
             if web_research_note:
                 research_section = f"External research findings:\n{web_research_note}\n\n"
+            acceptance_section = ""
+            if acceptance_steps:
+                acceptance_lines = ["Executable acceptance checks (include or improve these in the plan):"]
+                for check in acceptance_steps:
+                    if not isinstance(check, dict):
+                        continue
+                    acceptance_lines.append(
+                        f"- {_step_command_text(check)} (workdir={_safe_str(check.get('workdir')) or '.'})"
+                    )
+                acceptance_section = "\n".join(acceptance_lines).strip() + "\n\n"
+            template_section = (starter_template_context + "\n\n") if starter_template_context else ""
+            repeated_plan_section = repeated_plan_notes_by_source.get(source.path, "")
+            if repeated_plan_section:
+                repeated_plan_section = (
+                    "Repeated-plan guard:\n" + repeated_plan_section + "\n"
+                    "Change strategy, target, or verification rather than replaying the same plan.\n\n"
+                )
             progress_memory = _format_progress_memory(progress_tracker, source.path)
             skill_context = build_skill_context(
                 source.requirements_text,
@@ -10023,7 +10416,9 @@ def run_project_solver(
                 '      "find": "text to replace",\n'
                 '      "replace": "replacement text",\n'
                 '      "count": 0,\n'
-                '      "command": "python -m pytest tests/test_example.py",\n'
+                '      "expected_count": 1,\n'
+                '      "argv": ["python", "-m", "pytest", "tests/test_example.py"],\n'
+                '      "command": "legacy string form; prefer argv",\n'
                 '      "workdir": ".",\n'
                 '      "timeout": 600\n'
                 "    }\n"
@@ -10032,7 +10427,8 @@ def run_project_solver(
                 "    {\n"
                 '      "type": "run_command",\n'
                 '      "step": "verification step",\n'
-                '      "command": "python -m pytest tests/test_example.py",\n'
+                '      "argv": ["python", "-m", "pytest", "tests/test_example.py"],\n'
+                '      "command": "legacy string form; prefer argv",\n'
                 '      "workdir": ".",\n'
                 '      "timeout": 600\n'
                 "    }\n"
@@ -10041,6 +10437,7 @@ def run_project_solver(
             )
             notes_section = (
                 "Notes:\n"
+                "- Prefer structured argv plus workdir for commands; legacy command strings are accepted for compatibility.\n"
                 "- Command/workdir values shown in schema are examples, not literal placeholders.\n"
                 "- Treat ONLY the current requirement source. Do not merge requirements from other files unless explicitly requested.\n"
                 "- Reference requirement IDs (REQ-###) from the formal register in every plan step and in any code comments you add.\n"
@@ -10063,6 +10460,7 @@ def run_project_solver(
                 "- For solution files, include a module-level docstring that summarises the formal requirements and the workflow implemented.\n"
                 "- Ensure generated Python files are syntactically valid and do not contain duplicate or conflicting implementations.\n"
                 "- When code is created or changed, include pytest (or equivalent) coverage and a run_command step to execute tests or run the code to validate outputs. If results are not as expected, add follow-up steps to address gaps.\n"
+                "- For Express/Node services, export the Express app separately from the server bootstrap and verify it with an in-process integration test using listen(0); close the server in finally. Do not use fixed ports, foreground npm start, pkill, or fuser.\n"
                 "- If your code relies on environment variables, add explicit checks (prompt or clear error) for missing values and include tests or verification for the missing-value path.\n"
                 "- If verification output shows a FutureWarning, treat it as a failure and apply the suggested fix before retrying.\n"
                 "- If you need to run commands in the solver workspace, set workdir to the absolute workspace path explicitly.\n"
@@ -10171,6 +10569,24 @@ def run_project_solver(
                     content=research_section,
                     priority=80,
                     max_chars=3000,
+                ),
+                PromptSection(
+                    name="acceptance_checks",
+                    content=acceptance_section,
+                    priority=94,
+                    max_chars=2600,
+                ),
+                PromptSection(
+                    name="starter_templates",
+                    content=template_section,
+                    priority=74,
+                    max_chars=2200,
+                ),
+                PromptSection(
+                    name="repeated_plan_guard",
+                    content=repeated_plan_section,
+                    priority=97,
+                    max_chars=1400,
                 ),
                 PromptSection(
                     name="audit",
@@ -10410,13 +10826,25 @@ def run_project_solver(
 
             if payload is None:
                 try:
-                    resp = planner_provider.predict(
+                    active_planner_role = select_planner_role(
+                        fast_planner_available=fast_planner_provider is not None,
+                        source_requires_code=source_requires_code,
+                    )
+                    active_planner_provider = (
+                        fast_planner_provider
+                        if active_planner_role == "fast_planner"
+                        else planner_provider
+                    )
+                    active_planner_params = _role_params(active_planner_role)
+                    if active_planner_provider is not planner_provider:
+                        _record_action("Using fast planner role for routine non-code work.", source_actions_log)
+                    resp = active_planner_provider.predict(
                         [{"role": "user", "content": user_prompt}],
                         system=system_prompt,
-                        max_tokens=planner_params.get("max_tokens"),
-                        temperature=planner_params.get("temperature", llm_temperature),
-                        timeout=planner_params.get("timeout"),
-                        reasoning_effort=planner_params.get("reasoning_effort"),
+                        max_tokens=active_planner_params.get("max_tokens"),
+                        temperature=active_planner_params.get("temperature", llm_temperature),
+                        timeout=active_planner_params.get("timeout"),
+                        reasoning_effort=active_planner_params.get("reasoning_effort"),
                     )
                 except (LLMError, TimeoutError) as exc:
                     message = str(exc) or exc.__class__.__name__
@@ -10554,6 +10982,8 @@ def run_project_solver(
                             requires_code=source_requires_code,
                         )
                         if not payload:
+                            if _retry_rejected_plan(source.path, iteration, "invalid JSON response"):
+                                break
                             continue
             raw_payload = payload
             payload = _coerce_plan_payload(payload)
@@ -10563,10 +10993,14 @@ def run_project_solver(
                     requires_code=source_requires_code,
                 )
                 if not payload:
+                    if _retry_rejected_plan(source.path, iteration, "invalid plan payload"):
+                        break
                     continue
                 raw_payload = payload
                 payload = _coerce_plan_payload(payload)
                 if payload is None:
+                    if _retry_rejected_plan(source.path, iteration, "fallback returned invalid payload"):
+                        break
                     continue
             if isinstance(raw_payload, list):
                 _record_action("Coerced list payload into plan steps.", source_actions_log)
@@ -10579,10 +11013,14 @@ def run_project_solver(
             if not isinstance(plan_steps, list):
                 payload = _maybe_codingagent_fallback("missing plan list", requires_code=source_requires_code)
                 if not payload:
+                    if _retry_rejected_plan(source.path, iteration, "missing plan list"):
+                        break
                     continue
                 raw_payload = payload
                 payload = _coerce_plan_payload(payload)
                 if payload is None:
+                    if _retry_rejected_plan(source.path, iteration, "fallback missing plan list"):
+                        break
                     continue
                 if isinstance(raw_payload, list):
                     _record_action("Coerced list payload into plan steps.", source_actions_log)
@@ -10593,6 +11031,8 @@ def run_project_solver(
                             break
                 plan_steps = payload.get("plan", [])
                 if not isinstance(plan_steps, list):
+                    if _retry_rejected_plan(source.path, iteration, "plan is not a list"):
+                        break
                     continue
 
             verification_steps = payload.get("verification_steps")
@@ -10635,13 +11075,46 @@ def run_project_solver(
                         payload = fallback_payload
                         plan_steps = payload.get("plan", [])
                         if not isinstance(plan_steps, list):
+                            if _retry_rejected_plan(source.path, iteration, "fallback has no plan list"):
+                                break
                             continue
                     else:
                         _record_action(
                             "No usable file edits in plan for code-required source; retrying.",
                             source_actions_log,
                         )
+                        if _record_empty_plan_retry(source.path, iteration, reason):
+                            break
                         continue
+
+            fingerprint = plan_fingerprint(plan_steps)
+            fingerprint_counts = plan_fingerprint_counts_by_source.setdefault(source.path, {})
+            fingerprint_count = fingerprint_counts.get(fingerprint, 0) + 1
+            fingerprint_counts[fingerprint] = fingerprint_count
+            if fingerprint_count > 1:
+                repeated_plan_notes_by_source[source.path] = (
+                    f"Plan fingerprint {fingerprint} was returned {fingerprint_count} times."
+                )
+                _record_action(
+                    f"Repeated plan detected for {source.path} ({fingerprint_count}/{repeated_plan_limit}); requesting a changed strategy.",
+                    source_actions_log,
+                )
+                if fingerprint_count >= repeated_plan_limit:
+                    planner_failure = {
+                        "type": "repeated_plan",
+                        "message": "planner repeated an identical actionable plan without progress",
+                        "source": source.path,
+                        "iteration": iteration,
+                        "fingerprint": fingerprint,
+                        "count": fingerprint_count,
+                    }
+                    _record_action(
+                        "Repeated-plan limit reached; stopping this source with a resumable report.",
+                        source_actions_log,
+                    )
+                    break
+                continue
+            repeated_plan_notes_by_source.pop(source.path, None)
 
             plan_entry_id = None
             parent_path_id = progress_last_id_by_source.get(source.path)
@@ -10686,8 +11159,12 @@ def run_project_solver(
                         payload = opencode_payload
                         plan_steps = payload.get("plan", [])
                         if not isinstance(plan_steps, list):
+                            if _retry_rejected_plan(source.path, iteration, "done fallback has no plan list"):
+                                break
                             continue
                     else:
+                        if _record_empty_plan_retry(source.path, iteration, "done/no plan for code-required source"):
+                            break
                         continue
                 else:
                     _record_action(
@@ -10746,7 +11223,7 @@ def run_project_solver(
             plan_has_code_changes = _plan_has_code_changes(plan_steps)
             strict_requirement_refs = _env_bool("SOLVER_STRICT_REQUIREMENT_REFS", False)
             strict_verification = _env_bool("SOLVER_STRICT_VERIFICATION", False)
-            strict_test_coverage = _env_bool("SOLVER_STRICT_TEST_COVERAGE", False)
+            strict_test_coverage = _env_bool("SOLVER_STRICT_TEST_COVERAGE", True)
             verification_first = _env_bool("SOLVER_VERIFICATION_FIRST", True)
             if requirements_register_ids:
                 _ensure_plan_requirement_refs(
@@ -10789,6 +11266,8 @@ def run_project_solver(
                             payload = opencode_payload
                             plan_steps = payload.get("plan", [])
                             if not isinstance(plan_steps, list):
+                                if _retry_rejected_plan(source.path, iteration, "requirement-ref fallback has no plan list"):
+                                    break
                                 continue
                             plan_has_code_changes = _plan_has_code_changes(plan_steps)
                         else:
@@ -10814,6 +11293,8 @@ def run_project_solver(
                                     + (" ...(truncated)" if len(missing_required_ids) > 12 else ""),
                                     source_actions_log,
                                 )
+                            if _retry_rejected_plan(source.path, iteration, reason):
+                                break
                             continue
             if audit_required and audit_note:
                 _ensure_audit_step(plan_steps, audit_note)
@@ -10827,12 +11308,16 @@ def run_project_solver(
                         payload = opencode_payload
                         plan_steps = payload.get("plan", [])
                         if not isinstance(plan_steps, list):
+                            if _retry_rejected_plan(source.path, iteration, "audit fallback has no plan list"):
+                                break
                             continue
                     else:
                         _record_action(
                             "Plan missing AUDIT-prefixed steps to address audit findings; retrying.",
                             source_actions_log,
                         )
+                        if _retry_rejected_plan(source.path, iteration, "missing audit realignment steps"):
+                            break
                         continue
             if plan_has_code_changes and not _plan_has_verification(plan_steps):
                 if not strict_verification and allow_run:
@@ -10882,8 +11367,12 @@ def run_project_solver(
                         payload = opencode_payload
                         plan_steps = payload.get("plan", [])
                         if not isinstance(plan_steps, list):
+                            if _retry_rejected_plan(source.path, iteration, "verification fallback has no plan list"):
+                                break
                             continue
                     else:
+                        if _retry_rejected_plan(source.path, iteration, "code changes without verification"):
+                            break
                         continue
                 plan_has_code_changes = _plan_has_code_changes(plan_steps)
             if plan_has_code_changes and not _plan_has_test_changes(plan_steps):
@@ -10896,8 +11385,12 @@ def run_project_solver(
                         payload = opencode_payload
                         plan_steps = payload.get("plan", [])
                         if not isinstance(plan_steps, list):
+                            if _retry_rejected_plan(source.path, iteration, "test-coverage fallback has no plan list"):
+                                break
                             continue
                     else:
+                        if _retry_rejected_plan(source.path, iteration, "code changes without test coverage additions"):
+                            break
                         continue
 
             if plan_has_code_changes:
@@ -10912,12 +11405,16 @@ def run_project_solver(
                         payload = opencode_payload
                         plan_steps = payload.get("plan", [])
                         if not isinstance(plan_steps, list):
+                            if _retry_rejected_plan(source.path, iteration, "syntax fallback has no plan list"):
+                                break
                             continue
                     else:
                         _record_action(
                             f"Plan rejected due to Python syntax errors ({reason}); retrying.",
                             source_actions_log,
                         )
+                        if _retry_rejected_plan(source.path, iteration, "invalid Python syntax"):
+                            break
                         continue
             if source_requires_code and not _plan_has_actionable_steps(plan_steps):
                 opencode_payload = _maybe_codingagent_fallback(
@@ -10928,9 +11425,13 @@ def run_project_solver(
                     payload = opencode_payload
                     plan_steps = payload.get("plan", [])
                     if not isinstance(plan_steps, list):
+                        if _retry_rejected_plan(source.path, iteration, "fallback has no actionable plan list"):
+                            break
                         continue
                 else:
                     _record_action("Plan contained only notes; retrying.", source_actions_log)
+                    if _record_empty_plan_retry(source.path, iteration, "notes only"):
+                        break
                     continue
             if source_requires_code:
                 _normalize_plan_step_paths(plan_steps)
@@ -10948,6 +11449,8 @@ def run_project_solver(
                         "Plan became empty after dropping blocked mutating VCS steps; retrying.",
                         source_actions_log,
                     )
+                    if _record_empty_plan_retry(source.path, iteration, "blocked VCS steps only"):
+                        break
                     continue
                 suspicious_issues = _plan_suspicious_issues(plan_steps, eval_info)
                 if suspicious_issues:
@@ -10960,6 +11463,8 @@ def run_project_solver(
                         payload = opencode_payload
                         plan_steps = payload.get("plan", [])
                         if not isinstance(plan_steps, list):
+                            if _retry_rejected_plan(source.path, iteration, "fallback plan became invalid"):
+                                break
                             continue
                         _normalize_plan_step_paths(plan_steps)
                         plan_steps, dropped_vcs_steps = _drop_blocked_mutating_vcs_steps(
@@ -10976,6 +11481,8 @@ def run_project_solver(
                                 "Fallback plan became empty after dropping blocked mutating VCS steps; retrying.",
                                 source_actions_log,
                             )
+                            if _retry_rejected_plan(source.path, iteration, "fallback VCS filtering removed all steps"):
+                                break
                             continue
                         suspicious_issues = _plan_suspicious_issues(plan_steps, eval_info)
                         if suspicious_issues:
@@ -10983,19 +11490,29 @@ def run_project_solver(
                                 "Fallback plan still contains suspicious patterns; retrying.",
                                 source_actions_log,
                             )
+                            if _retry_rejected_plan(source.path, iteration, "fallback remains suspicious"):
+                                break
                             continue
                     else:
                         _record_action(
                             f"Plan flagged for likely schema or helper misuse ({reason}); retrying.",
                             source_actions_log,
                         )
+                        if _retry_rejected_plan(source.path, iteration, "suspicious plan"):
+                            break
                         continue
                 if not _plan_has_actionable_steps(plan_steps):
                     _record_action(
                         "Plan contained only notes after normalization and policy filtering; retrying.",
                         source_actions_log,
                     )
+                    if _record_empty_plan_retry(source.path, iteration, "normalisation removed all actions"):
+                        break
                     continue
+
+            # A valid, actionable plan has now reached execution. A later
+            # planner miss should get its own bounded retry allowance.
+            empty_plan_attempts_by_source.pop(source.path, None)
 
             remaining_steps = max_steps - total_steps_applied
             if remaining_steps <= 0:
@@ -11033,9 +11550,24 @@ def run_project_solver(
                 replace_failures: List[Dict[str, object]] = []
                 is_verification_step = False
                 if _normalize_step_type(step.get("type")) == "run_command":
-                    command = step.get("command")
-                    if isinstance(command, str) and _is_verification_command(command):
+                    command = _step_command_text(step)
+                    if command and _is_verification_command(command):
                         is_verification_step = True
+                _emit_progress(
+                    "execute",
+                    "running",
+                    15,
+                    source=source.path,
+                    iteration=iteration,
+                    phase="act",
+                    step=idx + 1,
+                    total_steps=total_steps_applied + 1,
+                    command=(
+                        _step_command_text(step)
+                        if _normalize_step_type(step.get("type")) == "run_command"
+                        else None
+                    ),
+                )
                 _apply_step(
                     project_root,
                     step,
@@ -11059,6 +11591,17 @@ def run_project_solver(
                     source_actions_log.extend(actions_log[before_len:])
                 total_steps_applied += 1
                 iteration_steps_applied += 1
+                _emit_progress(
+                    "execute",
+                    "running",
+                    15,
+                    source=source.path,
+                    iteration=iteration,
+                    phase="verify" if is_verification_step else "act",
+                    step=idx + 1,
+                    total_steps=total_steps_applied,
+                    failures=len(command_failures),
+                )
                 if is_verification_step:
                     verification_steps_executed += 1
                 if solver_workspace:
@@ -11169,8 +11712,8 @@ def run_project_solver(
                                 break
                             rec_is_verification = False
                             if _normalize_step_type(rec_step.get("type")) == "run_command":
-                                rec_command = rec_step.get("command")
-                                if isinstance(rec_command, str) and _is_verification_command(rec_command):
+                                rec_command = _step_command_text(rec_step)
+                                if rec_command and _is_verification_command(rec_command):
                                     rec_is_verification = True
                             _apply_step(
                                 project_root,
@@ -11240,7 +11783,10 @@ def run_project_solver(
                         ]
                         if _should_replan_verification_failures(
                             verification_failures,
-                            verification_first=verification_first,
+                            verification_first=(
+                                verification_first
+                                and _env_bool("SOLVER_VERIFICATION_BLOCKING", False)
+                            ),
                             allow_run=allow_run,
                             repeated_failures_exhausted=repeated_failures_exhausted,
                         ):
@@ -11475,18 +12021,21 @@ def run_project_solver(
                     "reflect",
                     PhaseResult.retry("replan due to hallucination", data={"scope": "source"}),
                 )
+                iteration += 1
                 continue
             if replan_due_to_verification:
                 cycle.record(
                     "reflect",
                     PhaseResult.retry("replan due to verification failure", data={"scope": "source"}),
                 )
+                iteration += 1
                 continue
             if replan_due_to_replace:
                 cycle.record(
                     "reflect",
                     PhaseResult.retry("replan due to replace-in-file failure", data={"scope": "source"}),
                 )
+                iteration += 1
                 continue
             if defer_source:
                 cycle.record(
@@ -11502,6 +12051,10 @@ def run_project_solver(
                 _record_action("Max steps reached; stopping iterations.", source_actions_log)
                 break
             cycle.record("reflect", PhaseResult.ok("continue"))
+            # Logical iterations advance only after an actionable plan has
+            # reached the act/reflect phases. Empty or note-only planner
+            # responses retry in-place and do not burn the iteration budget.
+            iteration += 1
         if planner_failure:
             break
         pending_verification = verification_failures_by_source.get(source.path)
@@ -11938,6 +12491,8 @@ def run_project_solver(
         "requirements_sanity": requirements_sanity,
         "sequence_gaps": sequence_gaps,
         "dataset_summary": dataset_summary,
+        "acceptance_checks": acceptance_steps,
+        "starter_template_guidance": starter_template_context,
         "helper_modules": helper_modules,
         "module_registry": module_registry,
         "todo_summary": todo_summary,
@@ -11989,6 +12544,9 @@ def run_project_solver(
         "solver_replay_analysis": solver_replay_analysis,
         "codex_preflight": codex_preflight,
         "verification_command_summary": selected_verification_commands,
+        "applied_steps_by_source": applied_steps_by_source,
+        "unresolved_failures": unresolved_failures,
+        "verification_failures_by_source": verification_failures_by_source,
         "failure_fingerprint_summary": failure_fingerprint_summary,
         "completion_summary": completion_summary,
         "planner_failure": planner_failure,
@@ -12019,6 +12577,7 @@ def run_project_solver(
         "ai_orchestration": {
             "general": provider_summary,
             "planner": describe_provider(planner_provider),
+            "fast_planner": describe_provider(fast_planner_provider) if fast_planner_provider else None,
             "reviewer": describe_provider(reviewer_provider),
             "researcher": describe_provider(researcher_provider),
         },
@@ -12027,6 +12586,9 @@ def run_project_solver(
             "source": resume_source_path,
             "start_iteration": resume_start_iteration.get(resume_source_path) if resume_source_path else None,
             "completed_sources": sorted(set(completed_sources)),
+            "state_restored": bool(previous_run),
+            "next_source": resume_source_path,
+            "next_iteration": resume_start_iteration.get(resume_source_path) if resume_source_path else None,
         },
     }
     output_dir = os.path.dirname(output_path)
@@ -12042,4 +12604,12 @@ def run_project_solver(
         except Exception:
             pass
 
+    _emit_progress(
+        "finalize",
+        "completed" if not planner_failure else "failed",
+        100,
+        completed_sources=len(completed_sources_final),
+        total_sources=len(source_paths),
+        needs_more_iterations=needs_more_iterations,
+    )
     return _solver_completion_exit_code(completion_summary)

@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1
+ARG TARGET_PAGE_SIZE=4k
 #
 # Refiner Containerfile
 # ---------------------
@@ -200,13 +201,15 @@ RUN set -eux; \
 FROM ${BASE_IMAGE} AS runtime
 
 ARG BASE_IMAGE
+ARG TARGET_PAGE_SIZE
 ARG APP_HOME
 ARG APP_USER
 ARG APP_UID
 ARG APP_GID
 ARG TZ
 
-LABEL org.opencontainers.image.title="Refiner" \
+LABEL org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}" \
+      org.opencontainers.image.title="Refiner" \
       org.opencontainers.image.description="Refiner API/runtime image for Podman and Kubernetes" \
       org.opencontainers.image.source="https://github.com/neuralmimicry" \
       org.opencontainers.image.vendor="NeuralMimicry" \
