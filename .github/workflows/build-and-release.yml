@@ -316,6 +316,32 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
+          # Self-hosted runners are intentionally minimal and may not have
+          # GitHub CLI installed. Keep the release job self-contained by
+          # downloading a temporary, architecture-matched CLI when needed.
+          if ! command -v gh >/dev/null 2>&1; then
+            case "$(uname -m)" in
+              x86_64) gh_arch="amd64" ;;
+              aarch64|arm64) gh_arch="arm64" ;;
+              *)
+                echo "::error::Unsupported runner architecture for GitHub CLI: $(uname -m)"
+                exit 1
+                ;;
+            esac
+            gh_version="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | sed -n 's/.*"tag_name": "\(v[^"]*\)".*/\1/p' | head -n 1)"
+            if [[ -z "${gh_version}" ]]; then
+              echo "::error::Unable to resolve the latest GitHub CLI release"
+              exit 1
+            fi
+            gh_root="${RUNNER_TEMP}/gh-${gh_version#v}-${gh_arch}"
+            gh_archive="${RUNNER_TEMP}/gh-${gh_version#v}-linux-${gh_arch}.tar.gz"
+            curl -fsSL "https://github.com/cli/cli/releases/download/${gh_version}/gh_${gh_version#v}_linux_${gh_arch}.tar.gz" -o "${gh_archive}"
+            mkdir -p "${gh_root}"
+            tar -xzf "${gh_archive}" --strip-components=1 -C "${gh_root}"
+            export PATH="${gh_root}/bin:${PATH}"
+          fi
+          gh --version
+
           gh_retry() {
             local max_attempts=5
             local attempt=1
@@ -529,22 +555,25 @@ jobs:
           image_ref="${IMAGE_REPO}:${RELEASE_TAG}-${{ matrix.variant }}"
           echo "Using GHCR credentials source: ${GHCR_AUTH_SOURCE}"
           if command -v podman >/dev/null 2>&1; then
-            printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
-            if podman build --format docker --pull \
-              --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
-              --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
-              --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
-              -f Containerfile -t "${image_ref}" .; then
-              if push_with_retry 2 podman_push_default; then
-                exit 0
+            if printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin; then
+              if podman build --format docker --pull \
+                --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
+                --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
+                --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
+                -f Containerfile -t "${image_ref}" .; then
+                if push_with_retry 2 podman_push_default; then
+                  exit 0
+                fi
+                echo "::warning::Default podman push failed for ${image_ref}; retrying with docker schema2 compatibility options."
+                if push_with_retry 2 podman_push_compat; then
+                  exit 0
+                fi
               fi
-              echo "::warning::Default podman push failed for ${image_ref}; retrying with docker schema2 compatibility options."
-              if push_with_retry 2 podman_push_compat; then
-                exit 0
-              fi
+            else
+              echo "::warning::Podman login failed; trying Docker fallback."
             fi
             if ! resolve_docker_cmd; then
-              echo "::error::Podman publish failed and docker fallback is unavailable (docker missing or no daemon access, including sudo)."
+              echo "::error::Podman publish/login failed and docker fallback is unavailable (docker missing or no daemon access, including sudo)."
               exit 1
             fi
             echo "::warning::Podman publish failed for ${image_ref}; falling back to docker publish."
