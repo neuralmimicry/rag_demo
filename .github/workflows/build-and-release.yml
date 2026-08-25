@@ -465,6 +465,28 @@ jobs:
             exit 1
           fi
 
+      - name: Configure rootless container runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
+          runtime_dir="/run/user/$(id -u)"
+          if [[ -z "${runner_home}" || ! -d "${runner_home}" ]]; then
+            echo "::error::Could not resolve the runner user's home directory"
+            exit 1
+          fi
+          if [[ ! -d "${runtime_dir}" || ! -w "${runtime_dir}" ]]; then
+            echo "::error::Rootless container runtime directory is unavailable: ${runtime_dir}"
+            exit 1
+          fi
+          # actions/checkout can temporarily override HOME while configuring
+          # git. Restore the service user's home/runtime before Podman runs.
+          echo "HOME=${runner_home}" >> "${GITHUB_ENV}"
+          echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "${GITHUB_ENV}"
+          export HOME="${runner_home}"
+          export XDG_RUNTIME_DIR="${runtime_dir}"
+          podman info --format '{{.Host.Security.Rootless}} {{.Store.GraphRoot}}'
+
       - name: Build and push architecture image
         shell: bash
         env:
@@ -620,6 +642,26 @@ jobs:
             echo "::error::Publishing container manifest requires a resolved release tag"
             exit 1
           fi
+
+      - name: Configure rootless container runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
+          runtime_dir="/run/user/$(id -u)"
+          if [[ -z "${runner_home}" || ! -d "${runner_home}" ]]; then
+            echo "::error::Could not resolve the runner user's home directory"
+            exit 1
+          fi
+          if [[ ! -d "${runtime_dir}" || ! -w "${runtime_dir}" ]]; then
+            echo "::error::Rootless container runtime directory is unavailable: ${runtime_dir}"
+            exit 1
+          fi
+          echo "HOME=${runner_home}" >> "${GITHUB_ENV}"
+          echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "${GITHUB_ENV}"
+          export HOME="${runner_home}"
+          export XDG_RUNTIME_DIR="${runtime_dir}"
+          podman info --format '{{.Host.Security.Rootless}} {{.Store.GraphRoot}}'
 
       - name: Publish multi-architecture manifest
         shell: bash
