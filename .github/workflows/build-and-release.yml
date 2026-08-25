@@ -564,11 +564,13 @@ jobs:
           }
 
           podman_push_default() {
-            podman push --retry 3 --retry-delay 8s "${image_ref}"
+            # Retry policy is provided by push_with_retry below. Keep the
+            # Podman invocation portable across the runner versions in use.
+            podman push "${image_ref}"
           }
 
           podman_push_compat() {
-            podman push --retry 3 --retry-delay 8s \
+            podman push \
               --format v2s2 \
               --compression-format gzip \
               --force-compression \
