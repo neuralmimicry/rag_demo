@@ -3807,7 +3807,7 @@ def _execute_shell_command(
                 f"Verification output issue detected ({verification_issue}); treating as failure."
             )
     no_tests_is_informational = (
-        verification_issue == "no tests ran"
+        verification_issue in {"no tests ran", "error output detected"}
         and "pytest" in command_display.lower()
         # pytest uses exit code 4 for a missing explicit target and exit code
         # 5 for an empty collection. Both are non-failures only when this
@@ -3815,6 +3815,7 @@ def _execute_shell_command(
         and result.returncode in {0, 4, 5}
         and not _has_pytest_config(workdir)
         and not os.path.isdir(os.path.join(workdir, "tests"))
+        and _discover_pytest_target(workdir) is None
     )
     if no_tests_is_informational:
         verification_issue = None
