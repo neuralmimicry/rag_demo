@@ -3804,7 +3804,10 @@ def _execute_shell_command(
     no_tests_is_informational = (
         verification_issue == "no tests ran"
         and "pytest" in command_display.lower()
-        and result.returncode in {0, 5}
+        # pytest uses exit code 4 for a missing explicit target and exit code
+        # 5 for an empty collection. Both are non-failures only when this
+        # project has no test configuration or discoverable test files.
+        and result.returncode in {0, 4, 5}
         and not _has_pytest_config(workdir)
         and not os.path.isdir(os.path.join(workdir, "tests"))
     )
@@ -6093,6 +6096,56 @@ def _is_verification_failure(failure: Dict[str, object]) -> bool:
     if isinstance(command, str) and _is_verification_command(command):
         return True
     return bool(failure.get("verification_issue"))
+
+
+def _normalise_command_for_comparison(command: object) -> str:
+    """Return a stable command representation for verification reconciliation."""
+
+    return re.sub(r"\s+", " ", _safe_str(command).strip()).lower()
+
+
+def _resolve_successful_verification_failures(
+    unresolved_failures: List[Dict[str, object]],
+    command_results: List[Dict[str, object]],
+    *,
+    source_path: str,
+    actions_log: List[str],
+) -> None:
+    """Remove transient failures after the same verification actually passes.
+
+    A solver source can be verified more than once while the model repairs a
+    generated file. Historically, the first failed attempt stayed in the
+    terminal TODO list even after a later identical command succeeded, making
+    a healthy final workspace report as failed. Only the same source and
+    command are reconciled; unrelated failures remain actionable.
+    """
+
+    successful_commands = {
+        _normalise_command_for_comparison(result.get("command"))
+        for result in command_results
+        if isinstance(result, dict)
+        and result.get("success") is True
+        and _is_verification_command(_safe_str(result.get("command")))
+    }
+    if not successful_commands:
+        return
+
+    retained: List[Dict[str, object]] = []
+    resolved = 0
+    for failure in unresolved_failures:
+        if (
+            _safe_str(failure.get("source")) == source_path
+            and _normalise_command_for_comparison(failure.get("command")) in successful_commands
+            and _is_verification_failure(failure)
+        ):
+            resolved += 1
+            continue
+        retained.append(failure)
+    if resolved:
+        unresolved_failures[:] = retained
+        actions_log.append(
+            f"Resolved {resolved} historical verification failure(s) after a matching command passed."
+        )
 
 
 def _is_deterministic_recovery_failure(failure: Dict[str, object]) -> bool:
@@ -11587,6 +11640,12 @@ def run_project_solver(
                     command_trust_store=command_trust_store,
                     command_results=iteration_command_results,
                 )
+                _resolve_successful_verification_failures(
+                    unresolved_failures,
+                    iteration_command_results,
+                    source_path=source.path,
+                    actions_log=source_actions_log,
+                )
                 if len(actions_log) > before_len:
                     source_actions_log.extend(actions_log[before_len:])
                 total_steps_applied += 1
@@ -11733,6 +11792,12 @@ def run_project_solver(
                                 executed_commands=iteration_executed_commands,
                                 command_trust_store=command_trust_store,
                                 command_results=iteration_command_results,
+                            )
+                            _resolve_successful_verification_failures(
+                                unresolved_failures,
+                                iteration_command_results,
+                                source_path=source.path,
+                                actions_log=source_actions_log,
                             )
                             if len(actions_log) > before_rec_len:
                                 source_actions_log.extend(actions_log[before_rec_len:])
