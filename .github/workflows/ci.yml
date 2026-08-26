@@ -21,8 +21,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner_arch: X64
-            runs_on: '"ubuntu-24.04"'
           - runner_arch: ARM64
             runs_on: '["self-hosted", "Linux", "ARM64"]'
     steps:
