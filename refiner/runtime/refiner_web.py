@@ -7673,6 +7673,10 @@ class JobManager:
         branch_name = (payload.get("work_branch") or f"refiner/{job.job_id[:8]}").strip()
         self._git_checkout(workspace, branch_name, job)
 
+        rollback_commit = str(payload.get("rollback_commit") or "").strip()
+        if rollback_commit:
+            self._git_revert_commit(workspace, rollback_commit, job)
+
         project_subdir = (payload.get("repo_subdir") or "").strip()
         project_root = os.path.join(workspace, project_subdir) if project_subdir else workspace
         if not os.path.isdir(project_root):
@@ -7819,6 +7823,8 @@ class JobManager:
         if not self._git_has_changes(workspace, job):
             job.append_log("No git changes detected; skipping commit/push.")
             return
+        base_sha_result = self._git_run(["git", "rev-parse", "HEAD"], workspace, job)
+        base_commit_sha = (base_sha_result.stdout or "").strip()
         author_name = job.payload.get("git_author_name") or "refiner-bot"
         author_email = job.payload.get("git_author_email") or "automation@neuralmimicry.ai"
         commit_message = job.payload.get("commit_message") or f"Refiner updates ({job.job_id[:8]})"
@@ -7836,6 +7842,8 @@ class JobManager:
             sha_result = self._git_run(["rev-parse", "HEAD"], workspace, job)
             commit_sha = (sha_result.stdout or "").strip()
             repo_info = job.repo_info
+            repo_info["base_commit_sha"] = base_commit_sha or None
+            repo_info["commit_sha"] = commit_sha or None
             actions_report = verify_repository_builds(
                 workspace=workspace,
                 owner=str(repo_info.get("fork_org") or repo_info.get("owner") or ""),
@@ -8073,6 +8081,22 @@ class JobManager:
         result = self._git_run(["git", "checkout", "-B", branch], cwd=workspace, job=job)
         if result.returncode != 0:
             raise ValueError(f"git checkout failed: {result.stderr.strip()}")
+
+    def _git_revert_commit(self, workspace: str, commit: str, job: Job) -> None:
+        """Create a safe revert commit for one exact delivered commit."""
+        commit = str(commit or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit):
+            raise ValueError("rollback_commit must be a hexadecimal git commit id")
+        job.append_log(f"Preparing deterministic rollback of commit {commit}")
+        result = self._git_run(
+            ["git", "revert", "--no-edit", commit],
+            cwd=workspace,
+            job=job,
+        )
+        if result.returncode != 0:
+            self._git_run(["git", "revert", "--abort"], cwd=workspace, job=job)
+            raise ValueError(f"git rollback failed: {result.stderr.strip()}")
+        job.append_log(f"Rollback revert commit created for {commit}")
 
     def _git_has_changes(self, workspace: str, job: Job) -> bool:
         result = self._git_run(["git", "status", "--porcelain"], cwd=workspace, job=job)
