@@ -4530,6 +4530,7 @@ def _build_local_plan_from_intent(
     <h1 id=\"title\">Fun Counter</h1>
     <p id=\"count\" aria-live=\"polite\" aria-atomic=\"true\">0</p>
     <div class=\"controls\" aria-label=\"Counter controls\">
+      <button id=\"decrement\" type=\"button\">Decrement</button>
       <button id=\"increment\" type=\"button\">Increment</button>
       <button id=\"reset\" type=\"button\">Reset</button>
     </div>
@@ -4589,13 +4590,15 @@ button:focus-visible {
   outline-offset: 0.15rem;
 }
 
+#decrement { background: #f6c453; }
 #increment { background: #63d471; }
 #reset { background: #f28b82; }
 """,
-            "app.js": """// REQ-006/REQ-007: keep state local and expose keyboard-accessible buttons.
+            "app.js": """// REQ-002/REQ-003: keep counter state local and expose native controls.
 (() => {
   let value = 0;
   const display = document.getElementById('count');
+  const decrement = document.getElementById('decrement');
   const increment = document.getElementById('increment');
   const reset = document.getElementById('reset');
 
@@ -4605,6 +4608,11 @@ button:focus-visible {
 
   increment.addEventListener('click', () => {
     value += 1;
+    render();
+  });
+
+  decrement.addEventListener('click', () => {
+    value -= 1;
     render();
   });
 
@@ -4618,21 +4626,30 @@ button:focus-visible {
 """,
             "README.md": """# Fun Counter
 
-Dependency-free static web app implementing REQ-001 through REQ-008.
+Dependency-free static web app implementing REQ-001 through REQ-009.
 
 Open `index.html` directly, or run `python -m http.server 8000` from this
-directory and visit <http://127.0.0.1:8000>.  The Increment button increases
-the value and Reset returns it to zero.  Both controls are native buttons and
-therefore work with keyboard focus and activation.
+directory and visit <http://127.0.0.1:8000>.  Increment and Decrement change
+the value by one, and Reset returns it to zero.  All controls are native
+buttons and therefore work with keyboard focus and activation.
 """,
-            "smoke_test.js": """// Behaviour check for REQ-006 and REQ-007; uses only Node's standard library.
+            "smoke_test.js": """// Behaviour check for REQ-002/REQ-003; uses only Node's standard library.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
+for (const requiredFile of ['index.html', 'styles.css', 'app.js']) {
+  assert.equal(fs.existsSync(requiredFile), true, `${requiredFile} must exist`);
+}
+const html = fs.readFileSync('index.html', 'utf8');
+for (const label of ['Increment', 'Decrement', 'Reset']) {
+  assert.match(html, new RegExp(label));
+}
+
 const handlers = {};
 const elements = {
   count: { textContent: '' },
+  decrement: { addEventListener: (event, fn) => { handlers.decrement = fn; } },
   increment: { addEventListener: (event, fn) => { handlers.increment = fn; } },
   reset: { addEventListener: (event, fn) => { handlers.reset = fn; } },
 };
@@ -4643,6 +4660,10 @@ vm.runInNewContext(fs.readFileSync('app.js', 'utf8'), {
 assert.equal(elements.count.textContent, '0');
 handlers.increment();
 assert.equal(elements.count.textContent, '1');
+handlers.decrement();
+assert.equal(elements.count.textContent, '0');
+handlers.decrement();
+assert.equal(elements.count.textContent, '-1');
 handlers.reset();
 assert.equal(elements.count.textContent, '0');
 console.log('counter smoke test passed');

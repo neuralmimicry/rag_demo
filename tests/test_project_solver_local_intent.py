@@ -31,6 +31,11 @@ def test_counter_requirements_get_safe_local_plan(tmp_path):
     assert any("node --check app.js" in command for command in commands)
     assert any("http.server" in command for command in commands)
 
+    files = {step["path"]: step["content"] for step in plan["plan"] if step.get("type") == "write_file"}
+    assert all(label in files["index.html"] for label in ("Increment", "Decrement", "Reset"))
+    assert "value -= 1" in files["app.js"]
+    assert "handlers.decrement" in files["smoke_test.js"]
+
 
 def test_smoke_test_is_a_valid_runnable_example_for_a_module(tmp_path):
     module = tmp_path / "app.js"
