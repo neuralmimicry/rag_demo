@@ -3387,6 +3387,11 @@ def _verification_output_issue(
         return "future warning detected"
     if NO_TESTS_RAN_RE.search(output):
         return "no tests ran"
+    # pytest reports a missing explicit target as an ERROR and exits with 4.
+    # Classify it with the no-tests path so projects without any test suite do
+    # not acquire a false verification failure from a model-hallucinated name.
+    if PYTEST_FILE_NOT_FOUND_RE.search(output):
+        return "no tests ran"
     mod_match = MODULE_NOT_FOUND_RE.search(output)
     if mod_match:
         return f"missing module: {mod_match.group(1)}"
