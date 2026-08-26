@@ -83,6 +83,7 @@ from refiner.runtime.llm_access import (
     provider_base_url as _provider_base_url,
     user_can_use_shared_llm_credentials as _user_can_use_shared_llm_credentials,
 )
+from refiner.workflows.delivery.github_actions import verify_repository_builds
 from refiner.solver_memory import SolverEpisode, SolverEpisodeStore
 from refiner.thought_inbox import (
     build_fingerprint as inbox_build_fingerprint,
@@ -7221,6 +7222,7 @@ class JobManager:
                 self._finalize_repo(job)
             except Exception as exc:
                 job.append_log(f"Repo finalize failed: {exc}")
+                job.exit_code = max(job.exit_code or 0, 1)
         if job.stop_requested:
             job.set_status("stopped")
         elif job.exit_code == 0 and not solver_incomplete:
@@ -7825,6 +7827,31 @@ class JobManager:
         self._git_commit(workspace, commit_message, job)
         token = self._get_github_token(job)
         self._git_push(workspace, branch, token, job)
+        build_requested = bool(
+            job.payload.get("project_run")
+            or job.payload.get("delivery_run")
+            or job.payload.get("github_actions_required")
+        )
+        if build_requested:
+            sha_result = self._git_run(["rev-parse", "HEAD"], workspace, job)
+            commit_sha = (sha_result.stdout or "").strip()
+            repo_info = job.repo_info
+            actions_report = verify_repository_builds(
+                workspace=workspace,
+                owner=str(repo_info.get("fork_org") or repo_info.get("owner") or ""),
+                repo=str(repo_info.get("fork_repo") or repo_info.get("repo") or ""),
+                branch=str(branch),
+                commit_sha=commit_sha,
+                token=token,
+                timeout_sec=float(job.payload.get("github_actions_timeout_sec") or 900),
+                poll_interval_sec=float(job.payload.get("github_actions_poll_interval_sec") or 10),
+            )
+            repo_info["github_actions"] = actions_report
+            if actions_report.get("enabled") and actions_report.get("succeeded") is not True:
+                raise RuntimeError(
+                    "GitHub Actions build gate failed: "
+                    + str(actions_report.get("reason") or "unknown failure")
+                )
         fork_org = job.repo_info.get("fork_org")
         fork_repo = job.repo_info.get("fork_repo") or job.repo_info.get("repo")
         if fork_org and fork_repo:

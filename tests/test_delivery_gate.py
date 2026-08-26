@@ -1,5 +1,6 @@
 import json
 import refiner.delivery_pipeline as delivery_pipeline
+import refiner.workflows.delivery.github_actions as github_actions
 from refiner.delivery_pipeline import run_delivery_pipeline
 
 
@@ -198,3 +199,32 @@ def test_github_actions_gate_matches_the_uploaded_commit(tmp_path, monkeypatch):
     assert report["succeeded"] is True
     assert report["expected_sha"] == expected_sha
     assert report["run"]["head_sha"] == expected_sha
+
+
+def test_repository_build_gate_discovers_and_requires_matching_workflow(tmp_path, monkeypatch):
+    workflow_dir = tmp_path / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "build-and-release.yml").write_text("name: build\n", encoding="utf-8")
+    expected_sha = "c" * 40
+
+    monkeypatch.setattr(
+        github_actions.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _FakeResponse(
+            {"workflow_runs": [{"status": "completed", "conclusion": "success", "head_sha": expected_sha}]}
+        ),
+    )
+
+    report = github_actions.verify_repository_builds(
+        workspace=str(tmp_path),
+        owner="neuralmimicry",
+        repo="demo",
+        branch="refiner/test",
+        commit_sha=expected_sha,
+        token="test-token",
+        timeout_sec=0,
+    )
+
+    assert report["enabled"] is True
+    assert report["succeeded"] is True
+    assert report["workflows"][0]["run"]["head_sha"] == expected_sha
