@@ -41,7 +41,17 @@ def test_successful_reverification_clears_matching_historical_failure():
     ]
 
 
-def test_missing_pytest_target_is_informational_without_project_tests(tmp_path):
+def test_missing_pytest_target_is_informational_without_project_tests(monkeypatch, tmp_path):
+    class CompletedProcess:
+        returncode = 4
+        stdout = "ERROR: test target is unavailable\n"
+        stderr = ""
+
+    monkeypatch.setattr(
+        project_solver.subprocess,
+        "run",
+        lambda *_args, **_kwargs: CompletedProcess(),
+    )
     failures = []
     results = []
 
