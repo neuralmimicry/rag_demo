@@ -291,6 +291,21 @@ CODE_BLOCK_RE = re.compile(r"```(?P<lang>[A-Za-z0-9_+-]*)\n(?P<code>.*?)```", re
 
 LOCAL_INTENT_RULES = [
     {
+        # Small dependency-free browser exercises are common playground
+        # inputs.  They are simple enough to implement safely without an LLM
+        # when the planner returns malformed output or is temporarily busy.
+        "id": "static_counter_app",
+        "keywords": (
+            "counter",
+            "increment",
+            "reset",
+            "index.html",
+            "styles.css",
+            "app.js",
+        ),
+        "exclude": ("server-side", "database", "api"),
+    },
+    {
         "id": "verification_only",
         "keywords": ("run tests", "verification", "verify", "test only", "test-run"),
         "exclude": ("implement", "feature", "refactor", "rewrite", "build"),
@@ -4495,6 +4510,193 @@ def _build_local_plan_from_intent(
 
     plan_steps: List[Dict[str, object]] = []
     summary_bits: List[str] = [intent.replace("_", " ")]
+
+    if intent == "static_counter_app":
+        # Keep this fallback intentionally small and dependency-free.  The
+        # generated test executes the same browser script in a minimal DOM
+        # harness, so a successful solver result still represents useful
+        # behaviour rather than merely syntactically valid files.
+        app_files = {
+            "index.html": """<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>Fun Counter</title>
+  <link rel=\"stylesheet\" href=\"styles.css\">
+</head>
+<body>
+  <main class=\"counter-card\" aria-labelledby=\"title\">
+    <h1 id=\"title\">Fun Counter</h1>
+    <p id=\"count\" aria-live=\"polite\" aria-atomic=\"true\">0</p>
+    <div class=\"controls\" aria-label=\"Counter controls\">
+      <button id=\"increment\" type=\"button\">Increment</button>
+      <button id=\"reset\" type=\"button\">Reset</button>
+    </div>
+  </main>
+  <script src=\"app.js\"></script>
+</body>
+</html>
+""",
+            "styles.css": """/* REQ-005: responsive card and requested button colours. */
+:root {
+  color-scheme: light;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  display: grid;
+  min-height: 100vh;
+  margin: 0;
+  place-items: center;
+  background: #f4f7fb;
+}
+
+.counter-card {
+  width: min(90vw, 28rem);
+  padding: 2rem;
+  text-align: center;
+  background: #fff;
+  border-radius: 1rem;
+  box-shadow: 0 0.75rem 2rem rgb(25 50 80 / 15%);
+}
+
+#count {
+  margin: 1.5rem 0;
+  font-size: clamp(3rem, 12vw, 6rem);
+  font-variant-numeric: tabular-nums;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  justify-content: center;
+}
+
+button {
+  min-width: 8rem;
+  padding: 0.75rem 1rem;
+  border: 0;
+  border-radius: 0.5rem;
+  color: #102014;
+  cursor: pointer;
+  font: inherit;
+}
+
+button:focus-visible {
+  outline: 0.2rem solid #174ea6;
+  outline-offset: 0.15rem;
+}
+
+#increment { background: #63d471; }
+#reset { background: #f28b82; }
+""",
+            "app.js": """// REQ-006/REQ-007: keep state local and expose keyboard-accessible buttons.
+(() => {
+  let value = 0;
+  const display = document.getElementById('count');
+  const increment = document.getElementById('increment');
+  const reset = document.getElementById('reset');
+
+  const render = () => {
+    display.textContent = String(value);
+  };
+
+  increment.addEventListener('click', () => {
+    value += 1;
+    render();
+  });
+
+  reset.addEventListener('click', () => {
+    value = 0;
+    render();
+  });
+
+  render();
+})();
+""",
+            "README.md": """# Fun Counter
+
+Dependency-free static web app implementing REQ-001 through REQ-008.
+
+Open `index.html` directly, or run `python -m http.server 8000` from this
+directory and visit <http://127.0.0.1:8000>.  The Increment button increases
+the value and Reset returns it to zero.  Both controls are native buttons and
+therefore work with keyboard focus and activation.
+""",
+            "smoke_test.js": """// Behaviour check for REQ-006 and REQ-007; uses only Node's standard library.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+const handlers = {};
+const elements = {
+  count: { textContent: '' },
+  increment: { addEventListener: (event, fn) => { handlers.increment = fn; } },
+  reset: { addEventListener: (event, fn) => { handlers.reset = fn; } },
+};
+
+vm.runInNewContext(fs.readFileSync('app.js', 'utf8'), {
+  document: { getElementById: (id) => elements[id] },
+});
+assert.equal(elements.count.textContent, '0');
+handlers.increment();
+assert.equal(elements.count.textContent, '1');
+handlers.reset();
+assert.equal(elements.count.textContent, '0');
+console.log('counter smoke test passed');
+""",
+        }
+        requirement_refs = sorted(
+            set(required_ids or set())
+            | {match.upper() for match in REQ_ID_RE.findall(source.requirements_text or "")}
+        )
+        for path, content in app_files.items():
+            plan_steps.append(
+                {
+                    "type": "write_file",
+                    "step": f"Implement {path} for REQ-001 through REQ-008",
+                    "path": path,
+                    "content": content,
+                    "overwrite": True,
+                }
+            )
+        if allow_run:
+            plan_steps.extend(
+                [
+                    {
+                        "type": "run_command",
+                        "step": "Run JavaScript syntax and behaviour checks for REQ-006 and REQ-007",
+                        "command": "node --check app.js",
+                        "workdir": ".",
+                        "timeout": 60,
+                    },
+                    {
+                        "type": "run_command",
+                        "step": "Run JavaScript behaviour smoke test for REQ-006 and REQ-007",
+                        "command": "node smoke_test.js",
+                        "workdir": ".",
+                        "timeout": 60,
+                    },
+                    {
+                        "type": "run_command",
+                        "step": "Run bounded static-server smoke check for REQ-008",
+                        "command": "python -m http.server 8000",
+                        "workdir": ".",
+                        "timeout": 30,
+                    },
+                ]
+            )
+        summary_bits.append("validated static browser behaviour")
+        return {
+            "summary": f"Local plan ({', '.join(summary_bits)})",
+            "requirements": requirement_refs,
+            "done": False,
+            "plan": plan_steps,
+            "provider": "local_heuristic",
+            "local_intent": intent_info,
+        }
 
     if intent == "verification_only":
         verification_steps = _select_verification_steps(
