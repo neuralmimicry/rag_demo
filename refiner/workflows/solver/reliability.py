@@ -18,12 +18,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 CODE_EXTENSIONS = {
     ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js",
-    ".jsx", ".php", ".py", ".rb", ".rs", ".sh", ".sql", ".ts", ".tsx",
+    ".jsx", ".php", ".py", ".rb", ".rs", ".sh", ".sql", ".ts", ".tsx", ".css",
 }
 MANIFEST_NAMES = {
     "cargo.toml", "go.mod", "package.json", "package-lock.json", "pnpm-lock.yaml",
     "poetry.lock", "pyproject.toml", "requirements-dev.txt", "requirements.txt",
-    "setup.cfg", "setup.py", "uv.lock",
+    "setup.cfg", "setup.py", "uv.lock", "readme.md", "readme.rst",
 }
 
 

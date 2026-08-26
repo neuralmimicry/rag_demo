@@ -7528,6 +7528,14 @@ def _build_module_registry(
             for source in payload["sources"]:
                 linked_examples |= examples_by_source.get(source, set())
 
+        # A runnable smoke test is also a concrete usage example when the
+        # project has no separate example module.  Treating it as both keeps
+        # the module-quality ledger aligned with small dependency-free apps,
+        # where duplicating the implementation in an example would reduce
+        # maintainability and create a second source of truth.
+        if not linked_examples and linked_tests:
+            linked_examples |= linked_tests
+
         module_entry = dict(payload)
         module_entry["tests"] = sorted(linked_tests)
         module_entry["examples"] = sorted(linked_examples)
@@ -12463,6 +12471,16 @@ def run_project_solver(
                     PhaseResult.halt("max steps reached", data={"scope": "run"}),
                 )
                 _record_action("Max steps reached; stopping iterations.", source_actions_log)
+                break
+            if payload.get("done") is True:
+                cycle.record(
+                    "reflect",
+                    PhaseResult.halt("terminal plan applied", data={"scope": "source"}),
+                )
+                _record_action(
+                    f"Terminal plan applied successfully for {source.path}; stopping further replanning.",
+                    source_actions_log,
+                )
                 break
             cycle.record("reflect", PhaseResult.ok("continue"))
             # Logical iterations advance only after an actionable plan has

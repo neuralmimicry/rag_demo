@@ -37,6 +37,30 @@ def test_canonical_project_target_keeps_generated_node_files_at_project_root(tmp
     assert resolved == "server.js"
 
 
+def test_canonical_project_target_keeps_web_assets_and_readme_together(tmp_path):
+    project_root = tmp_path / "project"
+    workspace = project_root / "project_solver_output"
+    workspace.mkdir(parents=True)
+
+    for requested in ("styles.css", "README.md"):
+        target, note = canonical_project_target(
+            requested,
+            project_root=str(project_root),
+            workspace_root=str(workspace),
+        )
+        assert target == requested
+        assert note and "canonical project-root" in note.lower()
+
+        resolved, _ = project_solver._resolve_file_target(
+            requested,
+            project_root=str(project_root),
+            workspace_root=str(workspace),
+            step_type="write_file",
+            prefer_workspace_new_files=True,
+        )
+        assert resolved == requested
+
+
 def test_canonical_project_target_does_not_hide_path_traversal():
     target, note = canonical_project_target(
         "../outside.js",
