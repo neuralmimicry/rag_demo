@@ -3625,6 +3625,38 @@ def _parse_localhost_probe(command: str) -> Optional[Tuple[str, int]]:
     return host, port
 
 
+def _parse_foreground_server_port(command: Union[str, Sequence[str]]) -> Optional[int]:
+    """Recognise bounded Python static-server commands emitted by planners.
+
+    A foreground development server is useful for an acceptance probe, but it
+    must never be handed to ``subprocess.run`` because that waits forever for a
+    process whose purpose is to stay alive.  The solver owns the short-lived
+    smoke-test lifecycle instead.  Keep this deliberately narrow: arbitrary
+    long-running commands still go through the normal command policy and
+    timeout handling.
+    """
+    if isinstance(command, str):
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return None
+    else:
+        parts = [str(part) for part in command]
+    if len(parts) < 3:
+        return None
+    executable = os.path.basename(parts[0]).lower()
+    if executable not in {"python", "python3"}:
+        return None
+    if parts[1:3] != ["-m", "http.server"]:
+        return None
+    for token in parts[3:]:
+        if token.isdigit():
+            port = int(token)
+            if 1 <= port <= 65535:
+                return port
+    return 8000
+
+
 def _is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -3742,6 +3774,111 @@ def _execute_shell_command(
         run_env.update(policy.env)
     if command_env:
         run_env.update({str(key): str(value) for key, value in command_env.items() if str(key)})
+
+    # A planner occasionally includes ``python -m http.server`` as a
+    # verification action.  Running it with subprocess.run would block until
+    # the solver's (usually ten-minute) command timeout.  Start it only long
+    # enough to prove that the server binds, then always tear it down.  The
+    # normal localhost-probe path remains responsible for bounded acceptance
+    # requests against an application server.
+    server_port = _parse_foreground_server_port(policy.argv)
+    if server_port is not None:
+        server_timeout = min(
+            max(1, int(timeout)),
+            max(1, _env_int("SOLVER_SERVER_STARTUP_TIMEOUT_SEC", 15)),
+        )
+        server_proc = None
+        started_by_solver = False
+        server_success = False
+        server_error = ""
+        try:
+            if _is_port_open("127.0.0.1", server_port):
+                actions_log.append(
+                    f"Foreground HTTP server smoke check reused open port {server_port}."
+                )
+                server_success = True
+            else:
+                logger.info(
+                    "Starting bounded foreground HTTP server smoke check: %s",
+                    command_display,
+                )
+                server_proc = subprocess.Popen(
+                    policy.argv,
+                    cwd=workdir,
+                    shell=False,
+                    start_new_session=(os.name == "posix"),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=run_env,
+                )
+                started_by_solver = True
+                server_success = _wait_for_port(
+                    "127.0.0.1",
+                    server_port,
+                    timeout=float(server_timeout),
+                )
+                if not server_success:
+                    server_error = (
+                        f"HTTP server did not open port {server_port} within "
+                        f"{server_timeout}s"
+                    )
+        except Exception as exc:
+            server_error = str(exc)
+        finally:
+            if started_by_solver and server_proc is not None:
+                terminate_process_tree(server_proc)
+
+        exit_code = 0 if server_success else None
+        if server_success:
+            actions_log.append(
+                f"Bounded foreground HTTP server smoke check succeeded: {command_display}"
+            )
+            if executed_commands is not None:
+                executed_commands.append(command_display)
+        else:
+            server_error = server_error or "foreground HTTP server smoke check failed"
+            actions_log.append(
+                f"Bounded foreground HTTP server smoke check failed: {command_display} ({server_error})"
+            )
+            if executed_commands is not None:
+                executed_commands.append(command_display)
+            if failure_log is not None:
+                failure_log.append(
+                    {
+                        "command": command_display,
+                        "workdir": workdir,
+                        "exit_code": exit_code,
+                        "stdout": "",
+                        "stderr": server_error,
+                        "verification_issue": "server smoke check failed",
+                    }
+                )
+        if command_trust_store is not None:
+            try:
+                trust = command_trust_store.record(
+                    policy,
+                    success=server_success,
+                    exit_code=exit_code,
+                )
+            except Exception:
+                pass
+        if command_results is not None:
+            command_results.append(
+                {
+                    "command": command_display,
+                    "shape": trust.shape if trust else "",
+                    "category": policy.category,
+                    "policy_allowed": True,
+                    "policy_risk": policy.risk,
+                    "effective_risk": trust.effective_risk if trust else policy.risk,
+                    "trust_level": trust.level if trust else "",
+                    "trust_score": round(float(trust.score), 4) if trust is not None else None,
+                    "success": server_success,
+                    "exit_code": exit_code,
+                    "verification_issue": None if server_success else "server smoke check failed",
+                }
+            )
+        return server_success
 
     try:
         logger.info(f"Executing command: {command_display} (workdir={workdir})")

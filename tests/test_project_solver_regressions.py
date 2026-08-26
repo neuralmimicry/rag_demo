@@ -11,6 +11,48 @@ class _FakeCompletedProcess:
         self.stderr = stderr
 
 
+class _FakeServerProcess:
+    pid = 12345
+
+
+def test_foreground_http_server_is_bounded_and_cleaned_up(monkeypatch, tmp_path):
+    process = _FakeServerProcess()
+    terminated = []
+
+    monkeypatch.setattr(project_solver, "_is_port_open", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(project_solver, "_wait_for_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        project_solver.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    monkeypatch.setattr(
+        project_solver,
+        "terminate_process_tree",
+        lambda value: terminated.append(value),
+    )
+
+    actions_log = []
+    failure_log = []
+    executed_commands = []
+    ok = project_solver._execute_shell_command(
+        "python -m http.server 8000",
+        workdir=str(tmp_path),
+        timeout=600,
+        actions_log=actions_log,
+        failure_log=failure_log,
+        dataset_summary=None,
+        eval_info=None,
+        executed_commands=executed_commands,
+    )
+
+    assert ok is True
+    assert failure_log == []
+    assert terminated == [process]
+    assert executed_commands == ["python -m http.server 8000"]
+    assert any("bounded foreground http server smoke check succeeded" in item.lower() for item in actions_log)
+
+
 def test_select_verification_steps_prefers_py_compile_without_tests(tmp_path):
     (tmp_path / "main.py").write_text("print('ok')\n", encoding="utf-8")
     lang_info = {"languages": ["python"], "build_systems": []}
