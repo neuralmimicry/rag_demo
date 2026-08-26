@@ -19,6 +19,23 @@ def test_command_policy_blocks_shell_chains_and_destructive_patterns():
     assert evaluate_command_policy("git reset --hard").allowed is False
 
 
+def test_command_policy_allows_compiled_language_verification():
+    for command in (
+        "cc -std=c11 -fsyntax-only main.c",
+        "cmake -S . -B build",
+        "cmake --build build",
+        "make",
+        "go test ./...",
+        "cargo test",
+        "mvn test",
+        "gradle test",
+        "kotlinc Main.kt -d refiner-kotlin-check.jar",
+    ):
+        decision = evaluate_command_policy(command)
+        assert decision.allowed is True, (command, decision)
+        assert decision.category == "verification"
+
+
 def test_command_policy_strict_mode_blocks_non_verification_commands(monkeypatch):
     monkeypatch.setenv("REFINER_SOLVER_COMMAND_POLICY_MODE", "strict")
 

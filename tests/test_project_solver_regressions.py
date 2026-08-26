@@ -706,3 +706,26 @@ def test_repair_source_requirement_registration_preserves_explicit_ids_and_drops
     assert by_id["REQ-001"]["description"] == "Use Node.js for the backend."
     assert by_id["REQ-002"]["description"] == "Export the Express app for tests."
     assert all(item["title"] != "Requirements Register" for item in repaired["requirements"])
+
+
+def test_compiled_language_verification_keeps_native_build_phases(tmp_path):
+    (tmp_path / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.15)\nproject(sample C)\nadd_executable(sample main.c)\n",
+        encoding="utf-8",
+    )
+    steps = project_solver._select_verification_steps(
+        str(tmp_path), {"languages": ["c"], "build_systems": ["cmake"]}, max_steps=2
+    )
+    commands = [step["command"] for step in steps]
+    assert "cmake -S . -B build" in commands
+    assert "cmake --build build" in commands
+
+
+def test_kotlin_verification_uses_project_build_tool(tmp_path):
+    (tmp_path / "Main.kt").write_text("fun main() = println(\"ok\")\n", encoding="utf-8")
+    (tmp_path / "pom.xml").write_text("<project/>\n", encoding="utf-8")
+    steps = project_solver._select_verification_steps(
+        str(tmp_path), {"languages": ["kotlin"], "build_systems": ["maven"]}, max_steps=2
+    )
+    assert any(step["command"] == "mvn test" for step in steps)

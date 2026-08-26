@@ -114,6 +114,12 @@ def _categorize_command(executable: str, argv: List[str]) -> str:
             return "verification"
         return "go"
 
+    if executable in {
+        "cc", "gcc", "clang", "c++", "g++", "clang++", "cmake", "make",
+        "ninja", "kotlinc", "kotlin", "gradle", "gradlew", "mvn", "mvnw",
+    }:
+        return "verification"
+
     if executable in _PACKAGE_MANAGERS:
         return "dependency_install"
 

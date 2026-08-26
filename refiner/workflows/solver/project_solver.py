@@ -3509,6 +3509,8 @@ def _is_verification_command(command: str) -> bool:
         r"\bgo\s+test\b",
         r"\bcargo\s+test\b",
         r"\bcargo\s+nextest\b",
+        r"\b(?:cc|gcc|clang|c\+\+|g\+\+|clang\+\+)\b",
+        r"\bcmake\s+--build\b",
         r"\bctest\b",
         r"\bmeson\s+test\b",
         r"\bdotnet\s+test\b",
@@ -3516,7 +3518,8 @@ def _is_verification_command(command: str) -> bool:
         r"\bgradle\s+test\b",
         r"\bgradle\s+check\b",
         r"\b\./gradlew\s+test\b",
-        r"\bmake\s+(test|check)\b",
+        r"\b(?:kotlinc|kotlin)\b",
+        r"\bmake(?:\s+(?:test|check))?\b",
         r"\bninja\s+test\b",
         r"\bflutter\s+test\b",
         r"\bdart\s+test\b",
@@ -4095,6 +4098,98 @@ def _discover_pytest_target(root: str, *, max_depth: int = 4) -> Optional[str]:
     return None
 
 
+def _source_files_for_language(
+    project_root: str,
+    extensions: Sequence[str],
+    *,
+    max_files: int = 12,
+) -> List[str]:
+    """Return deterministic source paths for compiler-backed checks.
+
+    A project can contain several languages and generated/build directories.
+    Keeping discovery bounded and using project-relative paths makes the
+    resulting verification command safe to log, replay, and send through the
+    existing shell-free command policy.
+    """
+
+    if not project_root or not os.path.isdir(project_root):
+        return []
+    wanted = {str(extension).lower() for extension in extensions}
+    ignored = _ignored_dirnames(None)
+    paths: List[str] = []
+    for walk_root, dirs, files in os.walk(project_root):
+        _filter_walk_dirs(walk_root, dirs, ignored)
+        for filename in sorted(files):
+            if os.path.splitext(filename)[1].lower() not in wanted:
+                continue
+            absolute = os.path.join(walk_root, filename)
+            relative = os.path.relpath(absolute, project_root).replace("\\", "/")
+            paths.append(relative)
+            if len(paths) >= max_files:
+                return paths
+    return paths
+
+
+def _native_syntax_check_command(
+    project_root: str,
+    *,
+    language: str,
+    max_files: int = 12,
+) -> Optional[str]:
+    """Build a compiler syntax check when no native build system is present."""
+
+    if language == "c":
+        files = _source_files_for_language(project_root, (".c",), max_files=max_files)
+        compiler, standard = "cc", "c11"
+    else:
+        files = _source_files_for_language(
+            project_root,
+            (".cc", ".cpp", ".cxx"),
+            max_files=max_files,
+        )
+        compiler, standard = "c++", "c++17"
+    if not files:
+        return None
+    quoted = " ".join(shlex.quote(path) for path in files)
+    return f"{compiler} -std={standard} -Wall -Wextra -Werror -fsyntax-only {quoted}"
+
+
+def _kotlin_verification_command(project_root: str) -> Optional[str]:
+    """Select the repository's Kotlin build tool, preserving wrapper use."""
+
+    if os.path.isfile(os.path.join(project_root, "gradlew")):
+        return "./gradlew test"
+    if os.path.isfile(os.path.join(project_root, "build.gradle")) or os.path.isfile(
+        os.path.join(project_root, "build.gradle.kts")
+    ):
+        return "gradle test"
+    if os.path.isfile(os.path.join(project_root, "pom.xml")):
+        return "./mvnw test" if os.path.isfile(os.path.join(project_root, "mvnw")) else "mvn test"
+    files = _source_files_for_language(project_root, (".kt",), max_files=12)
+    if not files:
+        files = _source_files_for_language(project_root, (".kts",), max_files=12)
+    if not files:
+        return None
+    quoted = " ".join(shlex.quote(path) for path in files)
+    # Keep the output in the current project directory: the solver runs
+    # commands shell-free and cannot rely on a preceding mkdir command.
+    return f"kotlinc {quoted} -d refiner-kotlin-check.jar"
+
+
+def _verification_step_budget(lang_info: Dict[str, List[str]]) -> int:
+    """Give mixed-language projects one check per detected implementation lane."""
+
+    languages = set(lang_info.get("languages") or [])
+    build_systems = set(lang_info.get("build_systems") or [])
+    lanes = languages | {
+        system for system in build_systems if system in {"cmake", "make", "gradle", "maven"}
+    }
+    # CMake has two intentionally separate shell-free phases. Reserve both
+    # slots so the build phase cannot be silently removed by the final slice.
+    required = len(lanes) + (1 if "cmake" in build_systems else 0)
+    return max(4, min(12, required or 4))
+
+
 def _select_verification_steps(
     project_root: str,
     lang_info: Dict[str, List[str]],
@@ -4102,6 +4197,10 @@ def _select_verification_steps(
     workspace_root: Optional[str] = None,
     max_steps: int = 2,
 ) -> List[Dict[str, object]]:
+    # ``max_steps`` is a caller safeguard, not permission to omit a required
+    # language lane. Native configure/build needs two observable steps and
+    # must remain atomic from an acceptance perspective.
+    max_steps = max(int(max_steps or 0), _verification_step_budget(lang_info))
     languages = set(lang_info.get("languages") or [])
     build_systems = set(lang_info.get("build_systems") or [])
     steps: List[Dict[str, object]] = []
@@ -4221,6 +4320,58 @@ def _select_verification_steps(
                 "timeout": 900,
             }
         )
+
+    native_build_system = next(
+        (system for system in ("cmake", "make") if system in build_systems),
+        None,
+    )
+    if ("c" in languages or "cpp" in languages or native_build_system) and len(steps) < max_steps:
+        if native_build_system == "cmake":
+            # Keep configure and build as separate shell-free steps.  The
+            # command policy deliberately rejects ``&&`` and other shell
+            # control operators, so each phase is independently observable.
+            if len(steps) < max_steps:
+                steps.append(
+                    {
+                        "type": "run_command",
+                        "step": "Configure C/C++ project with CMake",
+                        "command": "cmake -S . -B build",
+                        "workdir": ".",
+                        "timeout": 900,
+                    }
+                )
+            command = "cmake --build build"
+            step_name = "Build C/C++ project with CMake"
+        elif native_build_system == "make":
+            command = "make"
+            step_name = "Build C/C++ project with Make"
+        else:
+            language = "cpp" if "cpp" in languages else "c"
+            command = _native_syntax_check_command(project_root, language=language)
+            step_name = f"Run {language.upper()} compiler syntax checks"
+        if command and len(steps) < max_steps:
+            steps.append(
+                {
+                    "type": "run_command",
+                    "step": step_name,
+                    "command": command,
+                    "workdir": ".",
+                    "timeout": 900,
+                }
+            )
+
+    if "kotlin" in languages and len(steps) < max_steps:
+        command = _kotlin_verification_command(project_root)
+        if command:
+            steps.append(
+                {
+                    "type": "run_command",
+                    "step": "Run Kotlin build/tests",
+                    "command": command,
+                    "workdir": ".",
+                    "timeout": 900,
+                }
+            )
 
     return steps[:max_steps]
 
@@ -8759,6 +8910,15 @@ def _plan_local_recovery(
 
     if ("cargo: command not found" in text or "rustc: command not found" in text) and "rust" in languages:
         recovery["reason"] = "rust toolchain missing"
+        recovery["commands"] = []
+        return recovery
+
+    if (
+        ("kotlinc: command not found" in text or "gradle: command not found" in text
+         or "mvn: command not found" in text)
+        and "kotlin" in languages
+    ):
+        recovery["reason"] = "kotlin toolchain missing"
         recovery["commands"] = []
         return recovery
 

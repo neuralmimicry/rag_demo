@@ -425,6 +425,16 @@ def run_vcs_workflow(
             for cmd in commands:
                 action_entry["commands"].append({"command": " ".join(cmd), "status": "planned"})
         details["actions"].append(action_entry)
+        # A branch action may have changed HEAD. Re-read it before generating
+        # the next action so an implicit push follows the checked-out solver
+        # branch rather than the branch that was active at pipeline start.
+        if allow_run and action_entry["status"] == "ok":
+            active_branch = _current_branch(project_root)
+            if active_branch and active_branch != variables.get("branch"):
+                variables["branch"] = active_branch
 
+    final_branch = _current_branch(project_root) if allow_run else variables.get("branch")
+    if final_branch:
+        details["current_branch"] = final_branch
     details["status"] = details.get("status") or ("planned" if not allow_run else "ok")
     return VcsResult(status=details["status"], details=details)

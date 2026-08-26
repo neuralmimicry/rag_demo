@@ -234,14 +234,26 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR ${APP_HOME}
 
-# Runtime packages only. Compiler toolchains and headers remain in the builder
-# stage, reducing attack surface and image size.
+# Refiner executes acceptance checks in the runtime container, including for
+# repositories written in compiled languages. Keep the complete, non-header
+# toolchains here; otherwise a C/C++/Go/Rust/Kotlin job could be reported as
+# complete without actually running its language-appropriate verification.
 ARG RUNTIME_PACKAGES="\
     bash \
     ca-certificates \
     curl \
     ffmpeg \
     git \
+    build-essential \
+    cmake \
+    ninja-build \
+    golang-go \
+    rustc \
+    cargo \
+    openjdk-17-jdk-headless \
+    kotlin \
+    maven \
+    gradle \
     nodejs \
     npm \
     tini \

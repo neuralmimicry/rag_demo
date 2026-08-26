@@ -3,6 +3,20 @@ import refiner.delivery_pipeline as delivery_pipeline
 from refiner.delivery_pipeline import run_delivery_pipeline
 
 
+class _FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
 def test_delivery_gate_blocks_deploy_stage(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()
@@ -145,3 +159,42 @@ def test_delivery_gate_allows_production_rollout_with_successful_github_actions(
     assert report["status"] == "success"
     assert report["github_actions"]["succeeded"] is True
     assert report["stages"][0]["status"] == "no_op"
+
+
+def test_github_actions_gate_matches_the_uploaded_commit(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "README.md").write_text("demo", encoding="utf-8")
+    expected_sha = "a" * 40
+
+    monkeypatch.setattr(
+        delivery_pipeline.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _FakeResponse(
+            {
+                "workflow_runs": [
+                    {"status": "completed", "conclusion": "success", "head_sha": "b" * 40},
+                    {"status": "completed", "conclusion": "success", "head_sha": expected_sha},
+                ]
+            }
+        ),
+    )
+
+    report = delivery_pipeline._github_actions_report(
+        str(project_root),
+        {
+            "enabled": True,
+            "require_success": True,
+            "owner": "neuralmimicry",
+            "repo": "demo",
+            "branch": "main",
+            "workflow_file": "ci.yml",
+            "wait_timeout_sec": 0,
+        },
+        True,
+        expected_sha=expected_sha,
+    )
+
+    assert report["succeeded"] is True
+    assert report["expected_sha"] == expected_sha
+    assert report["run"]["head_sha"] == expected_sha

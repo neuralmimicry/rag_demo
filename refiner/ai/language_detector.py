@@ -15,6 +15,7 @@ LANGUAGE_EXTS = {
     "rust": {".rs"},
     "c": {".c", ".h"},
     "cpp": {".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"},
+    "kotlin": {".kt", ".kts"},
     "fortran": {".f", ".f90", ".f95", ".f03", ".f08"},
     "pascal": {".pas", ".pp"},
     "shell": {".sh"},
@@ -38,6 +39,8 @@ BUILD_SYSTEM_FILES = {
     "cmake": ["CMakeLists.txt"],
     "meson": ["meson.build"],
     "ninja": ["build.ninja"],
+    "gradle": ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradlew"],
+    "maven": ["pom.xml", "mvnw"],
 }
 
 
