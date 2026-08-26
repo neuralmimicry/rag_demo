@@ -8029,7 +8029,35 @@ class JobManager:
         askpass_dir = os.path.dirname(job.log_path) if job.log_path else cwd
         env = self._git_env(token, askpass_dir)
         job.append_log(f"git: {' '.join(command)}")
-        return subprocess.run(command, cwd=cwd, capture_output=True, text=True, env=env, check=False)
+        # Git operates on shared storage in production.  A stalled NFS write must
+        # fail the job and release its worker rather than holding the whole web
+        # process in an unbounded subprocess call.  Keep this configurable for
+        # unusually large repositories while retaining a safe finite default.
+        timeout_seconds = max(
+            5.0,
+            _safe_float(os.getenv("REFINER_GIT_COMMAND_TIMEOUT_SECONDS"), 180.0),
+        )
+        try:
+            return subprocess.run(
+                command,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            message = f"git command timed out after {timeout_seconds:.1f}s"
+            job.append_log(message)
+            return subprocess.CompletedProcess(
+                command,
+                124,
+                stdout=stdout,
+                stderr=(f"{stderr}\n{message}").strip(),
+            )
 
     def _git_clone(self, clone_url: str, workspace: str, branch: str, token: Optional[str], job: Job) -> None:
         result = self._git_run(
