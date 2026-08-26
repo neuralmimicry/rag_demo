@@ -4682,7 +4682,7 @@ console.log('counter smoke test passed');
                     {
                         "type": "run_command",
                         "step": "Run bounded static-server smoke check for REQ-008",
-                        "command": "python -m http.server 8000",
+                        "command": "python3 -m http.server 8000",
                         "workdir": ".",
                         "timeout": 30,
                     },
@@ -4692,7 +4692,7 @@ console.log('counter smoke test passed');
         return {
             "summary": f"Local plan ({', '.join(summary_bits)})",
             "requirements": requirement_refs,
-            "done": False,
+            "done": True,
             "plan": plan_steps,
             "provider": "local_heuristic",
             "local_intent": intent_info,
@@ -11546,7 +11546,12 @@ def run_project_solver(
                 ),
             )
 
-            if payload.get("done") is True or not plan_steps:
+            # A terminal planner response can still contain the actionable
+            # steps that implement the final change.  Execute those steps and
+            # only use the no-plan branch when there is genuinely nothing to
+            # apply.  This also lets deterministic local fallback plans mark
+            # themselves terminal without being mistaken for an empty plan.
+            if not plan_steps:
                 if source_requires_code:
                     opencode_payload = _maybe_codingagent_fallback(
                         "done/no plan for code-required source",

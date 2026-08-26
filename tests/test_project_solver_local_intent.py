@@ -24,6 +24,7 @@ def test_counter_requirements_get_safe_local_plan(tmp_path):
 
     assert intent["intent"] == "static_counter_app"
     assert plan is not None
+    assert plan["done"] is True
     paths = {step["path"] for step in plan["plan"] if "path" in step}
     assert {"index.html", "styles.css", "app.js", "smoke_test.js"} <= paths
     commands = [step.get("command", "") for step in plan["plan"]]
