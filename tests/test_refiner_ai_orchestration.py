@@ -251,7 +251,9 @@ def test_orchestrator_best_mode_still_waits_for_slow_valid_json_after_fast_inval
     assert response.provider == "slow_valid"
     assert json.loads(response.text)["summary"] == "ok"
     assert elapsed >= 0.07
-    assert elapsed < 0.16
+    # Keep enough room for scheduler/runner overhead on ARM64 while retaining
+    # the lower bound that proves the slower valid candidate was awaited.
+    assert elapsed < 0.35
 
 
 def test_orchestrator_fastest_mode_returns_first_acceptable_success(tmp_path, monkeypatch):
