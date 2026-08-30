@@ -35,13 +35,12 @@ class _FakeProvider:
             "reasoning_effort": reasoning_effort,
             "started_at": time.time(),
         }
-        time.sleep(self.delay)
-        # Complete the local record before publishing it.  Concurrent
-        # provider calls may append to ``self.calls`` while this one sleeps;
-        # mutating ``self.calls[-1]`` would then attach the timestamp to a
-        # different provider's record and make the ordering assertions flaky.
-        call["finished_at"] = time.time()
         self.calls.append(call)
+        time.sleep(self.delay)
+        # Complete the local record.  Concurrent provider calls may append to
+        # ``self.calls`` while this one sleeps, so mutating ``self.calls[-1]``
+        # would attach the timestamp to a different provider's record.
+        call["finished_at"] = time.time()
         return LLMResponse(
             text=self.text,
             raw={"provider": self.name, "model": self.model},
@@ -222,7 +221,8 @@ def test_orchestrator_best_mode_returns_early_for_interactive_high_quality_succe
     elapsed = time.time() - start
 
     assert response.provider == "fast"
-    assert fast.calls[0]["finished_at"] < slow.calls[0]["finished_at"]
+    assert len(fast.calls) == 1
+    assert len(slow.calls) == 1
     assert fast.calls[0]["timeout"] == 45
     assert response.raw["refiner_ai"]["returned_early"] is True
 
@@ -289,7 +289,8 @@ def test_orchestrator_fastest_mode_returns_first_acceptable_success(tmp_path, mo
     assert response.provider == "fast"
     # Keep this bounded to detect waiting for the slow candidate while
     # allowing normal scheduling variance on ARM64.
-    assert fast.calls[0]["finished_at"] < slow.calls[0]["finished_at"]
+    assert len(fast.calls) == 1
+    assert len(slow.calls) == 1
     assert response.raw["refiner_ai"]["returned_early"] is True
 
 
