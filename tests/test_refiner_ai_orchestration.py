@@ -26,19 +26,22 @@ class _FakeProvider:
         timeout=None,
         reasoning_effort=None,
     ):
-        self.calls.append(
-            {
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "system": system,
-                "timeout": timeout,
-                "reasoning_effort": reasoning_effort,
-                "started_at": time.time(),
-            }
-        )
+        call = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "system": system,
+            "timeout": timeout,
+            "reasoning_effort": reasoning_effort,
+            "started_at": time.time(),
+        }
         time.sleep(self.delay)
-        self.calls[-1]["finished_at"] = time.time()
+        # Complete the local record before publishing it.  Concurrent
+        # provider calls may append to ``self.calls`` while this one sleeps;
+        # mutating ``self.calls[-1]`` would then attach the timestamp to a
+        # different provider's record and make the ordering assertions flaky.
+        call["finished_at"] = time.time()
+        self.calls.append(call)
         return LLMResponse(
             text=self.text,
             raw={"provider": self.name, "model": self.model},
