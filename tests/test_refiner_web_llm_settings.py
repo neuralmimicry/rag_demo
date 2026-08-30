@@ -266,3 +266,53 @@ def test_build_request_llm_provider_disables_configured_pool_for_regular_users(m
     )
 
     assert captured["include_configured"] is False
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask-backed Refiner web tests require a real Flask runtime")
+def test_apply_user_job_defaults_resolves_provider_when_profile_has_none(monkeypatch):
+    monkeypatch.setattr(refiner_web, "_settings_defaults_for_user", lambda user: {})
+    monkeypatch.setattr(refiner_web, "_gail_enabled", lambda: False)
+    monkeypatch.setattr(
+        refiner_web,
+        "_resolve_llm_settings",
+        lambda user: {"provider": "ollama", "model": "qwen2.5-coder:7b"},
+    )
+
+    payload = {}
+    refiner_web._apply_user_job_defaults(payload, "conductor")
+
+    assert payload["llm_provider"] == "ollama"
+    assert payload["llm_model"] == "qwen2.5-coder:7b"
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask-backed Refiner web tests require a real Flask runtime")
+def test_apply_user_job_defaults_uses_gail_provider_hint_without_model(monkeypatch):
+    monkeypatch.setattr(
+        refiner_web,
+        "_settings_defaults_for_user",
+        lambda user: {"provider": "ollama", "model": "qwen2.5-coder:7b"},
+    )
+    monkeypatch.setattr(refiner_web, "_gail_enabled", lambda: True)
+    monkeypatch.setattr(refiner_web, "_resolve_llm_settings", lambda user: {})
+
+    payload = {}
+    refiner_web._apply_user_job_defaults(payload, "conductor")
+
+    assert payload == {"llm_provider": "openai"}
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask-backed Refiner web tests require a real Flask runtime")
+def test_apply_user_job_defaults_preserves_explicit_provider_and_model(monkeypatch):
+    monkeypatch.setattr(refiner_web, "_settings_defaults_for_user", lambda user: {})
+    monkeypatch.setattr(refiner_web, "_gail_enabled", lambda: True)
+    monkeypatch.setattr(
+        refiner_web,
+        "_resolve_llm_settings",
+        lambda user: {"provider": "ollama", "model": "qwen2.5-coder:7b"},
+    )
+
+    payload = {"llm_provider": "openai", "llm_model": "gpt-test"}
+    refiner_web._apply_user_job_defaults(payload, "conductor")
+
+    assert payload["llm_provider"] == "openai"
+    assert payload["llm_model"] == "gpt-test"

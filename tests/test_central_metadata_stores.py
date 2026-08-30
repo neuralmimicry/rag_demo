@@ -233,3 +233,42 @@ def test_job_persist_syncs_metadata_to_central_store(monkeypatch, tmp_path):
 
     assert job_store.records["job-123"]["owner"] == "alice"
     assert job_store.records["job-123"]["project_id"] == "project-123"
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask-backed Refiner tests require a real Flask runtime")
+def test_postgres_job_list_query_types_nullable_filters():
+    import inspect
+    from refiner.runtime import central_store
+
+    query = inspect.getsource(central_store.PostgresJobStore.list_jobs)
+
+    assert "(%s::text IS NULL OR owner = %s)" in query
+    assert "(%s::text IS NULL OR status = %s)" in query
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask-backed Refiner tests require a real Flask runtime")
+def test_job_logs_survive_live_buffer_rehydration(tmp_path):
+    job_dir = tmp_path / "job-logs"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    log_path = job_dir / "job.log"
+    log_path.touch()
+    job = refiner_web.Job(
+        job_id="job-logs",
+        payload={"workflow": "project_solver"},
+        owner="alice",
+        log_path=str(log_path),
+        events_path=str(job_dir / "events.jsonl"),
+        meta_path=str(job_dir / refiner_web.JOB_META_FILENAME),
+    )
+
+    job.append_log("Job blocked: missing GitHub token", stream="stderr")
+    job.log_buffer.clear()
+
+    logs = job.get_log_tail(10)
+    assert logs == [
+        {
+            "ts": "--",
+            "line": "Job blocked: missing GitHub token",
+            "stream": "logfile",
+        }
+    ]

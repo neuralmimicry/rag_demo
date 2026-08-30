@@ -126,7 +126,7 @@ RUN set -eux; \
     mkdir -p /src/data; \
     printf '%s\n' \
         "import json" \
-        "from refiner.capability_analyzer import analyse_repo" \
+        "from refiner.runtime.capability_analyzer import analyse_repo" \
         "" \
         "with open('/src/data/capabilities_report.json', 'w', encoding='utf-8') as handle:" \
         "    json.dump(analyse_repo('/src'), handle, ensure_ascii=True)" \

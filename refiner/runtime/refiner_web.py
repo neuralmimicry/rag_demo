@@ -156,6 +156,7 @@ from refiner.refiner_settings import (
 from refiner.versioning import get_public_version_info, get_version_info
 from refiner.refiner_ai_orchestration import build_workflow_provider, orchestration_status
 from refiner.refiner_ai_model_inventory import AIModelInventoryMonitor
+from refiner.refiner_ai_gail import gail_enabled as _gail_enabled
 from refiner.integrations.atlassian.actions import execute_atlassian_action as _execute_atlassian_action_impl
 from refiner.integrations.platform.continuum_client import (
     ContinuumClientConfig,
@@ -5213,6 +5214,19 @@ class Job:
         with self.lock:
             self.log_buffer.append(entry)
             listeners = list(self.log_listeners)
+            log_path = self.log_path
+        # Keep a durable plain-text trail as well as the bounded live buffer.
+        # The buffer is intentionally process-local, while job metadata can
+        # be rehydrated after a restart and get_log_tail() already falls back
+        # to this file when the buffer is empty.
+        if log_path:
+            try:
+                with open(log_path, "a", encoding="utf-8") as handle:
+                    handle.write(entry["line"] + "\n")
+            except Exception:
+                # Logging must never make a job fail, especially when a
+                # workspace or persistent volume is temporarily unavailable.
+                pass
         for listener in listeners:
             try:
                 listener.put_nowait(entry)
@@ -7488,7 +7502,10 @@ class JobManager:
             "-m",
             os.getenv("REFINER_RUNNER_MODULE", "refiner.run_refiner"),
             "--log-file",
-            job.log_path,
+            # The parent captures the runner's stdout and persists it through
+            # Job.append_log(). Keep the runner's own file handler off the
+            # durable job log or every captured line would be written twice.
+            os.devnull,
             "--emit-events",
             "--events-file",
             job.events_path,
@@ -7891,8 +7908,17 @@ class JobManager:
     @staticmethod
     def _parse_repo_input(value: str) -> Optional[tuple]:
         value = value.strip()
+        # Conductor sends the canonical SSH form (git@github.com:owner/repo.git)
+        # for repository-backed jobs. Normalise it to the same owner/repo pair
+        # used by the HTTPS and shorthand forms below; cloning still uses HTTPS
+        # so the job's GitHub token can authenticate non-interactively.
+        ssh_match = re.fullmatch(r"git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?", value)
+        if ssh_match:
+            return ssh_match.group("owner"), ssh_match.group("repo")
+        if value.startswith("github.com/"):
+            value = "https://" + value
         if value.startswith("http://") or value.startswith("https://"):
-            match = re.match(r"https?://[^/]+/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\\.git)?$", value)
+            match = re.match(r"https?://[^/]+/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$", value)
             if not match:
                 return None, None
             return match.group("owner"), match.group("repo")
@@ -10205,10 +10231,37 @@ def _apply_user_job_defaults(payload: Dict[str, Any], owner: str) -> None:
     if not isinstance(payload, dict):
         return
     defaults = _settings_defaults_for_user(owner)
-    if not payload.get("llm_provider") and defaults.get("provider"):
-        payload["llm_provider"] = defaults.get("provider")
-    if not payload.get("llm_model") and defaults.get("model"):
+    # Refiner deployments delegate generation to Gail.  The project-solver
+    # CLI still requires a provider selector before it can start, even though
+    # Gail owns the actual provider/model choice and credentials.  Use a
+    # provider hint only; do not force a model or copy credentials into the
+    # job payload.
+    gail_is_enabled = False
+    try:
+        gail_is_enabled = _gail_enabled()
+    except Exception:
+        pass
+    if not payload.get("llm_provider"):
+        if gail_is_enabled:
+            payload["llm_provider"] = "openai"
+        elif defaults.get("provider"):
+            payload["llm_provider"] = defaults.get("provider")
+    if not payload.get("llm_model") and not gail_is_enabled and defaults.get("model"):
         payload["llm_model"] = defaults.get("model")
+    # A job submitted by an integration (for example Conductor) may not have
+    # a user profile with an explicit provider preference. Resolve the same
+    # accessible provider used by assistant requests when Gail is not the
+    # configured generation path. Never copy credentials into the job payload.
+    if (not payload.get("llm_provider") or not payload.get("llm_model")) and not gail_is_enabled:
+        try:
+            resolved = _resolve_llm_settings(owner)
+        except Exception as exc:
+            logger.warning("unable to resolve default job LLM provider: %s", exc)
+            resolved = {}
+        if not payload.get("llm_provider") and resolved.get("provider"):
+            payload["llm_provider"] = resolved.get("provider")
+        if not payload.get("llm_model") and resolved.get("model"):
+            payload["llm_model"] = resolved.get("model")
     if not payload.get("llm_reasoning_effort") and defaults.get("reasoning_effort"):
         payload["llm_reasoning_effort"] = defaults.get("reasoning_effort")
     if payload.get("codingagent") and not payload.get("codingagent_reasoning_effort") and defaults.get("reasoning_effort"):

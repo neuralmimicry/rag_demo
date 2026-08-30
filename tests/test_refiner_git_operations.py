@@ -55,6 +55,14 @@ def test_git_timeout_is_reported_as_a_failed_command(monkeypatch):
     assert any("timed out after 12.0s" in message for message in job.logs)
 
 
+def test_repo_input_accepts_conductor_ssh_and_github_shorthand():
+    parse = refiner_web.JobManager._parse_repo_input
+
+    assert parse("git@github.com:neuralmimicry/conductor.git") == ("neuralmimicry", "conductor")
+    assert parse("github.com/neuralmimicry/conductor") == ("neuralmimicry", "conductor")
+    assert parse("https://github.com/neuralmimicry/conductor.git/") == ("neuralmimicry", "conductor")
+
+
 def test_deterministic_rollback_reverts_exact_commit_without_rewriting_history(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

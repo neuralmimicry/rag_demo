@@ -1727,8 +1727,12 @@ class PostgresJobStore:
                     job_id, owner, workflow, status, progress, project_name, project_id,
                     team_id, archived, created_at, updated_at, started_at, finished_at, data
                 FROM nm_jobs
-                WHERE (%s IS NULL OR owner = %s)
-                  AND (%s IS NULL OR status = %s)
+                -- PostgreSQL cannot infer the type of a parameter used only
+                -- by an IS NULL check.  This query is exercised by the jobs
+                -- polling endpoint, so keep the nullable filters explicitly
+                -- typed instead of relying on server-side inference.
+                WHERE (%s::text IS NULL OR owner = %s)
+                  AND (%s::text IS NULL OR status = %s)
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT %s
                 """,
