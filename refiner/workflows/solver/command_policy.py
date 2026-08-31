@@ -54,7 +54,19 @@ _BLOCKED_EXECUTABLES = {
     "pwsh",
     "cmd.exe",
 }
-_READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "branch", "rev-parse"}
+# ``ls-remote`` only reads refs from a remote.  It is required for the
+# delivery gate to verify that a solver-pushed branch is visible on GitHub;
+# treating it as a mutation leaves otherwise successful no-change jobs stuck
+# in the unresolved-failure path.
+_READ_ONLY_GIT_SUBCOMMANDS = {
+    "status",
+    "diff",
+    "log",
+    "show",
+    "branch",
+    "rev-parse",
+    "ls-remote",
+}
 _PACKAGE_MANAGERS = {"pip", "pip3", "npm", "pnpm", "yarn", "cargo", "go", "uv"}
 _STRICT_ALLOWED_CATEGORIES = {"verification", "vcs_readonly"}
 

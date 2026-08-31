@@ -48,6 +48,16 @@ def test_command_policy_strict_mode_blocks_non_verification_commands(monkeypatch
     assert readonly_git.category == "vcs_readonly"
 
 
+def test_command_policy_allows_read_only_remote_ref_verification():
+    decision = evaluate_command_policy(
+        "git ls-remote origin refs/heads/refiner/bounded-completion-probe-6"
+    )
+
+    assert decision.allowed is True
+    assert decision.category == "vcs_readonly"
+    assert decision.risk == "low"
+
+
 def test_execute_shell_command_blocks_before_subprocess(monkeypatch, tmp_path):
     called = {"value": False}
 
