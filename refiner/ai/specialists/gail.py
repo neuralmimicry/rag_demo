@@ -248,7 +248,11 @@ class GailProvider(LLMProvider):
         if not selection_mode and not workflow_mode:
             selection_mode = gail_direct_selection_mode()
         max_candidates = self.max_candidates
-        if max_candidates is None and not workflow_mode:
+        # Workflow callers use the same bounded Refiner bridge settings as
+        # direct callers.  Leaving this unset makes Gail fan out across its
+        # full global pool, so one slow native model can consume the entire
+        # request deadline before the solver gets a response.
+        if max_candidates is None:
             max_candidates = gail_direct_max_candidates()
         has_explicit_request_credentials = any(
             str(value or "").strip()

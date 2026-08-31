@@ -219,6 +219,7 @@ def test_build_workflow_provider_propagates_include_configured_default_to_gail(m
 
 def test_gail_workflow_provider_omits_candidates_when_no_hints_and_using_configured_pool(monkeypatch):
     _enable_gail(monkeypatch)
+    monkeypatch.setenv("REFINER_GAIL_DIRECT_MAX_CANDIDATES", "1")
     captured = {}
     from refiner import refiner_ai_gail
 
@@ -258,6 +259,7 @@ def test_gail_workflow_provider_omits_candidates_when_no_hints_and_using_configu
     assert captured["json_payload"]["fallback_provider"] is None
     assert captured["json_payload"]["fallback_model"] is None
     assert captured["json_payload"]["fallback_api_key"] is None
+    assert captured["json_payload"]["max_candidates"] == 1
 
 
 def test_gail_workflow_provider_preserves_explicit_candidates_with_configured_pool(monkeypatch):
