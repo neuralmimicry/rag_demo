@@ -30,7 +30,7 @@ ARG BASE_IMAGE=python:3.11-slim-bookworm
 # Debian Bookworm's rustc/cargo (1.63/1.65) cannot read Cargo.lock format 4.
 # Keep the acceptance-test toolchain reproducible and independent of Debian's
 # slower-moving packages while retaining the Python base image for Refiner.
-ARG RUST_TOOLCHAIN_IMAGE=rust:1.88.0-bookworm
+ARG RUST_TOOLCHAIN_IMAGE=docker.io/library/rust:1.88.0-bookworm
 
 # -----------------------------------------------------------------------------
 # Shared defaults
