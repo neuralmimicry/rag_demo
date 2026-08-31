@@ -189,6 +189,18 @@ def test_rewrite_workspace_command_paths_for_embedded_python_check(tmp_path):
     assert actions_log
 
 
+def test_requirements_explicit_repository_root_disables_solver_workspace():
+    assert project_solver._requirements_specify_output_dir(
+        "Create PROBE_STATUS.md in the repository root."
+    )
+    assert project_solver._requirements_specify_output_dir(
+        "Keep the generated manifest in the project root."
+    )
+    assert not project_solver._requirements_specify_output_dir(
+        "Create the generated report without specifying its location."
+    )
+
+
 def test_command_should_use_workspace_for_generated_node_project(tmp_path):
     project_root = tmp_path / "sample-project"
     workspace_root = project_root / "project_solver_output"

@@ -9109,6 +9109,13 @@ def _plan_local_recovery_steps(
 
 def _requirements_specify_output_dir(requirements_text: str) -> bool:
     lowered = requirements_text.lower()
+    # A requirement can deliberately target the repository itself (for
+    # example, "create README.md in the repository root").  Treat those
+    # explicit root phrases as an output-location decision so ordinary
+    # generated artefacts still use the isolated solver workspace, while
+    # requested repository files remain in the checkout and are committed.
+    if re.search(r"\b(?:project|repository|repo)\s+root\b", lowered):
+        return True
     tokens = (
         ".venv",
         "venv/",
