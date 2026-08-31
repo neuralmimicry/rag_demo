@@ -6769,6 +6769,42 @@ def _should_replan_verification_failures(
     )
 
 
+def _verification_proves_source_complete(
+    *,
+    verification_steps_executed: int,
+    replan_due_to_hallucination: bool,
+    replan_due_to_verification: bool,
+    replan_due_to_replace: bool,
+    defer_source: bool,
+    unresolved_failures: List[Dict[str, object]],
+    source_path: str,
+) -> bool:
+    """Return whether successful acceptance checks can close a source.
+
+    Planner models are not required to emit ``done=true`` reliably after an
+    actionable plan has been applied. A source with at least one executed
+    verification step and no unresolved failure has stronger completion
+    evidence than another identical planner iteration. Keep all explicit
+    replan/defer signals blocking so failed or ambiguous work remains
+    resumable.
+    """
+
+    if verification_steps_executed <= 0:
+        return False
+    if (
+        replan_due_to_hallucination
+        or replan_due_to_verification
+        or replan_due_to_replace
+        or defer_source
+    ):
+        return False
+    return not any(
+        isinstance(failure, dict)
+        and _safe_str(failure.get("source")) == source_path
+        for failure in unresolved_failures
+    )
+
+
 def _failure_fingerprint(failure: Dict[str, object]) -> str:
     command = re.sub(r"\s+", " ", _safe_str(failure.get("command")).lower())
     workdir = _safe_str(failure.get("workdir")).replace("\\", "/").lower()
@@ -12721,6 +12757,33 @@ def run_project_solver(
                 cycle.record(
                     "reflect",
                     PhaseResult.halt("deferred source", data={"scope": "source"}),
+                )
+                break
+            if _verification_proves_source_complete(
+                verification_steps_executed=verification_steps_executed,
+                replan_due_to_hallucination=replan_due_to_hallucination,
+                replan_due_to_verification=replan_due_to_verification,
+                replan_due_to_replace=replan_due_to_replace,
+                defer_source=defer_source,
+                unresolved_failures=unresolved_failures,
+                source_path=source.path,
+            ):
+                payload["done"] = True
+                for prior_plan in reversed(all_plans):
+                    if (
+                        isinstance(prior_plan, dict)
+                        and prior_plan.get("source_path") == source.path
+                        and prior_plan.get("iteration") == iteration
+                    ):
+                        prior_plan["done"] = True
+                        break
+                cycle.record(
+                    "reflect",
+                    PhaseResult.halt("acceptance verification passed", data={"scope": "source"}),
+                )
+                _record_action(
+                    f"Acceptance verification passed for {source.path}; marking source complete.",
+                    source_actions_log,
                 )
                 break
             if total_steps_applied >= max_steps:

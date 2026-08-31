@@ -13,6 +13,30 @@ def test_solver_completion_exit_code_defaults_to_zero_without_summary():
     assert project_solver._solver_completion_exit_code(None) == 0
 
 
+def test_successful_acceptance_verification_can_close_source():
+    assert project_solver._verification_proves_source_complete(
+        verification_steps_executed=1,
+        replan_due_to_hallucination=False,
+        replan_due_to_verification=False,
+        replan_due_to_replace=False,
+        defer_source=False,
+        unresolved_failures=[],
+        source_path="requirements.md",
+    ) is True
+
+
+def test_unresolved_source_failure_blocks_acceptance_completion():
+    assert project_solver._verification_proves_source_complete(
+        verification_steps_executed=1,
+        replan_due_to_hallucination=False,
+        replan_due_to_verification=False,
+        replan_due_to_replace=False,
+        defer_source=False,
+        unresolved_failures=[{"source": "requirements.md", "command": "pytest"}],
+        source_path="requirements.md",
+    ) is False
+
+
 def test_successful_reverification_clears_matching_historical_failure():
     failures = [
         {
