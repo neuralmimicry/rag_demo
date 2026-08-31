@@ -3765,16 +3765,22 @@ class TopicResearcher:
             # 1. Try web search with suggested terms
             search_terms = fallback_plan.get("search_terms")
             if search_terms:
-                max_chars = _env_int("WEB_SEARCH_MAX_QUERY_CHARS", 512)
-                results = search_web(
-                    self.search_engines,
-                    search_terms,
-                    max_results=5,
-                    cache=None,
-                    cache_ttl_hours=self.cache_ttl_hours,
-                    max_chars=max_chars,
-                )
-                fallback_results.extend([{"source": "web_fallback", "content": r} for r in results])
+                try:
+                    max_chars = _env_int("WEB_SEARCH_MAX_QUERY_CHARS", 512)
+                    results = search_web(
+                        self.search_engines,
+                        search_terms,
+                        max_results=5,
+                        cache=None,
+                        cache_ttl_hours=self.cache_ttl_hours,
+                        max_chars=max_chars,
+                    )
+                    fallback_results.extend([{"source": "web_fallback", "content": r} for r in results])
+                except Exception as e:
+                    # A web-search provider is only one fallback channel. Do not
+                    # discard Jira/Confluence fallback results when it is down or
+                    # returns an unexpected response.
+                    logger.warning(f"Web fallback search failed: {e}")
                 
             # 2. Try simple Jira search
             jira_keywords = fallback_plan.get("jira_keywords")
