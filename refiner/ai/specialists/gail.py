@@ -254,6 +254,13 @@ class GailProvider(LLMProvider):
         # request deadline before the solver gets a response.
         if max_candidates is None:
             max_candidates = gail_direct_max_candidates()
+        # The Refiner deployment uses fastest mode to avoid selecting a
+        # capacity-degraded native endpoint for long-running solver work.
+        # Apply that bridge setting to workflow requests too; otherwise the
+        # workflow path silently falls back to Gail's quality-ranked default
+        # and can spend its whole deadline walking slow candidates.
+        if not selection_mode:
+            selection_mode = gail_direct_selection_mode()
         has_explicit_request_credentials = any(
             str(value or "").strip()
             for value in (

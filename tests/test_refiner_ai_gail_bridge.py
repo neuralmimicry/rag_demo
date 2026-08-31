@@ -262,6 +262,30 @@ def test_gail_workflow_provider_omits_candidates_when_no_hints_and_using_configu
     assert captured["json_payload"]["max_candidates"] == 1
 
 
+def test_gail_workflow_provider_applies_direct_selection_mode_setting(monkeypatch):
+    _enable_gail(monkeypatch)
+    monkeypatch.setenv("REFINER_GAIL_DIRECT_SELECTION_MODE", "fastest")
+    captured = {}
+    from refiner import refiner_ai_gail
+
+    def _fake_post(url, *, headers, json_payload, timeout, max_retries):
+        captured["json_payload"] = json_payload
+        return _FakeResponse({"text": "ok", "provider": "openai", "model": "gpt-4o-mini"})
+
+    monkeypatch.setattr(refiner_ai_gail, "_http_post", _fake_post)
+    provider = build_workflow_provider(
+        workflow="project_solver",
+        role="general",
+        preferred_provider=None,
+        preferred_model=None,
+        include_configured=True,
+    )
+
+    provider.predict([{"role": "user", "content": "Plan the fix."}])
+
+    assert captured["json_payload"]["selection_mode"] == "fastest"
+
+
 def test_gail_workflow_provider_preserves_explicit_candidates_with_configured_pool(monkeypatch):
     _enable_gail(monkeypatch)
     captured = {}
