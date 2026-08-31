@@ -155,7 +155,7 @@ def test_git_push_reuses_deterministic_restart_branch_with_lease(monkeypatch):
     job = _Job()
     commands = []
 
-    def fake_git_run(command, cwd, git_job, token=None):
+    def fake_git_run(command, cwd, git_job=None, token=None, job=None):
         commands.append(command)
         if command[1:3] == ["ls-remote", "origin"]:
             return subprocess.CompletedProcess(
