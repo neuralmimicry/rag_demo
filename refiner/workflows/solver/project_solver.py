@@ -624,6 +624,12 @@ TEST_FILE_RE = re.compile(
     r"(^|/|\\\\)(tests|test)(/|\\\\)|(^|/|\\\\)(test_|spec_)|(_test\.|_spec\.)",
     re.IGNORECASE,
 )
+VALIDATION_FILE_RE = re.compile(
+    r"(^|/|\\\\)(validation|validations|acceptance|checks?|verification)(/|\\\\)"
+    r"|(^|/|\\\\)(check|verify|validate|acceptance|validation)[^/\\\\]*"
+    r"\.(sh|bash|zsh|ps1|py|js|ts)$",
+    re.IGNORECASE,
+)
 EXAMPLE_FILE_RE = re.compile(
     r"(^|/|\\\\)(examples?|samples?)(/|\\\\)|(^|/|\\\\)(example_|sample_)|(_example\.)",
     re.IGNORECASE,
@@ -3382,7 +3388,9 @@ def _plan_has_test_changes(plan_steps: List[Dict[str, object]]) -> bool:
         if step_type not in {"write_file", "append_file", "replace_in_file"}:
             continue
         path = step.get("path")
-        if isinstance(path, str) and TEST_FILE_RE.search(path):
+        if isinstance(path, str) and (
+            TEST_FILE_RE.search(path) or VALIDATION_FILE_RE.search(path)
+        ):
             return True
     return False
 

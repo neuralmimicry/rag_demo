@@ -307,6 +307,39 @@ def test_drop_blocked_mutating_vcs_steps():
     assert any("Dropped blocked mutating VCS command" in item for item in actions)
 
 
+def test_plan_has_test_changes_accepts_explicit_validation_scripts():
+    assert project_solver._plan_has_test_changes(
+        [
+            {
+                "type": "write_file",
+                "path": "check_validation.sh",
+                "content": "#!/usr/bin/env bash\nset -e\n",
+            }
+        ]
+    )
+    assert project_solver._plan_has_test_changes(
+        [
+            {
+                "type": "write_file",
+                "path": "acceptance/verify_contract.py",
+                "content": "assert True\n",
+            }
+        ]
+    )
+
+
+def test_plan_has_test_changes_does_not_accept_unrelated_artifacts():
+    assert not project_solver._plan_has_test_changes(
+        [
+            {
+                "type": "write_file",
+                "path": "validation_artifact.txt",
+                "content": "created\n",
+            }
+        ]
+    )
+
+
 def test_apply_step_skips_placeholder_command_literal(tmp_path):
     project_root = tmp_path / "sample-project"
     project_root.mkdir()
