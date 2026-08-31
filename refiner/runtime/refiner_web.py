@@ -7856,7 +7856,7 @@ class JobManager:
             or job.payload.get("github_actions_required")
         )
         if build_requested:
-            sha_result = self._git_run(["rev-parse", "HEAD"], workspace, job)
+            sha_result = self._git_run(["git", "rev-parse", "HEAD"], workspace, job)
             commit_sha = (sha_result.stdout or "").strip()
             repo_info = job.repo_info
             repo_info["base_commit_sha"] = base_commit_sha or None

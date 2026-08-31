@@ -1,4 +1,5 @@
 import subprocess
+from types import SimpleNamespace
 
 from refiner import refiner_web
 
@@ -99,3 +100,51 @@ def test_deterministic_rollback_rejects_non_commit_input(tmp_path):
         assert "hexadecimal git commit id" in str(exc)
     else:
         raise AssertionError("rollback accepted a shell expression")
+
+
+def test_repo_finalization_uses_git_prefix_for_post_push_sha_lookup(monkeypatch):
+    manager = object.__new__(refiner_web.JobManager)
+    job = SimpleNamespace(
+        job_id="12345678-job",
+        log_path="/tmp/refiner-git-test/job.log",
+        payload={"project_run": True},
+        repo_info={
+            "owner": "source-owner",
+            "repo": "source-repo",
+            "fork_org": "neuralmimicry",
+            "fork_repo": "fork-repo",
+            "workspace": "/tmp/refiner-git-test/repo",
+            "branch": "refiner/test",
+        },
+        logs=[],
+    )
+    job.append_log = job.logs.append
+    commands = []
+
+    def fake_git_run(command, cwd, git_job, token=None):
+        commands.append(command)
+        assert command[0] == "git"
+        stdout = "base-sha\n" if len(commands) == 1 else "commit-sha\n"
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(manager, "_git_has_changes", lambda workspace, git_job: True)
+    monkeypatch.setattr(manager, "_git_run", fake_git_run)
+    monkeypatch.setattr(manager, "_git_config", lambda *args: None)
+    monkeypatch.setattr(manager, "_git_add_all", lambda *args: None)
+    monkeypatch.setattr(manager, "_git_commit", lambda *args: None)
+    monkeypatch.setattr(manager, "_git_push", lambda *args: None)
+    monkeypatch.setattr(manager, "_get_github_token", lambda git_job: "test-token")
+    monkeypatch.setattr(
+        refiner_web,
+        "verify_repository_builds",
+        lambda **kwargs: {"enabled": False},
+    )
+
+    manager._finalize_repo(job)
+
+    assert commands == [
+        ["git", "rev-parse", "HEAD"],
+        ["git", "rev-parse", "HEAD"],
+    ]
+    assert job.repo_info["base_commit_sha"] == "base-sha"
+    assert job.repo_info["commit_sha"] == "commit-sha"
