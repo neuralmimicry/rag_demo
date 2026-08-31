@@ -8146,7 +8146,48 @@ class JobManager:
             raise ValueError(f"git commit failed: {stderr}")
 
     def _git_push(self, workspace: str, branch: str, token: Optional[str], job: Job) -> None:
-        result = self._git_run(["git", "push", "origin", branch], cwd=workspace, job=job, token=token)
+        # A restarted job intentionally reuses its deterministic branch.  The
+        # branch can therefore already contain the previous attempt's commit,
+        # while this workspace was freshly cloned from the default branch.  A
+        # plain push incorrectly reports a non-fast-forward failure in that
+        # case.  Read the remote tip immediately before updating it, then use
+        # an explicit lease so an unrelated concurrent writer is never
+        # overwritten silently.
+        remote_ref = f"refs/heads/{branch}"
+        remote_result = self._git_run(
+            ["git", "ls-remote", "origin", remote_ref],
+            cwd=workspace,
+            job=job,
+            token=token,
+        )
+        if remote_result.returncode != 0:
+            raise ValueError(f"git remote branch lookup failed: {remote_result.stderr.strip()}")
+        remote_sha = ""
+        for line in (remote_result.stdout or "").splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[1] == remote_ref:
+                remote_sha = fields[0].strip()
+                break
+
+        local_result = self._git_run(["git", "rev-parse", "HEAD"], cwd=workspace, job=job)
+        local_sha = (local_result.stdout or "").strip()
+        if local_result.returncode != 0 or not local_sha:
+            raise ValueError(f"git local commit lookup failed: {local_result.stderr.strip()}")
+        if remote_sha == local_sha:
+            job.append_log(f"Remote branch {branch} already points to {local_sha}; skipping push.")
+            return
+
+        if remote_sha:
+            push_command = [
+                "git",
+                "push",
+                f"--force-with-lease={remote_ref}:{remote_sha}",
+                "origin",
+                f"HEAD:{branch}",
+            ]
+        else:
+            push_command = ["git", "push", "origin", f"HEAD:{branch}"]
+        result = self._git_run(push_command, cwd=workspace, job=job, token=token)
         if result.returncode != 0:
             raise ValueError(f"git push failed: {result.stderr.strip()}")
 

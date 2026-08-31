@@ -148,3 +148,37 @@ def test_repo_finalization_uses_git_prefix_for_post_push_sha_lookup(monkeypatch)
     ]
     assert job.repo_info["base_commit_sha"] == "base-sha"
     assert job.repo_info["commit_sha"] == "commit-sha"
+
+
+def test_git_push_reuses_deterministic_restart_branch_with_lease(monkeypatch):
+    manager = object.__new__(refiner_web.JobManager)
+    job = _Job()
+    commands = []
+
+    def fake_git_run(command, cwd, git_job, token=None):
+        commands.append(command)
+        if command[1:3] == ["ls-remote", "origin"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="remote-sha\trefs/heads/refiner/restarted\n",
+                stderr="",
+            )
+        if command[1:3] == ["rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(command, 0, stdout="local-sha\n", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(manager, "_git_run", fake_git_run)
+    manager._git_push("/tmp/refiner-git-test/repo", "refiner/restarted", "test-token", job)
+
+    assert commands == [
+        ["git", "ls-remote", "origin", "refs/heads/refiner/restarted"],
+        ["git", "rev-parse", "HEAD"],
+        [
+            "git",
+            "push",
+            "--force-with-lease=refs/heads/refiner/restarted:remote-sha",
+            "origin",
+            "HEAD:refiner/restarted",
+        ],
+    ]
