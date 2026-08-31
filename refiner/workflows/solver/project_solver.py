@@ -902,6 +902,32 @@ def _resolve_relative_command_path(
                 continue
             rel_from_workdir = os.path.relpath(abs_candidate, abs_workdir)
             return rel_from_workdir.replace("\\", "/")
+
+    # New files are deliberately isolated under the solver workspace.  A
+    # generated verification command can still refer to one by its basename
+    # (for example, ``python -c \"assert Path('probe.txt').read_text()...\"``)
+    # even though the write step created ``project_solver_output/probe.txt``.
+    # Resolve that form only when it identifies one unambiguous workspace file
+    # so an unrelated duplicate cannot silently change command semantics.
+    if workspace_root:
+        workspace_matches: List[str] = []
+        workspace_abs = os.path.abspath(workspace_root)
+        for walk_root, dirs, files in os.walk(workspace_abs):
+            _filter_walk_dirs(walk_root, dirs, _ignored_dirnames(None))
+            for filename in files:
+                candidate_abs = os.path.abspath(os.path.join(walk_root, filename))
+                relative = os.path.relpath(candidate_abs, workspace_abs).replace("\\", "/")
+                if any(
+                    relative == variant
+                    or relative.endswith("/" + variant)
+                    or ("/" not in variant and filename == variant)
+                    for variant in variants
+                ):
+                    if candidate_abs not in workspace_matches:
+                        workspace_matches.append(candidate_abs)
+        if len(workspace_matches) == 1:
+            rel_from_workdir = os.path.relpath(workspace_matches[0], abs_workdir)
+            return rel_from_workdir.replace("\\", "/")
     return None
 
 
@@ -2495,9 +2521,45 @@ def _rewrite_workspace_command_paths(
             parts[idx] = rewritten
             changed = True
 
+    rewritten_command = " ".join(shlex.quote(part) for part in parts) if changed else command
+
+    # ``shlex`` treats the body of ``python -c`` as one argument, so a path
+    # embedded in that script is not visible as a standalone path token.  Use
+    # the same unambiguous workspace resolution for relative file names inside
+    # command arguments as well.  This keeps generated verification commands
+    # aligned with solver-workspace writes without changing arbitrary strings.
+    if workspace_root:
+        workspace_abs = os.path.abspath(workspace_root)
+        rewrites: Dict[str, str] = {}
+        for walk_root, dirs, files in os.walk(workspace_abs):
+            _filter_walk_dirs(walk_root, dirs, _ignored_dirnames(None))
+            for filename in files:
+                candidate_abs = os.path.abspath(os.path.join(walk_root, filename))
+                relative = os.path.relpath(candidate_abs, workspace_abs).replace("\\", "/")
+                replacement = os.path.relpath(candidate_abs, abs_workdir).replace("\\", "/")
+                if replacement == relative:
+                    continue
+                keys = {relative}
+                if "/" not in relative:
+                    keys.add(filename)
+                for key in keys:
+                    resolved = _resolve_relative_command_path(
+                        key,
+                        abs_workdir=abs_workdir,
+                        project_root=project_root,
+                        workspace_root=workspace_root,
+                    )
+                    if resolved == replacement:
+                        rewrites[key] = replacement
+        for source, replacement in sorted(rewrites.items(), key=lambda item: len(item[0]), reverse=True):
+            pattern = re.compile(r"(?<![A-Za-z0-9_./-])" + re.escape(source) + r"(?![A-Za-z0-9_./-])")
+            candidate = pattern.sub(replacement, rewritten_command)
+            if candidate != rewritten_command:
+                rewritten_command = candidate
+                changed = True
+
     if not changed:
         return command
-    rewritten_command = " ".join(shlex.quote(part) for part in parts)
     actions_log.append(
         f"Rewrote workspace command paths: {command} -> {rewritten_command}"
     )

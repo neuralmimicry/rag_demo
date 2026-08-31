@@ -170,6 +170,25 @@ def test_rewrite_workspace_command_paths_for_node_script(tmp_path):
     assert actions_log
 
 
+def test_rewrite_workspace_command_paths_for_embedded_python_check(tmp_path):
+    project_root = tmp_path / "sample-project"
+    workspace_root = project_root / "project_solver_output"
+    workspace_root.mkdir(parents=True)
+    (workspace_root / "probe.txt").write_text("READY", encoding="utf-8")
+    actions_log = []
+
+    rewritten = project_solver._rewrite_workspace_command_paths(
+        "python -c \"from pathlib import Path; assert Path('probe.txt').read_text() == 'READY'\"",
+        abs_workdir=str(project_root),
+        project_root=str(project_root),
+        workspace_root=str(workspace_root),
+        actions_log=actions_log,
+    )
+
+    assert "project_solver_output/probe.txt" in rewritten
+    assert actions_log
+
+
 def test_command_should_use_workspace_for_generated_node_project(tmp_path):
     project_root = tmp_path / "sample-project"
     workspace_root = project_root / "project_solver_output"
