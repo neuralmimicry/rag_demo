@@ -916,10 +916,20 @@ def run(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("--use-rovo", dest="use_rovo", action="store_true", help="Prefer Atlassian Rovo/AI endpoints when available")
     # Optional LLM integration flags
-    parser.add_argument("--llm-provider", dest="llm_provider", choices=["openai", "gemini", "ollama", "gpt", "chatgpt", "google"], help="Select LLM provider for analysis")
+    parser.add_argument(
+        "--llm-provider",
+        dest="llm_provider",
+        choices=["openai", "gemini", "ollama", "gail", "gpt", "chatgpt", "google"],
+        help="Select LLM provider for analysis (use 'gail' for the configured Gail bridge)",
+    )
     parser.add_argument("--llm-model", dest="llm_model", help="Override model name for the chosen LLM provider")
     parser.add_argument("--llm-reasoning-effort", dest="llm_reasoning_effort", help="Reasoning effort for the LLM provider (e.g., none, low, medium, high, xhigh)")
-    parser.add_argument("--fallback-llm-provider", dest="fallback_llm_provider", choices=["openai", "gemini", "ollama", "gpt", "chatgpt", "google"], help="Select fallback LLM provider if the primary fails")
+    parser.add_argument(
+        "--fallback-llm-provider",
+        dest="fallback_llm_provider",
+        choices=["openai", "gemini", "ollama", "gail", "gpt", "chatgpt", "google"],
+        help="Select fallback LLM provider if the primary fails (use 'gail' for the configured Gail bridge)",
+    )
     parser.add_argument("--fallback-llm-model", dest="fallback_llm_model", help="Override model name for the fallback LLM provider")
     parser.add_argument("--ollama-base-url", dest="ollama_base_url", help="Override Ollama base URL (default: http://localhost:11434)")
     parser.add_argument("--selection", dest="selection", help="Path to selection manifest JSON produced by the report UI")

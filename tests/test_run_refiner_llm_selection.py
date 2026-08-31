@@ -1,6 +1,19 @@
 from refiner import run_refiner
 
 
+def test_project_solver_accepts_explicit_gail_provider(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_project_solver(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(run_refiner, "_run_project_solver", fake_project_solver)
+
+    assert run_refiner.run(["--project", str(tmp_path), "--llm-provider", "gail"]) == 0
+    assert captured["llm_provider"] == "gail"
+
+
 def test_resolve_llm_selection_falls_back_to_accessible_ollama_config():
     llm_configs = [
         {"name": "shared-openai", "type": "openai", "model": "gpt-4o-mini"},
