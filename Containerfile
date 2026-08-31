@@ -27,6 +27,10 @@ ARG TARGET_PAGE_SIZE=4k
 #     Docker, Podman and Buildah-style workflows.
 
 ARG BASE_IMAGE=python:3.11-slim-bookworm
+# Debian Bookworm's rustc/cargo (1.63/1.65) cannot read Cargo.lock format 4.
+# Keep the acceptance-test toolchain reproducible and independent of Debian's
+# slower-moving packages while retaining the Python base image for Refiner.
+ARG RUST_TOOLCHAIN_IMAGE=rust:1.88.0-bookworm
 
 # -----------------------------------------------------------------------------
 # Shared defaults
@@ -196,6 +200,11 @@ RUN set -eux; \
     install -m 0755 /src/container/nvidia-smi /usr/local/bin/nvidia-smi
 
 # -----------------------------------------------------------------------------
+# Rust toolchain stage: provide a pinned compiler for compiled-language jobs.
+# -----------------------------------------------------------------------------
+FROM ${RUST_TOOLCHAIN_IMAGE} AS rust-toolchain
+
+# -----------------------------------------------------------------------------
 # Runtime stage: install only runtime OS packages and run as a non-root user.
 # -----------------------------------------------------------------------------
 FROM ${BASE_IMAGE} AS runtime
@@ -224,7 +233,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     VIRTUAL_ENV=/opt/venv \
-    PATH="/opt/venv/bin:${PATH}" \
+    CARGO_HOME=/home/${APP_USER}/.cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH="/usr/local/cargo/bin:/opt/venv/bin:${PATH}" \
     REFINER_HOST=0.0.0.0 \
     REFINER_PORT=5001 \
     REFINER_FRONTEND_HOST=0.0.0.0 \
@@ -248,8 +259,6 @@ ARG RUNTIME_PACKAGES="\
     cmake \
     ninja-build \
     golang-go \
-    rustc \
-    cargo \
     openjdk-17-jdk-headless \
     kotlin \
     maven \
@@ -286,9 +295,14 @@ RUN set -eux; \
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /src ${APP_HOME}
 COPY --from=builder /usr/local/bin/nvidia-smi /usr/local/bin/nvidia-smi
+COPY --from=rust-toolchain /usr/local/cargo/bin /usr/local/cargo/bin
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
 
 RUN set -eux; \
-    chown -R "${APP_UID}:${APP_GID}" "${APP_HOME}" /tmp/refiner
+    mkdir -p "${CARGO_HOME}"; \
+    chown -R "${APP_UID}:${APP_GID}" "${APP_HOME}" "${CARGO_HOME}" /tmp/refiner; \
+    rustc --version; \
+    cargo --version
 
 EXPOSE 5001 8080
 
