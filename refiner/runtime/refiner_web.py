@@ -7148,6 +7148,38 @@ class JobManager:
             self._settle_tokens(job)
             self._maybe_notify(job)
             return
+        # Rollback jobs already performed the only authorised repository
+        # mutation in _prepare_repo: a deterministic `git revert` of the
+        # exact delivered commit.  Sending these jobs through the general
+        # project solver invites unrelated LLM edits (and can turn a valid
+        # revert into a failing, non-executable test project).  Finalise the
+        # prepared revert directly so the normal commit/push and GitHub
+        # Actions gates remain authoritative.
+        if job.payload.get("rollback_commit"):
+            job.append_log("Deterministic rollback prepared; skipping project solver.")
+            job.update_stage("execute", "deterministic rollback prepared")
+            try:
+                self._finalize_repo(job)
+            except Exception as exc:
+                job.append_log(f"Rollback finalize failed: {exc}")
+                job.exit_code = 1
+                job.set_status("failed")
+                job.set_progress(100)
+                job.finished_at = _now_iso()
+                job.persist(force=True)
+                self._settle_tokens(job)
+                self._maybe_notify(job)
+                return
+            job.exit_code = 0
+            job.set_status("completed")
+            job.set_progress(100)
+            job.finished_at = _now_iso()
+            job.update_stage("finalize", "deterministic rollback committed and verified")
+            job.append_log("Deterministic rollback completed successfully.")
+            job.persist(force=True)
+            self._settle_tokens(job)
+            self._maybe_notify(job)
+            return
         try:
             command = self._build_command(job)
         except Exception as exc:
