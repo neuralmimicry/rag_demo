@@ -275,6 +275,58 @@ def test_planner_timeout_writes_incomplete_project_solution(monkeypatch, tmp_pat
     assert report["planner_failure"]["type"] == "planner_timeout"
 
 
+def test_requirements_only_skips_project_derived_requirement_enrichment(monkeypatch, tmp_path):
+    project_root = tmp_path / "sample-project"
+    project_root.mkdir()
+    requirements_path = project_root / "requirements.md"
+    requirements_path.write_text("Restore the service health endpoint.\n", encoding="utf-8")
+    output_path = project_root / "project_solution.json"
+
+    def _unexpected_project_scan(*_args, **_kwargs):
+        raise AssertionError("project-derived sequence enrichment must be disabled")
+
+    monkeypatch.setattr(project_solver, "_detect_sequence_gaps", _unexpected_project_scan)
+    monkeypatch.setenv("SOLVER_TRY_OLLAMA_FIRST", "0")
+    monkeypatch.setenv("SOLVER_REPO_RAG", "0")
+
+    class _FailingPlanner:
+        name = "test-planner"
+        model = "test-model"
+
+        def predict(self, *_args, **_kwargs):
+            raise LLMError("HTTP POST failed: Read timed out")
+
+        def cleanup(self):
+            return None
+
+    provider = _FailingPlanner()
+    monkeypatch.setattr(project_solver, "build_workflow_provider", lambda **_kwargs: provider)
+    monkeypatch.setattr(project_solver, "describe_provider", lambda _provider: {"name": "test-planner"})
+    monkeypatch.setattr(project_solver, "provider_log_summary", lambda _provider: "test-planner")
+
+    exit_code = project_solver.run_project_solver(
+        str(project_root),
+        requirements_path=str(requirements_path),
+        requirements_only=True,
+        output_path=str(output_path),
+        llm_provider="openai",
+        llm_model="test-model",
+        ollama_base_url=None,
+        llm_max_tokens=128,
+        llm_temperature=0.2,
+        llm_timeout=5,
+        llm_reasoning_effort=None,
+        llm_api_key=None,
+        max_steps=4,
+        max_iterations=1,
+    )
+
+    assert exit_code == 2
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    register = report["requirements_register"]["requirements"]
+    assert not any("sequence completeness" in item["description"].lower() for item in register)
+
+
 def test_is_workspace_project_mirror_source_detection(tmp_path):
     project_root = tmp_path / "MyProj"
     project_root.mkdir()

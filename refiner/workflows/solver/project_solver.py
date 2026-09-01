@@ -10469,19 +10469,30 @@ def run_project_solver(
                     f"Discovered {len(workspace_sources)} requirement sources in solver workspace."
                 )
 
-    sequence_gaps = _detect_sequence_gaps(project_root, extra_ignored=extra_ignored)
-    if sequence_gaps:
-        for gap in sequence_gaps:
-            prefix = _safe_str(gap.get("prefix"))
-            missing = gap.get("missing") if isinstance(gap.get("missing"), list) else []
-            if prefix and missing:
-                actions_log.append(
-                    f"Sequence gap detected for '{prefix}': missing {', '.join(str(num) for num in missing)}"
-                )
+    # An authoritative requirements document is the complete scope for this
+    # mode.  Project-derived enrichment must not turn unrelated repository
+    # artefacts into mandatory requirements (for example, historical filename
+    # sequence gaps in a repository-wide scan).
+    if requirements_only:
+        sequence_gaps = []
+        sample_code_map = {}
+        dataset_summary = {"count": 0}
+        eval_info = {}
+        helper_modules = {}
+    else:
+        sequence_gaps = _detect_sequence_gaps(project_root, extra_ignored=extra_ignored)
+        if sequence_gaps:
+            for gap in sequence_gaps:
+                prefix = _safe_str(gap.get("prefix"))
+                missing = gap.get("missing") if isinstance(gap.get("missing"), list) else []
+                if prefix and missing:
+                    actions_log.append(
+                        f"Sequence gap detected for '{prefix}': missing {', '.join(str(num) for num in missing)}"
+                    )
 
-    sample_code_map = _collect_sample_code_map(project_root, extra_ignored=extra_ignored)
-    if sample_code_map:
-        actions_log.append(f"Discovered {len(sample_code_map)} sample code file(s) for reference.")
+        sample_code_map = _collect_sample_code_map(project_root, extra_ignored=extra_ignored)
+        if sample_code_map:
+            actions_log.append(f"Discovered {len(sample_code_map)} sample code file(s) for reference.")
 
     repo_rag_enabled = _env_bool("SOLVER_REPO_RAG", True)
     repo_index: Optional[RepoIndex] = None
@@ -10502,21 +10513,22 @@ def run_project_solver(
             actions_log.append(f"Repo context index failed: {exc}")
             repo_index = None
 
-    dataset_summary = _collect_dataset_summary(project_root, extra_ignored=extra_ignored)
-    if dataset_summary.get("count"):
-        actions_log.append(
-            f"Dataset detected: {dataset_summary['count']} file(s) under data/."
-        )
-    eval_info = _collect_eval_data_schema(project_root)
-    if eval_info.get("count"):
-        actions_log.append(
-            f"Eval data detected: {eval_info.get('count')} record(s) in eval_data.json."
-        )
-    helper_modules = _collect_helper_module_summaries(project_root, extra_ignored=extra_ignored)
-    if helper_modules:
-        actions_log.append(
-            f"Helper modules detected: {', '.join(sorted(helper_modules.keys()))}"
-        )
+    if not requirements_only:
+        dataset_summary = _collect_dataset_summary(project_root, extra_ignored=extra_ignored)
+        if dataset_summary.get("count"):
+            actions_log.append(
+                f"Dataset detected: {dataset_summary['count']} file(s) under data/."
+            )
+        eval_info = _collect_eval_data_schema(project_root)
+        if eval_info.get("count"):
+            actions_log.append(
+                f"Eval data detected: {eval_info.get('count')} record(s) in eval_data.json."
+            )
+        helper_modules = _collect_helper_module_summaries(project_root, extra_ignored=extra_ignored)
+        if helper_modules:
+            actions_log.append(
+                f"Helper modules detected: {', '.join(sorted(helper_modules.keys()))}"
+            )
 
     language_info = detect_languages(project_root)
     if language_info.get("languages") or language_info.get("build_systems"):
