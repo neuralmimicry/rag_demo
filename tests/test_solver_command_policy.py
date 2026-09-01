@@ -42,6 +42,8 @@ def test_command_policy_strict_mode_blocks_non_verification_commands(monkeypatch
     install = evaluate_command_policy("npm install")
     readonly_git = evaluate_command_policy("git status")
     readonly_inspection = evaluate_command_policy("cat docs/refiner-supported-languages.md")
+    readonly_search = evaluate_command_policy("grep -q Refiner docs/refiner-supported-languages.md")
+    readonly_test = evaluate_command_policy("test -f docs/refiner-supported-languages.md")
 
     assert install.allowed is False
     assert "strict" in install.reason
@@ -49,6 +51,10 @@ def test_command_policy_strict_mode_blocks_non_verification_commands(monkeypatch
     assert readonly_git.category == "vcs_readonly"
     assert readonly_inspection.allowed is True
     assert readonly_inspection.category == "verification"
+    assert readonly_search.allowed is True
+    assert readonly_search.category == "verification"
+    assert readonly_test.allowed is True
+    assert readonly_test.category == "verification"
 
 
 def test_command_policy_allows_read_only_remote_ref_verification():
