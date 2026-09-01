@@ -140,6 +140,8 @@ def _categorize_command(executable: str, argv: List[str]) -> str:
         return "verification"
 
     if executable == "cargo":
+        if len(argv) > 1 and argv[1] == "fmt" and "--check" in argv[2:]:
+            return "verification"
         if len(argv) > 1 and argv[1] == "test":
             return "verification"
         if len(argv) > 1 and argv[1] in {"build", "check", "run"}:

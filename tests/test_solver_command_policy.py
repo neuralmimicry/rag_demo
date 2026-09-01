@@ -26,6 +26,7 @@ def test_command_policy_allows_compiled_language_verification():
         "cmake --build build",
         "make",
         "go test ./...",
+        "cargo fmt --check",
         "cargo test",
         "mvn test",
         "gradle test",
@@ -44,6 +45,7 @@ def test_command_policy_strict_mode_blocks_non_verification_commands(monkeypatch
     readonly_inspection = evaluate_command_policy("cat docs/refiner-supported-languages.md")
     readonly_search = evaluate_command_policy("grep -q Refiner docs/refiner-supported-languages.md")
     readonly_test = evaluate_command_policy("test -f docs/refiner-supported-languages.md")
+    readonly_cargo_fmt = evaluate_command_policy("cargo fmt --check")
 
     assert install.allowed is False
     assert "strict" in install.reason
@@ -55,6 +57,8 @@ def test_command_policy_strict_mode_blocks_non_verification_commands(monkeypatch
     assert readonly_search.category == "verification"
     assert readonly_test.allowed is True
     assert readonly_test.category == "verification"
+    assert readonly_cargo_fmt.allowed is True
+    assert readonly_cargo_fmt.category == "verification"
 
 
 def test_command_policy_allows_read_only_remote_ref_verification():
