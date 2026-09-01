@@ -772,6 +772,97 @@ def test_repair_source_requirement_registration_preserves_explicit_ids_and_drops
     assert all(item["title"] != "Requirements Register" for item in repaired["requirements"])
 
 
+def test_requirement_coverage_accepts_operational_implement_language_on_documentation(tmp_path):
+    source = project_solver.RequirementSource(
+        path="requirements.md",
+        requirements_text="REQ-002: Implement only the scoped job update supported by evidence.",
+        requirement_lines=[],
+        todo_lines=[],
+        context_excerpt="",
+    )
+    register = {
+        "requirements": [
+            {
+                "id": "REQ-002",
+                "title": "Scoped job update",
+                "description": "Implement only the scoped job update supported by evidence.",
+                "type": "unspecified",
+                "source": ["requirements.md"],
+            }
+        ]
+    }
+
+    coverage, missing = project_solver._build_requirement_coverage(
+        [source],
+        {
+            "requirements.md": [
+                {"path": "docs/rollout.md", "is_code": False, "note": "documented evidence"}
+            ]
+        },
+        str(tmp_path),
+        requirements_register=register,
+    )
+
+    assert missing == []
+    assert coverage["requirements.md"]["requirements"][0]["status"] == "covered"
+
+
+def test_requirement_coverage_keeps_code_artifact_requirements_strict(tmp_path):
+    source = project_solver.RequirementSource(
+        path="requirements.md",
+        requirements_text="REQ-001: Implement the parser function.",
+        requirement_lines=[],
+        todo_lines=[],
+        context_excerpt="",
+    )
+    register = {
+        "requirements": [
+            {
+                "id": "REQ-001",
+                "title": "Parser function",
+                "description": "Implement the parser function.",
+                "type": "functional",
+                "source": ["requirements.md"],
+            }
+        ]
+    }
+
+    coverage, missing = project_solver._build_requirement_coverage(
+        [source],
+        {
+            "requirements.md": [
+                {"path": "docs/rollout.md", "is_code": False, "note": "documentation only"}
+            ]
+        },
+        str(tmp_path),
+        requirements_register=register,
+    )
+
+    assert missing == ["requirements.md"]
+    assert coverage["requirements.md"]["requirements"][0]["status"] == "missing"
+
+
+def test_explicit_source_requirement_ids_are_added_to_plan_references():
+    plan = [{"type": "write_file", "path": "docs/rollout.md", "step": "Record the rollout."}]
+
+    changed = project_solver._ensure_plan_requirement_refs(
+        plan,
+        payload_requirements=["REQ-001"],
+        required_ids={"REQ-001", "REQ-002", "REQ-003"},
+        global_ids=set(),
+        sequence_ids=set(),
+        all_ids={"REQ-001", "REQ-002", "REQ-003"},
+        strict=True,
+    )
+
+    assert changed is True
+    assert project_solver._extract_requirement_refs_from_plan(plan, []) >= {
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+    }
+
+
 def test_compiled_language_verification_keeps_native_build_phases(tmp_path):
     (tmp_path / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
     (tmp_path / "CMakeLists.txt").write_text(

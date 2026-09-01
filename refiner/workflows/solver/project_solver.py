@@ -248,6 +248,21 @@ CODE_REQUIREMENT_RE = re.compile(
     r"\b(implement|build|create|develop|refactor|rewrite|fix|bug|feature|module|class|function|script|cli|library|algorithm|api)\b",
     re.IGNORECASE,
 )
+# These terms describe delivery evidence or operational governance rather than
+# a code artifact.  They commonly appear alongside "implement" in a request
+# that is asking for a recorded rollout/check, so coverage must not require a
+# source-code reference merely because of that verb.
+OPERATIONAL_REQUIREMENT_RE = re.compile(
+    r"\b(record|document|evidence|acceptance|rollback|recovery|revert|rollout|"
+    r"readiness|health window|monitoring|governance|staged progression|job update|"
+    r"progress-monitoring|verification|verify|ansible|runtime|protected-target)\b",
+    re.IGNORECASE,
+)
+CODE_ARTIFACT_RE = re.compile(
+    r"\b(file|module|class|function|script|cli|library|algorithm|api|source code|"
+    r"test suite|test file|implementation)\b",
+    re.IGNORECASE,
+)
 NON_CODE_HINT_RE = re.compile(
     r"\b(deploy|deployment|infrastructure|infra|environment|config|configuration|documentation|docs|readme|requirements\.txt|install|dependency|dependencies|package|build pipeline|ci|cd|release)\b",
     re.IGNORECASE,
@@ -6627,6 +6642,24 @@ def _format_requirement_label(requirement: object) -> Tuple[str, Optional[str], 
     return label or "Unnamed requirement", None, label
 
 
+def _requirement_requires_code(requirement: object) -> bool:
+    """Return whether coverage needs a code reference for this requirement.
+
+    Requirement text often uses implementation verbs for operational work
+    (for example, implementing a rollout or recording a readiness baseline).
+    Those requirements are satisfied by documented/live evidence and should
+    not be reported as missing merely because the run touched documentation.
+    Explicit artifact terms retain the stricter code-reference requirement.
+    """
+    label, _req_id, req_text = _format_requirement_label(requirement)
+    text = req_text or label
+    if not CODE_REQUIREMENT_RE.search(text):
+        return False
+    if OPERATIONAL_REQUIREMENT_RE.search(text) and not CODE_ARTIFACT_RE.search(text):
+        return False
+    return True
+
+
 def _build_requirements_register_section(
     register: Dict[str, object],
     source_path: str,
@@ -7458,7 +7491,7 @@ def _build_requirement_coverage(
         missing_requirements = []
         for requirement in requirements:
             label, req_id, req_text = _format_requirement_label(requirement)
-            requires_code = bool(CODE_REQUIREMENT_RE.search(req_text or label))
+            requires_code = _requirement_requires_code(requirement)
             refs = code_refs if (requires_code and code_refs) else file_refs
             if requires_code and not code_refs:
                 requirements_report.append(
@@ -10550,6 +10583,11 @@ def run_project_solver(
         for item in requirements_register_list
         if isinstance(item, dict) and _safe_str(item.get("id"))
     }
+    explicit_source_requirement_ids = {
+        _safe_str(item.get("id")).upper()
+        for item in _explicit_source_requirements(requirement_sources)
+        if isinstance(item, dict) and _safe_str(item.get("id"))
+    }
     requirements_register_sequence_ids = {
         _safe_str(item.get("id")).upper()
         for item in requirements_register_list
@@ -12009,6 +12047,14 @@ def run_project_solver(
 
             plan_has_code_changes = _plan_has_code_changes(plan_steps)
             strict_requirement_refs = _env_bool("SOLVER_STRICT_REQUIREMENT_REFS", False)
+            # Explicit source requirements are authoritative.  Keep inferred
+            # and global requirements advisory by default, but ensure every
+            # explicitly supplied source ID is represented in the plan so the
+            # final sanity check cannot silently lose governance requirements.
+            strict_source_requirement_refs = bool(
+                source_required_ids & explicit_source_requirement_ids
+            )
+            strict_plan_requirement_refs = strict_requirement_refs or strict_source_requirement_refs
             strict_verification = _env_bool("SOLVER_STRICT_VERIFICATION", False)
             strict_test_coverage = _env_bool("SOLVER_STRICT_TEST_COVERAGE", True)
             verification_first = _env_bool("SOLVER_VERIFICATION_FIRST", True)
@@ -12020,9 +12066,9 @@ def run_project_solver(
                     global_ids=requirements_register_global_ids,
                     sequence_ids=requirements_register_sequence_ids,
                     all_ids=requirements_register_ids,
-                    strict=strict_requirement_refs,
+                    strict=strict_plan_requirement_refs,
                 )
-                if strict_requirement_refs:
+                if strict_plan_requirement_refs:
                     missing_ref_steps = _plan_steps_missing_requirement_refs(plan_steps)
                     referenced_ids = _extract_requirement_refs_from_plan(
                         plan_steps, payload.get("requirements")
