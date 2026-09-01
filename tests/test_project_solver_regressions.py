@@ -856,7 +856,7 @@ def test_explicit_source_requirement_ids_are_added_to_plan_references():
     )
 
     assert changed is True
-    assert project_solver._extract_requirement_refs_from_plan(plan, []) >= {
+    assert project_solver._extract_requirement_refs_from_plan(plan, ["REQ-001"]) >= {
         "REQ-001",
         "REQ-002",
         "REQ-003",
