@@ -75,6 +75,7 @@ _PACKAGE_MANAGERS = {"pip", "pip3", "npm", "pnpm", "yarn", "cargo", "go", "uv"}
 _READ_ONLY_INSPECTION_COMMANDS = {
     "cat",
     "cut",
+    "echo",
     "file",
     "grep",
     "head",

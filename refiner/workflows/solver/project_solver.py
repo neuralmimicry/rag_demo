@@ -3811,6 +3811,32 @@ def _execute_shell_command(
     command_results: Optional[List[Dict[str, object]]] = None,
     command_env: Optional[Dict[str, str]] = None,
 ) -> bool:
+    readonly_chain = _read_only_conditional_chain(command)
+    if readonly_chain is not None:
+        previous_success = False
+        for index, (operator, part) in enumerate(readonly_chain):
+            should_run = (
+                index == 0
+                or (operator == "&&" and previous_success)
+                or (operator == "||" and not previous_success)
+            )
+            if not should_run:
+                continue
+            previous_success = _execute_shell_command(
+                part,
+                workdir=workdir,
+                timeout=timeout,
+                actions_log=actions_log,
+                failure_log=failure_log,
+                dataset_summary=dataset_summary,
+                eval_info=eval_info,
+                executed_commands=executed_commands,
+                command_trust_store=command_trust_store,
+                command_results=command_results,
+                command_env=command_env,
+            )
+        return previous_success
+
     policy = evaluate_command_policy(command)
     command_display = policy.command
     trust = None
@@ -4093,6 +4119,63 @@ def _execute_shell_command(
             }
         )
     return False
+
+
+def _read_only_conditional_chain(
+    command: Union[str, Sequence[str]],
+) -> Optional[List[Tuple[str, str]]]:
+    """Parse a safe ``&&``/``||`` chain without invoking a shell.
+
+    Model-generated verification plans commonly use conditionals such as
+    ``test -f result && cat result || echo missing``.  Shell execution remains
+    prohibited; this narrowly supports the equivalent control flow by running
+    each independently policy-approved read-only command with ``shell=False``.
+    Any other shell syntax, structured argv, or mixed-risk segment is left for
+    the normal policy rejection path.
+    """
+    if not isinstance(command, str) or not ("&&" in command or "||" in command):
+        return None
+
+    parts: List[Tuple[str, str]] = []
+    start = 0
+    operator = ""
+    quote = ""
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if character in {"'", '"'}:
+            if not quote:
+                quote = character
+            elif quote == character:
+                quote = ""
+            index += 1
+            continue
+        if quote:
+            index += 1
+            continue
+        if command[index:index + 2] in {"&&", "||"}:
+            part = command[start:index].strip()
+            if not part:
+                return None
+            parts.append((operator, part))
+            operator = command[index:index + 2]
+            start = index + 2
+            index += 2
+            continue
+        index += 1
+
+    if quote:
+        return None
+    final_part = command[start:].strip()
+    if not final_part:
+        return None
+    parts.append((operator, final_part))
+
+    for _, part in parts:
+        decision = evaluate_command_policy(part)
+        if not decision.allowed or decision.category not in {"verification", "vcs_readonly"}:
+            return None
+    return parts
 
 
 def _has_pytest_config(project_root: str) -> bool:

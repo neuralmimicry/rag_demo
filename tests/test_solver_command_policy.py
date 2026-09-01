@@ -116,3 +116,27 @@ def test_execute_shell_command_runs_via_shell_false(tmp_path):
     assert failure_log == []
     assert executed_commands == [command]
     assert any("Command policy approved" in entry for entry in actions_log)
+
+
+def test_execute_shell_command_runs_safe_read_only_conditionals_without_shell(monkeypatch, tmp_path):
+    monkeypatch.setenv("REFINER_SOLVER_COMMAND_POLICY_MODE", "strict")
+    result_file = tmp_path / "result.txt"
+    result_file.write_text("Refiner Supported Languages\n", encoding="utf-8")
+    actions_log = []
+    failure_log = []
+    executed_commands = []
+
+    ok = project_solver._execute_shell_command(
+        f"test -f {result_file} && grep -q 'Refiner Supported Languages' {result_file}",
+        workdir=str(tmp_path),
+        timeout=10,
+        actions_log=actions_log,
+        failure_log=failure_log,
+        dataset_summary=None,
+        eval_info=None,
+        executed_commands=executed_commands,
+    )
+
+    assert ok is True
+    assert failure_log == []
+    assert len(executed_commands) == 2
