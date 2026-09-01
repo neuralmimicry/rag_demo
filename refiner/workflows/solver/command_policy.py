@@ -68,6 +68,24 @@ _READ_ONLY_GIT_SUBCOMMANDS = {
     "ls-remote",
 }
 _PACKAGE_MANAGERS = {"pip", "pip3", "npm", "pnpm", "yarn", "cargo", "go", "uv"}
+# Read-only workspace inspection is part of verification.  Solver commands
+# are executed without a shell and from the bounded solver workspace, so these
+# tools cannot introduce shell chaining or privilege escalation.  Keeping the
+# list explicit preserves strict mode's prohibition on arbitrary commands.
+_READ_ONLY_INSPECTION_COMMANDS = {
+    "cat",
+    "cut",
+    "file",
+    "head",
+    "ls",
+    "od",
+    "pwd",
+    "sed",
+    "stat",
+    "tail",
+    "tr",
+    "wc",
+}
 _STRICT_ALLOWED_CATEGORIES = {"verification", "vcs_readonly"}
 
 
@@ -112,6 +130,9 @@ def _categorize_command(executable: str, argv: List[str]) -> str:
         return "node"
 
     if executable in {"node", "nodejs"} and len(argv) > 1 and argv[1] in {"--check", "-c"}:
+        return "verification"
+
+    if executable in _READ_ONLY_INSPECTION_COMMANDS:
         return "verification"
 
     if executable == "cargo":
