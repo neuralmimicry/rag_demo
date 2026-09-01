@@ -275,7 +275,15 @@ PROJECTS_ROOT = os.path.join(JOB_ROOT, "projects")
 SECRET_STORE_ROOT = os.path.join(JOB_ROOT, "secrets")
 ASSISTANT_MEMORY_ROOT = os.path.join(JOB_ROOT, "assistant_memory")
 USERS_PATH = os.path.join(JOB_ROOT, "users.json")
-WORKSPACE_ROOT = os.path.join(JOB_ROOT, "workspaces")
+# Keep durable job metadata and logs on the configured job-data volume, but
+# allow repository worktrees to live on node-local storage.  Git's object and
+# index writes are particularly sensitive to a degraded shared/NFS volume;
+# isolating worktrees prevents one stalled clone from wedging a worker and
+# leaves the durable job record available for reconciliation.
+WORKSPACE_ROOT = os.getenv(
+    "REFINER_WORKSPACE_DIR",
+    os.path.join(JOB_ROOT, "workspaces"),
+)
 AUDIT_LOG_PATH = os.getenv("REFINER_AUDIT_LOG_PATH", os.path.join(JOB_ROOT, "audit.log"))
 ACCESS_STORE_PATH = os.path.join(JOB_ROOT, "access.json")
 SESSIONS_ROOT = os.path.join(JOB_ROOT, "sessions")
@@ -693,6 +701,8 @@ if BASE_DIR not in RAG_ALLOWED_ROOTS:
     RAG_ALLOWED_ROOTS.append(BASE_DIR)
 if JOB_ROOT not in RAG_ALLOWED_ROOTS:
     RAG_ALLOWED_ROOTS.append(JOB_ROOT)
+if WORKSPACE_ROOT not in RAG_ALLOWED_ROOTS:
+    RAG_ALLOWED_ROOTS.append(WORKSPACE_ROOT)
 try:
     TOKEN_BTC_RATE = float(os.getenv("REFINER_TOKEN_BTC_RATE", "0.000016"))
 except Exception:
