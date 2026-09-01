@@ -102,6 +102,30 @@ def test_deterministic_rollback_rejects_non_commit_input(tmp_path):
         raise AssertionError("rollback accepted a shell expression")
 
 
+def test_rollback_expected_head_rejects_a_concurrent_branch_update(monkeypatch):
+    manager = object.__new__(refiner_web.JobManager)
+    job = _Job()
+    job.payload = {
+        "rollback_commit": "a" * 40,
+        "rollback_expected_head": "b" * 40,
+    }
+    calls = []
+
+    def fake_git_run(command, cwd, job):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="c" * 40 + "\n", stderr="")
+
+    monkeypatch.setattr(manager, "_git_run", fake_git_run)
+    try:
+        # Exercise the same guard through the small helper used by repo prep.
+        manager._assert_rollback_head("/tmp", job)
+    except ValueError as exc:
+        assert "rollback branch changed" in str(exc)
+    else:
+        raise AssertionError("stale rollback branch was accepted")
+    assert calls == [["git", "rev-parse", "HEAD"]]
+
+
 def test_repo_finalization_uses_git_prefix_for_post_push_sha_lookup(monkeypatch):
     manager = object.__new__(refiner_web.JobManager)
     job = SimpleNamespace(

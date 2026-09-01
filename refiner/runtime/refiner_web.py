@@ -7724,6 +7724,7 @@ class JobManager:
 
         rollback_commit = str(payload.get("rollback_commit") or "").strip()
         if rollback_commit:
+            self._assert_rollback_head(workspace, job)
             self._git_revert_commit(workspace, rollback_commit, job)
 
         project_subdir = (payload.get("repo_subdir") or "").strip()
@@ -8155,6 +8156,20 @@ class JobManager:
             self._git_run(["git", "revert", "--abort"], cwd=workspace, job=job)
             raise ValueError(f"git rollback failed: {result.stderr.strip()}")
         job.append_log(f"Rollback revert commit created for {commit}")
+
+    def _assert_rollback_head(self, workspace: str, job: Job) -> None:
+        """Reject a rollback checkout that is no longer at its expected tip."""
+        expected_head = str(job.payload.get("rollback_expected_head") or job.payload.get("rollback_commit") or "").strip()
+        if not expected_head:
+            raise ValueError("rollback expected head is missing")
+        head_result = self._git_run(["git", "rev-parse", "HEAD"], cwd=workspace, job=job)
+        actual_head = (head_result.stdout or "").strip()
+        if head_result.returncode != 0 or actual_head.lower() != expected_head.lower():
+            raise ValueError(
+                "rollback branch changed before revert: "
+                f"expected {expected_head}, found {actual_head or 'unknown'}"
+            )
+        job.append_log(f"Rollback branch tip verified at {actual_head}")
 
     def _git_has_changes(self, workspace: str, job: Job) -> bool:
         result = self._git_run(["git", "status", "--porcelain"], cwd=workspace, job=job)
