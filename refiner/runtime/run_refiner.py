@@ -629,6 +629,7 @@ def _run_project_solver(
     allow_run: bool = False,
     max_steps: int = 25,
     max_iterations: int = 3,
+    requirements_only: bool = False,
     project_output_dir: Optional[str] = None,
     codingagent: Optional[str] = None,
     codingagent_fallback: Optional[str] = None,
@@ -693,6 +694,7 @@ def _run_project_solver(
     exit_code = run_project_solver(
         project_root,
         requirements_path=requirements_path,
+        requirements_only=requirements_only,
         output_path=out_path,
         llm_provider=llm_provider,
         llm_model=llm_model,
@@ -876,6 +878,7 @@ def run(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--clear-research-cache", dest="clear_research_cache", action="store_true", help="Clear the research cache before starting")
     parser.add_argument("--project", dest="project_root", help="Project folder to scan for requirements and solve (enables project solver mode)")
     parser.add_argument("--requirements", dest="requirements_path", help="Optional requirements document; if provided, project scanning is skipped")
+    parser.add_argument("--requirements-only", dest="requirements_only", action="store_true", help="Use only the supplied requirements document; skip repository and solver-workspace requirement enrichment")
     parser.add_argument("--project-run", dest="project_run", action="store_true", help="Allow project solver to execute run_command steps (default: disabled)")
     parser.add_argument("--project-max-steps", dest="project_max_steps", type=int, default=25, help="Max steps to apply for project solving (default: 25)")
     parser.add_argument("--project-iterations", dest="project_iterations", type=int, default=3, help="Max planning iterations for project solving (default: 3)")
@@ -1105,6 +1108,7 @@ def run(argv: Optional[List[str]] = None) -> int:
                 _run_project_solver,
                 project_root=args.project_root,
                 requirements_path=args.requirements_path,
+                requirements_only=args.requirements_only,
                 output=args.output,
                 llm_provider=args.llm_provider,
                 llm_model=args.llm_model,

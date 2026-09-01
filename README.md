@@ -1268,6 +1268,7 @@ refiner --project /path/to/project --project-output-dir /tmp/solver_workspace --
 Inputs
 - `--project`: Path to the project folder to scan and solve.
 - `--requirements`: Optional requirements document (txt/md/pdf/docx/etc.). When supplied, project scanning is skipped.
+- `--requirements-only`: Use only the supplied requirements document and skip repository/solver-workspace requirement enrichment; useful when an upstream controller supplies the authoritative scope.
 - `--output`: JSON report path. Defaults to `project_solution.json` inside the project root.
 - `project_solution.json` includes `requirement_traceability` mapping requirements → plan steps → file changes.
 - `--project-run`: Allow the solver to execute `run_command` steps (disabled by default).

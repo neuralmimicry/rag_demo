@@ -7555,6 +7555,8 @@ class JobManager:
             requirements_path = self._resolve_requirements(job)
             if requirements_path:
                 command += ["--requirements", requirements_path]
+            if payload.get("requirements_only"):
+                command.append("--requirements-only")
             if payload.get("project_run"):
                 command.append("--project-run")
             if payload.get("project_max_steps"):
