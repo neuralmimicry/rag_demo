@@ -204,6 +204,13 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 FROM ${RUST_TOOLCHAIN_IMAGE} AS rust-toolchain
 
+# Cargo's formatter is a separately distributed rustup component. Refiner's
+# strict acceptance checks invoke `cargo fmt --check`, so install and verify it
+# before the toolchain is copied into the runtime image.
+RUN set -eux; \
+    rustup component add rustfmt; \
+    cargo fmt --version
+
 # -----------------------------------------------------------------------------
 # Runtime stage: install only runtime OS packages and run as a non-root user.
 # -----------------------------------------------------------------------------
@@ -302,7 +309,8 @@ RUN set -eux; \
     mkdir -p "${CARGO_HOME}"; \
     chown -R "${APP_UID}:${APP_GID}" "${APP_HOME}" "${CARGO_HOME}" /tmp/refiner; \
     rustc --version; \
-    cargo --version
+    cargo --version; \
+    cargo fmt --version
 
 EXPOSE 5001 8080
 
