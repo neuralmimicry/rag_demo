@@ -61,6 +61,29 @@ def test_canonical_project_target_keeps_web_assets_and_readme_together(tmp_path)
         assert resolved == requested
 
 
+def test_canonical_project_target_keeps_documentation_in_project_root(tmp_path):
+    project_root = tmp_path / "project"
+    workspace = project_root / "project_solver_output"
+    workspace.mkdir(parents=True)
+
+    target, note = canonical_project_target(
+        "docs/refiner-supported-languages.md",
+        project_root=str(project_root),
+        workspace_root=str(workspace),
+    )
+
+    assert target == "docs/refiner-supported-languages.md"
+    assert note and "canonical project-root" in note.lower()
+    resolved, _ = project_solver._resolve_file_target(
+        "docs/refiner-supported-languages.md",
+        project_root=str(project_root),
+        workspace_root=str(workspace),
+        step_type="write_file",
+        prefer_workspace_new_files=True,
+    )
+    assert resolved == "docs/refiner-supported-languages.md"
+
+
 def test_canonical_project_target_does_not_hide_path_traversal():
     target, note = canonical_project_target(
         "../outside.js",

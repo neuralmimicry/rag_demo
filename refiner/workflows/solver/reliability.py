@@ -117,12 +117,18 @@ def canonical_project_target(
         normalized = normalized[len(workspace_name) + 1 :]
     basename = os.path.basename(normalized).lower()
     extension = os.path.splitext(basename)[1]
-    # Source, tests, manifests, and web resources need one shared cwd.  Other
-    # generated material may still be redirected by the caller when desired.
+    # Source, tests, documentation, manifests, and web resources need one
+    # shared cwd. Other generated material may still be redirected by the
+    # caller when desired. Documentation is a repository deliverable just
+    # like source and README files; isolating ``docs/`` would make a solver
+    # appear to succeed while leaving the requested documentation out of the
+    # commit.
     canonical = (
         extension in CODE_EXTENSIONS
         or basename in MANIFEST_NAMES
-        or normalized.startswith(("tests/", "test/", "src/", "public/", "static/", "templates/"))
+        or normalized.startswith((
+            "docs/", "tests/", "test/", "src/", "public/", "static/", "templates/"
+        ))
         or basename in {"index.html", "index.css", "index.js", "server.js", "app.js", "main.py"}
     )
     if canonical or step_type in {"append_file", "replace_in_file"}:
