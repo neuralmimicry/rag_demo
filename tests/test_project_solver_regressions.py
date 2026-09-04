@@ -53,6 +53,73 @@ def test_foreground_http_server_is_bounded_and_cleaned_up(monkeypatch, tmp_path)
     assert any("bounded foreground http server smoke check succeeded" in item.lower() for item in actions_log)
 
 
+def test_node_http_server_entrypoint_is_recognised_for_bounded_smoke_check(tmp_path):
+    entrypoint = tmp_path / "server.js"
+    entrypoint.write_text(
+        "const http = require('http');\n"
+        "http.createServer((_req, res) => res.end('ok')).listen(3000);\n",
+        encoding="utf-8",
+    )
+
+    assert project_solver._parse_foreground_server_port(
+        ["node", "server.js"], workdir=str(tmp_path)
+    ) == 3000
+
+
+def test_node_syntax_check_is_not_treated_as_foreground_server(tmp_path):
+    entrypoint = tmp_path / "server.js"
+    entrypoint.write_text(
+        "require('http').createServer((_req, res) => res.end('ok')).listen(3000);\n",
+        encoding="utf-8",
+    )
+
+    assert project_solver._parse_foreground_server_port(
+        ["node", "--check", "server.js"], workdir=str(tmp_path)
+    ) is None
+
+
+def test_node_server_chain_keeps_server_alive_for_localhost_probe(monkeypatch, tmp_path):
+    entrypoint = tmp_path / "server.js"
+    entrypoint.write_text(
+        "require('http').createServer((_req, res) => res.end('ok')).listen(3000);\n",
+        encoding="utf-8",
+    )
+    process = _FakeServerProcess()
+    terminated = []
+    commands = []
+
+    monkeypatch.setattr(project_solver, "_is_port_open", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(project_solver, "_wait_for_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(project_solver.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(
+        project_solver.subprocess,
+        "run",
+        lambda argv, **_kwargs: (
+            commands.append(list(argv)) or _FakeCompletedProcess(0, "ok\n", "")
+        ),
+    )
+    monkeypatch.setattr(
+        project_solver,
+        "terminate_process_tree",
+        lambda value: terminated.append(value),
+    )
+
+    actions_log = []
+    failure_log = []
+    assert project_solver._execute_shell_command(
+        "node server.js && curl http://localhost:3000/",
+        workdir=str(tmp_path),
+        timeout=30,
+        actions_log=actions_log,
+        failure_log=failure_log,
+        dataset_summary=None,
+        eval_info=None,
+    ) is True
+    assert commands == [["curl", "http://localhost:3000/"]]
+    assert terminated == [process]
+    assert failure_log == []
+
+
 def test_select_verification_steps_prefers_py_compile_without_tests(tmp_path):
     (tmp_path / "main.py").write_text("print('ok')\n", encoding="utf-8")
     lang_info = {"languages": ["python"], "build_systems": []}
@@ -62,6 +129,30 @@ def test_select_verification_steps_prefers_py_compile_without_tests(tmp_path):
     assert steps
     assert steps[0]["command"].startswith("python -m py_compile ")
     assert "pytest" not in steps[0]["command"]
+
+
+def test_fresh_project_has_no_test_surface(tmp_path):
+    assert not project_solver._project_has_test_surface(str(tmp_path))
+
+    (tmp_path / "server.test.js").write_text("describe('server', () => {});\n", encoding="utf-8")
+    assert project_solver._project_has_test_surface(str(tmp_path))
+
+
+def test_plan_verification_uses_pending_source_files_for_fresh_workspace():
+    steps = project_solver._select_plan_verification_steps(
+        [
+            {"type": "write_file", "path": "server.js", "content": ""},
+            {"type": "write_file", "path": "index.html", "content": ""},
+            {"type": "write_file", "path": "app.py", "content": ""},
+        ]
+    )
+
+    commands = [step["command"] for step in steps]
+    assert commands == [
+        "node --check server.js",
+        "python -m py_compile app.py",
+    ]
+    assert all("pytest" not in command for command in commands)
 
 
 def test_execute_shell_command_treats_pytest_no_tests_as_informational(monkeypatch, tmp_path):
@@ -151,6 +242,38 @@ def test_apply_step_normalizes_parent_workdir(monkeypatch, tmp_path):
     assert any("normalized unsafe workdir to project root" in item.lower() for item in actions_log)
 
 
+def test_apply_step_normalizes_redundant_project_workdir(monkeypatch, tmp_path):
+    project_root = tmp_path / "Homework-Habit-Hero"
+    project_root.mkdir()
+    (project_root / project_root.name).mkdir()
+
+    captured = {}
+
+    def _fake_execute(command, **kwargs):
+        captured["command"] = command
+        captured["workdir"] = kwargs.get("workdir")
+        return True
+
+    monkeypatch.setattr(project_solver, "_execute_shell_command", _fake_execute)
+    actions_log = []
+    step = {
+        "type": "run_command",
+        "command": "node server.js",
+        "workdir": project_root.name,
+    }
+
+    project_solver._apply_step(
+        str(project_root),
+        step,
+        allow_run=True,
+        actions_log=actions_log,
+    )
+
+    assert captured["workdir"] == str(project_root)
+    assert captured["command"] == "node server.js"
+    assert any("normalized redundant project workdir" in item.lower() for item in actions_log)
+
+
 def test_rewrite_workspace_command_paths_for_node_script(tmp_path):
     project_root = tmp_path / "sample-project"
     workspace_root = project_root / "project_solver_output"
@@ -201,6 +324,44 @@ def test_requirements_explicit_repository_root_disables_solver_workspace():
     )
 
 
+def test_contract_validation_intent_builds_required_artifacts_and_command(tmp_path):
+    source = project_solver.RequirementSource(
+        path="requirements.md",
+        requirements_text=(
+            "Validate the contract in the isolated starter workspace. "
+            "Create validation_report.md and test_contract.py, then run "
+            "python -m pytest -q."
+        ),
+        requirement_lines=[],
+        todo_lines=[],
+        context_excerpt="",
+    )
+
+    intent = project_solver._classify_local_intent(source, str(tmp_path))
+    assert intent["intent"] == "contract_validation"
+
+    payload = project_solver._build_local_plan_from_intent(
+        intent,
+        source,
+        str(tmp_path),
+        {"languages": ["python"], "build_systems": []},
+        allow_run=True,
+        required_ids=set(),
+    )
+
+    assert payload is not None
+    assert payload["done"] is True
+    steps = payload["plan"]
+    assert {step["path"] for step in steps if step["type"] == "write_file"} == {
+        "validation_report.md",
+        "test_contract.py",
+    }
+    assert any(
+        step["type"] == "run_command" and step["command"] == "python -m pytest -q"
+        for step in steps
+    )
+
+
 def test_command_should_use_workspace_for_generated_node_project(tmp_path):
     project_root = tmp_path / "sample-project"
     workspace_root = project_root / "project_solver_output"
@@ -215,7 +376,6 @@ def test_command_should_use_workspace_for_generated_node_project(tmp_path):
         project_root=str(project_root),
         workspace_root=str(workspace_root),
     )
-
     (project_root / "server.js").write_text("console.log('project')\n", encoding="utf-8")
     assert not project_solver._command_should_use_workspace(
         "node server.js",
@@ -223,6 +383,51 @@ def test_command_should_use_workspace_for_generated_node_project(tmp_path):
         project_root=str(project_root),
         workspace_root=str(workspace_root),
     )
+
+
+def test_project_root_prefixed_commands_are_relative_to_actual_root_after_retry(tmp_path):
+    project_root = tmp_path / "Maths-Practice-Game-job"
+    workspace_root = tmp_path / "project_solver_output"
+    project_root.mkdir()
+    workspace_root.mkdir()
+
+    rewritten = project_solver._rewrite_project_root_prefixed_command_paths(
+        "mkdir -p project_root/views && python -c \"from pathlib import Path; Path('project_root/views/index.ejs').write_text('ok')\"",
+        abs_workdir=str(workspace_root),
+        project_root=str(project_root),
+    )
+
+    assert "../Maths-Practice-Game-job/views" in rewritten
+    assert "project_solver_output/project_root" not in rewritten
+
+    target, note = project_solver._resolve_file_target(
+        "project_root/views/index.ejs",
+        project_root=str(project_root),
+        workspace_root=str(workspace_root),
+        step_type="write_file",
+        prefer_workspace_new_files=True,
+    )
+    assert target == "views/index.ejs"
+    assert note and "project-root alias" in note
+
+
+def test_plan_drops_exact_directory_file_collision_but_keeps_valid_parent(tmp_path):
+    actions = []
+    steps = [
+        {"type": "create_dir", "path": "views"},
+        {"type": "write_file", "path": "views", "content": "legacy"},
+        {"type": "create_dir", "path": "assets"},
+        {"type": "write_file", "path": "assets/index.ejs", "content": "ok"},
+    ]
+
+    filtered, dropped = project_solver._drop_exact_directory_file_conflicts(
+        steps,
+        actions_log=actions,
+    )
+
+    assert dropped == 1
+    assert [step["path"] for step in filtered] == ["views", "assets", "assets/index.ejs"]
+    assert any("exact path is also a file target" in item for item in actions)
 
 
 def test_planner_timeout_writes_incomplete_project_solution(monkeypatch, tmp_path):
@@ -273,6 +478,60 @@ def test_planner_timeout_writes_incomplete_project_solution(monkeypatch, tmp_pat
     assert report["completion_summary"]["status"] == "incomplete"
     assert report["completion_summary"]["needs_more_iterations"] is True
     assert report["planner_failure"]["type"] == "planner_timeout"
+
+
+def test_code_source_without_configured_agent_uses_automatic_coding_recovery(monkeypatch, tmp_path):
+    project_root = tmp_path / "sample-project"
+    project_root.mkdir()
+    requirements_path = project_root / "requirements.md"
+    requirements_path.write_text(
+        "Create a server.js file for the application.\n",
+        encoding="utf-8",
+    )
+    output_path = project_root / "project_solution.json"
+
+    class _Planner:
+        name = "test-planner"
+        model = "test-model"
+
+        def predict(self, *_args, **_kwargs):
+            return type("Response", (), {"text": '{"done": true, "plan": []}'})()
+
+        def cleanup(self):
+            return None
+
+    recovery_agents = []
+
+    def _fake_codingagent_plan(**kwargs):
+        recovery_agents.append(kwargs["agent"])
+        return {"done": True, "plan": [{"type": "note", "step": "recovery response"}]}
+
+    provider = _Planner()
+    monkeypatch.setattr(project_solver, "build_workflow_provider", lambda **_kwargs: provider)
+    monkeypatch.setattr(project_solver, "describe_provider", lambda _provider: {"name": "test-planner"})
+    monkeypatch.setattr(project_solver, "provider_log_summary", lambda _provider: "test-planner")
+    monkeypatch.setattr(project_solver, "_query_codingagent_plan", _fake_codingagent_plan)
+    monkeypatch.setenv("SOLVER_TRY_OLLAMA_FIRST", "0")
+    monkeypatch.setenv("SOLVER_AUTO_CODINGAGENT", "1")
+
+    project_solver.run_project_solver(
+        str(project_root),
+        requirements_path=str(requirements_path),
+        output_path=str(output_path),
+        llm_provider="openai",
+        llm_model="test-model",
+        ollama_base_url=None,
+        llm_max_tokens=128,
+        llm_temperature=0.2,
+        llm_timeout=5,
+        llm_reasoning_effort=None,
+        llm_api_key=None,
+        max_steps=4,
+        max_iterations=1,
+    )
+
+    assert recovery_agents
+    assert set(recovery_agents) == {"codex"}
 
 
 def test_requirements_only_skips_project_derived_requirement_enrichment(monkeypatch, tmp_path):
@@ -390,6 +649,96 @@ def test_plan_has_test_changes_does_not_accept_unrelated_artifacts():
             }
         ]
     )
+
+
+def test_requirement_coverage_requires_matching_requirement_id():
+    source = project_solver.RequirementSource(
+        path="requirements.md",
+        requirements_text="Implement the application.",
+        requirement_lines=[],
+        todo_lines=[],
+        context_excerpt="",
+    )
+    register = {
+        "requirements": [
+            {
+                "id": "REQ-001",
+                "title": "Counter",
+                "description": "Implement the counter behavior.",
+                "source": ["requirements.md"],
+            },
+            {
+                "id": "REQ-002",
+                "title": "Reset",
+                "description": "Implement the reset behavior.",
+                "source": ["requirements.md"],
+            },
+        ]
+    }
+    coverage, missing = project_solver._build_requirement_coverage(
+        [source],
+        {
+            "requirements.md": [
+                {
+                    "path": "app.js",
+                    "is_code": True,
+                    "requirement_ids": ["REQ-001"],
+                }
+            ]
+        },
+        "/tmp/project",
+        requirements_register=register,
+    )
+
+    requirements = coverage["requirements.md"]["requirements"]
+    assert requirements[0]["status"] == "covered"
+    assert requirements[1]["status"] == "missing"
+    assert "REQ-002: Reset" in coverage["requirements.md"]["missing_requirements"]
+    assert missing == ["requirements.md"]
+
+
+def test_requirement_ids_in_source_comments_do_not_create_traceability():
+    step = {
+        "type": "write_file",
+        "path": "app.js",
+        "content": "// REQ-001\nconsole.log('implementation');\n",
+    }
+
+    assert project_solver._extract_requirement_refs_from_step(step) == []
+    assert project_solver._extract_requirement_refs_from_plan([step], []) == set()
+
+
+def test_behavior_test_classification_excludes_syntax_checks():
+    assert not project_solver._is_behavior_test_command("node --check app.js")
+    assert not project_solver._is_behavior_test_command("python -m py_compile app.py")
+    assert project_solver._is_behavior_test_command("node smoke_test.js")
+    assert project_solver._is_behavior_test_command("python -m pytest tests/test_app.py")
+
+
+def test_plan_behavior_test_is_added_for_smoke_test():
+    steps = [
+        {
+            "type": "write_file",
+            "path": "app.js",
+            "content": "console.log('ok');\n",
+        },
+        {
+            "type": "write_file",
+            "path": "smoke_test.js",
+            "content": "require('node:assert').equal(1, 1);\n",
+        },
+    ]
+
+    checks = project_solver._select_plan_behavior_test_steps(steps)
+    assert [check["command"] for check in checks] == ["node smoke_test.js"]
+
+
+def test_test_artifact_quality_rejects_placeholder(tmp_path):
+    path = tmp_path / "smoke_test.js"
+    path.write_text("console.log('smoke');\n", encoding="utf-8")
+    assert "assertion" in project_solver._test_artifact_quality(str(path))
+    path.write_text("require('node:assert').equal(1, 1);\n", encoding="utf-8")
+    assert project_solver._test_artifact_quality(str(path)) is None
 
 
 def test_apply_step_skips_placeholder_command_literal(tmp_path):
@@ -913,6 +1262,14 @@ def test_explicit_source_requirement_ids_are_added_to_plan_references():
         "REQ-002",
         "REQ-003",
     }
+
+
+def test_global_requirement_refs_are_advisory_unless_strict_mode_is_enabled():
+    assert not project_solver._global_requirement_refs_required(False, False)
+    # Strict source traceability must not promote generated global guidance to
+    # a hard requirement; only the dedicated strict-global switch does that.
+    assert not project_solver._global_requirement_refs_required(True, False)
+    assert project_solver._global_requirement_refs_required(False, True)
 
 
 def test_compiled_language_verification_keeps_native_build_phases(tmp_path):

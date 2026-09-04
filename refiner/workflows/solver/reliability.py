@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 CODE_EXTENSIONS = {
     ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js",
-    ".jsx", ".php", ".py", ".rb", ".rs", ".sh", ".sql", ".ts", ".tsx", ".css",
+    ".ejs", ".jsx", ".php", ".py", ".rb", ".rs", ".sh", ".sql", ".ts", ".tsx", ".css",
 }
 MANIFEST_NAMES = {
     "cargo.toml", "go.mod", "package.json", "package-lock.json", "pnpm-lock.yaml",
@@ -129,7 +129,17 @@ def canonical_project_target(
         or normalized.startswith((
             "docs/", "tests/", "test/", "src/", "public/", "static/", "templates/"
         ))
-        or basename in {"index.html", "index.css", "index.js", "server.js", "app.js", "main.py"}
+        or basename in {
+            "index.html",
+            "index.css",
+            "index.js",
+            "server.js",
+            "app.js",
+            "main.py",
+            # Contract-validation reports are repository deliverables and
+            # must remain alongside the project-root test that verifies them.
+            "validation_report.md",
+        }
     )
     if canonical or step_type in {"append_file", "replace_in_file"}:
         return normalized, "Canonical project-root target: {}".format(requested)
