@@ -37,6 +37,61 @@ def test_unresolved_source_failure_blocks_acceptance_completion():
     ) is False
 
 
+def test_code_source_requires_behavior_test_for_acceptance_completion():
+    assert project_solver._verification_proves_source_complete(
+        verification_steps_executed=1,
+        behavior_test_steps_executed=0,
+        requires_behavior_test=True,
+        replan_due_to_hallucination=False,
+        replan_due_to_verification=False,
+        replan_due_to_replace=False,
+        defer_source=False,
+        unresolved_failures=[],
+        source_path="requirements.md",
+    ) is False
+    assert project_solver._verification_proves_source_complete(
+        verification_steps_executed=1,
+        behavior_test_steps_executed=1,
+        requires_behavior_test=True,
+        replan_due_to_hallucination=False,
+        replan_due_to_verification=False,
+        replan_due_to_replace=False,
+        defer_source=False,
+        unresolved_failures=[],
+        source_path="requirements.md",
+    ) is True
+
+
+def test_completion_blockers_include_hard_acceptance_gaps_but_not_advisory_globals():
+    blockers = project_solver._completion_blockers(
+        planner_failure=False,
+        incomplete_sources=[],
+        test_quality_missing_sources=[],
+        coverage_missing_sources=["requirements.md"],
+        requirements_missing_hard_ids=["REQ-001"],
+        requirements_missing_advisory_ids=["GLOBAL-REQ-001"],
+        requirements_sanity_strict_global=False,
+        unresolved_verification_failures=[],
+        module_registry={"missing_tests": [], "missing_examples": []},
+    )
+    assert blockers == ["coverage_missing_sources", "requirements_missing_hard_ids"]
+
+
+def test_completion_blockers_include_missing_module_evidence():
+    blockers = project_solver._completion_blockers(
+        planner_failure=False,
+        incomplete_sources=[],
+        test_quality_missing_sources=[],
+        coverage_missing_sources=[],
+        requirements_missing_hard_ids=[],
+        requirements_missing_advisory_ids=[],
+        requirements_sanity_strict_global=False,
+        unresolved_verification_failures=[],
+        module_registry={"missing_tests": [{"path": "app.js"}], "missing_examples": [{"path": "app.js"}]},
+    )
+    assert blockers == ["module_missing_tests", "module_missing_examples"]
+
+
 def test_successful_reverification_clears_matching_historical_failure():
     failures = [
         {

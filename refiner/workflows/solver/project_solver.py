@@ -7746,6 +7746,8 @@ def _verification_proves_source_complete(
     defer_source: bool,
     unresolved_failures: List[Dict[str, object]],
     source_path: str,
+    behavior_test_steps_executed: int = 0,
+    requires_behavior_test: bool = False,
 ) -> bool:
     """Return whether successful acceptance checks can close a source.
 
@@ -7759,6 +7761,8 @@ def _verification_proves_source_complete(
 
     if verification_steps_executed <= 0:
         return False
+    if requires_behavior_test and behavior_test_steps_executed <= 0:
+        return False
     if (
         replan_due_to_hallucination
         or replan_due_to_verification
@@ -7771,6 +7775,42 @@ def _verification_proves_source_complete(
         and _safe_str(failure.get("source")) == source_path
         for failure in unresolved_failures
     )
+
+
+def _completion_blockers(
+    *,
+    planner_failure: bool,
+    incomplete_sources: Sequence[str],
+    test_quality_missing_sources: Sequence[str],
+    coverage_missing_sources: Sequence[str],
+    requirements_missing_hard_ids: Sequence[str],
+    requirements_missing_advisory_ids: Sequence[str],
+    requirements_sanity_strict_global: bool,
+    unresolved_verification_failures: Sequence[Dict[str, object]],
+    module_registry: Optional[Dict[str, object]],
+) -> List[str]:
+    """Return the hard acceptance failures that keep a solver run incomplete."""
+    blockers: List[str] = []
+    if planner_failure:
+        blockers.append("planner_failure")
+    if incomplete_sources:
+        blockers.append("incomplete_sources")
+    if test_quality_missing_sources:
+        blockers.append("test_quality_missing_sources")
+    if coverage_missing_sources:
+        blockers.append("coverage_missing_sources")
+    if requirements_missing_hard_ids:
+        blockers.append("requirements_missing_hard_ids")
+    if requirements_sanity_strict_global and requirements_missing_advisory_ids:
+        blockers.append("requirements_missing_advisory_ids")
+    if unresolved_verification_failures:
+        blockers.append("unresolved_verification_failures")
+    if isinstance(module_registry, dict):
+        if module_registry.get("missing_tests"):
+            blockers.append("module_missing_tests")
+        if module_registry.get("missing_examples"):
+            blockers.append("module_missing_examples")
+    return blockers
 
 
 def _failure_fingerprint(failure: Dict[str, object]) -> str:
@@ -13555,6 +13595,7 @@ def run_project_solver(
             replan_due_to_verification = False
             replan_due_to_replace = False
             verification_steps_executed = 0
+            behavior_test_steps_executed = 0
             iteration_applied_start = len(source_applied_steps)
             iteration_executed_commands: List[str] = []
             iteration_command_results: List[Dict[str, object]] = []
@@ -13599,6 +13640,7 @@ def run_project_solver(
                         else None
                     ),
                 )
+                command_results_before_step = len(iteration_command_results)
                 _apply_step(
                     project_root,
                     step,
@@ -13618,12 +13660,13 @@ def run_project_solver(
                     command_trust_store=command_trust_store,
                     command_results=iteration_command_results,
                 )
-                for command_result in iteration_command_results:
+                for command_result in iteration_command_results[command_results_before_step:]:
                     if (
                         isinstance(command_result, dict)
                         and command_result.get("success") is True
                         and _is_behavior_test_command(_safe_str(command_result.get("command")))
                     ):
+                        behavior_test_steps_executed += 1
                         evidence = _safe_str(command_result.get("command"))
                         if evidence and evidence not in behavior_test_evidence_by_source.setdefault(source.path, []):
                             behavior_test_evidence_by_source[source.path].append(evidence)
@@ -13761,6 +13804,7 @@ def run_project_solver(
                                 rec_command = _step_command_text(rec_step)
                                 if rec_command and _is_verification_command(rec_command):
                                     rec_is_verification = True
+                            command_results_before_step = len(iteration_command_results)
                             _apply_step(
                                 project_root,
                                 rec_step,
@@ -13780,12 +13824,13 @@ def run_project_solver(
                                 command_trust_store=command_trust_store,
                                 command_results=iteration_command_results,
                             )
-                            for command_result in iteration_command_results:
+                            for command_result in iteration_command_results[command_results_before_step:]:
                                 if (
                                     isinstance(command_result, dict)
                                     and command_result.get("success") is True
                                     and _is_behavior_test_command(_safe_str(command_result.get("command")))
                                 ):
+                                    behavior_test_steps_executed += 1
                                     evidence = _safe_str(command_result.get("command"))
                                     if evidence and evidence not in behavior_test_evidence_by_source.setdefault(source.path, []):
                                         behavior_test_evidence_by_source[source.path].append(evidence)
@@ -14106,6 +14151,8 @@ def run_project_solver(
                 break
             if _verification_proves_source_complete(
                 verification_steps_executed=verification_steps_executed,
+                behavior_test_steps_executed=behavior_test_steps_executed,
+                requires_behavior_test=bool(source_requires_code and strict_test_coverage),
                 replan_due_to_hallucination=replan_due_to_hallucination,
                 replan_due_to_verification=replan_due_to_verification,
                 replan_due_to_replace=replan_due_to_replace,
@@ -14360,8 +14407,24 @@ def run_project_solver(
         needs_more_iterations = True
     if unresolved_verification_failures:
         needs_more_iterations = True
+    completion_blockers = _completion_blockers(
+        planner_failure=planner_failure,
+        incomplete_sources=incomplete_sources,
+        test_quality_missing_sources=test_quality_missing_sources,
+        coverage_missing_sources=coverage_missing_sources,
+        requirements_missing_hard_ids=requirements_missing_hard_ids,
+        requirements_missing_advisory_ids=requirements_missing_advisory_ids,
+        requirements_sanity_strict_global=requirements_sanity_strict_global,
+        unresolved_verification_failures=unresolved_verification_failures,
+        module_registry=module_registry,
+    )
+    if completion_blockers:
+        needs_more_iterations = True
+        actions_log.append(
+            "Completion blocked by: " + ", ".join(completion_blockers)
+        )
     completion_summary = {
-        "status": "incomplete" if (planner_failure or test_quality_missing_sources) else "complete",
+        "status": "incomplete" if completion_blockers else "complete",
         "total_sources": len(source_paths),
         "completed_sources": completed_sources_final,
         "incomplete_sources": incomplete_sources,
@@ -14377,6 +14440,7 @@ def run_project_solver(
         "requirements_missing_hard_ids": requirements_missing_hard_ids,
         "requirements_missing_advisory_ids": requirements_missing_advisory_ids,
         "requirements_sanity_strict_global": requirements_sanity_strict_global,
+        "completion_blockers": completion_blockers,
         "unresolved_verification_failures": [
             {
                 "command": failure.get("command"),
@@ -14639,7 +14703,7 @@ def run_project_solver(
     )
 
     output_data = {
-        "status": "incomplete" if (planner_failure or test_quality_missing_sources) else "complete",
+        "status": "incomplete" if completion_blockers else "complete",
         "summary": all_plans[-1].get("summary") if all_plans else None,
         "requirements": all_plans[-1].get("requirements") if all_plans else None,
         "plans": all_plans,
