@@ -3742,12 +3742,14 @@ class TopicResearcher:
         if self._quota_reached and not self.fallback_llm:
             return []
             
+        response_text = ""
         try:
             resp = self._predict_with_role(
                 "researcher",
                 [{"role": "user", "content": user_content}],
                 system=system_prompt,
             )
+            response_text = getattr(resp, "text", "") or ""
             
             if not resp.text or not resp.text.strip():
                 logger.warning("LLM returned an empty response for fallback research.")
@@ -3833,7 +3835,7 @@ class TopicResearcher:
             logger.error(f"Fallback research failed due to quota: {e}")
             return []
         except Exception as e:
-            logger.error(f"Fallback URL research failed: {e}. Response was: {getattr(resp, 'text', '')[:200]}...")
+            logger.error(f"Fallback URL research failed: {e}. Response was: {response_text[:200]}...")
             return []
 
     def _formulate_document(self, topic: str, requirements: str, results: Dict[str, Any], current_draft: str = "", context: str = "", target_section: Optional[str] = None) -> str:

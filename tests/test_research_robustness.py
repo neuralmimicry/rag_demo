@@ -72,6 +72,12 @@ def test_fallback_research_empty_response(researcher, mock_llm):
     results = researcher._fallback_url_research("https://fail.com", "404")
     assert results == []
 
+
+def test_fallback_research_provider_failure_is_recoverable(researcher, mock_llm):
+    mock_llm.predict.side_effect = RuntimeError("provider unavailable")
+    results = researcher._fallback_url_research("https://fail.com", "503")
+    assert results == []
+
 def test_extract_json_robustness(researcher):
     # Test with extra text and stray braces
     text = """
