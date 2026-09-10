@@ -8099,9 +8099,9 @@ class JobManager:
             script = (
                 "#!/bin/sh\n"
                 "case \"$1\" in\n"
-                "*Username*) echo \"x-access-token\" ;;\n"
-                "*Password*) echo \"" + token.replace('"', '\\"') + "\" ;;\n"
-                "*) echo \"" + token.replace('"', '\\"') + "\" ;;\n"
+                "  *Username*) printf '%s\\n' x-access-token ;;\n"
+                "  *Password*) printf '%s\\n' \"$GIT_ASKPASS_TOKEN\" ;;\n"
+                "  *) printf '%s\\n' \"$GIT_ASKPASS_TOKEN\" ;;\n"
                 "esac\n"
             )
             with open(askpass_path, "w", encoding="utf-8") as handle:
@@ -8111,6 +8111,9 @@ class JobManager:
             except Exception:
                 pass
             env["GIT_ASKPASS"] = askpass_path
+            # Keep the secret out of the helper script and let Git pass the
+            # prompt text through the small, process-local environment instead.
+            env["GIT_ASKPASS_TOKEN"] = token
         return env
 
     def _git_run(self, command: List[str], cwd: str, job: Job, token: Optional[str] = None) -> subprocess.CompletedProcess:

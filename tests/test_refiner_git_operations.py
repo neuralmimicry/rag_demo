@@ -35,6 +35,35 @@ def test_git_commands_have_a_finite_configurable_timeout(monkeypatch):
     assert captured["timeout"] == 180.0
 
 
+def test_git_askpass_helper_supplies_username_and_password(tmp_path):
+    env = refiner_web.JobManager._git_env(
+        object.__new__(refiner_web.JobManager),
+        "deployment-token",
+        str(tmp_path),
+    )
+    helper = env["GIT_ASKPASS"]
+
+    username = subprocess.run(
+        [helper, "Username for 'https://github.com':"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    password = subprocess.run(
+        [helper, "Password for 'https://github.com':"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert username.stdout.strip() == "x-access-token"
+    assert password.stdout.strip() == "deployment-token"
+    with open(helper, encoding="utf-8") as handle:
+        assert "deployment-token" not in handle.read()
+
+
 def test_git_timeout_is_reported_as_a_failed_command(monkeypatch):
     job = _Job()
 
