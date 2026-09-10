@@ -733,6 +733,26 @@ def test_plan_behavior_test_is_added_for_smoke_test():
     assert [check["command"] for check in checks] == ["node smoke_test.js"]
 
 
+def test_plan_behavior_test_runs_python_validation_script_directly():
+    steps = [
+        {
+            "type": "write_file",
+            "path": "tests/test_smoke.py",
+            "content": (
+                "def run_smoke():\n"
+                "    observed = 'ok'\n"
+                "    assert observed == 'ok'\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    run_smoke()\n"
+            ),
+        }
+    ]
+
+    checks = project_solver._select_plan_behavior_test_steps(steps)
+    assert [check["command"] for check in checks] == ["python tests/test_smoke.py"]
+
+
 def test_test_artifact_quality_rejects_placeholder(tmp_path):
     path = tmp_path / "smoke_test.js"
     path.write_text("console.log('smoke');\n", encoding="utf-8")

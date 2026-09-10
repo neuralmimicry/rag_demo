@@ -3628,7 +3628,21 @@ def _select_plan_behavior_test_steps(
         ]
         suffix = os.path.splitext(normalized)[1].lower()
         if suffix == ".py":
-            command = f"python -m pytest {shlex.quote(normalized)}"
+            # A requirement may ask for a runnable validation script rather
+            # than a pytest collection.  Running a __main__ script through
+            # pytest produces exit code 5 when it intentionally has no test
+            # function, even though the requested behaviour is valid.
+            content = _safe_str(step.get("content"))
+            has_pytest_shape = bool(
+                re.search(r"(?im)^\s*(?:async\s+)?def\s+test_", content)
+                or re.search(r"(?im)\b(?:pytest|unittest)\b", content)
+                or re.search(r"(?im)^\s*class\s+Test[A-Za-z0-9_]*\b", content)
+            )
+            command = (
+                f"python -m pytest {shlex.quote(normalized)}"
+                if has_pytest_shape or "__name__" not in content
+                else f"python {shlex.quote(normalized)}"
+            )
         elif suffix in {".js", ".mjs", ".cjs"}:
             command = f"node {shlex.quote(normalized)}"
         elif suffix in {".sh", ".bash"}:
