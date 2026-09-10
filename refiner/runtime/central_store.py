@@ -3,9 +3,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 import secrets
 import threading
+import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -26,6 +28,7 @@ from central_store import (
 )
 
 UTC = dt.timezone.utc
+LOGGER = logging.getLogger(__name__)
 DEFAULT_ACCESS_TOKEN_TTL_SECONDS = int(os.getenv("REFINER_ACCESS_TOKEN_TTL", "43200"))
 DEFAULT_SSO_TOKEN_TTL_SECONDS = int(os.getenv("REFINER_SSO_TTL", "300"))
 
@@ -380,8 +383,12 @@ class PostgresCentralStore:
             timeout=max(1.0, float(timeout)),
             kwargs={"row_factory": dict_row},
         )
-        self.pool.wait()
-        self.ensure_schema()
+        try:
+            self.pool.wait()
+            self.ensure_schema()
+        except Exception:
+            self.pool.close()
+            raise
         self.users = PostgresUserStore(self)
         self.access_tokens = PostgresAccessTokenStore(self)
         self.voice_tokens = PostgresVoiceTokenStore(self)
@@ -1994,4 +2001,19 @@ def create_central_store_from_env() -> Optional[PostgresCentralStore]:
     min_size = int(os.getenv("REFINER_AUTH_DB_POOL_MIN", "1"))
     max_size = int(os.getenv("REFINER_AUTH_DB_POOL_MAX", "4"))
     timeout = float(os.getenv("REFINER_AUTH_DB_POOL_TIMEOUT", "10"))
-    return PostgresCentralStore(dsn, min_size=min_size, max_size=max_size, timeout=timeout)
+    attempts = max(1, int(os.getenv("REFINER_AUTH_DB_INIT_ATTEMPTS", "6")))
+    retry_delay = max(0.0, float(os.getenv("REFINER_AUTH_DB_INIT_RETRY_DELAY", "5")))
+    for attempt in range(1, attempts + 1):
+        try:
+            return PostgresCentralStore(dsn, min_size=min_size, max_size=max_size, timeout=timeout)
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            LOGGER.warning(
+                "Postgres central store initialization attempt %s/%s failed: %s; retrying",
+                attempt,
+                attempts,
+                exc,
+            )
+            time.sleep(retry_delay * attempt)
+    return None
