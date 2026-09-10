@@ -1,6 +1,30 @@
 from refiner import project_solver
 
 
+def test_tautological_python_test_is_not_acceptance_evidence(tmp_path):
+    test_path = tmp_path / "test_smoke.py"
+    test_path.write_text(
+        "def test_smoke():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    issue = project_solver._test_artifact_quality(str(test_path))
+
+    assert issue and "tautological" in issue
+
+
+def test_python_test_with_observable_assertion_is_acceptance_evidence(tmp_path):
+    test_path = tmp_path / "test_smoke.py"
+    test_path.write_text(
+        "from pathlib import Path\n\n"
+        "def test_smoke():\n"
+        "    assert Path('result.txt').read_text(encoding='utf-8') == 'ok\\n'\n",
+        encoding="utf-8",
+    )
+
+    assert project_solver._test_artifact_quality(str(test_path)) is None
+
+
 def test_solver_completion_exit_code_is_zero_when_complete():
     assert project_solver._solver_completion_exit_code({"needs_more_iterations": False}) == 0
 
@@ -90,6 +114,22 @@ def test_completion_blockers_include_missing_module_evidence():
         module_registry={"missing_tests": [{"path": "app.js"}], "missing_examples": [{"path": "app.js"}]},
     )
     assert blockers == ["module_missing_tests", "module_missing_examples"]
+
+
+def test_completion_blockers_include_tautological_test_evidence():
+    blockers = project_solver._completion_blockers(
+        planner_failure=False,
+        incomplete_sources=[],
+        test_quality_missing_sources=["requirements.md"],
+        coverage_missing_sources=[],
+        requirements_missing_hard_ids=[],
+        requirements_missing_advisory_ids=[],
+        requirements_sanity_strict_global=False,
+        unresolved_verification_failures=[],
+        module_registry={"missing_tests": [], "missing_examples": []},
+    )
+
+    assert blockers == ["test_quality_missing_sources"]
 
 
 def test_successful_reverification_clears_matching_historical_failure():

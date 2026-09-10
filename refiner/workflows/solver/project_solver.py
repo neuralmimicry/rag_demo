@@ -8545,9 +8545,37 @@ def _test_artifact_quality(path: str) -> Optional[str]:
     if not text.strip():
         return "test artifact is empty"
     suffix = os.path.splitext(path)[1].lower()
-    if suffix in {".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".sh", ".bash"}:
+    if suffix == ".py":
+        try:
+            tree = ast.parse(text, filename=path)
+        except SyntaxError:
+            return "test artifact is not valid Python"
+        assertions = [node for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+        if not assertions and not re.search(r"\b(pytest|unittest)\b", text, re.I):
+            return "test artifact contains no recognizable assertion or failure check"
+        if assertions:
+            meaningful_assertions = []
+            for assertion in assertions:
+                try:
+                    constant_value = ast.literal_eval(assertion.test)
+                except (ValueError, TypeError, SyntaxError):
+                    constant_value = None
+                    is_constant = False
+                else:
+                    is_constant = True
+                if not is_constant:
+                    meaningful_assertions.append(assertion)
+            if not meaningful_assertions:
+                return "test artifact contains only tautological assertions (for example, assert True)"
+    elif suffix in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".sh", ".bash"}:
         if not re.search(r"\b(assert|expect|should|pytest|unittest|describe|it\s*\(|exit\s+1|grep)\b", text, re.I):
             return "test artifact contains no recognizable assertion or failure check"
+        if re.search(r"\b(?:assert|expect)\s*\(\s*true\s*\)\s*(?:\.toBe\(\s*true\s*\))?", text, re.I) and not re.search(
+            r"\b(?:assert|expect)\s*\([^)]*(?:[A-Za-z_$][\w$]*|[.\\[\\]])[^)]*\)",
+            text,
+            re.I,
+        ):
+            return "test artifact contains only tautological assertions (for example, assert(true))"
     return None
 
 
@@ -14122,6 +14150,53 @@ def run_project_solver(
                         },
                     )
                 )
+            if strict_test_coverage:
+                persisted_test_paths: set = set()
+                for applied_step in source_applied_steps:
+                    if not isinstance(applied_step, dict):
+                        continue
+                    raw_path = applied_step.get("abs_path") or applied_step.get("path")
+                    if not isinstance(raw_path, str):
+                        continue
+                    display_path = _display_path_for_report(
+                        project_root,
+                        raw_path if os.path.isabs(raw_path) else os.path.join(project_root, raw_path),
+                    )
+                    if TEST_FILE_RE.search(display_path) or VALIDATION_FILE_RE.search(display_path):
+                        persisted_test_paths.add(
+                            raw_path if os.path.isabs(raw_path) else os.path.join(project_root, raw_path)
+                        )
+                artifact_issues = []
+                for test_path in sorted(persisted_test_paths):
+                    quality_issue = _test_artifact_quality(test_path)
+                    if quality_issue:
+                        artifact_issues.append(
+                            f"{_display_path_for_report(project_root, test_path)}: {quality_issue}"
+                        )
+                if artifact_issues:
+                    quality_message = "; ".join(artifact_issues)
+                    verification_failures_by_source[source.path] = [
+                        {
+                            "source": source.path,
+                            "iteration": iteration,
+                            "command": "test-artifact-quality",
+                            "exit_code": 1,
+                            "verification_issue": quality_message,
+                            "stderr": quality_message,
+                            "fingerprint": _failure_fingerprint(
+                                {
+                                    "command": "test-artifact-quality",
+                                    "verification_issue": quality_message,
+                                    "source": source.path,
+                                }
+                            ),
+                        }
+                    ]
+                    replan_due_to_verification = True
+                    _record_action(
+                        "Test artifact quality failed; replanning current source: " + quality_message,
+                        source_actions_log,
+                    )
             if replan_due_to_hallucination:
                 cycle.record(
                     "reflect",
@@ -14277,7 +14352,7 @@ def run_project_solver(
                     test_paths.add(raw_path if os.path.isabs(raw_path) else os.path.join(project_root, raw_path))
                 elif step.get("is_code") and os.path.splitext(display_path)[1].lower() in CODE_FILE_EXTS:
                     implementation_steps.append(display_path)
-            if not implementation_steps:
+            if not implementation_steps and not test_paths:
                 continue
             artifact_issues = []
             for path in sorted(test_paths):
