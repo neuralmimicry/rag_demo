@@ -11732,32 +11732,38 @@ def run_project_solver(
             llm_reasoning_effort=llm_reasoning_effort,
             actions_log=actions_log,
         )
-    requirements_register = _ensure_sequence_requirements(
-        requirements_register,
-        sequence_gaps,
-        requirement_sources=requirement_sources,
-    )
-    requirements_register = _ensure_dataset_requirements(
-        requirements_register,
-        dataset_summary,
-        requirements_material,
-        requirement_sources=requirement_sources,
-    )
-    requirements_register = _ensure_eval_schema_requirements(
-        requirements_register,
-        eval_info,
-        requirement_sources=requirement_sources,
-    )
-    requirements_register = _ensure_accuracy_strategy_requirements(
-        requirements_register,
-        requirements_material,
-        requirement_sources=requirement_sources,
-    )
-    requirements_register = _ensure_helper_module_requirements(
-        requirements_register,
-        helper_modules,
-        requirement_sources=requirement_sources,
-    )
+    # In requirements-only mode the supplied document is authoritative.  Do
+    # not add derived requirements from repository shape or keywords in the
+    # prose (for example, turning the word "mismatch" into an accuracy
+    # requirement).  Such enrichment changes the requested scope and can
+    # make a correct REQ-### implementation appear incomplete.
+    if not requirements_only:
+        requirements_register = _ensure_sequence_requirements(
+            requirements_register,
+            sequence_gaps,
+            requirement_sources=requirement_sources,
+        )
+        requirements_register = _ensure_dataset_requirements(
+            requirements_register,
+            dataset_summary,
+            requirements_material,
+            requirement_sources=requirement_sources,
+        )
+        requirements_register = _ensure_eval_schema_requirements(
+            requirements_register,
+            eval_info,
+            requirement_sources=requirement_sources,
+        )
+        requirements_register = _ensure_accuracy_strategy_requirements(
+            requirements_register,
+            requirements_material,
+            requirement_sources=requirement_sources,
+        )
+        requirements_register = _ensure_helper_module_requirements(
+            requirements_register,
+            helper_modules,
+            requirement_sources=requirement_sources,
+        )
     requirements_register_markdown = _format_requirements_register_markdown(requirements_register)
     requirements_register_list = requirements_register.get("requirements")
     if not isinstance(requirements_register_list, list):
