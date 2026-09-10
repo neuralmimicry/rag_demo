@@ -206,3 +206,14 @@ def test_git_push_reuses_deterministic_restart_branch_with_lease(monkeypatch):
             "HEAD:refiner/restarted",
         ],
     ]
+
+
+def test_github_token_falls_back_to_deployment_environment(monkeypatch):
+    manager = object.__new__(refiner_web.JobManager)
+    job = SimpleNamespace(payload={}, owner=None)
+
+    monkeypatch.setenv("GITHUB_TOKEN", "deployment-token")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_PAT", raising=False)
+
+    assert manager._get_github_token(job) == "deployment-token"

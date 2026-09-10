@@ -7948,6 +7948,15 @@ class JobManager:
             for key in candidates:
                 if env.get(key):
                     return env.get(key)
+        # The deployment may provide the same credential as a container
+        # environment variable.  This is the normal path for service-owned
+        # jobs, where no per-job secret is submitted.  Keep this fallback
+        # after scoped job and owner credentials so an explicit credential
+        # always wins.
+        for key in candidates:
+            value = os.getenv(key, "").strip()
+            if value:
+                return value
         return None
 
     @staticmethod
