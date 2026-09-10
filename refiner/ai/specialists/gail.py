@@ -275,9 +275,7 @@ class GailProvider(LLMProvider):
         has_explicit_provider_hints = any(
             str(value or "").strip()
             for value in (
-                self.preferred_provider,
                 self.preferred_model,
-                self.fallback_provider,
                 self.fallback_model,
             )
         )

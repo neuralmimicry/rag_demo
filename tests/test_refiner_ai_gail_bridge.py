@@ -262,6 +262,30 @@ def test_gail_workflow_provider_omits_candidates_when_no_hints_and_using_configu
     assert captured["json_payload"]["max_candidates"] == 1
 
 
+def test_gail_workflow_provider_ignores_generic_provider_hint_without_model(monkeypatch):
+    _enable_gail(monkeypatch)
+    captured = {}
+    from refiner import refiner_ai_gail
+
+    def _fake_post(url, *, headers, json_payload, timeout, max_retries):
+        captured["json_payload"] = json_payload
+        return _FakeResponse({"text": "ok", "provider": "openai", "model": "qwen3.5:9b"})
+
+    monkeypatch.setattr(refiner_ai_gail, "_http_post", _fake_post)
+    provider = build_workflow_provider(
+        workflow="topic_research",
+        role="researcher",
+        preferred_provider="openai",
+        preferred_model=None,
+        include_configured=True,
+    )
+
+    provider.predict([{"role": "user", "content": "Research the fix."}])
+
+    assert captured["json_payload"]["preferred_provider"] is None
+    assert captured["json_payload"]["preferred_model"] is None
+
+
 def test_gail_workflow_provider_applies_direct_selection_mode_setting(monkeypatch):
     _enable_gail(monkeypatch)
     monkeypatch.setenv("REFINER_GAIL_DIRECT_SELECTION_MODE", "fastest")
