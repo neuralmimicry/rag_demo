@@ -6513,12 +6513,30 @@ class JobManager:
         self.lock = threading.Lock()
         self.workers: List[threading.Thread] = []
         _ensure_dirs()
-        self._load_jobs_from_disk()
-        self._cleanup_old_jobs()
         for idx in range(max(1, workers)):
             t = threading.Thread(target=self._worker_loop, args=(idx,), daemon=True)
             t.start()
             self.workers.append(t)
+        # REQ-STARTUP-001: shared job storage can contain thousands of jobs and
+        # may be backed by slow NFS. Restore persisted metadata after workers
+        # and the HTTP server are available so health checks and new queue
+        # submissions do not time out during startup.
+        self._startup_rehydrate_thread = threading.Thread(
+            target=self._rehydrate_after_startup,
+            name="job-disk-rehydrate",
+            daemon=True,
+        )
+        self._startup_rehydrate_thread.start()
+
+    def _rehydrate_after_startup(self) -> None:
+        """Restore persisted jobs without blocking web-server readiness."""
+
+        try:
+            with self.lock:
+                self._load_jobs_from_disk()
+                self._cleanup_old_jobs()
+        except Exception as exc:
+            logger.warning("background job rehydrate failed for %s: %s", JOB_ROOT, exc)
 
     def submit_job(self, payload: Dict[str, Any], owner: str) -> Job:
         job_id = uuid.uuid4().hex
@@ -19083,8 +19101,6 @@ if hasattr(app, "add_url_rule"):
 
 def main() -> int:
     """Run the Refiner backend Flask application."""
-    _rehydrate_job_manager_from_disk()
-
     # Register API documentation and health endpoints
     try:
         from refiner.api_docs import add_api_documentation_support
