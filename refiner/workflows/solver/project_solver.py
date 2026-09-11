@@ -3475,7 +3475,7 @@ def _rephrase_json_payload(
         resp = provider.predict(
             [{"role": "user", "content": user_prompt}],
             system="You are a strict JSON reformatter.",
-            max_tokens=llm_max_tokens or 10240,
+            max_tokens=llm_max_tokens or 16_384,
             temperature=min(0.1, llm_temperature),
             timeout=llm_timeout,
             reasoning_effort=llm_reasoning_effort,
@@ -8412,7 +8412,7 @@ def _build_requirements_register(
         resp = provider.predict(
             [{"role": "user", "content": user_prompt}],
             system=system_prompt,
-            max_tokens=llm_max_tokens or 10240,
+            max_tokens=llm_max_tokens or 16_384,
             temperature=min(0.2, llm_temperature),
             timeout=llm_timeout,
             reasoning_effort=llm_reasoning_effort,
