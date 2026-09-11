@@ -1269,7 +1269,12 @@ def test_requirement_coverage_accepts_operational_implement_language_on_document
         [source],
         {
             "requirements.md": [
-                {"path": "docs/rollout.md", "is_code": False, "note": "documented evidence"}
+                {
+                    "path": "docs/rollout.md",
+                    "is_code": False,
+                    "note": "documented evidence",
+                    "requirement_ids": ["REQ-002"],
+                }
             ]
         },
         str(tmp_path),

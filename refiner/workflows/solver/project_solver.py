@@ -8493,10 +8493,14 @@ def _build_requirement_coverage(
         for requirement in requirements:
             label, req_id, req_text = _format_requirement_label(requirement)
             requires_code = _requirement_requires_code(requirement)
-            if req_id and requires_code:
-                # Numbered requirements require explicit traceability.  Do
-                # not let an unrelated touched file, or a source comment that
-                # happens to contain a REQ ID, satisfy this requirement.
+            if req_id and not req_id.upper().startswith("GLOBAL-REQ-"):
+                # Every user supplied REQ-* is an acceptance contract, even
+                # when its wording describes an output, document, or
+                # operational result rather than source code.  Do not let an
+                # unrelated touched file, or a source comment that happens to
+                # contain a REQ ID, make the solver report success.  The
+                # planner must attach the ID to the artifact that implements
+                # the requirement.
                 refs = [
                     ref
                     for ref in file_refs
@@ -8526,7 +8530,7 @@ def _build_requirement_coverage(
                         "files": refs,
                         "evidence": (
                             "explicit requirement-to-file mapping"
-                            if req_id and requires_code
+                            if req_id and not req_id.upper().startswith("GLOBAL-REQ-")
                             else "legacy file coverage"
                         ),
                     }
