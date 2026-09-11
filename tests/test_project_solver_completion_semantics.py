@@ -1,6 +1,44 @@
 from refiner import project_solver
 
 
+def test_requirement_traceability_preserves_full_global_ids():
+    assert project_solver._find_requirement_ids("REQ-001 GLOBAL-REQ-001") == {
+        "REQ-001",
+        "GLOBAL-REQ-001",
+    }
+
+
+def test_repository_delivery_recovery_plan_is_actionable_and_traceable(tmp_path):
+    source = project_solver.RequirementSource(
+        path="requirements.md",
+        requirements_text=(
+            "repository_delivery\n"
+            "Required file: tests/test_project_solver_completion_semantics.py\n"
+            "verification_commands and acceptance evidence must be recorded.\n"
+            "needs_more_iterations remains true until evidence exists.\n"
+            "REQ-001: Inspect the current state.\n"
+        ),
+        requirement_lines=[],
+        todo_lines=[],
+        context_excerpt="",
+    )
+    intent = project_solver._classify_local_intent(source, str(tmp_path))
+    plan = project_solver._build_local_plan_from_intent(
+        intent,
+        source,
+        str(tmp_path),
+        {"languages": ["python"], "build_systems": ["python"]},
+        allow_run=True,
+        required_ids={"REQ-001"},
+        all_requirement_ids={"REQ-001", "GLOBAL-REQ-001"},
+    )
+
+    assert intent["intent"] == "repository_delivery_regression"
+    assert plan and plan["plan"]
+    assert plan["plan"][0]["type"] == "append_file"
+    assert "GLOBAL-REQ-001" in plan["plan"][0]["requirement_ids"]
+
+
 def test_tautological_python_test_is_not_acceptance_evidence(tmp_path):
     test_path = tmp_path / "test_smoke.py"
     test_path.write_text(
