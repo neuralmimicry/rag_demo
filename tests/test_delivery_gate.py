@@ -228,3 +228,30 @@ def test_repository_build_gate_discovers_and_requires_matching_workflow(tmp_path
     assert report["enabled"] is True
     assert report["succeeded"] is True
     assert report["workflows"][0]["run"]["head_sha"] == expected_sha
+
+
+def test_repository_build_gate_skips_workflow_restricted_to_protected_branch(tmp_path, monkeypatch):
+    workflow_dir = tmp_path / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "build-and-release.yml").write_text(
+        "name: build\non:\n  push:\n    branches: [main, master]\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_request(*_args, **_kwargs):
+        raise AssertionError("a non-triggered workflow must not be polled")
+
+    monkeypatch.setattr(github_actions.urllib.request, "urlopen", unexpected_request)
+    report = github_actions.verify_repository_builds(
+        workspace=str(tmp_path),
+        owner="neuralmimicry",
+        repo="demo",
+        branch="conductor/test",
+        commit_sha="d" * 40,
+        token="test-token",
+        timeout_sec=900,
+    )
+
+    assert report["succeeded"] is True
+    assert report["workflows"][0]["succeeded"] is True
+    assert "does not trigger" in report["workflows"][0]["reason"]
