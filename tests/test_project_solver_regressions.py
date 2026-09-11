@@ -1245,6 +1245,31 @@ def test_repair_source_requirement_registration_preserves_explicit_ids_and_drops
     assert all(item["title"] != "Requirements Register" for item in repaired["requirements"])
 
 
+def test_fallback_requirements_register_preserves_explicit_ids_and_ignores_context():
+    source = project_solver.RequirementSource(
+        path="requirements.md",
+        requirements_text=(
+            "Overview: execute the requested change.\n\n"
+            "Delivery Context:\n"
+            "- Current stage: development\n\n"
+            "Requirements Register:\n"
+            "- REQ-001: Inspect the current state first.\n"
+            "- REQ-002: Apply only the scoped change.\n"
+        ),
+        requirement_lines=[],
+        todo_lines=[],
+        context_excerpt="",
+    )
+
+    register = project_solver._fallback_requirements_register([source], "")
+
+    assert [item["id"] for item in register["requirements"]] == ["REQ-001", "REQ-002"]
+    assert [item["description"] for item in register["requirements"]] == [
+        "Inspect the current state first.",
+        "Apply only the scoped change.",
+    ]
+
+
 def test_requirement_coverage_accepts_operational_implement_language_on_documentation(tmp_path):
     source = project_solver.RequirementSource(
         path="requirements.md",

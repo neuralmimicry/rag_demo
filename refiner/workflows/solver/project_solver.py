@@ -6564,6 +6564,16 @@ def _fallback_requirements_register(
     requirement_sources: List[RequirementSource],
     context_summary: str,
 ) -> Dict[str, object]:
+    # A supplied requirements-only document is authoritative. Preserve its
+    # explicit REQ identifiers before falling back to line-oriented parsing;
+    # headings and delivery context must not become synthetic requirements.
+    explicit = _explicit_source_requirements(requirement_sources)
+    if explicit:
+        return {
+            "requirements": explicit,
+            "assumptions": [],
+            "open_questions": [],
+        }
     items: List[Dict[str, object]] = []
     seen: set = set()
     used_ids: set = set()
