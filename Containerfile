@@ -104,9 +104,10 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends ${BUILD_PACKAGES}; \
     ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime; \
     echo "${TZ}" > /etc/timezone; \
-    python -m venv "${VIRTUAL_ENV}"; \
-    pip install --upgrade pip setuptools wheel; \
-    pip install --requirement /tmp/requirements.txt; \
+    python3 -m venv "${VIRTUAL_ENV}"; \
+    test -x "${VIRTUAL_ENV}/bin/python"; \
+    "${VIRTUAL_ENV}/bin/python" -m pip install --upgrade pip setuptools wheel; \
+    "${VIRTUAL_ENV}/bin/python" -m pip install --requirement /tmp/requirements.txt; \
     rm -f /tmp/requirements.txt; \
     rm -rf /var/lib/apt/lists/*
 
