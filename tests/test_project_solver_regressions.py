@@ -1270,6 +1270,30 @@ def test_fallback_requirements_register_preserves_explicit_ids_and_ignores_conte
     ]
 
 
+def test_fallback_requirements_register_decodes_escaped_newlines():
+    source = project_solver.RequirementSource(
+        path="requirements.md",
+        requirements_text=(
+            r"REQ-001: Create intent_result.json containing {\"status\": \"ok\", \"intent_met\": true}.\n"
+            r"REQ-002: Add pytest coverage for the intent result.\n"
+            r"REQ-003: Run pytest and record the successful result."
+        ),
+        requirement_lines=[],
+        todo_lines=[],
+        context_excerpt="",
+    )
+
+    register = project_solver._fallback_requirements_register([source], "")
+
+    assert [item["id"] for item in register["requirements"]] == [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+    ]
+    assert "intent_result.json" in register["requirements"][0]["description"]
+    assert "pytest" in register["requirements"][1]["description"]
+
+
 def test_requirement_coverage_accepts_operational_implement_language_on_documentation(tmp_path):
     source = project_solver.RequirementSource(
         path="requirements.md",

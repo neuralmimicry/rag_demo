@@ -772,6 +772,20 @@ class ProjectScanResult:
     context_summary: str
 
 
+def _normalise_requirement_text(text: str) -> str:
+    """Restore line breaks escaped by an upstream JSON/text producer.
+
+    Conductor and other API clients may submit a requirements document as a
+    JSON string that has been escaped twice before it reaches the filesystem.
+    In that case ``splitlines()`` sees one physical line and distinct REQ-*
+    entries are incorrectly merged.  Only line-break escapes are decoded here;
+    quotes and other backslash sequences remain part of the requirement text.
+    """
+    if not text:
+        return ""
+    return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+
+
 def _is_subpath(root: str, candidate: str) -> bool:
     abs_root = os.path.abspath(root)
     abs_path = os.path.abspath(candidate)
@@ -6386,7 +6400,8 @@ def _explicit_source_requirements(
     extracted: List[Dict[str, object]] = []
     seen: set = set()
     for source in requirement_sources:
-        for raw_line in (source.requirements_text or "").splitlines():
+        source_text = _normalise_requirement_text(source.requirements_text or "")
+        for raw_line in source_text.splitlines():
             match = re.search(
                 r"(?P<id>REQ-\d{3,})\s*[:.)-]\s*(?P<text>.+)",
                 raw_line,
@@ -11619,7 +11634,7 @@ def run_project_solver(
     requirements_only = bool(requirements_only)
     if requirements_path:
         converter = FileConverter()
-        requirements_text = converter.convert(requirements_path)
+        requirements_text = _normalise_requirement_text(converter.convert(requirements_path))
         if requirements_text.startswith("Error:"):
             raise ValueError(requirements_text)
         context_summary = "Requirements provided directly; no project scan performed."
