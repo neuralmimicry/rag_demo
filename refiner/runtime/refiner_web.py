@@ -657,12 +657,12 @@ ESTIMATE_REPO_SAMPLE_MULTIPLIER = float(os.getenv("REFINER_ESTIMATE_REPO_SAMPLE_
 ESTIMATE_CALIBRATION_TTL_SEC = int(os.getenv("REFINER_ESTIMATE_CALIBRATION_TTL", "90"))
 DEFAULT_LLM_MAX_TOKENS = int(os.getenv("REFINER_DEFAULT_LLM_MAX_TOKENS", "48000"))
 PROJECT_LLM_MAX_TOKENS = max(
-    512,
-    int(os.getenv("REFINER_PROJECT_LLM_MAX_TOKENS", "6000")),
+    16_384,
+    int(os.getenv("REFINER_PROJECT_LLM_MAX_TOKENS", "16384")),
 )
 PLAYGROUND_LLM_MAX_TOKENS = max(
-    1000,
-    int(os.getenv("REFINER_PLAYGROUND_LLM_MAX_TOKENS", str(min(DEFAULT_LLM_MAX_TOKENS, 12000)))),
+    16_384,
+    int(os.getenv("REFINER_PLAYGROUND_LLM_MAX_TOKENS", str(min(DEFAULT_LLM_MAX_TOKENS, 16384)))),
 )
 PLAYGROUND_PROJECT_MAX_STEPS = max(25, int(os.getenv("REFINER_PLAYGROUND_PROJECT_MAX_STEPS", "120")))
 PLAYGROUND_PROJECT_MIN_ITERATIONS = max(1, int(os.getenv("REFINER_PLAYGROUND_PROJECT_MIN_ITERATIONS", "6")))
@@ -7532,7 +7532,7 @@ class JobManager:
             payload["llm_max_tokens"] = DEFAULT_LLM_MAX_TOKENS
         if workflow in {"project_solver", "project"}:
             requested_tokens = _safe_int(payload.get("llm_max_tokens"), PROJECT_LLM_MAX_TOKENS)
-            bounded_tokens = min(max(512, requested_tokens), PROJECT_LLM_MAX_TOKENS)
+            bounded_tokens = min(max(16_384, requested_tokens), PROJECT_LLM_MAX_TOKENS)
             if requested_tokens != bounded_tokens:
                 payload["llm_max_tokens"] = bounded_tokens
                 job.append_log(
