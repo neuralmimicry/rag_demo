@@ -12051,6 +12051,12 @@ def run_project_solver(
     empty_plan_retry_limit = max(1, _env_int("SOLVER_EMPTY_PLAN_RETRIES", 3))
     repeated_plan_limit = max(1, _env_int("SOLVER_REPEATED_PLAN_LIMIT", 2))
     plan_fingerprint_counts_by_source: Dict[str, Dict[str, int]] = {}
+    # Provider failures are transient in the deployed Gail path (502s and
+    # connection resets are retried by the HTTP client, but the final retry
+    # can still surface as an LLMError).  Do not turn one such failure into a
+    # zero-step result when the source still has useful iteration budget.
+    planner_retry_limit = max(1, _env_int("SOLVER_PLANNER_RETRIES", 3))
+    planner_retry_attempts_by_source: Dict[str, int] = {}
     repeated_plan_notes_by_source: Dict[str, str] = {}
     agentic_workflow = AgenticWorkflow(
         phases=["plan", "act", "verify", "reflect"],
@@ -12977,6 +12983,15 @@ def run_project_solver(
                     )
                 except (LLMError, TimeoutError) as exc:
                     message = str(exc) or exc.__class__.__name__
+                    planner_retry_attempts = planner_retry_attempts_by_source.get(source.path, 0) + 1
+                    planner_retry_attempts_by_source[source.path] = planner_retry_attempts
+                    if planner_retry_attempts < planner_retry_limit:
+                        _record_action(
+                            f"Planner request failed for {source.path} at iteration {iteration}; "
+                            f"retrying ({planner_retry_attempts}/{planner_retry_limit}): {message}",
+                            source_actions_log,
+                        )
+                        continue
                     failure_kind = (
                         "planner_timeout"
                         if isinstance(exc, TimeoutError)
@@ -12996,6 +13011,11 @@ def run_project_solver(
                         source_actions_log,
                     )
                     break
+
+            # A successful provider response clears the transient failure
+            # streak.  Later iterations therefore receive the full retry
+            # allowance instead of inheriting an earlier network fault.
+            planner_retry_attempts_by_source.pop(source.path, None)
 
             def _maybe_codingagent_fallback(reason: str, *, requires_code: bool) -> Optional[Dict[str, object]]:
                 if not requires_code:

@@ -671,6 +671,7 @@ PLAYGROUND_PROJECT_MAX_ITERATIONS = max(
     int(os.getenv("REFINER_PLAYGROUND_PROJECT_MAX_ITERATIONS", "12")),
 )
 RESUME_LLM_MAX_TOKENS_CAP = int(os.getenv("REFINER_RESUME_LLM_MAX_TOKENS_CAP", "96000"))
+SOLVER_AUTO_RESUME_MAX = max(0, int(os.getenv("REFINER_SOLVER_AUTO_RESUME_MAX", "3")))
 JOB_RETENTION_DAYS = int(os.getenv("REFINER_JOB_RETENTION_DAYS", "0"))
 SESSION_TTL_SEC = int(os.getenv("REFINER_SESSION_TTL_SEC", "14400"))
 SESSION_HISTORY_MAX = int(os.getenv("REFINER_SESSION_HISTORY_MAX", "200"))
@@ -6939,10 +6940,10 @@ class JobManager:
             if not isinstance(job.payload, dict):
                 job.payload = {}
             job.payload["include_global_requirements"] = True
-            if job.status == "completed":
+            if job.status in {"completed", "failed", "running"}:
                 self._apply_project_limits(job)
                 summary = _completion_summary_from_output(job.output_paths.get("primary"))
-                if isinstance(summary, dict):
+                if isinstance(summary, dict) and summary.get("needs_more_iterations"):
                     steps_applied = _safe_int(summary.get("steps_applied"))
                     needs_more = bool(summary.get("needs_more_iterations"))
                     max_steps_reached = bool(summary.get("max_steps_reached"))
@@ -7291,6 +7292,25 @@ class JobManager:
                 isinstance(completion_summary, dict)
                 and completion_summary.get("needs_more_iterations")
             )
+        # An incomplete solver result is resumable, but it must not be exposed
+        # as the final outcome after a transient provider failure or a planner
+        # response that made no progress. Keep the same job alive and resume
+        # it with the persisted output so requirement coverage can converge.
+        if (
+            solver_incomplete
+            and not job.stop_requested
+            and job.exit_code in {0, 2}
+            and SOLVER_AUTO_RESUME_MAX > 0
+        ):
+            auto_resume_count = _safe_int(job.payload.get("solver_auto_resume_count"), 0)
+            if auto_resume_count < SOLVER_AUTO_RESUME_MAX:
+                job.payload["solver_auto_resume_count"] = auto_resume_count + 1
+                job.append_log(
+                    f"Solver output remains incomplete; automatically resuming "
+                    f"iteration pass {auto_resume_count + 1}/{SOLVER_AUTO_RESUME_MAX}."
+                )
+                if self.resume_job(job.job_id):
+                    return
         if job.exit_code == 0 or (job.exit_code == 2 and solver_incomplete):
             try:
                 self._finalize_repo(job)
