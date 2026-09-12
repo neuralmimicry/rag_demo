@@ -227,3 +227,39 @@ def test_missing_pytest_target_is_informational_without_project_tests(monkeypatc
     assert failures == []
     assert results[-1]["success"] is True
     assert results[-1]["verification_issue"] is None
+
+from refiner import project_solver
+
+
+def test_explicit_hard_requirement_stays_incomplete_until_acceptance_evidence():
+    source = project_solver.RequirementSource(
+        path="requirements.md",
+        requirements_text="REQ-001: Implement the parser function.",
+        requirement_lines=[], todo_lines=[], context_excerpt="",
+    )
+    register = {"requirements": [{"id": "REQ-001",
+        "title": "Parser function",
+        "description": "Implement the parser function.",
+        "type": "functional",
+        "source": ["requirements.md"]}]}
+    _, missing = project_solver._build_requirement_coverage(
+        [source], {"requirements.md": []}, ".",
+        requirements_register=register
+    )
+    assert missing == ["requirements.md"]
+    assert not project_solver._verification_proves_source_complete(
+        verification_steps_executed=0, replan_due_to_hallucination=False,
+        replan_due_to_verification=False, replan_due_to_replace=False,
+        defer_source=False, unresolved_failures=[], source_path="requirements.md"
+    )
+    evidence = {"requirements.md": [{"path": "tests/test_parser.py",
+        "is_code": True, "requirement_ids": ["REQ-001"]}]}
+    _, missing = project_solver._build_requirement_coverage(
+        [source], evidence, ".", requirements_register=register
+    )
+    assert missing == []
+    assert project_solver._verification_proves_source_complete(
+        verification_steps_executed=1, replan_due_to_hallucination=False,
+        replan_due_to_verification=False, replan_due_to_replace=False,
+        defer_source=False, unresolved_failures=[], source_path="requirements.md"
+    )
