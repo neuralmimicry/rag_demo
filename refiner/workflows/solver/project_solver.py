@@ -5371,6 +5371,12 @@ def _source_is_pure_code_request(source: RequirementSource) -> bool:
     )
     if not combined:
         return False
+    # Delivery, rollout, evidence, and monitoring requests may mention
+    # "implement" or "fix" while requiring operational checks rather than a
+    # source-code artifact.  Sending those requests through code-only mode
+    # caused the coding-agent fallback to invent sample applications.
+    if OPERATIONAL_REQUIREMENT_RE.search(combined):
+        return False
     return not NON_CODE_HINT_RE.search(combined)
 
 
@@ -8362,6 +8368,53 @@ def _plan_is_usable(plan_steps: List[Dict[str, object]], *, requires_code: bool,
         if not allow_run and not _plan_has_file_changes(plan_steps):
             return False, "no file changes when run_command disabled"
     return True, ""
+
+
+def _plan_scope_issues(
+    plan_steps: List[Dict[str, object]],
+    *,
+    project_root: str,
+    extra_roots: Optional[List[str]] = None,
+) -> List[str]:
+    """Reject fabricated plans before they can be normalised or executed.
+
+    LLM plans occasionally contain an unrelated absolute path or a generic
+    starter application.  The executor already skips unsafe paths, but
+    silently skipping them lets an apparently actionable plan finish with no
+    implementation.  Treat the mismatch as a planner failure so the next
+    iteration receives the real project context.
+    """
+    issues: List[str] = []
+    generic_markers = (
+        "no specific task was provided",
+        "create a sample python application",
+        "basic python application structure",
+        "minimal python application structure",
+        "application running successfully",
+    )
+    for step in plan_steps:
+        if not isinstance(step, dict):
+            continue
+        values: List[str] = []
+        for key in ("path", "file_path", "workdir"):
+            value = step.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            values.append(value)
+            if os.path.isabs(value) and not _safe_path(project_root, value, extra_roots=extra_roots):
+                issues.append(f"absolute path outside project workspace: {value}")
+        for key in ("command", "step", "description", "content"):
+            value = step.get(key)
+            if isinstance(value, str):
+                values.append(value)
+        joined = "\n".join(values).lower()
+        for marker in generic_markers:
+            if marker in joined:
+                issues.append(f"placeholder plan text: {marker}")
+                break
+    # Preserve order while avoiding repeated diagnostics for a multi-step
+    # hallucination that references the same invalid root.
+    return list(dict.fromkeys(issues))
 
 
 def _extract_plan_text(plan_steps: List[Dict[str, object]]) -> str:
@@ -13679,6 +13732,20 @@ def run_project_solver(
                         break
                     continue
             if source_requires_code:
+                scope_issues = _plan_scope_issues(
+                    plan_steps,
+                    project_root=project_root,
+                    extra_roots=allowed_roots,
+                )
+                if scope_issues:
+                    reason = "; ".join(scope_issues[:4])
+                    _record_action(
+                        f"Rejected plan outside the authoritative project scope: {reason}; retrying.",
+                        source_actions_log,
+                    )
+                    if _retry_rejected_plan(source.path, iteration, "plan outside project scope or placeholder"):
+                        break
+                    continue
                 _normalize_plan_step_paths(plan_steps)
                 plan_steps, dropped_path_conflicts = _drop_exact_directory_file_conflicts(
                     plan_steps,

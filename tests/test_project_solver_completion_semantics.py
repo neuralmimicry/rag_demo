@@ -8,6 +8,51 @@ def test_requirement_traceability_preserves_full_global_ids():
     }
 
 
+def test_operational_delivery_request_is_not_forced_into_code_only_mode(tmp_path):
+    source = project_solver.RequirementSource(
+        path="requirements.md",
+        requirements_text=(
+            "Implement only the scoped change supported by evidence.\n"
+            "Capture a readiness baseline, use a canary rollout, and verify the health window."
+        ),
+        requirement_lines=[],
+        todo_lines=[],
+        context_excerpt="",
+    )
+
+    assert project_solver._source_is_pure_code_request(source) is False
+
+
+def test_plan_scope_rejects_placeholder_paths_and_text(tmp_path):
+    issues = project_solver._plan_scope_issues(
+        [
+            {
+                "type": "write_file",
+                "path": "/srv/swar/app.py",
+                "step": "Since no specific task was provided, create a sample Python application.",
+            }
+        ],
+        project_root=str(tmp_path),
+    )
+
+    assert any("outside project workspace" in issue for issue in issues)
+    assert any("placeholder plan text" in issue for issue in issues)
+
+
+def test_plan_scope_allows_project_and_solver_workspace_paths(tmp_path):
+    solver_workspace = tmp_path / "project_solver_output"
+    solver_workspace.mkdir()
+
+    assert project_solver._plan_scope_issues(
+        [
+            {"type": "write_file", "path": "src/health.rs", "step": "Implement the scoped health check."},
+            {"type": "run_command", "workdir": str(solver_workspace), "command": "cargo test"},
+        ],
+        project_root=str(tmp_path),
+        extra_roots=[str(solver_workspace)],
+    ) == []
+
+
 def test_repository_delivery_recovery_plan_is_actionable_and_traceable(tmp_path):
     source = project_solver.RequirementSource(
         path="requirements.md",
