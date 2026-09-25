@@ -27,6 +27,33 @@ def test_billing_assets_bypass_login_redirect(monkeypatch):
 
 
 @pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+@pytest.mark.parametrize("path", ["/api/billing/checkout", "/api/billing/orders", "/api/tokens"])
+def test_customer_billing_routes_delegate_access_to_billing(monkeypatch, path):
+    monkeypatch.setattr(refiner_web, "_billing_enabled", lambda: True)
+    monkeypatch.setattr(refiner_web, "_current_user", lambda: None)
+    monkeypatch.setattr(refiner_web, "_proxy_service_request", lambda *args, **kwargs: refiner_web.jsonify({"error": "unauthorized"}))
+    with refiner_web.app.test_client() as client:
+        response = client.get(path)
+    assert response.status_code in {200, 405}  # Checkout is POST-only in Billing.
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_cardstream_callback_body_and_origin_reach_billing(monkeypatch):
+    monkeypatch.setattr(refiner_web, "_billing_enabled", lambda: True)
+    monkeypatch.setattr(refiner_web, "_current_user", lambda: None)
+    monkeypatch.setattr(refiner_web, "CSRF_ORIGIN_CHECK", True)
+    observed = []
+    def proxy(*args, **kwargs):
+        observed.append(refiner_web.request.get_data())
+        return refiner_web.jsonify({"status": "ok"})
+    monkeypatch.setattr(refiner_web, "_proxy_service_request", proxy)
+    with refiner_web.app.test_client() as client:
+        response = client.post('/api/billing/cardstream/callback', data='orderRef=test&signature=signed', content_type='application/x-www-form-urlencoded', headers={"Origin": "https://gateway.cardstream.com"})
+    assert response.status_code == 200
+    assert observed == [b'orderRef=test&signature=signed']
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
 def test_billing_dashboard_still_requires_login(monkeypatch):
     monkeypatch.setattr(refiner_web.user_store, "has_users", lambda: True)
     monkeypatch.setattr(refiner_web, "_current_user", lambda: None)

@@ -223,6 +223,7 @@ def register_jobs_routes(app, handlers: Dict[str, Callable]) -> None:
     app.add_url_rule("/api/billing/dashboard/customer", view_func=handlers["billing_dashboard_customer"])
     app.add_url_rule("/api/billing/dashboard/admin", view_func=handlers["billing_dashboard_admin_data"])
     app.add_url_rule("/api/tokens", view_func=handlers["tokens"], methods=["GET", "POST"])
+    app.add_url_rule("/api/billing/<path:path>", view_func=handlers["billing_commerce"], methods=["GET", "POST"])
     app.add_url_rule("/api/tokens/ledger", view_func=handlers["tokens_ledger"])
     app.add_url_rule("/api/secrets", view_func=handlers["secrets"], methods=["GET", "POST"])
     app.add_url_rule("/api/secrets/<name>", view_func=handlers["delete_secret"], methods=["DELETE"])

@@ -13313,6 +13313,9 @@ def _origin_matches_host(origin: str) -> bool:
 
 
 def _check_origin() -> Optional[Response]:
+    if _billing_enabled() and request.path in {"/api/billing/cardstream/callback", "/api/billing/cardstream/return"}:
+        # Callback signatures are verified by Billing; the return only redirects.
+        return None
     if not CSRF_ORIGIN_CHECK:
         return None
     if request.method in {"GET", "HEAD", "OPTIONS"}:
@@ -13370,6 +13373,12 @@ def _metrics_path_label() -> str:
 
 def _require_login() -> Optional[Response]:
     path = request.path or ""
+    # These services enforce their own identity and service access. Requiring
+    # Refiner access here locks customers out of billing and profile management.
+    if _billing_enabled() and (path.startswith("/api/billing/") or path in {"/api/tokens", "/api/tokens/ledger"}):
+        return None
+    if _customers_enabled() and (path.startswith("/api/profile") or path.startswith("/api/team-invitations/") or path == "/api/teams"):
+        return None
     if (
         path.startswith("/static/")
         or path.startswith("/public/")
@@ -17897,6 +17906,8 @@ def tokens() -> Response:
 
     payload = request.get_json(force=True, silent=True) or {}
     action = (payload.get("action") or "review").strip().lower()
+    if action in {"add", "cashout", "refund", "sync"}:
+        return jsonify({"error": "verified_payment_required", "details": "Use billing checkout or request a refund against an existing payment."}), 409
     username = (payload.get("username") or user).strip()
     if action != "grant" and username and username != user:
         return jsonify({"error": "invalid_user", "details": "Username mismatch."}), 403
@@ -18149,6 +18160,13 @@ def tokens() -> Response:
         return jsonify({"message": "Sync complete.", "status": status, **snapshot})
 
     return jsonify({"error": "invalid_action"}), 400
+
+
+def billing_commerce(path: str) -> Response:
+    """Proxy commerce, including signed callbacks, without changing the body."""
+    if not _billing_enabled():
+        return jsonify({"error": "billing_unavailable"}), 503
+    return _proxy_service_request(BILLING_API_BASE, BILLING_TIMEOUT)
 
 
 def tokens_ledger() -> Response:
@@ -19105,6 +19123,7 @@ if hasattr(app, "add_url_rule"):
             "billing_dashboard_asset": billing_dashboard_asset,
             "billing_dashboard_customer": billing_dashboard_customer,
             "billing_dashboard_admin_data": billing_dashboard_admin_data,
+            "billing_commerce": billing_commerce,
             "tokens": tokens,
             "tokens_ledger": tokens_ledger,
             "secrets": secrets,
