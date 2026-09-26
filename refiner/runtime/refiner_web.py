@@ -6981,6 +6981,12 @@ class JobManager:
                         execute_stage.message = None
                     else:
                         job.stages.append(Stage(name="execute", status="queued"))
+                    # Resumed jobs are active again. Clear terminal metadata
+                    # from the previous attempt so clients that reconcile
+                    # status, finished_at, and exit_code do not mistake this
+                    # retry for a completed or failed job.
+                    job.exit_code = None
+                    job.finished_at = None
                     job.updated_at = _now_iso()
                 job.persist(force=True)
             job.set_status("queued")
