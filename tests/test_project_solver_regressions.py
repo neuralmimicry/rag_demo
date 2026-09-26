@@ -760,6 +760,22 @@ def test_requirement_ids_in_source_comments_do_not_create_traceability():
     assert project_solver._extract_requirement_refs_from_plan([step], []) == set()
 
 
+def test_structured_plan_requirement_ids_satisfy_traceability_gates():
+    step = {
+        "type": "inspect",
+        "step": 1,
+        "action": "Inspect host inventory",
+        "description": "Review the current resource fingerprint implementation.",
+        "requirements": ["REQ-001", "REQ-014"],
+    }
+
+    assert project_solver._extract_requirement_refs_from_plan([step], []) == {
+        "REQ-001",
+        "REQ-014",
+    }
+    assert project_solver._plan_steps_missing_requirement_refs([step]) == []
+
+
 def test_behavior_test_classification_excludes_syntax_checks():
     assert not project_solver._is_behavior_test_command("node --check app.js")
     assert not project_solver._is_behavior_test_command("python -m py_compile app.py")

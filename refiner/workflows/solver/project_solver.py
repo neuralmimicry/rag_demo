@@ -8094,12 +8094,11 @@ def _extract_requirement_refs_from_plan(
         # File content is implementation payload, not traceability metadata.
         # A comment such as ``// REQ-001`` must not make an otherwise
         # unannotated plan appear covered.
-        for key in ("step", "note", "command"):
-            val = step.get(key)
-            if not isinstance(val, str):
-                continue
-            snippet = val if len(val) <= 2000 else val[:2000]
-            refs.update(_find_requirement_ids(snippet))
+        # The planner's structured ``requirements`` / ``requirement_ids``
+        # fields are authoritative traceability metadata. Use the same
+        # extractor as per-step reporting so those IDs satisfy both the
+        # strict planning gate and the final requirements sanity check.
+        refs.update(_extract_requirement_refs_from_step(step))
     return refs
 
 
@@ -8156,13 +8155,7 @@ def _plan_steps_missing_requirement_refs(plan_steps: List[Dict[str, object]]) ->
         if not isinstance(step, dict):
             missing.append(idx)
             continue
-        found = False
-        for key in ("step", "note"):
-            val = step.get(key)
-            if isinstance(val, str) and _find_requirement_ids(val):
-                found = True
-                break
-        if not found:
+        if not _extract_requirement_refs_from_step(step):
             missing.append(idx)
     return missing
 
