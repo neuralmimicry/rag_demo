@@ -418,7 +418,7 @@ jobs:
   publish-container-arch:
     name: Publish Container (${{ matrix.runner_arch }})
     needs: package-release
-    runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 60
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
@@ -439,10 +439,16 @@ jobs:
       max-parallel: 1
       matrix:
         include:
+          - runner_arch: AMD64
+            runs_on: ubuntu-24.04
+            variant: amd64
+            page_size: 4k
           - runner_arch: ARM64
+            runs_on: ubuntu-24.04-arm
             variant: arm64-4k
             page_size: 4k
           - runner_arch: ARM64
+            runs_on: ubuntu-24.04-arm
             variant: arm64-64k-hwe
             page_size: 64k-hwe
 
