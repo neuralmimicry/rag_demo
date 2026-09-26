@@ -19,6 +19,12 @@ def test_resume_clears_terminal_metadata_before_requeue(monkeypatch, tmp_path):
     job.status = "failed"
     job.finished_at = "2026-09-26T06:24:00Z"
     job.exit_code = 2
+    persisted_states = []
+    monkeypatch.setattr(
+        job,
+        "persist",
+        lambda force=False: persisted_states.append((job.status, job.finished_at, job.exit_code)),
+    )
 
     manager = refiner_web.JobManager.__new__(refiner_web.JobManager)
     manager.jobs = {job.job_id: job}
@@ -30,4 +36,5 @@ def test_resume_clears_terminal_metadata_before_requeue(monkeypatch, tmp_path):
     assert job.status == "queued"
     assert job.finished_at is None
     assert job.exit_code is None
+    assert persisted_states == [("queued", None, None)]
     assert manager.queue.get_nowait() == job.job_id

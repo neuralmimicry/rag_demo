@@ -6987,9 +6987,9 @@ class JobManager:
                     # retry for a completed or failed job.
                     job.exit_code = None
                     job.finished_at = None
+                    job.status = "queued"
                     job.updated_at = _now_iso()
                 job.persist(force=True)
-            job.set_status("queued")
             self.queue.put(job_id)
             _notify_continuum_autoscaler()
             return True
