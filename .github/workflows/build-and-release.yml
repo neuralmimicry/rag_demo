@@ -44,7 +44,7 @@ env:
 jobs:
   test:
     name: Test (runner Python)
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 30
 
     steps:
@@ -73,7 +73,7 @@ jobs:
 
   nmstt-rust:
     name: nmstt Rust Build/Test
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 30
 
     steps:
@@ -166,7 +166,7 @@ jobs:
     needs:
       - test
       - nmstt-rust
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, Linux, ARM64]
     timeout-minutes: 20
     outputs:
       artifact_name: ${{ steps.meta.outputs.artifact_name }}
@@ -271,7 +271,7 @@ jobs:
   publish-release:
     name: Publish Release
     needs: package-release
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, Linux, ARM64]
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (
@@ -418,7 +418,7 @@ jobs:
   publish-container-arch:
     name: Publish Container (${{ matrix.runner_arch }})
     needs: package-release
-    runs-on: ${{ matrix.runs_on }}
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     timeout-minutes: 60
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
@@ -440,15 +440,15 @@ jobs:
       matrix:
         include:
           - runner_arch: AMD64
-            runs_on: ubuntu-24.04
+            runs_on: '["self-hosted","Linux","X64"]'
             variant: amd64
             page_size: 4k
           - runner_arch: ARM64
-            runs_on: ubuntu-24.04-arm
+            runs_on: '["self-hosted","Linux","ARM64"]'
             variant: arm64-4k
             page_size: 4k
           - runner_arch: ARM64
-            runs_on: ubuntu-24.04-arm
+            runs_on: '["self-hosted","Linux","ARM64"]'
             variant: arm64-64k-hwe
             page_size: 64k-hwe
 
@@ -627,7 +627,7 @@ jobs:
     needs:
       - package-release
       - publish-container-arch
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, Linux, ARM64]
     timeout-minutes: 20
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||

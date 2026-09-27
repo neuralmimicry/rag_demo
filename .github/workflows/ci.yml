@@ -21,8 +21,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner_arch: ARM64
-            runs_on: '["ubuntu-24.04-arm"]'
+          - runner_arch: X64
+            runs_on: '["self-hosted","Linux","X64"]'
     steps:
       - name: Checkout
         uses: actions/checkout@v5
