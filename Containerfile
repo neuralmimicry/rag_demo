@@ -228,7 +228,8 @@ ARG TZ
 LABEL org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}" \
       org.opencontainers.image.title="Refiner" \
       org.opencontainers.image.description="Refiner API/runtime image for Podman and Kubernetes" \
-      org.opencontainers.image.source="https://github.com/neuralmimicry" \
+      org.opencontainers.image.source="https://github.com/neuralmimicry/rag_demo" \
+      org.opencontainers.image.url="https://github.com/neuralmimicry/rag_demo" \
       org.opencontainers.image.vendor="NeuralMimicry" \
       org.opencontainers.image.base.name="${BASE_IMAGE}"
 
@@ -327,3 +328,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/container/entrypoint.sh"]
 CMD ["full"]
+
+# Revision label last so changing the commit does not invalidate cached layers.
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.revision="${GIT_COMMIT}"
