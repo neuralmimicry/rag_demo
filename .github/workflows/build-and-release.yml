@@ -166,7 +166,9 @@ jobs:
     needs:
       - test
       - nmstt-rust
-    runs-on: [self-hosted, Linux, ARM64]
+    # The wheel is pure Python and the Debian package declares Architecture: all.
+    # Use the existing X64 runner instead of waiting for an ARM64-only runner.
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
     outputs:
       artifact_name: ${{ steps.meta.outputs.artifact_name }}
@@ -271,7 +273,7 @@ jobs:
   publish-release:
     name: Publish Release
     needs: package-release
-    runs-on: [self-hosted, Linux, ARM64]
+    runs-on: [self-hosted, Linux, X64]
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (
@@ -416,10 +418,10 @@ jobs:
           gh_retry gh release create "${args[@]}"
 
   publish-container-arch:
-    name: Publish Container (${{ matrix.runner_arch }})
+    name: Publish Container (${{ matrix.variant }})
     needs: package-release
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
-    timeout-minutes: 60
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 120
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (
@@ -439,16 +441,13 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - runner_arch: AMD64
-            runs_on: '["self-hosted","Linux","X64"]'
+          - platform: linux/amd64
             variant: amd64
             page_size: 4k
-          - runner_arch: ARM64
-            runs_on: '["self-hosted","Linux","ARM64"]'
+          - platform: linux/arm64
             variant: arm64-4k
             page_size: 4k
-          - runner_arch: ARM64
-            runs_on: '["self-hosted","Linux","ARM64"]'
+          - platform: linux/arm64
             variant: arm64-64k-hwe
             page_size: 64k-hwe
 
@@ -496,6 +495,15 @@ jobs:
             exit 1
           fi
 
+      - name: Enable pinned ARM64 emulation for this build only
+        if: matrix.platform == 'linux/arm64'
+        env:
+          BINFMT_IMAGE: >-
+            docker.io/tonistiigi/binfmt@sha256:1b804311fe87047a4c96d38b4b3ef6f62fca8cd125265917a9e3dc3c996c39e6
+        run: >-
+          sudo podman run --rm --privileged --pull=always "$BINFMT_IMAGE"
+          --install arm64
+
       - name: Build and push architecture image
         shell: bash
         env:
@@ -504,7 +512,7 @@ jobs:
           GHCR_USERNAME: ${{ secrets.GHCR_USERNAME != '' && secrets.GHCR_USERNAME || github.actor }}
           GHCR_PASSWORD: ${{ secrets.GHCR_PASSWORD != '' && secrets.GHCR_PASSWORD || github.token }}
           GHCR_AUTH_SOURCE: ${{ secrets.GHCR_PASSWORD != '' && 'secrets.GHCR_PASSWORD' || 'github.token' }}
-          RUNNER_ARCH: ${{ matrix.runner_arch }}
+          BUILD_PLATFORM: ${{ matrix.platform }}
           BUILD_NUMBER: ${{ needs.package-release.outputs.build_number }}
           BUILD_GIT_COMMIT: ${{ needs.package-release.outputs.git_commit }}
         run: |
@@ -552,13 +560,15 @@ jobs:
 
           docker_build() {
             if [[ "${DOCKER_CMD[0]}" == "sudo" ]]; then
-              sudo DOCKER_BUILDKIT=0 docker build --pull \
+              sudo DOCKER_BUILDKIT=0 docker build \
+                --platform "${BUILD_PLATFORM}" --pull \
                 --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
                 --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
                 --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
                 -f Containerfile -t "${image_ref}" .
             else
-              DOCKER_BUILDKIT=0 docker build --pull \
+              DOCKER_BUILDKIT=0 docker build \
+                --platform "${BUILD_PLATFORM}" --pull \
                 --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
                 --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
                 --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
@@ -589,7 +599,9 @@ jobs:
           echo "Using GHCR credentials source: ${GHCR_AUTH_SOURCE}"
           if command -v podman >/dev/null 2>&1; then
             if printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin; then
-            if podman build --cgroup-manager=cgroupfs --format docker --pull \
+            if podman build \
+                --platform "${BUILD_PLATFORM}" \
+                --cgroup-manager=cgroupfs --format docker --pull \
                 --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
                 --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
                 --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
@@ -622,12 +634,21 @@ jobs:
             exit 1
           fi
 
+      - name: Remove ARM64 emulation registration
+        if: always() && matrix.platform == 'linux/arm64'
+        env:
+          BINFMT_IMAGE: >-
+            docker.io/tonistiigi/binfmt@sha256:1b804311fe87047a4c96d38b4b3ef6f62fca8cd125265917a9e3dc3c996c39e6
+        run: >-
+          sudo podman run --rm --privileged --pull=always "$BINFMT_IMAGE"
+          --uninstall qemu-aarch64
+
   publish-container-manifest:
     name: Publish Container Manifest
     needs:
       - package-release
       - publish-container-arch
-    runs-on: [self-hosted, Linux, ARM64]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
