@@ -154,6 +154,11 @@ def register_jobs_routes(app, handlers: Dict[str, Callable]) -> None:
     app.add_url_rule("/api/jobs", view_func=handlers["jobs"], methods=["GET", "POST"])
     app.add_url_rule("/api/jobs/<job_id>", view_func=handlers["job_detail"], methods=["GET", "DELETE"])
     app.add_url_rule(
+        "/api/jobs/<job_id>/managed-ide-handoff",
+        view_func=handlers["job_managed_ide_handoff"],
+        methods=["POST"],
+    )
+    app.add_url_rule(
         "/api/jobs/<job_id>/workspace",
         view_func=handlers["job_workspace"],
         methods=["GET", "POST"],

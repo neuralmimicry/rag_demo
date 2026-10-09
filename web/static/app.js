@@ -5112,6 +5112,26 @@ function renderJobDetail(job, options = {}) {
     : '';
   const repoInfo = job.repo_info || {};
   const canManageJob = Boolean(job.project_capabilities?.write);
+  const managedHandoff = repoInfo.managed_ide_handoff || null;
+  const managedHandoffUrl = /^https?:\/\//i.test(managedHandoff?.browserUrl || '')
+    ? managedHandoff.browserUrl
+    : '';
+  const showManagedHandoff = job.workflow === 'project_solver' || job.workflow === 'project';
+  const managedHandoffPanel = showManagedHandoff && managedHandoff
+    ? `<div class="transfer-panel managed-ide-handoff">
+        <div class="label">NeuralMimicry IDE fallback</div>
+        <div class="value">${escapeHtml(managedHandoff.status || 'unknown')}${managedHandoff.sourceSha ? ` · ${escapeHtml(managedHandoff.sourceSha.slice(0, 12))}` : ''}</div>
+        ${managedHandoff.error ? `<p class="subtitle">${escapeHtml(managedHandoff.error)}</p>` : ''}
+        <div class="transfer-actions">
+          ${managedHandoffUrl && ['queued', 'preparing'].includes(managedHandoff.status)
+            ? `<a class="button-link" href="${escapeHtml(managedHandoffUrl)}" target="_blank" rel="noopener">Open managed IDE conversation</a>`
+            : ''}
+          ${canManageJob && job.status === 'failed' && managedHandoff.status === 'blocked'
+            ? '<button type="button" class="ghost" id="retryManagedIdeHandoff">Retry managed IDE handoff</button>'
+            : ''}
+        </div>
+      </div>`
+    : '';
   const repoMeta = repoInfo.fork_org && repoInfo.fork_repo
     ? `${repoInfo.fork_org}/${repoInfo.fork_repo}`
     : (repoInfo.owner ? `${repoInfo.owner}/${repoInfo.repo}` : '--');
@@ -5280,6 +5300,7 @@ function renderJobDetail(job, options = {}) {
       <div class="detail-card"><span class="label">Branch</span><div class="value">${repoBranch}</div></div>
     </div>
     ${transferPanelHtml}
+    ${managedHandoffPanel}
     <div class="session-panel" id="sessionPanel" data-job-id="${job.id}">
       <div class="label">Workspace Session</div>
       <div class="value" id="sessionStatus">Connecting...</div>
@@ -5350,6 +5371,28 @@ function renderJobDetail(job, options = {}) {
   jobDetailEl.querySelectorAll('button[data-action]').forEach((btn) => {
     btn.addEventListener('click', () => postAction(job.id, btn.dataset.action));
   });
+  const retryManagedIdeHandoffBtn = document.getElementById('retryManagedIdeHandoff');
+  if (retryManagedIdeHandoffBtn) {
+    retryManagedIdeHandoffBtn.addEventListener('click', async () => {
+      retryManagedIdeHandoffBtn.disabled = true;
+      showJobStatus('Retrying the managed IDE handoff…');
+      try {
+        const res = await apiFetch(`/api/jobs/${encodeURIComponent(job.id)}/managed-ide-handoff`, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) {
+          showJobStatus(data.details || data.error || 'Managed IDE handoff retry failed.', true);
+          retryManagedIdeHandoffBtn.disabled = false;
+          return;
+        }
+        renderJobDetail(data);
+        await fetchJobs();
+      } catch (err) {
+        console.error(err);
+        showJobStatus('Managed IDE handoff retry failed. Check the connection and try again.', true);
+        retryManagedIdeHandoffBtn.disabled = false;
+      }
+    });
+  }
   const refundToggleBtn = document.getElementById('refundToggle');
   if (refundToggleBtn) {
     refundToggleBtn.addEventListener('click', () => {
