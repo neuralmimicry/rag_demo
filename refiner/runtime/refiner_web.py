@@ -83,6 +83,7 @@ from refiner.runtime.llm_access import (
     provider_base_url as _provider_base_url,
     user_can_use_shared_llm_credentials as _user_can_use_shared_llm_credentials,
 )
+from refiner.runtime.managed_ide import build_handoff_payload, submit_handoff
 from refiner.workflows.delivery.github_actions import verify_repository_builds
 from refiner.solver_memory import SolverEpisode, SolverEpisodeStore
 from refiner.thought_inbox import (
@@ -7163,6 +7164,104 @@ class JobManager:
             self._run_job(job)
             self.queue.task_done()
 
+    def _submit_managed_ide_fallback(
+        self,
+        job: "Job",
+        completion_summary: Optional[Dict[str, Any]] = None,
+        completion_reason: str = "",
+        *,
+        retry: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Offer a failed project-solver request to its isolated managed IDE worktree."""
+        enabled = _env_flag("REFINER_MANAGED_IDE_ENABLED", False)
+        if not enabled or job.workflow not in {"project_solver", "project"} or job.stop_requested:
+            return None
+        repo_info = job.repo_info if isinstance(job.repo_info, dict) else {}
+        prior = repo_info.get("managed_ide_handoff")
+        if isinstance(prior, dict) and prior.get("status") in {"queued", "preparing"} and not retry:
+            return prior
+
+        result: Dict[str, Any]
+        try:
+            owner = str(repo_info.get("fork_org") or repo_info.get("owner") or "").strip()
+            name = str(repo_info.get("fork_repo") or repo_info.get("repo") or "").strip()
+            branch = str(repo_info.get("branch") or "").strip()
+            workspace = str(repo_info.get("workspace") or "").strip()
+            if (
+                not workspace
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+", owner)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+", name)
+                or not re.fullmatch(r"(?:refiner|conductor)/[A-Za-z0-9._/-]{1,180}", branch)
+                or ".." in branch
+                or branch.endswith("/")
+                or "//" in branch
+            ):
+                raise ValueError("Only a pushed Refiner or Conductor work branch can be handed off.")
+
+            # Failed solver runs may still have useful partial work. The explicit
+            # fallback setting permits committing it to the job branch, never main.
+            self._finalize_repo(job, verify_builds=False)
+            sha_result = self._git_run(["git", "rev-parse", "HEAD"], workspace, job)
+            source_sha = str(sha_result.stdout or "").strip().lower()
+            if not re.fullmatch(r"[a-f0-9]{40}", source_sha):
+                raise ValueError("Refiner could not identify the final source commit.")
+            if self._git_has_changes(workspace, job):
+                raise ValueError("Refiner worktree still has unsaved changes after finalisation.")
+            repo_info["commit_sha"] = source_sha
+            repo_info["repo_url"] = f"https://github.com/{owner}/{name}"
+
+            requirements = str(job.payload.get("requirements_text") or "")
+            requirements_path = str(job.payload.get("requirements_path") or "")
+            if not requirements and requirements_path and os.path.isfile(requirements_path):
+                requirements = _read_file_limited(requirements_path, 10_000)
+            payload = build_handoff_payload(
+                job_id=job.job_id,
+                repository=f"{owner}/{name}",
+                source_ref=branch,
+                source_sha=source_sha,
+                requirements=requirements,
+                completion_summary=completion_summary,
+                completion_reason=completion_reason,
+            )
+            result = submit_handoff(
+                payload,
+                enabled=True,
+                endpoint=os.getenv(
+                    "REFINER_MANAGED_IDE_URL",
+                    "http://agentd.neuralmimicry-ide.svc.cluster.local:8080/internal/refiner/handoffs",
+                ),
+                service_token=os.getenv("REFINER_MANAGED_IDE_SERVICE_TOKEN", ""),
+            ) or {"status": "blocked", "error": "Managed IDE fallback is unavailable."}
+            result.update({
+                "jobId": job.job_id,
+                "repository": f"{owner}/{name}",
+                "sourceRef": branch,
+                "sourceSha": source_sha,
+                "attemptedAt": _now_iso(),
+            })
+        except Exception as exc:
+            safe_error = (
+                str(exc)[:500]
+                if isinstance(exc, ValueError)
+                else "Refiner could not prepare a verified branch snapshot for managed IDE handoff. Review the job log and retry."
+            )
+            result = {
+                "status": "blocked",
+                "error": safe_error,
+                "jobId": job.job_id,
+                "attemptedAt": _now_iso(),
+            }
+        repo_info["managed_ide_handoff"] = result
+        job.repo_info = repo_info
+        job.update_stage("managed_ide_fallback", result.get("status", "blocked"), message=result.get("error", ""))
+        job.append_log(
+            "Managed IDE fallback queued for Refiner snapshot " + str(result.get("sourceSha", "unknown"))
+            if result.get("status") in {"queued", "preparing"}
+            else "Managed IDE fallback blocked: " + str(result.get("error", "unknown reason"))
+        )
+        job.persist(force=True)
+        return result
+
     def _run_job(self, job: Job) -> None:
         job.set_status("running")
         job.started_at = _now_iso()
@@ -7332,6 +7431,8 @@ class JobManager:
         job.set_progress(100)
         if completion_reason and job.status in {"completed", "failed"}:
             job.update_stage("finalize", completion_reason)
+        if job.status == "failed" and job.workflow in {"project_solver", "project"} and not job.stop_requested:
+            self._submit_managed_ide_fallback(job, completion_summary, completion_reason or "")
         job.append_log(f"Job finished with exit code {job.exit_code}")
         job.persist(force=True)
         self._settle_tokens(job)
@@ -7919,7 +8020,7 @@ class JobManager:
             job.project_name = project_name
         return True
 
-    def _finalize_repo(self, job: Job) -> None:
+    def _finalize_repo(self, job: Job, *, verify_builds: bool = True) -> None:
         if not job.repo_info:
             return
         workspace = job.repo_info.get("workspace")
@@ -7928,6 +8029,10 @@ class JobManager:
             return
         if not self._git_has_changes(workspace, job):
             job.append_log("No git changes detected; skipping commit/push.")
+            sha_result = self._git_run(["git", "rev-parse", "HEAD"], workspace, job)
+            job.repo_info["commit_sha"] = (sha_result.stdout or "").strip() or None
+            if not verify_builds:
+                self._git_push(workspace, branch, self._get_github_token(job), job)
             return
         base_sha_result = self._git_run(["git", "rev-parse", "HEAD"], workspace, job)
         base_commit_sha = (base_sha_result.stdout or "").strip()
@@ -7939,17 +8044,17 @@ class JobManager:
         self._git_commit(workspace, commit_message, job)
         token = self._get_github_token(job)
         self._git_push(workspace, branch, token, job)
+        sha_result = self._git_run(["git", "rev-parse", "HEAD"], workspace, job)
+        commit_sha = (sha_result.stdout or "").strip()
+        job.repo_info["base_commit_sha"] = base_commit_sha or None
+        job.repo_info["commit_sha"] = commit_sha or None
         build_requested = bool(
             job.payload.get("project_run")
             or job.payload.get("delivery_run")
             or job.payload.get("github_actions_required")
-        )
+        ) and verify_builds
         if build_requested:
-            sha_result = self._git_run(["git", "rev-parse", "HEAD"], workspace, job)
-            commit_sha = (sha_result.stdout or "").strip()
             repo_info = job.repo_info
-            repo_info["base_commit_sha"] = base_commit_sha or None
-            repo_info["commit_sha"] = commit_sha or None
             actions_report = verify_repository_builds(
                 workspace=workspace,
                 owner=str(repo_info.get("fork_org") or repo_info.get("owner") or ""),
@@ -16667,6 +16772,24 @@ def job_detail(job_id: str) -> Response:
     return jsonify(_augment_job_dict_for_user(data, user, job))
 
 
+def job_managed_ide_handoff(job_id: str) -> Response:
+    """Retry an opted-in managed IDE handoff for an incomplete solver job."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    job = manager.get_job(job_id)
+    if not job or not _can_view_job(user, job):
+        return jsonify({"error": "job not found"}), 404
+    if not _can_manage_job(user, job):
+        return jsonify({"error": "forbidden"}), 403
+    if job.status != "failed" or job.workflow not in {"project_solver", "project"}:
+        return jsonify({"error": "job_not_eligible", "details": "Only a finished, failed project-solver job can be handed to the managed IDE."}), 409
+    result = manager._submit_managed_ide_fallback(job, retry=True)
+    if result is None:
+        return jsonify({"error": "managed_ide_disabled", "details": "The managed IDE fallback is not enabled for this Refiner deployment."}), 409
+    return jsonify(_augment_job_dict_for_user(job.to_dict(), user, job))
+
+
 def _workspace_capabilities() -> Dict[str, Any]:
     return {
         "continuum": _continuum_enabled(),
@@ -19107,6 +19230,7 @@ if hasattr(app, "add_url_rule"):
             "refund_file": refund_file,
             "jobs": jobs,
             "job_detail": job_detail,
+            "job_managed_ide_handoff": job_managed_ide_handoff,
             "job_workspace": job_workspace,
             "job_workspace_open": job_workspace_open,
             "job_tasks": job_tasks,
