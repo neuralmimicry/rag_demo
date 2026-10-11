@@ -239,3 +239,12 @@ setupvars.local.sh
 .gemini/skills/
 .kiro/skills/
 .skills_sync.json
+
+# project_solver ignore additions
+.refiner/
+project_solver_output/
+node_modules/
+.next/
+.nuxt/
+.turbo/
+coverage/
