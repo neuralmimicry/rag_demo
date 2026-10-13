@@ -51,6 +51,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Prepare the pinned release verification runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.22.1'
+
+      - name: Verify immutable release and lost-response behavior
+        run: node --test scripts/publish-release.test.mjs
+
+      - name: Verify short private container runtimes and scoped cleanup
+        run: bash scripts/test-ci-podman.sh
+
       - name: Use runner Python runtime
         run: python3 --version
 
@@ -170,6 +181,10 @@ jobs:
     # Use the existing X64 runner instead of waiting for an ARM64-only runner.
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     outputs:
       artifact_name: ${{ steps.meta.outputs.artifact_name }}
       artifact_version: ${{ steps.meta.outputs.artifact_version }}
@@ -219,9 +234,9 @@ jobs:
             release_tag="${GITHUB_REF#refs/tags/}"
             artifact_version="${release_tag#v}"
           else
-            artifact_version="${package_version}-dev.${GITHUB_RUN_NUMBER}.${short_sha}"
+            artifact_version="${package_version}-dev.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}.${short_sha}"
             if [[ "${GITHUB_REF}" == refs/heads/main || "${GITHUB_REF}" == refs/heads/master || "${GITHUB_REF}" == refs/heads/develop ]]; then
-              release_tag="latest-${GITHUB_REF#refs/heads/}"
+              release_tag="v${artifact_version}"
             fi
           fi
 
@@ -270,6 +285,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Attest packaged source and build
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: dist/*
+
   publish-release:
     name: Publish Release
     needs: package-release
@@ -289,6 +310,16 @@ jobs:
       contents: write
 
     steps:
+      - name: Check out the exact source publisher
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Prepare the pinned publisher runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.22.1'
+
       - name: Validate publish target
         shell: bash
         run: |
@@ -304,122 +335,17 @@ jobs:
           name: ${{ needs.package-release.outputs.artifact_name }}
           path: ./dist
 
-      - name: Create or update GitHub release
-        shell: bash
+      - name: Publish immutable source-bound release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.package-release.outputs.release_tag }}
-          DRAFT_RELEASE: >-
-            ${{ github.event_name == 'workflow_dispatch' && inputs.draft_release }}
-          MANUAL_PRERELEASE: >-
-            ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-
-          # Self-hosted runners are intentionally minimal and may not have
-          # GitHub CLI installed. Keep the release job self-contained by
-          # downloading a temporary, architecture-matched CLI when needed.
-          if ! command -v gh >/dev/null 2>&1; then
-            case "$(uname -m)" in
-              x86_64) gh_arch="amd64" ;;
-              aarch64|arm64) gh_arch="arm64" ;;
-              *)
-                echo "::error::Unsupported runner architecture for GitHub CLI: $(uname -m)"
-                exit 1
-                ;;
-            esac
-            gh_version="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | sed -n 's/.*"tag_name": "\(v[^"]*\)".*/\1/p' | head -n 1)"
-            if [[ -z "${gh_version}" ]]; then
-              echo "::error::Unable to resolve the latest GitHub CLI release"
-              exit 1
-            fi
-            gh_root="${RUNNER_TEMP}/gh-${gh_version#v}-${gh_arch}"
-            gh_archive="${RUNNER_TEMP}/gh-${gh_version#v}-linux-${gh_arch}.tar.gz"
-            curl -fsSL "https://github.com/cli/cli/releases/download/${gh_version}/gh_${gh_version#v}_linux_${gh_arch}.tar.gz" -o "${gh_archive}"
-            mkdir -p "${gh_root}"
-            tar -xzf "${gh_archive}" --strip-components=1 -C "${gh_root}"
-            export PATH="${gh_root}/bin:${PATH}"
-          fi
-          gh --version
-
-          gh_retry() {
-            local max_attempts=5
-            local attempt=1
-            local retry_delay=6
-            while true; do
-              if "$@"; then
-                return 0
-              fi
-              if (( attempt >= max_attempts )); then
-                echo "::error::GitHub API command failed after ${max_attempts} attempts: $*" >&2
-                return 1
-              fi
-              echo "::warning::GitHub API command failed (attempt ${attempt}/${max_attempts}); retrying in ${retry_delay}s..." >&2
-              sleep "${retry_delay}"
-              attempt=$((attempt + 1))
-            done
-          }
-
-          files=(dist/*)
-          if [[ ${#files[@]} -eq 0 ]]; then
-            echo "::error::No packaged artifacts were downloaded"
-            exit 1
-          fi
-
-          title="Refiner ${RELEASE_TAG}"
-          prerelease="${MANUAL_PRERELEASE}"
-          if [[ "${RELEASE_TAG}" == latest-* ]]; then
-            prerelease="true"
-          fi
-          if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" && "${RELEASE_TAG}" == *-* ]]; then
-            prerelease="true"
-          fi
-
-          if gh_retry gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            edit_args=(
-              "${RELEASE_TAG}"
-              --target "${GITHUB_SHA}"
-              --title "${title}"
-            )
-            if [[ "${DRAFT_RELEASE}" == "true" ]]; then
-              edit_args+=(--draft)
-            fi
-            if [[ "${prerelease}" == "true" ]]; then
-              edit_args+=(--prerelease)
-            fi
-            gh_retry gh release edit "${edit_args[@]}"
-            if [[ "${RELEASE_TAG}" == latest-* ]]; then
-              mapfile -t existing_assets < <(gh_retry gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')
-              for asset_name in "${existing_assets[@]}"; do
-                gh_retry gh release delete-asset "${RELEASE_TAG}" "${asset_name}" -y || true
-              done
-            fi
-            gh_retry gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber
-            exit 0
-          fi
-
-          args=(
-            "${RELEASE_TAG}"
-            "${files[@]}"
-            --target "${GITHUB_SHA}"
-            --title "${title}"
-            --generate-notes
-          )
-
-          if [[ "${DRAFT_RELEASE}" == "true" ]]; then
-            args+=(--draft)
-          fi
-          if [[ "${prerelease}" == "true" ]]; then
-            args+=(--prerelease)
-          fi
-
-          gh_retry gh release create "${args[@]}"
+          DRAFT_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.draft_release }}
+          MANUAL_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
+        run: node scripts/publish-release.mjs
 
   publish-container-arch:
     name: Publish Container (${{ matrix.variant }})
-    needs: package-release
+    needs: [package-release, publish-release]
     runs-on: ${{ fromJSON(matrix.runner_labels) }}
     timeout-minutes: 120
     if: >-
@@ -436,6 +362,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -458,184 +386,68 @@ jobs:
             page_size: 64k-hwe
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Check out exact image source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
-      - name: Validate publish target
-        shell: bash
+      - name: Prepare the pinned image verification runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.22.1'
+
+      - name: Prepare isolated rootless container runtime
         run: |
           set -euo pipefail
-          if [[ -z "${{ needs.package-release.outputs.release_tag }}" ]]; then
-            echo "::error::Publishing container requires a resolved release tag"
-            exit 1
-          fi
+          test "$(df -Pk /var/tmp | awk 'NR == 2 { print $4 }')" -ge 20971520
+          bash scripts/ci-podman.sh --prepare
 
-      - name: Configure rootless container runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          runner_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
-          runtime_dir="${RUNNER_TEMP:-/tmp}/podman-runtime-$(id -u)"
-          if [[ -z "${runner_home}" || ! -d "${runner_home}" ]]; then
-            echo "::error::Could not resolve the runner user's home directory"
-            exit 1
-          fi
-          mkdir -p "${runtime_dir}"
-          chmod 700 "${runtime_dir}"
-          if [[ ! -w "${runtime_dir}" ]]; then
-            echo "::error::Rootless container runtime directory is not writable: ${runtime_dir}"
-            exit 1
-          fi
-          # actions/checkout can temporarily override HOME while configuring
-          # git. Restore the service user's home/runtime before Podman runs.
-          echo "HOME=${runner_home}" >> "${GITHUB_ENV}"
-          echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "${GITHUB_ENV}"
-          export HOME="${runner_home}"
-          export XDG_RUNTIME_DIR="${runtime_dir}"
-          if command -v podman >/dev/null 2>&1 && podman info --format '{{.Host.Security.Rootless}} {{.Store.GraphRoot}}'; then
-            echo "Using rootless Podman for the container build."
-          elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-            echo "Podman is unavailable; using the Docker fallback."
-          else
-            echo "::error::Neither Podman nor Docker is available on this runner."
-            exit 1
-          fi
-
-      - name: Require the native build architecture
-        shell: bash
-        run: |
-          test "$(uname -m)" = "${{ matrix.runner_arch }}"
-
-      - name: Build and push architecture image
-        shell: bash
+      - name: Log in with the job's private registry credential
         env:
-          IMAGE_REPO: ghcr.io/neuralmimicry/refiner
-          RELEASE_TAG: ${{ needs.package-release.outputs.release_tag }}
-          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME != '' && secrets.GHCR_USERNAME || github.actor }}
-          GHCR_PASSWORD: ${{ secrets.GHCR_PASSWORD != '' && secrets.GHCR_PASSWORD || github.token }}
-          GHCR_AUTH_SOURCE: ${{ secrets.GHCR_PASSWORD != '' && 'secrets.GHCR_PASSWORD' || 'github.token' }}
-          BUILD_PLATFORM: ${{ matrix.platform }}
-          BUILD_NUMBER: ${{ needs.package-release.outputs.build_number }}
-          BUILD_GIT_COMMIT: ${{ needs.package-release.outputs.git_commit }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GHCR_PASSWORD || github.token }}
         run: |
           set -euo pipefail
+          printf '%s' "$GHCR_PASSWORD" | "$CONTAINER_RUNTIME" login ghcr.io --username "$GHCR_USERNAME" --password-stdin
 
-          push_with_retry() {
-            local max_attempts="$1"
-            shift
-            local attempt=1
-            local retry_delay=12
-            while true; do
-              if "$@"; then
-                return 0
-              fi
-              if (( attempt >= max_attempts )); then
-                echo "::error::Push failed after ${max_attempts} attempts: $*"
-                return 1
-              fi
-              echo "::warning::Push attempt ${attempt}/${max_attempts} failed for ${image_ref}; retrying in ${retry_delay}s..."
-              sleep "${retry_delay}"
-              attempt=$((attempt + 1))
-            done
-          }
-
-          DOCKER_CMD=()
-
-          resolve_docker_cmd() {
-            if [[ ${#DOCKER_CMD[@]} -gt 0 ]]; then
-              return 0
-            fi
-            if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-              DOCKER_CMD=(docker)
-              return 0
-            fi
-            if command -v sudo >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1; then
-              DOCKER_CMD=(sudo docker)
-              return 0
-            fi
-            return 1
-          }
-
-          docker_login() {
-            printf '%s' "${GHCR_PASSWORD}" | "${DOCKER_CMD[@]}" login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
-          }
-
-          docker_build() {
-            if [[ "${DOCKER_CMD[0]}" == "sudo" ]]; then
-              sudo DOCKER_BUILDKIT=0 docker build \
-                --platform "${BUILD_PLATFORM}" --pull \
-                --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
-                --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
-                --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
-                -f Containerfile -t "${image_ref}" .
-            else
-              DOCKER_BUILDKIT=0 docker build \
-                --platform "${BUILD_PLATFORM}" --pull \
-                --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
-                --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
-                --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
-                -f Containerfile -t "${image_ref}" .
-            fi
-          }
-
-          docker_push() {
-            "${DOCKER_CMD[@]}" push "${image_ref}"
-          }
-
-          podman_push_default() {
-            # Retry policy is provided by push_with_retry below. Keep the
-            # Podman invocation portable across the runner versions in use.
-            podman push "${image_ref}"
-          }
-
-          podman_push_compat() {
-            podman push \
-              --format v2s2 \
-              --compression-format gzip \
-              --force-compression \
-              --remove-signatures \
-              "${image_ref}"
-          }
-
-          image_ref="${IMAGE_REPO}:${RELEASE_TAG}-${{ matrix.variant }}"
-          echo "Using GHCR credentials source: ${GHCR_AUTH_SOURCE}"
-          if command -v podman >/dev/null 2>&1; then
-            if printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin; then
-            if podman build \
-                --platform "${BUILD_PLATFORM}" \
-                --cgroup-manager=cgroupfs --format docker --pull \
-                --build-arg BUILD_NUMBER="${BUILD_NUMBER}" \
-                --build-arg GIT_COMMIT="${BUILD_GIT_COMMIT}" \
-                --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
-                -f Containerfile -t "${image_ref}" .; then
-                if push_with_retry 2 podman_push_default; then
-                  exit 0
-                fi
-                echo "::warning::Default podman push failed for ${image_ref}; retrying with docker schema2 compatibility options."
-                if push_with_retry 2 podman_push_compat; then
-                  exit 0
-                fi
-              fi
-            else
-              echo "::warning::Podman login failed; trying Docker fallback."
-            fi
-            if ! resolve_docker_cmd; then
-              echo "::error::Podman publish/login failed and docker fallback is unavailable (docker missing or no daemon access, including sudo)."
-              exit 1
-            fi
-            echo "::warning::Podman publish failed for ${image_ref}; falling back to docker publish."
-            docker_login
-            docker_build
-            push_with_retry 5 docker_push
-          elif resolve_docker_cmd; then
-            docker_login
-            docker_build
-            push_with_retry 5 docker_push
-          else
-            echo "::error::Neither podman nor a usable docker daemon (direct or sudo) is available on this runner."
-            exit 1
+      - name: Build and push on the required native architecture
+        env:
+          IMAGE_REF: ghcr.io/neuralmimicry/refiner:${{ needs.package-release.outputs.release_tag }}-${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "${{ matrix.runner_arch }}"
+          test "$GITHUB_SHA" = "${{ needs.package-release.outputs.git_commit }}"
+          runtime_args=()
+          if [[ "${{ matrix.runner_arch }}" == aarch64 ]] && command -v runc >/dev/null; then
+            runtime_args=(--runtime "$(command -v runc)")
           fi
+          "$CONTAINER_RUNTIME" "${runtime_args[@]}" build --network=slirp4netns --format docker --pull \
+            --build-arg BUILD_NUMBER="${{ needs.package-release.outputs.build_number }}" \
+            --build-arg GIT_COMMIT="$GITHUB_SHA" \
+            --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
+            -f Containerfile -t "$IMAGE_REF" .
+          "$CONTAINER_RUNTIME" push --format v2s2 --compression-format gzip \
+            --digestfile "$RUNNER_TEMP/refiner-${{ matrix.variant }}-digest" "$IMAGE_REF"
 
+      - name: Independently verify pushed digest and image source
+        id: image_identity
+        env:
+          IMAGE_REF: ghcr.io/neuralmimicry/refiner:${{ needs.package-release.outputs.release_tag }}-${{ matrix.variant }}
+          IMAGE_DIGEST_FILE: ${{ runner.temp }}/refiner-${{ matrix.variant }}-digest
+          IMAGE_PLATFORM: ${{ matrix.platform }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GHCR_PASSWORD || github.token }}
+        run: node scripts/publish-release.mjs --image
+
+      - name: Attest immutable image source and build
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-name: ghcr.io/neuralmimicry/refiner
+          subject-digest: ${{ steps.image_identity.outputs.digest }}
+
+      - name: Remove the job's private container runtime
+        if: ${{ always() && env.CONDUCTOR_PODMAN_ROOT != '' }}
+        run: bash scripts/ci-podman.sh --cleanup
 
   publish-container-manifest:
     name: Publish Container Manifest
@@ -658,163 +470,61 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
 
     steps:
-      - name: Validate publish target
-        shell: bash
+      - name: Check out exact image source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Prepare the pinned image verification runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.22.1'
+
+      - name: Prepare isolated rootless container runtime
         run: |
           set -euo pipefail
-          if [[ -z "${{ needs.package-release.outputs.release_tag }}" ]]; then
-            echo "::error::Publishing container manifest requires a resolved release tag"
-            exit 1
-          fi
+          test "$(df -Pk /var/tmp | awk 'NR == 2 { print $4 }')" -ge 20971520
+          bash scripts/ci-podman.sh --prepare
 
-      - name: Configure rootless container runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          runner_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
-          runtime_dir="${RUNNER_TEMP:-/tmp}/podman-runtime-$(id -u)"
-          if [[ -z "${runner_home}" || ! -d "${runner_home}" ]]; then
-            echo "::error::Could not resolve the runner user's home directory"
-            exit 1
-          fi
-          mkdir -p "${runtime_dir}"
-          chmod 700 "${runtime_dir}"
-          if [[ ! -w "${runtime_dir}" ]]; then
-            echo "::error::Rootless container runtime directory is not writable: ${runtime_dir}"
-            exit 1
-          fi
-          echo "HOME=${runner_home}" >> "${GITHUB_ENV}"
-          echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "${GITHUB_ENV}"
-          export HOME="${runner_home}"
-          export XDG_RUNTIME_DIR="${runtime_dir}"
-          if command -v podman >/dev/null 2>&1 && podman info --format '{{.Host.Security.Rootless}} {{.Store.GraphRoot}}'; then
-            echo "Using rootless Podman for the manifest build."
-          elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-            echo "Podman is unavailable; using the Docker fallback."
-          else
-            echo "::error::Neither Podman nor Docker is available on this runner."
-            exit 1
-          fi
-
-      - name: Publish multi-architecture manifest
-        shell: bash
+      - name: Log in with the job's private registry credential
         env:
-          IMAGE_REPO: ghcr.io/neuralmimicry/refiner
-          RELEASE_TAG: ${{ needs.package-release.outputs.release_tag }}
-          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME != '' && secrets.GHCR_USERNAME || github.actor }}
-          GHCR_PASSWORD: ${{ secrets.GHCR_PASSWORD != '' && secrets.GHCR_PASSWORD || github.token }}
-          GHCR_AUTH_SOURCE: ${{ secrets.GHCR_PASSWORD != '' && 'secrets.GHCR_PASSWORD' || 'github.token' }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GHCR_PASSWORD || github.token }}
         run: |
           set -euo pipefail
+          printf '%s' "$GHCR_PASSWORD" | "$CONTAINER_RUNTIME" login ghcr.io --username "$GHCR_USERNAME" --password-stdin
 
-          push_with_retry() {
-            local max_attempts="$1"
-            shift
-            local attempt=1
-            local retry_delay=12
-            while true; do
-              if "$@"; then
-                return 0
-              fi
-              if (( attempt >= max_attempts )); then
-                echo "::error::Manifest publish failed after ${max_attempts} attempts: $*"
-                return 1
-              fi
-              echo "::warning::Manifest push attempt ${attempt}/${max_attempts} failed; retrying in ${retry_delay}s..."
-              sleep "${retry_delay}"
-              attempt=$((attempt + 1))
-            done
-          }
+      - name: Publish the same-source native architecture index
+        env:
+          IMAGE_REF: ghcr.io/neuralmimicry/refiner:${{ needs.package-release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          manifest="refiner-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          "$CONTAINER_RUNTIME" manifest create "$manifest"
+          "$CONTAINER_RUNTIME" manifest add "$manifest" "docker://$IMAGE_REF-amd64"
+          "$CONTAINER_RUNTIME" manifest add "$manifest" "docker://$IMAGE_REF-arm64-4k"
+          "$CONTAINER_RUNTIME" manifest push --all --format v2s2 \
+            --digestfile "$RUNNER_TEMP/refiner-manifest-digest" "$manifest" "docker://$IMAGE_REF"
 
-          DOCKER_CMD=()
+      - name: Independently verify pushed digest and image source
+        id: image_identity
+        env:
+          IMAGE_REF: ghcr.io/neuralmimicry/refiner:${{ needs.package-release.outputs.release_tag }}
+          IMAGE_DIGEST_FILE: ${{ runner.temp }}/refiner-manifest-digest
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GHCR_PASSWORD || github.token }}
+        run: node scripts/publish-release.mjs --image
 
-          resolve_docker_cmd() {
-            if [[ ${#DOCKER_CMD[@]} -gt 0 ]]; then
-              return 0
-            fi
-            if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-              DOCKER_CMD=(docker)
-              return 0
-            fi
-            if command -v sudo >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1; then
-              DOCKER_CMD=(sudo docker)
-              return 0
-            fi
-            return 1
-          }
+      - name: Attest immutable image source and build
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-name: ghcr.io/neuralmimicry/refiner
+          subject-digest: ${{ steps.image_identity.outputs.digest }}
 
-          docker_login() {
-            printf '%s' "${GHCR_PASSWORD}" | "${DOCKER_CMD[@]}" login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
-          }
-
-          docker_manifest_push() {
-            "${DOCKER_CMD[@]}" manifest push --purge "${image_ref}"
-          }
-
-          podman_manifest_push_default() {
-            podman manifest push --all "${image_ref}" "docker://${image_ref}"
-          }
-
-          podman_manifest_push_compat() {
-            podman manifest push \
-              --all \
-              --format v2s2 \
-              --compression-format gzip \
-              --force-compression \
-              --remove-signatures \
-              "${image_ref}" \
-              "docker://${image_ref}"
-          }
-
-          image_ref="${IMAGE_REPO}:${RELEASE_TAG}"
-          amd64_ref="${IMAGE_REPO}:${RELEASE_TAG}-amd64"
-          arm64_ref="${IMAGE_REPO}:${RELEASE_TAG}-arm64-4k"
-          manifest_tags=("${RELEASE_TAG}")
-          if [[ "${RELEASE_TAG}" == "latest-main" || "${RELEASE_TAG}" == "latest-master" ]]; then
-            manifest_tags+=("latest")
-          fi
-          echo "Using GHCR credentials source: ${GHCR_AUTH_SOURCE}"
-
-          for manifest_tag in "${manifest_tags[@]}"; do
-            image_ref="${IMAGE_REPO}:${manifest_tag}"
-            echo "Publishing manifest ${image_ref}"
-
-            if command -v podman >/dev/null 2>&1; then
-              printf '%s' "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
-              podman manifest rm "${image_ref}" >/dev/null 2>&1 || true
-              if podman manifest create "${image_ref}" \
-                && podman manifest add "${image_ref}" "docker://${amd64_ref}" \
-                && podman manifest add "${image_ref}" "docker://${arm64_ref}"; then
-                if push_with_retry 2 podman_manifest_push_default; then
-                  continue
-                fi
-                echo "::warning::Default podman manifest push failed for ${image_ref}; retrying with docker schema2 compatibility options."
-                if push_with_retry 2 podman_manifest_push_compat; then
-                  continue
-                fi
-              fi
-              if ! resolve_docker_cmd; then
-                echo "::error::Podman manifest publish failed and docker fallback is unavailable (docker missing or no daemon access, including sudo)."
-                exit 1
-              fi
-              echo "::warning::Podman manifest publish failed for ${image_ref}; falling back to docker manifest publish."
-              docker_login
-              "${DOCKER_CMD[@]}" manifest rm "${image_ref}" >/dev/null 2>&1 || true
-              "${DOCKER_CMD[@]}" manifest create "${image_ref}" "${amd64_ref}" "${arm64_ref}"
-              "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${amd64_ref}" --os linux --arch amd64
-              "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${arm64_ref}" --os linux --arch arm64
-              push_with_retry 5 docker_manifest_push
-            elif resolve_docker_cmd; then
-              docker_login
-              "${DOCKER_CMD[@]}" manifest rm "${image_ref}" >/dev/null 2>&1 || true
-              "${DOCKER_CMD[@]}" manifest create "${image_ref}" "${amd64_ref}" "${arm64_ref}"
-              "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${amd64_ref}" --os linux --arch amd64
-              "${DOCKER_CMD[@]}" manifest annotate "${image_ref}" "${arm64_ref}" --os linux --arch arm64
-              push_with_retry 5 docker_manifest_push
-            else
-              echo "::error::Neither podman nor a usable docker daemon (direct or sudo) is available on this runner."
-              exit 1
-            fi
-          done
+      - name: Remove the job's private container runtime
+        if: ${{ always() && env.CONDUCTOR_PODMAN_ROOT != '' }}
+        run: bash scripts/ci-podman.sh --cleanup
