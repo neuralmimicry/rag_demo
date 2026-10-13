@@ -17,8 +17,13 @@ function fixture(options = {}) {
     fetchImpl: async (url, init) => {
       calls.push({ url, method: init.method });
       const path = new URL(url).pathname;
-      if (init.method === 'GET' && path.includes('/commits/')) {
-        return tagExists ? Response.json({ sha: options.tagSha ?? sha }) : new Response('', { status: 404 });
+      if (init.method === 'GET' && path.includes('/git/ref/tags/')) {
+        return tagExists ? Response.json({ object: { type: options.annotated ? 'tag' : 'commit',
+          sha: options.annotated ? 'c'.repeat(40) : options.tagSha ?? sha } }) : new Response('', { status: 404 });
+      }
+      if (init.method === 'GET' && path.includes('/git/tags/')) {
+        return Response.json({ object: { type: options.tagCycle ? 'tag' : 'commit',
+          sha: options.tagCycle ? 'c'.repeat(40) : options.tagSha ?? sha } });
       }
       if (init.method === 'GET') return exists ? Response.json(release) : new Response('', { status: 404 });
       if (path.endsWith('/git/refs')) {
@@ -46,6 +51,17 @@ test('existing source tag and matching asset are read-only', async () => {
 test('a stale tag blocks all release and asset writes', async () => {
   const f = fixture({ tagSha: 'b'.repeat(40) });
   await assert.rejects(publishRelease(f.config), /qualified source/);
+  assert.ok(f.calls.every(call => call.method === 'GET'));
+});
+test('annotated GitHub tags resolve to their commit before publication', async () => {
+  const f = fixture({ annotated: true });
+  await publishRelease(f.config);
+  assert.ok(f.calls.some(call => call.url.includes('/git/tags/')));
+  assert.ok(f.calls.every(call => !call.url.includes('/commits/')));
+});
+test('unresolvable annotation cycles block all writes', async () => {
+  const f = fixture({ annotated: true, tagCycle: true });
+  await assert.rejects(publishRelease(f.config), /cannot be resolved/);
   assert.ok(f.calls.every(call => call.method === 'GET'));
 });
 test('different or missing existing digests never clobber assets', async () => {
