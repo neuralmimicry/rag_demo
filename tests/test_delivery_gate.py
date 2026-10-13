@@ -255,3 +255,39 @@ def test_repository_build_gate_skips_workflow_restricted_to_protected_branch(tmp
     assert report["succeeded"] is True
     assert report["workflows"][0]["succeeded"] is True
     assert "does not trigger" in report["workflows"][0]["reason"]
+
+
+def test_release_gate_rejects_missing_commit_without_accepting_old_ci(tmp_path, monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Missing source must not query or accept branch CI")
+    monkeypatch.setattr(delivery_pipeline.urllib.request, "urlopen", forbidden)
+    report = delivery_pipeline._github_actions_report(
+        str(tmp_path), {"enabled": True, "require_success": True,
+                        "owner": "neuralmimicry", "repo": "demo", "branch": "main"}, True,
+    )
+    assert report["succeeded"] is False
+    assert "exact full source commit" in report["reason"]
+
+
+def test_uat_and_staging_are_release_gates():
+    for kind in ("uat", "staging", "preprod", "production"):
+        stage = delivery_pipeline.PipelineStage(name=kind, kind=kind)
+        assert delivery_pipeline._is_production_rollout_stage(stage)
+
+
+def test_named_uat_is_gated_even_with_generic_stage_kind():
+    assert delivery_pipeline._is_production_rollout_stage(
+        delivery_pipeline.PipelineStage(name="UAT validation", kind="test")
+    )
+
+
+def test_release_gate_rejects_malformed_source_sha(tmp_path, monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Malformed source must not query branch CI")
+    monkeypatch.setattr(delivery_pipeline.urllib.request, "urlopen", forbidden)
+    for sha in ("abcdef", "z" * 40, "a" * 41):
+        report = delivery_pipeline._github_actions_report(
+            str(tmp_path), {"enabled": True, "owner": "neuralmimicry", "repo": "demo"},
+            True, expected_sha=sha,
+        )
+        assert report["succeeded"] is False

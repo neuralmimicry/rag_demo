@@ -1326,8 +1326,9 @@ def _is_deploy_stage(stage: PipelineStage) -> bool:
 
 
 def _is_production_rollout_stage(stage: PipelineStage) -> bool:
-    kind = (stage.kind or stage.name or "").strip().lower()
-    return kind in {"deploy", "delivery", "release", "production", "prod"}
+    release_kinds = {"deploy", "delivery", "release", "production", "prod", "staging", "uat", "preprod", "pre-production"}
+    labels = re.split(r"[^a-z0-9-]+", f"{stage.kind or ''} {stage.name or ''}".lower())
+    return bool(release_kinds.intersection(labels))
 
 
 def _git_output(project_root: str, args: List[str]) -> Optional[str]:
@@ -1473,10 +1474,12 @@ def _github_actions_report(
     request = urllib.request.Request(url, headers=headers, method="GET")
 
     expected_sha = (expected_sha or "").strip() or None
-    # Without an exact commit there is nothing safe to wait for or approve.
-    # Keep direct helper calls fail-closed and immediate; normal delivery calls
-    # always obtain HEAD after the VCS actions above.
-    wait_timeout = 0.0 if not expected_sha else max(
+    if not expected_sha or not re.fullmatch(r"[0-9a-fA-F]{40}", expected_sha):
+        report["checked"] = True
+        report["succeeded"] = False
+        report["reason"] = "release validation requires an exact full source commit SHA"
+        return report
+    wait_timeout = max(
         0.0,
         float(cfg.get("wait_timeout_sec", cfg.get("timeout_sec", 900)) or 0),
     )
@@ -1524,17 +1527,11 @@ def _github_actions_report(
 
         workflow_runs = payload.get("workflow_runs") or []
         report["checked"] = True
-        if expected_sha:
-            matching_runs = [
-                run for run in workflow_runs
-                if str(run.get("head_sha") or "").strip().lower() == expected_sha.lower()
-            ]
-            run = matching_runs[0] if matching_runs else None
-        else:
-            # Direct callers without a commit context retain the old behavior,
-            # while the delivery pipeline always supplies expected_sha.
-            completed_runs = [run for run in workflow_runs if run.get("status") == "completed"]
-            run = completed_runs[0] if completed_runs else None
+        matching_runs = [
+            run for run in workflow_runs
+            if str(run.get("head_sha") or "").strip().lower() == expected_sha.lower()
+        ]
+        run = matching_runs[0] if matching_runs else None
 
         if run is not None:
             report["run"] = _run_summary(run)
@@ -1545,27 +1542,21 @@ def _github_actions_report(
                 if report["succeeded"]:
                     report["reason"] = (
                         f"GitHub Actions workflow {workflow_file} succeeded for commit "
-                        f"{expected_sha or run.get('head_sha')} on {owner}/{repo} branch {branch}"
+                        f"{expected_sha} on {owner}/{repo} branch {branch}"
                     )
                 else:
                     report["reason"] = (
                         f"GitHub Actions workflow {workflow_file} concluded with "
-                        f"{conclusion or 'unknown'} for commit {expected_sha or run.get('head_sha')}"
+                        f"{conclusion or 'unknown'} for commit {expected_sha}"
                     )
                 return report
 
         if time.monotonic() >= deadline:
             report["succeeded"] = False
-            if expected_sha:
-                report["reason"] = (
-                    f"timed out waiting for GitHub Actions workflow {workflow_file} for commit "
-                    f"{expected_sha} on {owner}/{repo} branch {branch}"
-                )
-            else:
-                report["reason"] = (
-                    f"GitHub Actions workflow {workflow_file} has no completed runs for "
-                    f"{owner}/{repo} on branch {branch}"
-                )
+            report["reason"] = (
+                f"timed out waiting for GitHub Actions workflow {workflow_file} for commit "
+                f"{expected_sha} on {owner}/{repo} branch {branch}"
+            )
             return report
         time.sleep(min(poll_interval, max(0.1, deadline - time.monotonic())))
 
