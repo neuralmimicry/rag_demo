@@ -420,7 +420,7 @@ jobs:
   publish-container-arch:
     name: Publish Container (${{ matrix.variant }})
     needs: package-release
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ fromJSON(matrix.runner_labels) }}
     timeout-minutes: 120
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
@@ -442,12 +442,18 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
+            runner_labels: '["self-hosted","Linux","X64"]'
+            runner_arch: x86_64
             variant: amd64
             page_size: 4k
           - platform: linux/arm64
+            runner_labels: '["self-hosted","Linux","ARM64"]'
+            runner_arch: aarch64
             variant: arm64-4k
             page_size: 4k
           - platform: linux/arm64
+            runner_labels: '["self-hosted","Linux","ARM64"]'
+            runner_arch: aarch64
             variant: arm64-64k-hwe
             page_size: 64k-hwe
 
@@ -495,14 +501,10 @@ jobs:
             exit 1
           fi
 
-      - name: Enable pinned ARM64 emulation for this build only
-        if: matrix.platform == 'linux/arm64'
-        env:
-          BINFMT_IMAGE: >-
-            docker.io/tonistiigi/binfmt@sha256:1b804311fe87047a4c96d38b4b3ef6f62fca8cd125265917a9e3dc3c996c39e6
-        run: >-
-          sudo podman run --rm --privileged --pull=always "$BINFMT_IMAGE"
-          --install arm64
+      - name: Require the native build architecture
+        shell: bash
+        run: |
+          test "$(uname -m)" = "${{ matrix.runner_arch }}"
 
       - name: Build and push architecture image
         shell: bash
@@ -634,14 +636,6 @@ jobs:
             exit 1
           fi
 
-      - name: Remove ARM64 emulation registration
-        if: always() && matrix.platform == 'linux/arm64'
-        env:
-          BINFMT_IMAGE: >-
-            docker.io/tonistiigi/binfmt@sha256:1b804311fe87047a4c96d38b4b3ef6f62fca8cd125265917a9e3dc3c996c39e6
-        run: >-
-          sudo podman run --rm --privileged --pull=always "$BINFMT_IMAGE"
-          --uninstall qemu-aarch64
 
   publish-container-manifest:
     name: Publish Container Manifest
