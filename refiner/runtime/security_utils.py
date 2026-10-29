@@ -154,7 +154,7 @@ def is_private_host(hostname: str) -> bool:
     return False
 
 
-def url_allowed(url: str) -> bool:
+def url_allowed(url: str, *, private_urls: Iterable[str] = ()) -> bool:
     """Validate a URL against scheme, allowlist, blocklist, and private-host policy."""
     if not url:
         return False
@@ -171,13 +171,26 @@ def url_allowed(url: str) -> bool:
         if not allowed_by_list:
             return False
     allow_private = os.getenv("REFINER_ALLOW_PRIVATE_URLS", "").strip().lower() in {"1", "true", "yes", "y"}
-    if not allow_private and not allowed_by_list and is_private_host(host):
+    if not allow_private and not allowed_by_list and url not in private_urls and is_private_host(host):
         return False
     blocklist = _split_csv(os.getenv("REFINER_URL_BLOCKLIST", ""))
     if blocklist:
         if any(host == entry or host.endswith("." + entry) for entry in blocklist):
             return False
     return True
+
+
+def mcp_url_allowed(url: str) -> bool:
+    """Apply normal URL policy plus exact operator-approved private MCP URLs.
+
+    This grants no private-network access to research/download URL consumers.
+    The complete scheme, host, port, path and query must match an approved URL;
+    global host allowlists and blocklists continue to constrain MCP as well.
+    """
+    parsed = urlparse(url)
+    if parsed.username is not None or parsed.password is not None or parsed.fragment:
+        return False
+    return url_allowed(url, private_urls=_split_csv(os.getenv("REFINER_MCP_PRIVATE_URLS", "")))
 
 
 @dataclass

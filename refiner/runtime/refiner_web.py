@@ -138,6 +138,7 @@ from refiner.security_utils import (
     ensure_dir_permissions,
     ensure_file_permissions,
     hash_identifier,
+    mcp_url_allowed,
     url_allowed,
 )
 from refiner.refiner_central_store import (
@@ -6506,13 +6507,16 @@ class LLMTelemetryJanitor:
         return removed
 
 
+_JOB_RUNTIME_READY = threading.Event()
+
+
 class JobManager:
     """Background job queue manager for workflow execution processes."""
 
     def __init__(self, workers: int = DEFAULT_WORKERS):
         self.jobs: Dict[str, Job] = {}
         self.queue: queue.Queue = queue.Queue()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.workers: List[threading.Thread] = []
         _ensure_dirs()
         for idx in range(max(1, workers)):
@@ -6534,9 +6538,10 @@ class JobManager:
         """Restore persisted jobs without blocking web-server readiness."""
 
         try:
-            with self.lock:
-                self._load_jobs_from_disk()
-                self._cleanup_old_jobs()
+            self._load_jobs_from_disk()
+            _JOB_RUNTIME_READY.wait()
+            self.reconcile_tokens()
+            self._cleanup_old_jobs()
         except Exception as exc:
             logger.warning("background job rehydrate failed for %s: %s", JOB_ROOT, exc)
 
@@ -6814,11 +6819,23 @@ class JobManager:
         except Exception:
             return None
 
-    def _remember_loaded_job(self, job: Job) -> None:
-        existing = self.jobs.get(job.job_id)
-        if existing and _timestamp_sort_key(existing.updated_at) > _timestamp_sort_key(job.updated_at):
-            return
-        self.jobs[job.job_id] = job
+    def _remember_loaded_job(self, job: Job) -> bool:
+        # Keep storage I/O outside the queue lock. A newly submitted/running
+        # job must never be replaced or stopped by an older disk snapshot.
+        with self.lock:
+            existing = self.jobs.get(job.job_id)
+            if existing and _timestamp_sort_key(existing.updated_at) >= _timestamp_sort_key(job.updated_at):
+                return False
+            interrupted = job.status in {"queued", "running", "paused"}
+            if interrupted:
+                job.status = "stopped"
+                job.updated_at = _now_iso()
+                if not job.finished_at:
+                    job.finished_at = job.updated_at
+            self.jobs[job.job_id] = job
+        if interrupted:
+            job.persist(force=True)
+        return True
 
     def _load_jobs_from_central_store(self) -> None:
         central_job_store = _central_job_store()
@@ -6864,20 +6881,12 @@ class JobManager:
                 job = Job.from_persisted(data, meta_path)
             except Exception:
                 continue
-            self._remember_loaded_job(job)
-            if central_job_store is not None:
+            restored = self._remember_loaded_job(job)
+            if restored and central_job_store is not None:
                 try:
                     central_job_store.upsert(job.to_persisted_dict())
                 except Exception as exc:
                     logger.debug("central job metadata backfill skipped for %s: %s", job.job_id, exc)
-
-        for job in self.jobs.values():
-            if job.status in {"queued", "running", "paused"}:
-                job.status = "stopped"
-                job.updated_at = _now_iso()
-                if not job.finished_at:
-                    job.finished_at = job.updated_at
-                job.persist(force=True)
 
     def _cleanup_old_jobs(self) -> None:
         if JOB_RETENTION_DAYS <= 0:
@@ -6885,7 +6894,9 @@ class JobManager:
         cutoff = time.time() - JOB_RETENTION_DAYS * 86400
         removed = 0
         central_job_store = _central_job_store()
-        for job in list(self.jobs.values()):
+        with self.lock:
+            jobs = list(self.jobs.values())
+        for job in jobs:
             if job.status not in {"completed", "failed", "stopped"}:
                 continue
             finished = _parse_timestamp(job.finished_at) if job.finished_at else None
@@ -9957,6 +9968,10 @@ def _mcp_masked_server(user: str, server: MCPServerConfig) -> Dict[str, Any]:
 
 
 def _mcp_resolve_server(user: str, server: MCPServerConfig) -> MCPServerConfig:
+    # Recheck policy at execution so removing an operator approval revokes an
+    # already-registered private adapter, without rewriting user configurations.
+    if not mcp_url_allowed(server.base_url):
+        raise ValueError("base_url is blocked by the current MCP URL safety policy")
     headers = {}
     if isinstance(server.headers, dict):
         headers.update(_validate_mcp_headers(server.headers))
@@ -10007,7 +10022,7 @@ def _prepare_mcp_server_config(
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("base_url must be a valid http or https URL")
-    if not url_allowed(base_url):
+    if not mcp_url_allowed(base_url):
         raise ValueError("base_url is blocked by the current URL safety policy")
 
     auth_type = str(payload.get("auth_type") or (current.auth_type if current else "bearer")).strip().lower() or "bearer"
@@ -12483,7 +12498,9 @@ def _notify_portal_usage(job: "Job") -> None:
         pass
 
 
-manager.reconcile_tokens()
+# Reconciliation follows metadata restoration in the background. Waiting for
+# its queue lock here would block module import and the HTTP health endpoint.
+_JOB_RUNTIME_READY.set()
 
 
 def _estimate_tokens_from_text(text: str) -> int:
