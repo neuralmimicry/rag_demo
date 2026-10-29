@@ -32,3 +32,26 @@ def test_audit_logger_writes_jsonl_record(tmp_path):
     assert payload["actor"] == "alice"
     assert payload["status"] == "success"
     assert payload["details"]["ip_hash"] == "abc"
+
+
+def test_private_mcp_approval_is_exact_and_does_not_change_general_url_policy(monkeypatch):
+    approved = "http://192.168.1.2:18180/mcp"
+    monkeypatch.delenv("REFINER_URL_ALLOWLIST", raising=False)
+    monkeypatch.delenv("REFINER_URL_BLOCKLIST", raising=False)
+    monkeypatch.delenv("REFINER_ALLOW_PRIVATE_URLS", raising=False)
+    monkeypatch.setattr(su, "is_private_host", lambda _host: True)
+    monkeypatch.setenv("REFINER_MCP_PRIVATE_URLS", approved)
+    assert su.mcp_url_allowed(approved)
+    assert not su.url_allowed(approved)
+    for denied in [approved + "/other", approved + "?target=admin", approved + "#fragment",
+                   "http://192.168.1.2:18181/mcp", "http://192.168.1.3:18180/mcp",
+                   "http://user@192.168.1.2:18180/mcp"]:
+        assert not su.mcp_url_allowed(denied)
+    monkeypatch.setenv("REFINER_URL_BLOCKLIST", "192.168.1.2")
+    assert not su.mcp_url_allowed(approved)
+    monkeypatch.delenv("REFINER_URL_BLOCKLIST")
+    monkeypatch.setenv("REFINER_URL_ALLOWLIST", "example.com")
+    assert not su.mcp_url_allowed(approved)
+    monkeypatch.delenv("REFINER_URL_ALLOWLIST")
+    monkeypatch.delenv("REFINER_MCP_PRIVATE_URLS")
+    assert not su.mcp_url_allowed(approved)

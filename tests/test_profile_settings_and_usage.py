@@ -625,3 +625,20 @@ def test_mcp_server_save_uses_secret_refs(monkeypatch, tmp_path):
     assert secret_store.get(stored.auth_secret_ref) == "secret-token"
     header_payload = json.loads(secret_store.get(stored.headers_secret_ref))
     assert header_payload == {"X-App": "refiner", "X-Team": "ops"}
+
+
+@pytest.mark.skipif(not HAS_REAL_FLASK, reason="Flask integration tests require a real Flask runtime")
+def test_registered_private_mcp_adapter_rechecks_operator_approval(monkeypatch):
+    from refiner import security_utils
+
+    approved = "http://192.168.1.2:18180/mcp"
+    monkeypatch.delenv("REFINER_URL_ALLOWLIST", raising=False)
+    monkeypatch.delenv("REFINER_URL_BLOCKLIST", raising=False)
+    monkeypatch.delenv("REFINER_ALLOW_PRIVATE_URLS", raising=False)
+    monkeypatch.setattr(security_utils, "is_private_host", lambda _host: True)
+    monkeypatch.setenv("REFINER_MCP_PRIVATE_URLS", approved)
+    server = refiner_web.MCPServerConfig(name="health", base_url=approved, auth_type="none")
+    assert refiner_web._mcp_resolve_server("alice", server).base_url == approved
+    monkeypatch.delenv("REFINER_MCP_PRIVATE_URLS")
+    with pytest.raises(ValueError, match="URL safety policy"):
+        refiner_web._mcp_resolve_server("alice", server)
