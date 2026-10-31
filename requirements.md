@@ -1,8 +1,8 @@
 Overview: Improve Refiner through the Conductor execution loop.
 
 Delivery Context:
-- Current stage: production
-- Validated stages: development, testing, integration, integration_testing, uat
+- Current stage: development
+- Validated stages: none
 - Rollout strategy: canary
 
 Requirements Register:
@@ -14,36 +14,13 @@ Requirements Register:
 - REQ-006: Leave unrelated files untouched.
 - REQ-007: Record rollback/recovery steps and the acceptance signal proving the gap is closed.
 - REQ-008: Preserve staged progression and rollout governance metadata.
-- REQ-009: Capture a fresh protected-target readiness baseline before any change.
-- REQ-010: Use the selected canary or red-green rollout strategy and verify the post-rollout health window.
-- REQ-011: Automatically revert the exact produced commit without rewriting history if health or verification degrades.
-- REQ-012: Verify rollback readiness and recovery before finalising the delivery.
 - REQ-013: When runtime rollout or restart work is needed, use the available Ansible automation context: {"ansible_root":"/srv/swarmhpc/ansible","config_path":"/srv/swarmhpc/ansible/ansible.cfg","host_targets":["rk1"],"hosts":["spirit"],"inventory_path":"/srv/swarmhpc/ansible/inventory/hosts.ini","playbooks":["continuum_tenant_nmchain_site.yml","continuum_tenant_refiner_site.yml"],"repo_root":"/srv/swarmhpc","roles_path":"/srv/swarmhpc/ansible/roles","secrets_root":"/srv/swarmhpc/ansible/.secrets"}.
 
 Work Item Summary:
-Run a controlled Refiner solver task against the existing rag_demo repository. Requirements Register:
-- REQ-001: Inspect the existing project-solver completion and requirement coverage tests before changing files.
-- REQ-002: Add or update one focused regression test proving that an explicit hard REQ remains incomplete and requests another iteration until its acceptance evidence is present.
-- REQ-003: Keep the change scoped to the Refiner completion and requirement coverage test path; preserve unrelated files.
-- REQ-004: Run the focused pytest test and report the exact command and result.
-- REQ-005: Record the implementation, verification evidence, and rollback or recovery signal in the final output.
+rag_demo is linked to live services but no obvious test capability was discovered in the repository inventory. Establish at least a minimal regression or smoke-test baseline before deeper autonomous changes.
 
 Authoritative delivery constraints (mandatory; implement and verify these, do not merely describe them):
-- Required file: tests/test_project_solver_completion_semantics.py (must exist in the delivered repository).
+- No structured delivery constraints were supplied; follow the work-item summary exactly.
 
 Plan JSON:
-{"acceptance":"All explicit REQ IDs are covered, no hard REQ is missing, needs_more_iterations is false, and the focused test passes.","action":"repository_delivery","repository":"neuralmimicry/rag_demo","required_files":["tests/test_project_solver_completion_semantics.py"],"verification_commands":["python -m pytest tests/test_project_solver_completion_semantics.py -q"]}
-
-Planner guidance (advisory; it must not weaken or contradict the authoritative work-item requirements):
-Overview: This work item verifies that the Refiner solver correctly handles explicit requirement completion semantics, ensuring hard requirements remain incomplete until acceptance evidence is present. The implementation focuses on the test suite to validate iteration logic without disrupting unrelated code paths.
-
-Requirements Register:
-- REQ-001: Inspect the existing project-solver completion and requirement coverage tests before changing files.
-- REQ-002: Add or update one focused regression test proving that an explicit hard REQ remains incomplete and requests another iteration until its acceptance evidence is present.
-- REQ-003: Keep the change scoped to the Refiner completion and requirement coverage test path; preserve unrelated files.
-- REQ-004: Run the focused pytest test and report the exact command and result.
-- REQ-005: Record the implementation, verification evidence, and rollback or recovery signal in the final output.
-- REQ-006: Ensure the canary rollout strategy is applied safely to the production environment.
-
-
-Protected rollout contract (mandatory): capture a fresh readiness baseline before any change; use the selected canary or red_green strategy; verify health throughout the post-rollout window; if health or verification degrades, automatically revert the exact produced commit without rewriting history, rerun tests and GitHub Actions, and verify recovery.
+{"action":"establish_repository_test_baseline","finding_id":"190c8943-9ad3-43ef-bd46-4c92cd388920","finding_key":"repository_test_baseline:neuralmimicry/rag_demo","linked_services":["refiner"],"repository":"neuralmimicry/rag_demo"}
